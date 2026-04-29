@@ -23,7 +23,7 @@ const savedAccessToken = getSetting(db, 'netease_access_token');
 const savedRefreshToken = getSetting(db, 'netease_refresh_token');
 if (savedAccessToken) {
   netease.setTokens(savedAccessToken, savedRefreshToken || '');
-  console.log('[netease] loaded saved access token');
+  console.log('[netease] loaded saved token');
 }
 seedDemoLibrary(db);
 await updateProfile(db);
