@@ -1,0 +1,58 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#10131a" />
+    <link rel="manifest" href="/manifest.webmanifest" />
+    <link rel="stylesheet" href="/styles.css" />
+    <title>myMusic</title>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <a class="brand" href="/" data-link>
+          <span class="brand-mark">m</span>
+          <span>myMusic</span>
+        </a>
+        <nav class="nav">
+          <a href="/" data-link>电台</a>
+          <a href="/library" data-link>曲库</a>
+          <a href="/diary" data-link>日记</a>
+          <a href="/settings" data-link>设置</a>
+        </nav>
+      </header>
+      <main id="view" class="view"></main>
+    </div>
+    <template id="player-template">
+      <section class="player-shell">
+        <div class="now-panel">
+          <img id="cover" class="cover" src="/assets/cover-1.svg" alt="cover" />
+          <div class="track-meta">
+            <p class="eyebrow">AI PRIVATE RADIO</p>
+            <h1 id="track-title">myMusic</h1>
+            <p id="track-artist" class="muted">等待启动</p>
+            <p id="reason" class="reason">点击启动后，电台会根据你的收藏、时间、天气和对话自动推荐。</p>
+          </div>
+        </div>
+        <div class="host-panel">
+          <p class="eyebrow">主持人</p>
+          <p id="host-text" class="host-text">准备好以后，我会先说一小段，再放歌。</p>
+        </div>
+        <div class="transport">
+          <button id="start-btn" class="primary">启动电台</button>
+          <button id="next-btn">下一首</button>
+          <button id="pause-btn">暂停</button>
+        </div>
+        <audio id="host-audio"></audio>
+        <audio id="song-audio" controls></audio>
+        <form id="chat-form" class="chat-form">
+          <input id="chat-input" autocomplete="off" placeholder="告诉它你现在想听什么" />
+          <button type="submit">发送</button>
+        </form>
+        <div id="lyric" class="lyric"></div>
+      </section>
+    </template>
+    <script type="module" src="/app.js"></script>
+  </body>
+</html>
