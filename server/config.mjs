@@ -77,6 +77,7 @@ export function publicConfigStatus(config) {
       accessToken: Boolean(config.netease.accessToken),
       deviceId: Boolean(config.netease.device.deviceId)
     },
+    neteaseToken: null, // populated by index.mjs
     llm: {
       configured: Boolean(config.llm.baseUrl && config.llm.apiKey && config.llm.model),
       model: config.llm.model || null

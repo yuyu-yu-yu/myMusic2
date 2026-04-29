@@ -53,6 +53,12 @@ button.primary {
   background: var(--gold);
 }
 
+button.ghost {
+  border: none;
+  background: transparent;
+  color: var(--muted);
+}
+
 .topbar {
   position: sticky;
   top: 0;
@@ -305,6 +311,22 @@ audio {
 .settings-table td {
   padding: 12px 0;
   border-bottom: 1px solid var(--line);
+}
+
+.netease-login {
+  margin-top: 20px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+}
+
+.qr-img {
+  width: 200px;
+  height: 200px;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+  margin-top: 12px;
 }
 
 .status-ok {

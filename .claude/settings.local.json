@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(git -C /mnt/c/myMusic2/.claude/worktrees/sweet-grothendieck-7ba54e/ log --oneline -20)",
+      "Bash(timeout 5 node --experimental-sqlite server/index.mjs)",
+      "Bash(PORT=3001 node --experimental-sqlite \"C:/myMusic2/.claude/worktrees/sweet-grothendieck-7ba54e/server/index.mjs\")",
+      "Bash(curl -s http://127.0.0.1:3001/api/health)"
+    ]
+  }
+}

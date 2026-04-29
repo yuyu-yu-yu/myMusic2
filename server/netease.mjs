@@ -3,10 +3,22 @@ import crypto from 'node:crypto';
 export class NeteaseClient {
   constructor(config) {
     this.config = config;
+    this._accessToken = config.accessToken || '';
+    this._refreshToken = '';
+  }
+
+  setTokens(accessToken, refreshToken) {
+    this._accessToken = accessToken;
+    if (refreshToken) this._refreshToken = refreshToken;
+    this.onTokenChange?.(accessToken, refreshToken);
   }
 
   isConfigured() {
     return Boolean(this.config.appId && this.config.privateKey);
+  }
+
+  hasToken() {
+    return Boolean(this._accessToken);
   }
 
   buildCommonParams(bizContent = {}, options = {}) {
@@ -21,7 +33,7 @@ export class NeteaseClient {
       device: deviceJson
     };
     if (this.config.appSecret) params.appSecret = this.config.appSecret;
-    const token = options.accessToken ?? this.config.accessToken;
+    const token = options.accessToken ?? this._accessToken ?? this.config.accessToken;
     if (token) params.accessToken = token;
     params.sign = signParams(params, this.config.privateKey);
     return params;
@@ -47,14 +59,50 @@ export class NeteaseClient {
       url.search = search.toString();
     }
 
-    const response = await fetch(url, fetchOptions);
-    const text = await response.text();
+    let response = await fetch(url, fetchOptions);
+    let text = await response.text();
     let json;
     try {
       json = JSON.parse(text);
     } catch {
       throw new Error(`NetEase returned non-JSON response: ${text.slice(0, 200)}`);
     }
+
+    // Auto-refresh on token expiration
+    if (!response.ok && isTokenExpired(json) && this._refreshToken && !options._retry) {
+      try {
+        const refreshResult = await this.refreshToken(this._refreshToken);
+        const data = refreshResult?.data || refreshResult;
+        const token = data?.accessToken;
+        if (token && typeof token === 'object' && token.accessToken && token.accessToken !== 'null') {
+          this.setTokens(token.accessToken, token.refreshToken || this._refreshToken);
+          // Retry the original request with new token
+          const retryParams = this.buildCommonParams(bizContent, { ...options, _retry: true });
+          const retryUrl = new URL(pathname, this.config.baseUrl);
+          if (method.toUpperCase() === 'POST') {
+            const retrySearch = new URLSearchParams();
+            for (const [k, v] of Object.entries(retryParams)) {
+              if (v !== undefined && v !== null && v !== '') retrySearch.set(k, String(v));
+            }
+            response = await fetch(retryUrl, { method, headers: { 'content-type': 'application/x-www-form-urlencoded' }, body: retrySearch });
+          } else {
+            const retrySearch = new URLSearchParams();
+            for (const [k, v] of Object.entries(retryParams)) {
+              if (v !== undefined && v !== null && v !== '') retrySearch.set(k, String(v));
+            }
+            retryUrl.search = retrySearch.toString();
+            response = await fetch(retryUrl);
+          }
+          text = await response.text();
+          try { json = JSON.parse(text); } catch {
+            throw new Error(`NetEase returned non-JSON response: ${text.slice(0, 200)}`);
+          }
+        }
+      } catch {
+        // refresh failed, fall through to original error
+      }
+    }
+
     if (!response.ok) {
       throw new Error(`NetEase HTTP ${response.status}: ${json.message || text.slice(0, 200)}`);
     }
@@ -154,6 +202,12 @@ export function getSignContent(params) {
     .sort(([a], [b]) => a.localeCompare(b, 'en', { numeric: false }))
     .map(([key, value]) => `${key}=${value}`)
     .join('&');
+}
+
+function isTokenExpired(json) {
+  if (!json) return false;
+  const msg = (json.message || json.msg || '').toLowerCase();
+  return msg.includes('accesstoken') && (msg.includes('过期') || msg.includes('expired') || msg.includes('无效') || msg.includes('invalid'));
 }
 
 export function normalizePrivateKey(privateKey) {

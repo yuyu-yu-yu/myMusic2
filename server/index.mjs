@@ -4,7 +4,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
-import { openDatabase, seedDemoLibrary } from './db.mjs';
+import { openDatabase, seedDemoLibrary, getSetting, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { getLibrary, getProfile, syncLibrary, updateProfile } from './library.mjs';
 import { chatRadio, nextRadioItem, reportPlay, startRadio } from './radio.mjs';
@@ -15,6 +15,16 @@ loadEnv(rootDir);
 const config = getConfig();
 const db = openDatabase(rootDir);
 const netease = new NeteaseClient(config.netease);
+netease.onTokenChange = (accessToken, refreshToken) => {
+  setSetting(db, 'netease_access_token', accessToken);
+  if (refreshToken) setSetting(db, 'netease_refresh_token', refreshToken);
+};
+const savedAccessToken = getSetting(db, 'netease_access_token');
+const savedRefreshToken = getSetting(db, 'netease_refresh_token');
+if (savedAccessToken) {
+  netease.setTokens(savedAccessToken, savedRefreshToken || '');
+  console.log('[netease] loaded saved access token');
+}
 seedDemoLibrary(db);
 await updateProfile(db);
 
@@ -22,14 +32,24 @@ const publicDir = path.join(rootDir, 'public');
 const cacheDir = path.join(rootDir, 'cache', 'tts');
 
 const routes = {
-  'GET /api/health': async () => ({ ok: true, config: publicConfigStatus(config) }),
-  'GET /api/config/status': async () => publicConfigStatus(config),
+  'GET /api/health': async () => ({ ok: true, config: tokenStatus(publicConfigStatus(config)) }),
+  'GET /api/config/status': async () => tokenStatus(publicConfigStatus(config)),
   'POST /api/auth/netease/qrcode': async () => netease.qrcode(),
-  'GET /api/auth/netease/status': async (req) => {
-    const url = new URL(req.url, 'http://local');
-    const key = url.searchParams.get('key') || url.searchParams.get('qrCodeKey');
+  'POST /api/auth/netease/qrcode/check': async (req) => {
+    const body = await readJson(req);
+    const key = body.key || body.qrCodeKey;
     if (!key) return jsonError('qrCodeKey is required', 400);
-    return netease.qrcodeStatus(key);
+    const result = await netease.qrcodeStatus(key);
+    tryNeteaseLogin(db, netease, result);
+    return result;
+  },
+  'GET /api/auth/netease/token-status': async () => ({
+    configured: netease.isConfigured(),
+    hasToken: netease.hasToken()
+  }),
+  'POST /api/auth/netease/refresh': async () => {
+    const ok = await tryRefreshToken(db, netease);
+    return { ok, token: netease.hasToken() };
   },
   'POST /api/library/sync': async () => syncLibrary(db, netease),
   'GET /api/library': async () => getLibrary(db),
@@ -54,6 +74,46 @@ const routes = {
     return generateDiary(db, config, body.date || today());
   }
 };
+
+function tokenStatus(status) {
+  return { ...status, neteaseToken: netease.hasToken() };
+}
+
+function tryNeteaseLogin(db, netease, result) {
+  const data = result?.data || result;
+  const token = data?.accessToken;
+  if (!token || typeof token !== 'object') return false;
+  const accessToken = token.accessToken;
+  const refreshToken = token.refreshToken;
+  if (!accessToken || accessToken === 'null') return false;
+  netease.setTokens(accessToken, refreshToken || '');
+  setSetting(db, 'netease_access_token', accessToken);
+  if (refreshToken) setSetting(db, 'netease_refresh_token', refreshToken);
+  console.log('[netease] token saved from QR login');
+  return true;
+}
+
+async function tryRefreshToken(db, netease) {
+  const refreshToken = getSetting(db, 'netease_refresh_token');
+  if (!refreshToken) return false;
+  try {
+    const result = await netease.refreshToken(refreshToken);
+    const data = result?.data || result;
+    const token = data?.accessToken;
+    if (!token || typeof token !== 'object') return false;
+    const newAccessToken = token.accessToken;
+    const newRefreshToken = token.refreshToken || refreshToken;
+    if (!newAccessToken || newAccessToken === 'null') return false;
+    netease.setTokens(newAccessToken, newRefreshToken);
+    setSetting(db, 'netease_access_token', newAccessToken);
+    if (newRefreshToken !== refreshToken) setSetting(db, 'netease_refresh_token', newRefreshToken);
+    console.log('[netease] token refreshed');
+    return true;
+  } catch (error) {
+    console.warn('[netease] token refresh failed:', error.message);
+    return false;
+  }
+}
 
 const server = http.createServer(async (req, res) => {
   try {
