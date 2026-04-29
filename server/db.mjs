@@ -99,6 +99,18 @@ function migrate(db) {
   `);
 }
 
+export function getSetting(db, key) {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  return row ? row.value : null;
+}
+
+export function setSetting(db, key, value) {
+  db.prepare(`
+    INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+    ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(key, value, nowIso());
+}
+
 export function nowIso() {
   return new Date().toISOString();
 }

@@ -175,26 +175,75 @@ async function renderSettings() {
       <table class="settings-table">
         ${statusRow('网易云 appId', status.netease.appId)}
         ${statusRow('网易云 RSA 私钥', status.netease.privateKey)}
-        ${statusRow('网易云 accessToken', status.netease.accessToken)}
+        ${statusRow('网易云 登录状态', status.neteaseToken)}
         ${statusRow('LLM', status.llm.configured, status.llm.model)}
         ${statusRow('TTS', status.tts.configured, status.tts.provider)}
         ${statusRow('天气城市', status.weather.configured, status.weather.city)}
       </table>
       <p class="muted">真实密钥只读取本地 .env.local，前端不会接收密钥内容。</p>
-      <button id="qr-btn">获取网易云登录二维码</button>
-      <pre id="qr-output" class="lyric"></pre>
+      <div class="netease-login">
+        <button id="qr-btn">扫码登录网易云</button>
+        <button id="qr-refresh-btn" class="ghost">刷新 token</button>
+        <p id="qr-status"></p>
+        <img id="qr-img" class="qr-img" src="" alt="登录二维码" style="display:none" />
+      </div>
     </section>
   `;
-  document.querySelector('#qr-btn').addEventListener('click', async () => {
-    const output = document.querySelector('#qr-output');
-    output.textContent = '请求中...';
-    try {
-      const data = await api('/api/auth/netease/qrcode', { method: 'POST', body: {} });
-      output.textContent = JSON.stringify(data.data || data, null, 2);
-    } catch (error) {
-      output.textContent = error.message;
-    }
+  document.querySelector('#qr-btn').addEventListener('click', () => startQrLogin());
+  document.querySelector('#qr-refresh-btn').addEventListener('click', async () => {
+    const statusEl = document.querySelector('#qr-status');
+    statusEl.textContent = '正在续期...';
+    const res = await api('/api/auth/netease/refresh', { method: 'POST', body: {} });
+    statusEl.textContent = res.ok ? 'token 已续期（7天内有效）' : '续期失败，请重新扫码';
   });
+}
+
+async function startQrLogin() {
+  const statusEl = document.querySelector('#qr-status');
+  const img = document.querySelector('#qr-img');
+  statusEl.textContent = '获取二维码...';
+  try {
+    const data = await api('/api/auth/netease/qrcode', { method: 'POST', body: {} });
+    const info = data.data || data;
+    const qrUrl = info.qrCodeUrl || info.qrCode || '';
+    const key = info.qrCodeKey;
+    if (qrUrl) {
+      // Use Google Chart API to render QR code image
+      img.src = 'https://chart.googleapis.com/chart?chs=200x200&cht=qr&chl=' + encodeURIComponent(qrUrl);
+      img.style.display = 'block';
+    }
+    statusEl.textContent = '请用网易云音乐 App 扫码';
+    pollQrStatus(key, statusEl);
+  } catch (error) {
+    statusEl.textContent = '获取失败: ' + error.message;
+  }
+}
+
+async function pollQrStatus(key, statusEl) {
+  for (let i = 0; i < 60; i++) {
+    await sleep(2000);
+    try {
+      const res = await api('/api/auth/netease/qrcode/check', { method: 'POST', body: { key } });
+      const data = res.data || res;
+      const code = data.code || data.status || 0;
+      if (code === 803) {
+        statusEl.textContent = '扫码成功！已保存登录信息。';
+        document.querySelector('#qr-img').style.display = 'none';
+        return;
+      }
+      if (code === 802) { statusEl.textContent = '已扫码，请在手机上确认授权...'; continue; }
+      if (code === 801) { statusEl.textContent = '等待扫码...'; continue; }
+      if (code === 800) { statusEl.textContent = '二维码已过期，请重新获取'; return; }
+      statusEl.textContent = '状态: ' + (data.msg || data.message || code);
+    } catch {
+      // keep polling
+    }
+  }
+  statusEl.textContent = '超时，请重新获取二维码';
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function trackItem(track) {
