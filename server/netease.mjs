@@ -59,6 +59,17 @@ export class NeteaseClient {
       url.search = search.toString();
     }
 
+    if (pathname.includes('qrcode')) {
+      const dev = params.device ? JSON.parse(params.device) : {};
+      console.log('[netease debug]', pathname.split('/').pop(), {
+        appId: params.appId?.slice(0, 6) + '...',
+        device: dev,
+        bizContent: params.bizContent,
+        timestamp: params.timestamp,
+        signLen: params.sign?.length
+      });
+    }
+
     let response = await fetch(url, fetchOptions);
     let text = await response.text();
     let json;
@@ -107,6 +118,10 @@ export class NeteaseClient {
       throw new Error(`NetEase HTTP ${response.status}: ${json.message || text.slice(0, 200)}`);
     }
     return json;
+  }
+
+  anonymousLogin() {
+    return this.request('/openapi/music/basic/oauth2/login/anonymous', { clientId: this.config.appId });
   }
 
   qrcode() {
