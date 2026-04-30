@@ -37,7 +37,10 @@ export async function nextRadioItem({ db, config, netease, sessionId, userMessag
   saveTrack(db, selected);
 
   const prompt = [
-    { role: 'system', content: '你是 myMusic 的私人 AI 电台主持人。用中文输出一段 40 字以内的自然串场，不要解释系统规则。' },
+    {
+      role: 'system',
+      content: '你是 myMusic 的私人 AI 电台主持人。用中文输出一段 40 字以内的自然串场，不要解释系统规则。'
+    },
     {
       role: 'user',
       content: [
@@ -51,7 +54,7 @@ export async function nextRadioItem({ db, config, netease, sessionId, userMessag
   ];
   const hostText = await generateChatCompletion(config.llm, prompt, () => {
     const artists = (selected.artists || []).join('、') || '熟悉的声音';
-    return `现在放一首 ${selected.name}，来自 ${artists}。它和此刻的时间、心情很合拍。`;
+    return `现在放一首 ${selected.name}，来自 ${artists}。它和此刻的时间、天气、心情很合拍。`;
   });
   const ttsUrl = await synthesizeSpeech(config.tts, hostText);
   const reason = await generateReason(config, profile, selected, weather, userMessage);
@@ -113,7 +116,7 @@ function chooseCandidates(db) {
 async function pickTrack(candidates, hour, userMessage) {
   if (!candidates.length) return { id: 'demo-1', name: '晚风里的城市', artists: ['myMusic Demo'], coverUrl: '/assets/cover-1.svg' };
   const text = userMessage.toLowerCase();
-  if (/安静|学习|专注|focus|work/.test(text)) return candidates.find((track) => /piano|钢琴|ambient|lofi|夜/i.test(`${track.name} ${track.album}`)) || candidates[0];
+  if (/安静|学习|专注|focus|work/.test(text)) return candidates.find((track) => /piano|钢琴|ambient|lofi|氛围/i.test(`${track.name} ${track.album}`)) || candidates[0];
   if (/开心|运动|跑步|能量|嗨|rock/.test(text)) return candidates.find((track) => /rock|live|dance|摇滚|电/i.test(`${track.name} ${track.album}`)) || candidates[0];
   const index = Math.abs((hour * 7 + new Date().getDate()) % candidates.length);
   return candidates[index];
@@ -124,7 +127,7 @@ async function generateReason(config, profile, track, weather, userMessage) {
     config.llm,
     [
       { role: 'system', content: '用中文输出 30 字以内的推荐理由。' },
-      { role: 'user', content: `画像：${profile.summary}\n天气：${weather}\n用户：${userMessage}\n歌曲：${track.name}` }
+      { role: 'user', content: `画像：${profile.summary}\n天气：${weather}\n用户：${userMessage || '无'}\n歌曲：${track.name}` }
     ],
     () => `基于你的收藏画像和当前环境，${track.name} 适合接在这里。`
   );

@@ -207,6 +207,25 @@ audio {
   width: 100%;
 }
 
+.player-status {
+  grid-column: 1 / -1;
+  min-height: 44px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  color: var(--muted);
+  background: var(--panel);
+  line-height: 1.5;
+}
+
+.player-status.error {
+  color: #ffb7a6;
+}
+
+.player-status.playing {
+  color: #65d6a6;
+}
+
 .lyric {
   grid-column: 1 / -1;
   max-height: 220px;

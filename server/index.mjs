@@ -9,12 +9,14 @@ import { NeteaseClient } from './netease.mjs';
 import { getLibrary, getProfile, syncLibrary, updateProfile } from './library.mjs';
 import { chatRadio, nextRadioItem, reportPlay, startRadio } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
+import { createNcmPlayer } from './player.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 loadEnv(rootDir);
 const config = getConfig();
 const db = openDatabase(rootDir);
 const netease = new NeteaseClient(config.netease);
+const player = createNcmPlayer({ db });
 netease.onTokenChange = (accessToken, refreshToken) => {
   setSetting(db, 'netease_access_token', accessToken);
   if (refreshToken) setSetting(db, 'netease_refresh_token', refreshToken);
@@ -67,6 +69,16 @@ const routes = {
     const body = await readJson(req);
     return reportPlay({ db, netease, payload: body });
   },
+  'POST /api/player/play': async (req) => {
+    const body = await readJson(req);
+    if (!body.trackId) return jsonError('trackId is required', 400);
+    return player.play(body.trackId, { maxSkips: body.maxSkips ?? 6 });
+  },
+  'POST /api/player/pause': async () => player.pause(),
+  'POST /api/player/resume': async () => player.resume(),
+  'POST /api/player/stop': async () => player.stop(),
+  'POST /api/player/next': async () => player.next(),
+  'GET /api/player/state': async () => player.state(),
   'GET /api/diary': async () => listDiaries(db),
   'GET /api/diary/today': async () => getDiary(db, today()) || generateDiary(db, config, today()),
   'POST /api/diary/generate': async (req) => {

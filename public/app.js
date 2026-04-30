@@ -1,7 +1,8 @@
 const state = {
   sessionId: null,
   current: null,
-  library: null
+  library: null,
+  playerPollTimer: null
 };
 
 const view = document.querySelector('#view');
@@ -38,15 +39,21 @@ function renderPlayer() {
   const startBtn = document.querySelector('#start-btn');
   const nextBtn = document.querySelector('#next-btn');
   const pauseBtn = document.querySelector('#pause-btn');
+  const resumeBtn = document.querySelector('#resume-btn');
+  const stopBtn = document.querySelector('#stop-btn');
   const chatForm = document.querySelector('#chat-form');
-  const songAudio = document.querySelector('#song-audio');
 
-  startBtn.addEventListener('click', () => runRadio('/api/radio/start', {}));
-  nextBtn.addEventListener('click', () => runRadio('/api/radio/next', { sessionId: state.sessionId }));
-  pauseBtn.addEventListener('click', () => {
-    document.querySelector('#host-audio').pause();
-    songAudio.pause();
+  startBtn.addEventListener('click', () => {
+    api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
+    runRadio('/api/radio/start', {});
   });
+  nextBtn.addEventListener('click', () => {
+    api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
+    runRadio('/api/radio/next', { sessionId: state.sessionId });
+  });
+  pauseBtn.addEventListener('click', () => pausePlayback());
+  resumeBtn.addEventListener('click', () => resumePlayback());
+  stopBtn.addEventListener('click', () => stopPlayback());
   chatForm.addEventListener('submit', (event) => {
     event.preventDefault();
     const input = document.querySelector('#chat-input');
@@ -55,22 +62,22 @@ function renderPlayer() {
     input.value = '';
     runRadio('/api/radio/chat', { sessionId: state.sessionId, message });
   });
-  songAudio.addEventListener('ended', () => runRadio('/api/radio/next', { sessionId: state.sessionId }));
-  songAudio.addEventListener('play', () => {
-    if (state.current?.track?.id) {
-      api('/api/play/report', { method: 'POST', body: { trackId: state.current.track.id, playType: 'play' } }).catch(() => {});
-    }
-  });
 
   if (state.current) updatePlayer(state.current, false);
+  startPlayerPolling();
 }
 
 async function runRadio(path, body) {
   setHostText('正在为你组织下一段电台...');
-  const data = await api(path, { method: 'POST', body });
-  state.sessionId = data.sessionId || state.sessionId;
-  state.current = data;
-  updatePlayer(data, true);
+  setPlayerStatus('正在准备电台...', 'playing');
+  try {
+    const data = await api(path, { method: 'POST', body });
+    state.sessionId = data.sessionId || state.sessionId;
+    state.current = data;
+    updatePlayer(data, true);
+  } catch (error) {
+    setPlayerStatus(error.message, 'error');
+  }
 }
 
 async function updatePlayer(data, autoplay) {
@@ -82,21 +89,23 @@ async function updatePlayer(data, autoplay) {
   document.querySelector('#host-text').textContent = data.hostText || '';
   document.querySelector('#lyric').textContent = data.track?.lyric || '';
 
-  const songAudio = document.querySelector('#song-audio');
   const hostAudio = document.querySelector('#host-audio');
-  songAudio.src = track.playUrl || '';
   hostAudio.src = data.ttsUrl || '';
+  setPlayerStatus(
+    track.playable === false ? (track.playbackError || '当前歌曲缺少 ncm-cli 播放信息') : 'ncm-cli 播放器待命',
+    track.playable === false ? 'error' : ''
+  );
 
   if (!autoplay) return;
   try {
     if (data.ttsUrl) {
-      hostAudio.onended = () => songAudio.play().catch(() => {});
+      hostAudio.onended = () => playCurrentTrack();
       await hostAudio.play();
     } else {
-      speakText(data.hostText, () => songAudio.play().catch(() => {}));
+      speakText(data.hostText, () => playCurrentTrack());
     }
   } catch {
-    speakText(data.hostText, () => songAudio.play().catch(() => {}));
+    speakText(data.hostText, () => playCurrentTrack());
   }
 }
 
@@ -118,6 +127,86 @@ function setHostText(text) {
   if (el) el.textContent = text;
 }
 
+function setPlayerStatus(text, kind = '') {
+  const el = document.querySelector('#player-status');
+  if (!el) return;
+  el.textContent = text || 'ncm-cli 播放器待命';
+  el.classList.toggle('error', kind === 'error');
+  el.classList.toggle('playing', kind === 'playing');
+}
+
+async function playCurrentTrack() {
+  const track = state.current?.track;
+  if (!track?.id) {
+    setPlayerStatus('没有可播放的歌曲', 'error');
+    return;
+  }
+  setPlayerStatus(`正在调用 ncm-cli 播放：${track.name || track.id}`, 'playing');
+  try {
+    const result = await api('/api/player/play', { method: 'POST', body: { trackId: track.id, maxSkips: 6 } });
+    if (result.track && result.track.id !== track.id) {
+      state.current.track = result.track;
+      updatePlayer(state.current, false);
+    }
+    const skipped = result.skipped?.length ? `，已跳过 ${result.skipped.length} 首不可播歌曲` : '';
+    setPlayerStatus(`正在播放：${result.track?.name || track.name}${skipped}`, 'playing');
+    api('/api/play/report', { method: 'POST', body: { trackId: result.track?.id || track.id, playType: 'play' } }).catch(() => {});
+  } catch (error) {
+    setPlayerStatus(error.message, 'error');
+  }
+}
+
+async function pausePlayback() {
+  document.querySelector('#host-audio')?.pause();
+  window.speechSynthesis?.cancel?.();
+  try {
+    await api('/api/player/pause', { method: 'POST', body: {} });
+    setPlayerStatus('已暂停', '');
+  } catch (error) {
+    setPlayerStatus(error.message, 'error');
+  }
+}
+
+async function resumePlayback() {
+  try {
+    await api('/api/player/resume', { method: 'POST', body: {} });
+    setPlayerStatus('继续播放', 'playing');
+  } catch (error) {
+    setPlayerStatus(error.message, 'error');
+  }
+}
+
+async function stopPlayback() {
+  document.querySelector('#host-audio')?.pause();
+  window.speechSynthesis?.cancel?.();
+  try {
+    await api('/api/player/stop', { method: 'POST', body: {} });
+    setPlayerStatus('已停止', '');
+  } catch (error) {
+    setPlayerStatus(error.message, 'error');
+  }
+}
+
+function startPlayerPolling() {
+  if (state.playerPollTimer) clearInterval(state.playerPollTimer);
+  pollPlayerState();
+  state.playerPollTimer = setInterval(pollPlayerState, 5000);
+}
+
+async function pollPlayerState() {
+  const statusEl = document.querySelector('#player-status');
+  if (!statusEl || statusEl.classList.contains('error')) return;
+  try {
+    const data = await api('/api/player/state');
+    const status = data.state?.status || data.state?.playerState || 'unknown';
+    if (status === 'playing') setPlayerStatus('ncm-cli 正在播放', 'playing');
+    if (status === 'paused') setPlayerStatus('ncm-cli 已暂停', '');
+    if (status === 'stopped') setPlayerStatus('ncm-cli 播放器待命', '');
+  } catch {
+    // State polling should not interrupt the radio UI.
+  }
+}
+
 async function renderLibrary() {
   const data = await api('/api/library');
   state.library = data;
@@ -128,14 +217,14 @@ async function renderLibrary() {
       <p class="reason">${escapeHtml(data.profile.summary)}</p>
       <div class="tags">${(data.profile.tags || []).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}</div>
       <div class="stats">
-        <div class="stat"><span class="muted">歌曲</span><strong>${data.tracks.length}</strong></div>
+        <div class="stat"><span class="muted">歌曲</span><strong>${data.totalTracks || data.tracks.length}</strong></div>
         <div class="stat"><span class="muted">歌单</span><strong>${data.playlists.length}</strong></div>
         <div class="stat"><span class="muted">最近播放</span><strong>${data.recent.length}</strong></div>
       </div>
       <button id="sync-btn" class="primary">同步网易云音乐</button>
     </section>
     <section class="grid" style="margin-top:16px">
-      ${data.tracks.slice(0, 24).map(trackItem).join('')}
+      ${data.tracks.slice(0, 50).map(trackItem).join('')}
     </section>
   `;
   document.querySelector('#sync-btn').addEventListener('click', async () => {

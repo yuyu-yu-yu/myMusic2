@@ -71,7 +71,7 @@ export async function syncLibrary(db, netease) {
 }
 
 export async function updateProfile(db) {
-  const tracks = listTracks(db, 300);
+  const tracks = listTracks(db, 5000);
   const recent = listRecentPlays(db, 50);
   const artistCounts = new Map();
   const albumCounts = new Map();
@@ -82,8 +82,9 @@ export async function updateProfile(db) {
   const topArtists = [...artistCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([name]) => name);
   const topAlbums = [...albumCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name]) => name);
   const tags = inferTags(tracks, recent);
-  const summary = tracks.length
-    ? `已收录 ${tracks.length} 首歌。常听艺人：${topArtists.join('、') || '待补充'}。常见专辑/歌单线索：${topAlbums.join('、') || '待补充'}。近期适合按 ${tags.join('、')} 来组织推荐。`
+  const totalCount = db.prepare('SELECT COUNT(*) AS count FROM tracks').get().count;
+  const summary = totalCount
+    ? `已收录 ${totalCount} 首歌。常听艺人：${topArtists.join('、') || '待补充'}。常见专辑/歌单线索：${topAlbums.join('、') || '待补充'}。近期适合按 ${tags.join('、')} 来组织推荐。`
     : '还没有同步到音乐数据。启动同步后，我会根据红心、歌单和最近播放总结你的音乐画像。';
 
   db.prepare(`
@@ -105,11 +106,13 @@ export function getProfile(db) {
 
 export function getLibrary(db) {
   const playlists = db.prepare('SELECT id, name, kind, cover_url AS coverUrl FROM playlists ORDER BY updated_at DESC').all();
+  const total = db.prepare('SELECT COUNT(*) AS count FROM tracks').get().count;
   return {
     profile: getProfile(db),
-    tracks: listTracks(db, 200),
+    tracks: listTracks(db, 5000),
     playlists,
-    recent: listRecentPlays(db, 50)
+    recent: listRecentPlays(db, 50),
+    totalTracks: total
   };
 }
 
@@ -146,20 +149,22 @@ export async function resolvePlayableTrack(db, netease, track) {
     return {
       ...normalized,
       playUrl: `/assets/${normalized.id}.mp3`,
+      playbackMode: normalized.originalId ? 'ncm-cli' : 'browser-demo',
+      playable: Boolean(normalized.originalId),
+      playbackError: normalized.originalId ? null : 'Demo track does not have a NetEase originalId.',
       lyric: '[00:00.00] 本地演示曲目'
     };
   }
-  const [playUrlResponse, lyricResponse] = await Promise.allSettled([
-    netease.playUrl(normalized.id, 320),
+  const [lyricResponse] = await Promise.allSettled([
     netease.lyric(normalized.id)
   ]);
-  const playData = playUrlResponse.status === 'fulfilled' ? playUrlResponse.value.data : null;
-  const url = playData?.url || playData?.playUrl || null;
-  if (!url) return null;
   const lyricData = lyricResponse.status === 'fulfilled' ? lyricResponse.value.data : null;
   return {
     ...normalized,
-    playUrl: url,
+    playUrl: null,
+    playbackMode: 'ncm-cli',
+    playable: Boolean(normalized.originalId),
+    playbackError: normalized.originalId ? null : 'Track does not have originalId for ncm-cli playback.',
     lyric: lyricData?.lyric || lyricData?.lrc?.lyric || ''
   };
 }

@@ -169,6 +169,8 @@ export function linkPlaylistTrack(db, playlistId, trackId, position = 0) {
 export function normalizeTrack(input) {
   const song = input?.song ?? input?.track ?? input?.resource ?? input ?? {};
   const id = String(song.id ?? song.songId ?? song.trackId ?? song.resourceId ?? input?.songId ?? input?.id ?? `local-${Date.now()}`);
+  const originalIdValue = song.originalId ?? song.originalSongId ?? song.realSongId ?? input?.originalId ?? input?.originalSongId ?? input?.realSongId ?? null;
+  const originalId = originalIdValue === null || originalIdValue === undefined || originalIdValue === '' ? null : String(originalIdValue);
   const name = String(song.name ?? song.songName ?? song.title ?? input?.name ?? 'Unknown Track');
   const artistItems = song.artists ?? song.ar ?? song.singers ?? song.artistList ?? input?.artists ?? [];
   const artists = Array.isArray(artistItems)
@@ -178,26 +180,66 @@ export function normalizeTrack(input) {
   const album = typeof albumObj === 'string' ? albumObj : albumObj?.name ?? albumObj?.albumName ?? null;
   const coverUrl = song.coverUrl ?? song.picUrl ?? song.coverImgUrl ?? song.al?.picUrl ?? song.album?.picUrl ?? input?.coverUrl ?? null;
   const durationMs = Number(song.duration ?? song.dt ?? song.durationMs ?? input?.durationMs ?? 0) || null;
-  return { id, name, artists, album, coverUrl, durationMs };
+  return { id, originalId, name, artists, album, coverUrl, durationMs };
 }
 
 export function listTracks(db, limit = 100) {
   return db.prepare(`
-    SELECT id, name, artists, album, cover_url AS coverUrl, duration_ms AS durationMs
+    SELECT id, name, artists, album, cover_url AS coverUrl, duration_ms AS durationMs, raw_json AS rawJson
     FROM tracks
     ORDER BY updated_at DESC
     LIMIT ?
-  `).all(limit).map((row) => ({ ...row, artists: JSON.parse(row.artists || '[]') }));
+  `).all(limit).map(hydrateTrackRow);
+}
+
+export function getTrackById(db, id) {
+  const row = db.prepare(`
+    SELECT id, name, artists, album, cover_url AS coverUrl, duration_ms AS durationMs, raw_json AS rawJson
+    FROM tracks
+    WHERE id = ?
+  `).get(String(id));
+  return row ? hydrateTrackRow(row) : null;
 }
 
 export function listRecentPlays(db, limit = 30) {
   return db.prepare(`
-    SELECT p.*, t.name, t.artists, t.album, t.cover_url AS coverUrl
+    SELECT p.*, t.name, t.artists, t.album, t.cover_url AS coverUrl, t.duration_ms AS durationMs, t.raw_json AS rawJson
     FROM plays p
     JOIN tracks t ON t.id = p.track_id
     ORDER BY p.played_at DESC
     LIMIT ?
-  `).all(limit).map((row) => ({ ...row, artists: JSON.parse(row.artists || '[]') }));
+  `).all(limit).map((row) => {
+    const raw = safeJson(row.rawJson, {});
+    const rawOriginalId = raw?.originalId ?? raw?.song?.originalId ?? raw?.track?.originalId ?? null;
+    const { rawJson, ...play } = row;
+    return {
+      ...play,
+      originalId: rawOriginalId === null || rawOriginalId === undefined || rawOriginalId === '' ? null : String(rawOriginalId),
+      artists: safeJson(row.artists, [])
+    };
+  });
+}
+
+function hydrateTrackRow(row) {
+  const raw = safeJson(row.rawJson, {});
+  const rawOriginalId = raw?.originalId ?? raw?.song?.originalId ?? raw?.track?.originalId ?? null;
+  const originalId = row.originalId ?? (rawOriginalId === null || rawOriginalId === undefined || rawOriginalId === '' ? null : String(rawOriginalId));
+  const { rawJson, ...track } = row;
+  return {
+    ...track,
+    originalId,
+    playbackMode: originalId ? 'ncm-cli' : null,
+    playable: Boolean(originalId),
+    artists: safeJson(row.artists, [])
+  };
+}
+
+function safeJson(value, fallback) {
+  try {
+    return JSON.parse(value || '');
+  } catch {
+    return fallback;
+  }
 }
 
 export function seedDemoLibrary(db) {
