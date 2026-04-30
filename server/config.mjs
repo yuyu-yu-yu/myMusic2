@@ -60,16 +60,41 @@ export function getConfig() {
       baseUrl: env.TTS_BASE_URL || '',
       apiKey: env.TTS_API_KEY || '',
       model: env.TTS_MODEL || '',
-      voice: env.TTS_VOICE || ''
+      voice: env.TTS_VOICE || '',
+      volcengine: {
+        appId: env.VOLCENGINE_TTS_APP_ID || '',
+        accessToken: env.VOLCENGINE_TTS_ACCESS_TOKEN || '',
+        accessKey: env.VOLCENGINE_TTS_ACCESS_KEY || env.VOLCENGINE_TTS_API_KEY || '',
+        authType: env.VOLCENGINE_TTS_AUTH_TYPE || 'api-key',
+        cluster: env.VOLCENGINE_TTS_CLUSTER || 'volcano_tts',
+        voiceType: env.VOLCENGINE_TTS_VOICE_TYPE || '',
+        version: env.VOLCENGINE_TTS_VERSION || 'v3',
+        endpoint: env.VOLCENGINE_TTS_ENDPOINT || 'https://openspeech.bytedance.com/api/v3/tts/unidirectional/sse',
+        resourceId: env.VOLCENGINE_TTS_RESOURCE_ID || 'seed-tts-2.0',
+        appKey: env.VOLCENGINE_TTS_APP_KEY || 'aGjiRDfUWi',
+        speedRatio: env.VOLCENGINE_TTS_SPEED_RATIO || '1',
+        volumeRatio: env.VOLCENGINE_TTS_VOLUME_RATIO || '1',
+        pitchRatio: env.VOLCENGINE_TTS_PITCH_RATIO || '1',
+        language: env.VOLCENGINE_TTS_LANGUAGE || 'cn'
+      }
     },
     weather: {
-      city: env.WEATHER_CITY || '',
+      provider: env.WEATHER_PROVIDER || (env.WEATHER_API_KEY ? 'openweathermap' : 'openmeteo'),
+      city: env.WEATHER_CITY || '上海',
+      countryCode: env.WEATHER_COUNTRY_CODE || 'CN',
       apiKey: env.WEATHER_API_KEY || ''
     }
   };
 }
 
 export function publicConfigStatus(config) {
+  const ttsProvider = (config.tts.provider || '').toLowerCase();
+  const volcengineTts = config.tts.volcengine || {};
+  const ttsConfigured = ttsProvider === 'openai'
+    ? Boolean(config.tts.baseUrl && config.tts.apiKey)
+    : ttsProvider === 'volcengine'
+      ? Boolean((volcengineTts.accessKey || volcengineTts.accessToken) && volcengineTts.voiceType)
+      : false;
   return {
     netease: {
       appId: Boolean(config.netease.appId),
@@ -83,12 +108,13 @@ export function publicConfigStatus(config) {
       model: config.llm.model || null
     },
     tts: {
-      configured: Boolean(config.tts.provider && config.tts.baseUrl && config.tts.apiKey),
+      configured: ttsConfigured,
       provider: config.tts.provider || null,
-      voice: config.tts.voice || null
+      voice: config.tts.voice || volcengineTts.voiceType || null
     },
     weather: {
       configured: Boolean(config.weather.city),
+      provider: config.weather.provider || null,
       city: config.weather.city || null
     }
   };
