@@ -10,6 +10,7 @@ import { getLibrary, getProfile, syncLibrary, updateProfile } from './library.mj
 import { chatRadio, nextRadioItem, reportPlay, startRadio } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
+import { loadCookie } from './community.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 loadEnv(rootDir);
@@ -27,6 +28,7 @@ if (savedAccessToken) {
   netease.setTokens(savedAccessToken, savedRefreshToken || '');
   console.log('[netease] loaded saved token');
 }
+loadCookie(rootDir);
 seedDemoLibrary(db);
 await updateProfile(db);
 

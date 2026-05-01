@@ -1,4 +1,5 @@
 import { listRecentPlays, listTracks, linkPlaylistTrack, normalizeTrack, nowIso, savePlaylist, saveTrack, seedDemoLibrary } from './db.mjs';
+import { getSongUrl, getLyric as getCommunityLyric } from './community.mjs';
 
 export async function syncLibrary(db, netease) {
   const result = {
@@ -155,16 +156,43 @@ export async function resolvePlayableTrack(db, netease, track) {
       lyric: '[00:00.00] 本地演示曲目'
     };
   }
-  const [lyricResponse] = await Promise.allSettled([
-    netease.lyric(normalized.id)
-  ]);
-  const lyricData = lyricResponse.status === 'fulfilled' ? lyricResponse.value.data : null;
+  // Prefer community API (supports VIP via browser cookie)
+  let url = null;
+  let lyric = null;
+  try {
+    const songUrl = await getSongUrl(normalized.originalId || normalized.id, 'exhigh');
+    if (songUrl?.url) url = songUrl.url;
+  } catch { /* fall through */ }
+
+  // Fallback: NetEase OpenAPI with descending bitrates
+  if (!url) {
+    for (const br of [320, 128, 96]) {
+      try {
+        const res = await netease.playUrl(normalized.id, br);
+        const data = res?.data || res;
+        const candidate = data?.url || data?.playUrl || null;
+        if (candidate) { url = candidate; break; }
+      } catch { /* try next bitrate */ }
+    }
+  }
+
+  // Lyric - try community first
+  try {
+    lyric = await getCommunityLyric(normalized.id);
+  } catch { /* fall through */ }
+  if (!lyric) {
+    try {
+      const lyricRes = await netease.lyric(normalized.id);
+      lyric = lyricRes?.data?.lyric || lyricRes?.data?.lrc?.lyric || null;
+    } catch { /* ignore */ }
+  }
+
   return {
     ...normalized,
-    playUrl: null,
+    playUrl: url,
     playbackMode: 'ncm-cli',
-    playable: Boolean(normalized.originalId),
-    playbackError: normalized.originalId ? null : 'Track does not have originalId for ncm-cli playback.',
-    lyric: lyricData?.lyric || lyricData?.lrc?.lyric || ''
+    playable: Boolean(url),
+    playbackError: url ? null : '该歌曲暂无可用播放资源',
+    lyric: lyric || ''
   };
 }

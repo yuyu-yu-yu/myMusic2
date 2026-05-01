@@ -91,22 +91,49 @@ async function updatePlayer(data, autoplay) {
 
   const hostAudio = document.querySelector('#host-audio');
   hostAudio.src = data.ttsUrl || '';
-  setPlayerStatus(
-    track.playable === false ? (track.playbackError || '当前歌曲缺少 ncm-cli 播放信息') : 'ncm-cli 播放器待命',
-    track.playable === false ? 'error' : ''
-  );
+
+  // Set up song audio source
+  const songAudio = document.querySelector('#song-audio');
+  if (track.playUrl) {
+    songAudio.src = track.playUrl;
+    songAudio.style.display = '';
+    setPlayerStatus('歌曲就绪', 'playing');
+  } else {
+    songAudio.src = '';
+    songAudio.style.display = 'none';
+    setPlayerStatus(track.playbackError || '等待 ncm-cli 播放', track.playable === false ? 'error' : '');
+  }
 
   if (!autoplay) return;
   try {
     if (data.ttsUrl) {
-      hostAudio.onended = () => playCurrentTrack();
+      hostAudio.onended = () => startSongPlayback();
       await hostAudio.play();
     } else {
-      speakText(data.hostText, () => playCurrentTrack());
+      speakText(data.hostText, () => startSongPlayback());
     }
   } catch {
-    speakText(data.hostText, () => playCurrentTrack());
+    speakText(data.hostText, () => startSongPlayback());
   }
+}
+
+async function startSongPlayback() {
+  const track = state.current?.track;
+  const songAudio = document.querySelector('#song-audio');
+
+  // If we have a direct URL, play it in browser
+  if (track?.playUrl) {
+    setPlayerStatus(`正在播放：${track.name || '未知歌曲'}`, 'playing');
+    songAudio.play().catch(() => {});
+    songAudio.onended = () => runRadio('/api/radio/next', { sessionId: state.sessionId });
+    songAudio.onplay = () => {
+      api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
+    };
+    return;
+  }
+
+  // No direct URL, try ncm-cli via server
+  playCurrentTrack();
 }
 
 function speakText(text, onEnd) {
@@ -158,16 +185,21 @@ async function playCurrentTrack() {
 
 async function pausePlayback() {
   document.querySelector('#host-audio')?.pause();
+  document.querySelector('#song-audio')?.pause();
   window.speechSynthesis?.cancel?.();
   try {
     await api('/api/player/pause', { method: 'POST', body: {} });
-    setPlayerStatus('已暂停', '');
-  } catch (error) {
-    setPlayerStatus(error.message, 'error');
-  }
+  } catch {}
+  setPlayerStatus('已暂停', '');
 }
 
 async function resumePlayback() {
+  const songAudio = document.querySelector('#song-audio');
+  if (songAudio?.src) {
+    songAudio.play().catch(() => {});
+    setPlayerStatus('继续播放', 'playing');
+    return;
+  }
   try {
     await api('/api/player/resume', { method: 'POST', body: {} });
     setPlayerStatus('继续播放', 'playing');
@@ -178,13 +210,14 @@ async function resumePlayback() {
 
 async function stopPlayback() {
   document.querySelector('#host-audio')?.pause();
+  const songAudio = document.querySelector('#song-audio');
+  songAudio?.pause();
+  if (songAudio) songAudio.src = '';
   window.speechSynthesis?.cancel?.();
   try {
     await api('/api/player/stop', { method: 'POST', body: {} });
-    setPlayerStatus('已停止', '');
-  } catch (error) {
-    setPlayerStatus(error.message, 'error');
-  }
+  } catch {}
+  setPlayerStatus('已停止', '');
 }
 
 function startPlayerPolling() {

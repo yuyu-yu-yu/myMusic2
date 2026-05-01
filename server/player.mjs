@@ -67,24 +67,64 @@ export async function playTrackWithFallback({ db, runner = runNcmCli, trackId, m
 
 export async function playOneTrack(runner, track) {
   if (!track?.id) throw new Error('Track id is required.');
-  if (!track.originalId) {
-    throw new Error(`歌曲缺少 originalId，ncm-cli 无法播放：${track.name || track.id}`);
-  }
 
   await runner(['stop', '--output', 'json']).catch(() => {});
-  const result = await runner([
-    'play',
-    '--song',
-    '--encrypted-id',
-    String(track.id),
-    '--original-id',
-    String(track.originalId),
-    '--output',
-    'json'
-  ]);
-  assertNcmSuccess(result);
-  await waitForPlaybackStart(runner, track.id);
-  return result.data ?? result;
+
+  // Preferred: direct playUrl via mpv (bypasses ncm-cli VIP check)
+  if (track.playUrl) {
+    try {
+      const mpv = findMpvPath();
+      if (mpv) {
+        await playUrlWithMpv(mpv, track.playUrl);
+        return { ok: true, mode: 'mpv-direct', track };
+      }
+    } catch (error) {
+      console.warn('[player] mpv direct play failed, trying ncm-cli:', error.message);
+    }
+  }
+
+  // Fallback: ncm-cli song-id method (for songs without API URL)
+  if (track.originalId) {
+    const result = await runner([
+      'play',
+      '--song',
+      '--encrypted-id',
+      String(track.id),
+      '--original-id',
+      String(track.originalId),
+      '--output',
+      'json'
+    ]);
+    assertNcmSuccess(result);
+    await waitForPlaybackStart(runner, track.id);
+    return result.data ?? result;
+  }
+
+  throw new Error(`歌曲无法播放（无 URL 且无 originalId）：${track.name || track.id}`);
+}
+
+async function playUrlWithMpv(mpvPath, url) {
+  return new Promise((resolve, reject) => {
+    const child = execFile(mpvPath, [
+      '--no-video',
+      '--audio-display=no',
+      '--really-quiet',
+      String(url)
+    ], {
+      timeout: 10000,
+      windowsHide: true
+    });
+    child.on('error', reject);
+    // mpv starts playing quickly - resolve after a short delay
+    const timer = setTimeout(() => {
+      child.removeAllListeners();
+      resolve({ ok: true });
+    }, 2000);
+    child.on('exit', () => {
+      clearTimeout(timer);
+      resolve({ ok: true });
+    });
+  });
 }
 
 export async function runControlCommand(runner, command) {
