@@ -5,8 +5,8 @@
   "type": "module",
   "description": "Local AI music radio powered by NetEase Cloud Music OpenAPI.",
   "scripts": {
-    "dev": "node --experimental-sqlite server/index.mjs",
-    "start": "node --experimental-sqlite server/index.mjs",
+    "dev": "node start.mjs",
+    "start": "node start.mjs",
     "test": "node --experimental-sqlite --test"
   },
   "engines": {
