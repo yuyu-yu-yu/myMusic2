@@ -30,7 +30,7 @@ if (savedAccessToken) {
 }
 loadCookie(rootDir);
 seedDemoLibrary(db);
-await updateProfile(db);
+await updateProfile(db, config.llm);
 
 const publicDir = path.join(rootDir, 'public');
 const cacheDir = path.join(rootDir, 'cache', 'tts');
