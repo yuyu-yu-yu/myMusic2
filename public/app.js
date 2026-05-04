@@ -4,7 +4,9 @@ const state = {
   library: null,
   playerPollTimer: null,
   feedbackSent: new Set(),
-  activePlayback: null
+  activePlayback: null,
+  lyricLines: [],
+  activeLyricIndex: -1
 };
 
 const view = document.querySelector('#view');
@@ -194,7 +196,7 @@ async function updatePlayer(data, autoplay) {
   document.querySelector('#cover').src = track.coverUrl || '/assets/cover-1.svg';
   document.querySelector('#track-title').textContent = track.name || 'myMusic';
   document.querySelector('#track-artist').textContent = (track.artists || []).join(' / ') || '等待启动';
-  document.querySelector('#lyric').textContent = data.track?.lyric || '';
+  buildLyricDOM(data.track?.lyric || '');
 
   const songAudio = document.querySelector('#song-audio');
   if (track.playUrl) {
@@ -202,6 +204,88 @@ async function updatePlayer(data, autoplay) {
     songAudio.style.display = '';
   } else {
     songAudio.style.display = 'none';
+  }
+}
+
+function buildLyricDOM(lrcText) {
+  const container = document.querySelector('#lyric');
+  if (!container) return;
+
+  container.innerHTML = '';
+
+  if (!lrcText) {
+    container.innerHTML = '<p class="lyric-empty">暂无歌词</p>';
+    state.lyricLines = [];
+    state.activeLyricIndex = -1;
+    return;
+  }
+
+  const lines = [];
+  const regex = /\[(\d{2}):(\d{2})\.(\d{2,3})\](.*)/g;
+  let match;
+  while ((match = regex.exec(lrcText)) !== null) {
+    const minutes = parseInt(match[1], 10);
+    const seconds = parseInt(match[2], 10);
+    const ms = parseInt(match[3].padEnd(3, '0'), 10);
+    const time = minutes * 60 + seconds + ms / 1000;
+    const text = match[4].trim();
+    if (text) lines.push({ time, text });
+  }
+
+  state.lyricLines = lines;
+  state.activeLyricIndex = -1;
+
+  const viewport = document.createElement('div');
+  viewport.className = 'lyric-viewport';
+
+  if (!lines.length) {
+    viewport.innerHTML = '<p class="lyric-empty">纯音乐，请欣赏</p>';
+  } else {
+    lines.forEach((line, i) => {
+      const el = document.createElement('p');
+      el.className = 'lyric-line';
+      el.textContent = line.text;
+      el.dataset.index = i;
+      el.dataset.time = line.time;
+      viewport.appendChild(el);
+    });
+  }
+
+  container.appendChild(viewport);
+}
+
+function syncLyricTime(currentTimeSec) {
+  const lines = state.lyricLines;
+  if (!lines.length) return;
+
+  let activeIndex = -1;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].time <= currentTimeSec) {
+      activeIndex = i;
+    } else {
+      break;
+    }
+  }
+
+  if (activeIndex === state.activeLyricIndex) return;
+  state.activeLyricIndex = activeIndex;
+
+  const viewport = document.querySelector('.lyric-viewport');
+  if (!viewport) return;
+
+  viewport.querySelectorAll('.lyric-line').forEach((el, i) => {
+    const dist = Math.abs(i - activeIndex);
+    el.classList.remove('active', 'near', 'far');
+    if (dist === 0) el.classList.add('active');
+    else if (dist === 1) el.classList.add('near');
+    else if (dist > 2) el.classList.add('far');
+  });
+
+  if (activeIndex >= 0) {
+    const activeEl = viewport.querySelector(`.lyric-line[data-index="${activeIndex}"]`);
+    if (activeEl) {
+      activeEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+    }
   }
 }
 
@@ -221,6 +305,7 @@ async function startSongPlayback() {
     songAudio.onplay = () => {
       api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
     };
+    songAudio.ontimeupdate = () => syncLyricTime(songAudio.currentTime);
     return;
   }
 

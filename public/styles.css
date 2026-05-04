@@ -363,14 +363,82 @@ audio {
 }
 
 .lyric {
-  grid-column: 1 / -1;
-  max-height: 220px;
-  overflow: auto;
-  white-space: pre-wrap;
-  line-height: 1.7;
+  flex: 1;
+  min-height: 160px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.lyric-viewport {
+  height: 100%;
+  overflow-y: auto;
+  scroll-behavior: smooth;
+  padding: 48px 20px;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    rgba(0,0,0,1) 12%,
+    rgba(0,0,0,1) 88%,
+    transparent 100%
+  );
+  mask-image: linear-gradient(
+    to bottom,
+    transparent 0%,
+    rgba(0,0,0,1) 12%,
+    rgba(0,0,0,1) 88%,
+    transparent 100%
+  );
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255,255,255,0.12) transparent;
+}
+
+.lyric-viewport::-webkit-scrollbar {
+  width: 4px;
+}
+
+.lyric-viewport::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.12);
+  border-radius: 4px;
+}
+
+.lyric-line {
+  text-align: center;
+  padding: 10px 16px;
+  margin: 0;
+  font-size: 17px;
+  font-weight: 400;
+  line-height: 1.55;
   color: var(--muted);
-  border-top: 1px solid var(--line);
-  padding-top: 16px;
+  opacity: 0.32;
+  transition: all 0.45s cubic-bezier(0.25, 0.1, 0.25, 1);
+  cursor: default;
+  user-select: none;
+}
+
+.lyric-line.near {
+  opacity: 0.6;
+  font-size: 18px;
+}
+
+.lyric-line.active {
+  opacity: 1;
+  color: var(--text);
+  font-size: 20px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.lyric-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  margin: 0;
+  color: var(--muted);
+  opacity: 0.4;
+  font-size: 14px;
 }
 
 .page-panel {
