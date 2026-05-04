@@ -77,89 +77,100 @@ export async function updateProfile(db, llmConfig) {
   const ownedIds = db.prepare('SELECT DISTINCT track_id FROM playlist_tracks').all().map(r => r.track_id);
   const ownedIdSet = new Set(ownedIds);
   const tracks = listTracks(db, 5000).filter(t => ownedIdSet.has(t.id));
-  const recent = listRecentPlays(db, 50);
-  const artistCounts = new Map();
-  const albumCounts = new Map();
-  for (const track of tracks) {
-    for (const artist of track.artists || []) artistCounts.set(artist, (artistCounts.get(artist) || 0) + 1);
-    if (track.album) albumCounts.set(track.album, (albumCounts.get(track.album) || 0) + 1);
-  }
-  const topArtists = [...artistCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 8).map(([name]) => name);
-  const topAlbums = [...albumCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name]) => name);
-  const tags = inferTags(tracks, recent);
-  const totalCount = db.prepare('SELECT COUNT(*) AS count FROM tracks').get().count;
-
-  // Basic summary (fallback)
-  let summary = totalCount
-    ? `已收录 ${totalCount} 首歌。常听艺人：${topArtists.join('、') || '待补充'}。常见专辑/歌单线索：${topAlbums.join('、') || '待补充'}。近期适合按 ${tags.join('、')} 来组织推荐。`
-    : '还没有同步到音乐数据。启动同步后，我会根据红心、歌单和最近播放总结你的音乐画像。';
+  const playlists = getProfilePlaylists(db);
+  const stats = buildProfileStats(tracks, playlists);
+  let structured = buildFallbackStructuredProfile(stats);
+  let summary = structured.summary;
+  const tags = inferTags(tracks);
 
   // LLM enriched profile — only regenerate when needed
   const existing = getProfile(db);
   const lastUpdated = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
   const hoursSinceUpdate = (Date.now() - lastUpdated) / 3600000;
-  const trackCountChanged = existing?.summary && existing.summary.includes(String(totalCount))
-    ? false : Math.abs((totalCount - (existing?.summary?.match(/(\d+)\s*首/) || [])[1] || totalCount)) > totalCount * 0.05;
+  const previousCount = Number(existing?.structured?.trackCount || existing?.summary?.match(/(\d+)\s*首/)?.[1] || 0);
+  const trackCountChanged = previousCount
+    ? Math.abs(stats.trackCount - previousCount) > Math.max(10, stats.trackCount * 0.05)
+    : true;
+  const missingStructured = !existing?.structured || !Object.keys(existing.structured || {}).length;
 
-  if (llmConfig?.baseUrl && (hoursSinceUpdate > 24 || trackCountChanged || existing.summary.length < 150)) {
-    const enriched = await generateAIPortrait(tracks, topArtists, totalCount, llmConfig);
-    if (enriched) summary = enriched;
-  } else if (existing?.summary && existing.summary.length > 50) {
+  if (llmConfig?.baseUrl && (hoursSinceUpdate > 24 || trackCountChanged || missingStructured || existing.summary.length < 150)) {
+    const enriched = await generateAIPortrait(stats, llmConfig);
+    if (enriched) {
+      structured = normalizeStructuredProfile({ ...structured, ...enriched.structured, summary: enriched.summary || structured.summary }, stats);
+      summary = enriched.summary || structured.summary;
+    }
+  } else if (existing?.summary && existing.summary.length > 50 && existing?.structured) {
     // Reuse existing enriched profile, update only tags/artists stats
     summary = existing.summary;
+    structured = normalizeStructuredProfile({ ...structured, ...existing.structured, generatedAt: nowIso() }, stats);
   }
 
   db.prepare(`
-    INSERT INTO music_profile (id, summary, tags_json, updated_at)
-    VALUES (1, ?, ?, ?)
+    INSERT INTO music_profile (id, summary, tags_json, profile_json, updated_at)
+    VALUES (1, ?, ?, ?, ?)
     ON CONFLICT(id) DO UPDATE SET
       summary = excluded.summary,
       tags_json = excluded.tags_json,
+      profile_json = excluded.profile_json,
       updated_at = excluded.updated_at
-  `).run(summary, JSON.stringify(tags), nowIso());
-  return { summary, tags, topArtists, topAlbums, trackCount: tracks.length };
+  `).run(summary, JSON.stringify(tags), JSON.stringify(structured), nowIso());
+  return {
+    summary,
+    tags,
+    structured,
+    topArtists: structured.artists.map(item => item.name),
+    topAlbums: structured.albums.map(item => item.name),
+    trackCount: tracks.length
+  };
 }
 
-async function generateAIPortrait(tracks, topArtists, totalCount, llmConfig) {
-  // Use user's curated tracks (playlist-synced only, no AI recs)
-  const sample = tracks.slice(0, 60).map(t => `${t.name} - ${(t.artists || []).join('/')}`).join('、');
-  const artistSummary = topArtists.slice(0, 15).join('、');
+async function generateAIPortrait(stats, llmConfig) {
+  const sample = stats.sampleTracks.map(t => `${t.name} - ${(t.artists || []).join('/')}`).join('、');
+  const playlistText = stats.playlistProfiles.map(p =>
+    `${p.name}（${p.kind}，${p.trackCount}首）：${p.sampleTracks.map(t => `${t.name}-${(t.artists || []).join('/')}`).join('、')}`
+  ).join('\n');
 
   const text = await generateChatCompletion(llmConfig, [
     {
       role: 'system',
       content: [
-        '你是音乐分析师。以下是用户主动收藏入库的歌曲（来自网易云歌单同步，不含AI推荐），请客观分析他的音乐口味。',
-        '直接输出以下格式，不要打招呼：',
-        '',
-        '【整体风格】基于曲库数据的客观风格概括',
-        '【流派偏好】3-5个常听流派+各举一首典型曲目',
-        '【情绪倾向】从歌单中可观察到的情绪偏好，不要编造行为场景',
-        '【艺人偏好】常听艺人共同特点（国籍、语种、年代、风格等）',
-        '【风格分布】不同风格在曲库中的占比估算',
-        '【惊喜建议】2-3个可探索的新方向',
-        '【补充】曲库中明显的风格反差（如有）',
-        '',
-        '重要：不要编造用户行为、习惯、作息。只分析歌曲本身。250-400字。'
+        '你是音乐画像分析师。只分析用户主动同步的网易云歌单曲目。',
+        '不要使用最近播放、AI电台推荐、在线搜索结果来推断长期口味。',
+        '只输出严格 JSON，不要 Markdown。',
+        'JSON schema: {"summary":"中文摘要120-400字","genres":[{"name":"...","weight":0-1,"evidence":["..."]}],"moods":[...],"artists":[...],"albums":[...],"languages":[...],"scenes":[...],"eras":[...],"energy":[...],"discoveryDirections":[{"name":"...","weight":0-1,"evidence":["..."]}],"avoidSignals":[{"name":"...","weight":0-1,"evidence":["..."]}]}',
+        'weight 表示长期偏好强度。avoidSignals 只填写曲库明显少或反差大的方向，不要凭空编造。'
       ].join('\n')
     },
     {
       role: 'user',
       content: [
-        `曲库总量：${totalCount} 首（全部来自用户歌单同步，非AI推荐）`,
-        `常听艺人 Top 15：${artistSummary}`,
-        `曲库样本（随机 60 首）：${sample}`
+        `曲库总量：${stats.trackCount} 首，歌单数：${stats.playlistCount}`,
+        `艺人 Top：${stats.topArtists.map(item => `${item.name}(${item.count})`).join('、')}`,
+        `专辑 Top：${stats.topAlbums.map(item => `${item.name}(${item.count})`).join('、')}`,
+        `规则初判：${JSON.stringify(stats.ruleSignals)}`,
+        `歌单级样本：\n${playlistText}`,
+        `曲库样本：${sample}`
       ].join('\n')
     }
   ], () => null);
 
-  return text || null;
+  const parsed = parseJsonObject(text);
+  if (!parsed?.summary) return null;
+  return {
+    summary: String(parsed.summary).trim(),
+    structured: parsed
+  };
 }
 
 export function getProfile(db) {
-  const row = db.prepare('SELECT summary, tags_json AS tagsJson, updated_at AS updatedAt FROM music_profile WHERE id = 1').get();
-  if (!row) return { summary: '尚未生成音乐画像。', tags: [], updatedAt: null };
-  return { summary: row.summary, tags: JSON.parse(row.tagsJson || '[]'), updatedAt: row.updatedAt };
+  const row = db.prepare('SELECT summary, tags_json AS tagsJson, profile_json AS profileJson, updated_at AS updatedAt FROM music_profile WHERE id = 1').get();
+  if (!row) return { summary: '尚未生成音乐画像。', tags: [], structured: {}, updatedAt: null };
+  return {
+    summary: row.summary,
+    tags: safeJson(row.tagsJson, []),
+    structured: safeJson(row.profileJson, {}),
+    updatedAt: row.updatedAt
+  };
 }
 
 export function getLibrary(db) {
@@ -188,8 +199,285 @@ export function extractRecords(data) {
   return [];
 }
 
-function inferTags(tracks, recent) {
-  const names = [...tracks, ...recent].map((track) => `${track.name} ${track.album || ''}`).join(' ').toLowerCase();
+function getProfilePlaylists(db) {
+  const playlists = db.prepare('SELECT id, name, kind FROM playlists ORDER BY updated_at DESC').all();
+  const trackStmt = db.prepare(`
+    SELECT t.id, t.name, t.artists, t.album, t.cover_url AS coverUrl, t.duration_ms AS durationMs, t.raw_json AS rawJson
+    FROM playlist_tracks pt
+    JOIN tracks t ON t.id = pt.track_id
+    WHERE pt.playlist_id = ?
+    ORDER BY pt.position ASC
+    LIMIT 120
+  `);
+  return playlists.map((playlist) => ({
+    ...playlist,
+    tracks: trackStmt.all(playlist.id).map((row) => {
+      const { rawJson, ...track } = row;
+      return {
+        ...track,
+        raw: safeJson(rawJson, {}),
+        artists: safeJson(row.artists, [])
+      };
+    })
+  }));
+}
+
+function buildProfileStats(tracks, playlists) {
+  const profilePlaylists = playlists.filter(p => p.tracks.length);
+  const topArtists = countTop(tracks.flatMap(t => t.artists || []), 20);
+  const topAlbums = countTop(tracks.map(t => t.album).filter(Boolean), 20);
+  const playlistProfiles = profilePlaylists.slice(0, 30).map((playlist) => ({
+    id: playlist.id,
+    name: playlist.name,
+    kind: playlist.kind,
+    trackCount: playlist.tracks.length,
+    sampleTracks: playlist.tracks.slice(0, 18).map(t => ({ name: t.name, artists: t.artists || [], album: t.album || '' })),
+    signals: inferRuleSignals(playlist.tracks, [playlist])
+  }));
+  return {
+    trackCount: tracks.length,
+    playlistCount: profilePlaylists.length,
+    topArtists,
+    topAlbums,
+    playlistNames: profilePlaylists.map(p => p.name),
+    sampleTracks: tracks.slice(0, 120).map(t => ({ name: t.name, artists: t.artists || [], album: t.album || '' })),
+    playlistProfiles,
+    ruleSignals: inferRuleSignals(tracks, profilePlaylists)
+  };
+}
+
+function buildFallbackStructuredProfile(stats) {
+  const genres = normalizeWeightedList(stats.ruleSignals.genres);
+  const moods = normalizeWeightedList(stats.ruleSignals.moods);
+  const languages = normalizeWeightedList(stats.ruleSignals.languages);
+  const scenes = normalizeWeightedList(stats.ruleSignals.scenes);
+  const eras = normalizeWeightedList(stats.ruleSignals.eras);
+  const energy = normalizeWeightedList(stats.ruleSignals.energy);
+  const artists = stats.topArtists.slice(0, 12).map((item, index) => ({
+    name: item.name,
+    weight: weightedByCount(item.count, stats.trackCount),
+    evidence: [`用户歌单中出现 ${item.count} 首`, index < 3 ? '常听艺人 Top' : '歌单艺人频次较高'].filter(Boolean)
+  }));
+  const albums = stats.topAlbums.slice(0, 10).map((item) => ({
+    name: item.name,
+    weight: weightedByCount(item.count, stats.trackCount),
+    evidence: [`用户歌单中出现 ${item.count} 首`]
+  }));
+  const discoveryDirections = normalizeWeightedList([
+    ...genres.slice(0, 4).map(item => ({ ...item, evidence: [...(item.evidence || []), '由歌单曲目关键词推断'] })),
+    ...moods.slice(0, 3).map(item => ({ ...item, evidence: [...(item.evidence || []), '适合作为后续探索方向'] })),
+    ...scenes.slice(0, 3).map(item => ({ ...item, evidence: [...(item.evidence || []), '歌单场景信号'] }))
+  ]).slice(0, 8);
+  const topArtistText = artists.slice(0, 4).map(item => item.name).join('、') || '暂不明显';
+  const topMoodText = moods.slice(0, 3).map(item => item.name).join('、') || '日常陪伴';
+  const summary = stats.trackCount
+    ? `已基于 ${stats.trackCount} 首用户主动同步的网易云歌单歌曲生成长期画像。你的歌单里常见艺人包括 ${topArtistText}，整体情绪偏向 ${topMoodText}。这份画像不会使用电台 DJ 推荐、在线搜索结果、播放记录或最近播放，避免推荐结果反向污染长期口味。`
+    : '尚未从用户歌单中找到可分析的歌曲。同步网易云歌单后，会只基于歌单内容生成长期音乐画像。';
+
+  return normalizeStructuredProfile({
+    summary,
+    genres,
+    moods,
+    artists,
+    albums,
+    languages,
+    scenes,
+    eras,
+    energy,
+    discoveryDirections,
+    avoidSignals: []
+  }, stats);
+}
+
+function normalizeStructuredProfile(profile = {}, stats = {}) {
+  const normalized = {
+    source: 'playlist_tracks',
+    version: 1,
+    trackCount: stats.trackCount || Number(profile.trackCount) || 0,
+    playlistCount: stats.playlistCount || Number(profile.playlistCount) || 0,
+    generatedAt: nowIso(),
+    summary: String(profile.summary || '').trim(),
+    genres: normalizeWeightedList(profile.genres).slice(0, 12),
+    moods: normalizeWeightedList(profile.moods).slice(0, 12),
+    artists: normalizeWeightedList(profile.artists).slice(0, 15),
+    albums: normalizeWeightedList(profile.albums).slice(0, 12),
+    languages: normalizeWeightedList(profile.languages).slice(0, 8),
+    scenes: normalizeWeightedList(profile.scenes).slice(0, 10),
+    eras: normalizeWeightedList(profile.eras).slice(0, 8),
+    energy: normalizeWeightedList(profile.energy).slice(0, 6),
+    discoveryDirections: normalizeWeightedList(profile.discoveryDirections).slice(0, 10),
+    avoidSignals: normalizeWeightedList(profile.avoidSignals).slice(0, 10)
+  };
+  if (!normalized.artists.length && stats.topArtists?.length) {
+    normalized.artists = stats.topArtists.slice(0, 12).map(item => ({
+      name: item.name,
+      weight: weightedByCount(item.count, stats.trackCount),
+      evidence: [`用户歌单中出现 ${item.count} 首`]
+    }));
+  }
+  if (!normalized.albums.length && stats.topAlbums?.length) {
+    normalized.albums = stats.topAlbums.slice(0, 10).map(item => ({
+      name: item.name,
+      weight: weightedByCount(item.count, stats.trackCount),
+      evidence: [`用户歌单中出现 ${item.count} 首`]
+    }));
+  }
+  if (!normalized.summary) {
+    const artistText = normalized.artists.slice(0, 4).map(item => item.name).join('、') || '暂不明显';
+    normalized.summary = normalized.trackCount
+      ? `已基于 ${normalized.trackCount} 首用户歌单歌曲生成结构化画像，常听艺人包括 ${artistText}。`
+      : '尚未生成音乐画像。';
+  }
+  return normalized;
+}
+
+function inferRuleSignals(tracks, playlists = []) {
+  const baseText = [
+    ...tracks.flatMap(track => [track.name, track.album, ...(track.artists || [])]),
+    ...playlists.map(playlist => playlist.name)
+  ].filter(Boolean).join(' ').toLowerCase();
+  const cjkText = [
+    ...tracks.flatMap(track => [track.name, track.album, ...(track.artists || [])]),
+    ...playlists.map(playlist => playlist.name)
+  ].filter(Boolean).join(' ');
+
+  return {
+    genres: scoreRuleSignals(baseText, [
+      ['华语流行', /华语|中文|国语|粤语|陈奕迅|周杰伦|林俊杰|五月天|苏打绿|吴青峰|王菲|孙燕姿/],
+      ['电子', /electronic|edm|remix|dj|house|techno|trance|dubstep|future bass|synth|电子|电音|混音/],
+      ['民谣', /folk|民谣|赵雷|宋冬野|马頔|尧十三/],
+      ['摇滚', /rock|摇滚|metal|punk|alternative/],
+      ['爵士', /jazz|爵士|swing|bossa/],
+      ['古典/器乐', /classic|classical|古典|piano|钢琴|orchestra|管弦|instrumental|纯音乐/],
+      ['影视原声', /ost|score|soundtrack|theme|原声|配乐|影视|电影|动画/],
+      ['说唱', /hip.?hop|rap|说唱|嘻哈/],
+      ['氛围/Lo-Fi', /ambient|lofi|lo-fi|氛围|白噪|冥想/]
+    ], tracks.length),
+    moods: scoreRuleSignals(baseText, [
+      ['夜晚', /night|moon|深夜|夜|晚安|凌晨|星|月/],
+      ['安静', /calm|quiet|silent|安静|轻柔|慢|独处/],
+      ['治愈', /heal|comfort|治愈|温柔|陪伴|暖|拥抱/],
+      ['怀旧', /old|classic|memory|nostalg|回忆|怀旧|老歌|从前/],
+      ['忧伤', /sad|blue|rain|melancholy|雨|伤心|难过|孤独|离别/],
+      ['浪漫', /love|romantic|恋爱|浪漫|情歌|喜欢/],
+      ['能量', /energy|power|燃|热血|快乐|兴奋|舞曲/]
+    ], tracks.length),
+    languages: detectLanguages(cjkText, tracks.length),
+    scenes: scoreRuleSignals(baseText, [
+      ['睡前', /sleep|bed|晚安|睡前|失眠|深夜/],
+      ['专注', /focus|study|work|学习|工作|专注|钢琴|lofi/],
+      ['放松', /relax|chill|放松|休息|慢歌|咖啡/],
+      ['通勤', /drive|road|city|公路|城市|通勤|地铁/],
+      ['运动', /run|workout|运动|跑步|健身|燃/],
+      ['独处', /alone|solo|独处|一个人|孤独/]
+    ], tracks.length),
+    eras: detectEras(baseText, tracks.length),
+    energy: detectEnergy(baseText, tracks.length)
+  };
+}
+
+function scoreRuleSignals(text, rules, trackCount) {
+  return rules.map(([name, pattern]) => {
+    const matches = text.match(new RegExp(pattern.source, `${pattern.flags.includes('i') ? pattern.flags : `${pattern.flags}i`}g`)) || [];
+    return {
+      name,
+      weight: weightedByCount(matches.length, Math.max(trackCount, 1)),
+      evidence: matches.length ? [`关键词命中 ${matches.length} 次`] : []
+    };
+  }).filter(item => item.weight > 0);
+}
+
+function detectLanguages(text, trackCount) {
+  const signals = [];
+  const cjk = (text.match(/[\u4e00-\u9fff]/g) || []).length;
+  const latin = (text.match(/[a-zA-Z]/g) || []).length;
+  const kana = (text.match(/[\u3040-\u30ff]/g) || []).length;
+  if (cjk) signals.push({ name: '中文', weight: weightedByCount(cjk / 12, trackCount), evidence: ['歌名/艺人中有中文信号'] });
+  if (latin) signals.push({ name: '英文/欧美', weight: weightedByCount(latin / 18, trackCount), evidence: ['歌名/艺人中有英文信号'] });
+  if (kana || /j-?pop|anime|日本|日语/.test(text.toLowerCase())) signals.push({ name: '日语', weight: weightedByCount(kana || 2, trackCount), evidence: ['歌名/歌单中有日语或日本音乐信号'] });
+  return signals;
+}
+
+function detectEras(text, trackCount) {
+  return scoreRuleSignals(text, [
+    ['经典老歌', /80s|90s|八十|九十|老歌|classic/],
+    ['千禧年代', /2000|00s|千禧|周杰伦|孙燕姿|王心凌|陶喆/],
+    ['近年流行', /2020|2021|2022|2023|2024|2025|2026|新歌/]
+  ], trackCount);
+}
+
+function detectEnergy(text, trackCount) {
+  const high = scoreRuleSignals(text, [['高能量', /edm|rock|燃|热血|舞曲|跑步|运动|快歌|power|energy/]], trackCount);
+  const low = scoreRuleSignals(text, [['低能量', /calm|sleep|安静|轻柔|慢歌|钢琴|lofi|氛围|晚安/]], trackCount);
+  const medium = trackCount ? [{ name: '中等能量', weight: 0.35, evidence: ['作为默认日常收听能量'] }] : [];
+  return [...high, ...low, ...medium];
+}
+
+function countTop(values, limit) {
+  const counts = new Map();
+  for (const value of values) {
+    const name = String(value || '').trim();
+    if (!name) continue;
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+    .slice(0, limit);
+}
+
+function normalizeWeightedList(items = []) {
+  const byName = new Map();
+  for (const raw of items || []) {
+    const name = String(typeof raw === 'string' ? raw : raw?.name || '').trim();
+    if (!name) continue;
+    const existing = byName.get(name.toLowerCase());
+    const weight = clampWeight(raw?.weight ?? raw?.score ?? 0.35);
+    const evidence = Array.isArray(raw?.evidence)
+      ? raw.evidence.map(item => String(item).trim()).filter(Boolean).slice(0, 4)
+      : [];
+    if (!existing || weight > existing.weight) {
+      byName.set(name.toLowerCase(), { name, weight, evidence });
+    } else if (existing) {
+      existing.evidence = [...new Set([...existing.evidence, ...evidence])].slice(0, 4);
+    }
+  }
+  return [...byName.values()].sort((a, b) => b.weight - a.weight || a.name.localeCompare(b.name));
+}
+
+function weightedByCount(count, total) {
+  if (!count || !total) return 0;
+  return clampWeight(0.18 + Math.min(0.75, Number(count) / Math.max(Number(total), 1) * 4));
+}
+
+function clampWeight(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0;
+  return Math.max(0, Math.min(1, Math.round(number * 100) / 100));
+}
+
+function parseJsonObject(text) {
+  const value = String(text || '').trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '');
+  const start = value.indexOf('{');
+  const end = value.lastIndexOf('}');
+  if (start < 0 || end <= start) return null;
+  try {
+    return JSON.parse(value.slice(start, end + 1));
+  } catch {
+    return null;
+  }
+}
+
+function safeJson(value, fallback) {
+  try {
+    return JSON.parse(value || '');
+  } catch {
+    return fallback;
+  }
+}
+
+function inferTags(tracks) {
+  const names = tracks.map((track) => `${track.name} ${track.album || ''}`).join(' ').toLowerCase();
   const tags = [];
   if (/雨|rain|夜|night|凌晨|moon/.test(names)) tags.push('夜晚');
   if (/live|现场|concert/.test(names)) tags.push('现场');
@@ -200,7 +488,7 @@ function inferTags(tracks, recent) {
   return tags.slice(0, 5);
 }
 
-export async function resolvePlayableTrack(db, netease, track) {
+export async function resolvePlayableTrack(db, netease, track, { includeLyric = true } = {}) {
   if (!track) return null;
   const normalized = normalizeTrack(track);
   if (!netease.isConfigured() || normalized.id.startsWith('demo-')) {
@@ -233,15 +521,17 @@ export async function resolvePlayableTrack(db, netease, track) {
     }
   }
 
-  // Lyric - try community first
-  try {
-    lyric = await getCommunityLyric(normalized.id);
-  } catch { /* fall through */ }
-  if (!lyric) {
+  if (includeLyric) {
+    // Lyric - try community first
     try {
-      const lyricRes = await netease.lyric(normalized.id);
-      lyric = lyricRes?.data?.lyric || lyricRes?.data?.lrc?.lyric || null;
-    } catch { /* ignore */ }
+      lyric = await getCommunityLyric(normalized.id);
+    } catch { /* fall through */ }
+    if (!lyric) {
+      try {
+        const lyricRes = await netease.lyric(normalized.id);
+        lyric = lyricRes?.data?.lyric || lyricRes?.data?.lrc?.lyric || null;
+      } catch { /* ignore */ }
+    }
   }
 
   return {

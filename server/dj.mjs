@@ -2,15 +2,27 @@
 import crypto from 'node:crypto';
 import { generateChatCompletion, getWeatherSummary, synthesizeSpeech } from './ai.mjs';
 import { getProfile, resolvePlayableTrack } from './library.mjs';
-import { listRecentPlays, listTracks, nowIso, saveTrack, getSessionMode, setSessionMode } from './db.mjs';
+import { listRecentPlays, listTracks, nowIso, saveTrack, getSessionMode, setSessionMode, getFeedbackSummaryMap } from './db.mjs';
 import { searchOnline } from './community.mjs';
 import { getUserPrefs } from './radio.mjs';
 import { getGenreDiscoveryKeywords, searchGenres } from './genre.mjs';
 
-export async function djTurn({ db, config, netease, sessionId, userMessage }) {
+const CANDIDATE_LIMIT = 60;
+const AUTO_QUOTAS = { library_recent: 18, library_deep: 22, ai_discovery: 20 };
+const SEARCH_QUOTAS = { community_search: 24, ai_discovery: 12, library_recent: 12, library_deep: 12 };
+const SOURCE_BASE_SCORES = {
+  community_search: 70,
+  ai_discovery: 45,
+  library_recent: 42,
+  library_deep: 35
+};
+const MOODS = new Set(['comfort', 'melancholy', 'calm', 'healing', 'focus', 'energy', 'romantic', 'nostalgic', 'night', 'random']);
+const WEATHER_CACHE_MS = 10 * 60 * 1000;
+
+export async function djTurn({ db, config, netease, sessionId, userMessage, conversationMood = null }) {
   ensureSession(db, sessionId);
   const profile = getProfile(db);
-  const weather = await getWeatherSummary(config.weather);
+  const weather = await getCachedWeather(db, sessionId, config.weather);
   const hour = new Date().getHours();
   const timeOfDay = hour < 6 ? '深夜' : hour < 9 ? '清晨' : hour < 12 ? '上午' : hour < 14 ? '中午' : hour < 18 ? '下午' : hour < 21 ? '傍晚' : '夜晚';
   const mode = getSessionMode(db, sessionId);
@@ -20,10 +32,10 @@ export async function djTurn({ db, config, netease, sessionId, userMessage }) {
   const history = loadHistory(db, sessionId);
 
   // Build candidates
-  const candidates = await buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode);
+  const candidates = await buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, userMessage, conversationMood);
 
   // Single LLM call: chat + pick
-  const result = await callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage });
+  const result = await callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood });
 
   // Save to DB
   if (userMessage) {
@@ -51,6 +63,7 @@ export async function djTurn({ db, config, netease, sessionId, userMessage }) {
   const ttsUrl = await synthesizeSpeech(config.tts, result.chatText);
 
   return {
+    sessionId,
     chatText: result.chatText,
     track: result.track,
     reason: result.reason,
@@ -61,6 +74,67 @@ export async function djTurn({ db, config, netease, sessionId, userMessage }) {
   };
 }
 
+export async function chatTurn({ db, config, netease, sessionId, message }) {
+  ensureSession(db, sessionId);
+  const userMessage = String(message || '').trim();
+  const profile = getProfile(db);
+  const mode = getSessionMode(db, sessionId);
+  const history = loadHistory(db, sessionId);
+  const currentTrack = getCurrentTrack(db);
+  const context = getSessionContext(db, sessionId);
+  const baseMood = analyzeConversationMood({ history, userMessage, profile, currentTrack, mode });
+  const explicitIntent = hasExplicitMusicIntent(userMessage);
+  const userMessageCountAfterThisTurn = countUserMessages(db, sessionId) + (userMessage ? 1 : 0);
+  const canSuggest = canProactivelyRecommend({
+    userMessageCount: userMessageCountAfterThisTurn,
+    lastSuggestedAtUserCount: context.lastSuggestedAtUserCount,
+    currentTrack,
+    mood: baseMood
+  });
+  const chatDecision = await generateChatDecision({
+    config,
+    profile,
+    mode,
+    history,
+    userMessage,
+    currentTrack,
+    baseMood,
+    explicitIntent,
+    canSuggest
+  });
+  const conversationMood = normalizeMoodDecision({ ...baseMood, ...chatDecision });
+  const shouldRecommend = explicitIntent || (canSuggest && conversationMood.shouldRecommend);
+
+  if (shouldRecommend) {
+    const result = await djTurn({ db, config, netease, sessionId, userMessage, conversationMood });
+    setSessionContext(db, sessionId, {
+      ...getSessionContext(db, sessionId),
+      lastSuggestedAtUserCount: countUserMessages(db, sessionId)
+    });
+    return { ...result, conversationMood, intent: explicitIntent ? 'explicit' : 'proactive' };
+  }
+
+  if (userMessage) saveMessage(db, sessionId, 'user', userMessage);
+  saveMessage(db, sessionId, 'assistant', chatDecision.chatText);
+  if (chatDecision.newMode) {
+    const newMode = { ...chatDecision.newMode, updatedAt: nowIso() };
+    setSessionMode(db, sessionId, newMode);
+  }
+
+  return {
+    sessionId,
+    chatText: chatDecision.chatText,
+    track: null,
+    reason: '',
+    ttsUrl: null,
+    mode: chatDecision.newMode || mode,
+    profile,
+    weather: getSessionContext(db, sessionId).weather || '',
+    conversationMood,
+    intent: 'chat'
+  };
+}
+
 function loadHistory(db, sessionId) {
   const rows = db.prepare(
     'SELECT role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 20'
@@ -68,29 +142,481 @@ function loadHistory(db, sessionId) {
   return rows.reverse().map(r => ({ role: r.role, content: r.content }));
 }
 
-async function buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode) {
+function saveMessage(db, sessionId, role, content) {
+  db.prepare('INSERT INTO messages (session_id, role, content, created_at) VALUES (?,?,?,?)')
+    .run(sessionId, role, content, nowIso());
+}
+
+function getSessionContext(db, sessionId) {
+  try {
+    const row = db.prepare('SELECT context_json AS contextJson FROM radio_sessions WHERE id = ?').get(sessionId);
+    return row ? JSON.parse(row.contextJson || '{}') : {};
+  } catch {
+    return {};
+  }
+}
+
+function setSessionContext(db, sessionId, context) {
+  db.prepare('UPDATE radio_sessions SET context_json = ? WHERE id = ?')
+    .run(JSON.stringify(context || {}), sessionId);
+}
+
+async function getCachedWeather(db, sessionId, weatherConfig) {
+  const context = getSessionContext(db, sessionId);
+  const cachedAt = context.weatherUpdatedAt ? new Date(context.weatherUpdatedAt).getTime() : 0;
+  if (context.weather && Date.now() - cachedAt < WEATHER_CACHE_MS) return context.weather;
+  const weather = await getWeatherSummary(weatherConfig);
+  setSessionContext(db, sessionId, { ...context, weather, weatherUpdatedAt: nowIso() });
+  return weather;
+}
+
+function getCurrentTrack(db) {
+  try {
+    return listRecentPlays(db, 1)[0] || null;
+  } catch {
+    return null;
+  }
+}
+
+function countUserMessages(db, sessionId) {
+  return db.prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ? AND role = ?')
+    .get(sessionId, 'user').count || 0;
+}
+
+export function hasExplicitMusicIntent(text) {
+  const value = String(text || '');
+  if (/不想听|先别放|不要切|别切|别换/.test(value)) return false;
+  return /下一首|换一首|换歌|切歌|播放|放一首|来点|想听|推荐|给我.*(歌|音乐)|有没有.*(歌|音乐)|听.*(歌|音乐)|artist|song|music|play|recommend/i.test(value);
+}
+
+export function canProactivelyRecommend({ userMessageCount = 0, lastSuggestedAtUserCount = 0, currentTrack = null, mood = {} } = {}) {
+  if (!currentTrack) return Boolean(mood?.shouldRecommend);
+  if (userMessageCount < 3) return false;
+  if (lastSuggestedAtUserCount && userMessageCount - Number(lastSuggestedAtUserCount) < 3) return false;
+  return Boolean(mood?.shouldRecommend);
+}
+
+export function analyzeConversationMood({ history = [], userMessage = '', profile = {}, currentTrack = null, mode = {} } = {}) {
+  const text = [...history.slice(-12).map(h => h.content), userMessage].join(' ').toLowerCase();
+  const result = {
+    shouldRecommend: false,
+    mood: 'random',
+    energy: 'medium',
+    intent: 'chat',
+    searchHints: [],
+    reason: ''
+  };
+
+  const setMood = (mood, energy, hints, reason) => {
+    result.shouldRecommend = true;
+    result.mood = mood;
+    result.energy = energy;
+    result.searchHints = hints;
+    result.reason = reason;
+  };
+
+  if (/心情不好|难受|吵架|崩溃|委屈|emo|低落|伤心|难过|烦/.test(text)) {
+    setMood('comfort', 'low', ['治愈', '安慰', '温柔', '陪伴'], 'user needs comfort');
+  } else if (/睡不着|失眠|深夜|夜里|凌晨/.test(text)) {
+    setMood('night', 'low', ['深夜', '安静', '氛围', '睡前'], 'night conversation');
+  } else if (/累|疲惫|放松|安静|缓一缓/.test(text)) {
+    setMood('calm', 'low', ['放松', '安静', '轻柔', '慢歌'], 'user wants calm');
+  } else if (/提神|振作|有劲|运动|跑步|开心|兴奋/.test(text)) {
+    setMood('energy', 'high', ['提神', '电子', '节奏', '能量'], 'user wants energy');
+  } else if (/想念|怀念|以前|回忆|老歌/.test(text)) {
+    setMood('nostalgic', 'medium', ['怀旧', '回忆', '老歌', '温暖'], 'nostalgic tone');
+  }
+
+  if (mode?.genre) {
+    result.searchHints = [...new Set([mode.genre, ...result.searchHints])];
+  }
+  return result;
+}
+
+async function generateChatDecision({ config, profile, mode, history, userMessage, currentTrack, baseMood, explicitIntent, canSuggest }) {
+  const fallback = () => ({
+    chatText: fallbackFriendChat(userMessage, baseMood),
+    shouldRecommend: explicitIntent || (canSuggest && baseMood.shouldRecommend),
+    mood: baseMood.mood,
+    energy: baseMood.energy,
+    intent: explicitIntent ? 'music' : 'chat',
+    searchHints: baseMood.searchHints,
+    reason: baseMood.reason,
+    newMode: null
+  });
+  if (!config?.llm?.baseUrl) return fallback();
+
+  const raw = await generateChatCompletion(config.llm, [
+    {
+      role: 'system',
+      content: [
+        '你是私人电台 DJ 灿灿，也像熟悉的朋友。',
+        '先自然回应听众，不要每句话都转去推荐音乐。',
+        '只有明确音乐请求，或情绪稳定到适合接一首歌时，才 shouldRecommend=true。',
+        '输出 JSON：{"chatText":"40-120字自然回复","shouldRecommend":boolean,"mood":"comfort|melancholy|calm|healing|focus|energy|romantic|nostalgic|night|random","energy":"low|medium|high","intent":"chat|music|mood","searchHints":["2-6字关键词"],"reason":"简短理由","mode":null或"reset"或偏好名}'
+      ].join('\n')
+    },
+    {
+      role: 'user',
+      content: [
+        `听众画像：${profile.summary || ''}`,
+        `当前模式：${mode?.genre || '无'}`,
+        `当前歌曲：${currentTrack?.name || '无'}`,
+        `启发式情绪：${JSON.stringify(baseMood)}`,
+        `允许主动推荐：${canSuggest}`,
+        `明确音乐意图：${explicitIntent}`,
+        `最近对话：${history.slice(-10).map(h => `${h.role}: ${h.content}`).join('\n')}`,
+        `听众刚说：${userMessage}`
+      ].join('\n')
+    }
+  ], () => JSON.stringify(fallback()));
+
+  try {
+    const parsed = JSON.parse(String(raw).replace(/^```json|```$/g, '').trim());
+    const normalized = normalizeMoodDecision(parsed);
+    return {
+      ...normalized,
+      chatText: String(parsed.chatText || fallback().chatText).trim(),
+      newMode: parsed.mode === 'reset' ? {} : (parsed.mode && typeof parsed.mode === 'string' ? { genre: parsed.mode, note: '用户指定' } : null)
+    };
+  } catch {
+    return fallback();
+  }
+}
+
+function normalizeMoodDecision(input = {}) {
+  const mood = MOODS.has(input.mood) ? input.mood : 'random';
+  const hints = Array.isArray(input.searchHints) ? input.searchHints : [];
+  return {
+    shouldRecommend: Boolean(input.shouldRecommend),
+    mood,
+    energy: ['low', 'medium', 'high'].includes(input.energy) ? input.energy : 'medium',
+    intent: input.intent || 'chat',
+    searchHints: [...new Set(hints.map(h => String(h).trim()).filter(Boolean))].slice(0, 5),
+    reason: input.reason || ''
+  };
+}
+
+function fallbackFriendChat(userMessage, mood) {
+  if (mood?.mood === 'comfort') return '听起来你现在挺不好受的。先别急着把自己讲清楚，我在这儿陪你缓一缓；要是你愿意，也可以慢慢跟我说发生了什么。';
+  if (mood?.mood === 'night') return '夜里人的情绪会被放大一点。你不用马上睡着，先把呼吸放慢，我陪你把这一会儿安静地过过去。';
+  if (mood?.mood === 'energy') return '我听出来你想把状态拉起来一点。先把肩膀松一下，我们一点点把节奏找回来。';
+  return userMessage ? '我听着呢。你可以继续说，不用急着转到音乐；我会跟着你的状态，觉得合适的时候再接一首歌。' : '我在。想聊什么都可以。';
+}
+
+export async function buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, userMessage = '', conversationMood = null) {
   const played = db.prepare(
-    'SELECT track_id FROM plays WHERE track_id IN (SELECT track_id FROM plays ORDER BY played_at DESC LIMIT 300)'
+    'SELECT track_id FROM plays ORDER BY played_at DESC LIMIT 300'
   ).all();
   const playedIds = new Set(played.map(p => p.track_id));
   const allTracks = listTracks(db, 5000);
 
-  // 20%: Recent 100
   const recentFavIds = db.prepare('SELECT id FROM tracks ORDER BY updated_at DESC LIMIT 100').all().map(t => t.id);
-  const recentFavs = allTracks.filter(t => recentFavIds.includes(t.id) && !playedIds.has(t.id));
+  const recentFavIdSet = new Set(recentFavIds);
+  const recentFavs = allTracks
+    .filter(t => recentFavIdSet.has(t.id) && !playedIds.has(t.id))
+    .map(track => makeCandidate(track, 'library_recent', 'recent library'));
 
-  // 40%: Other library
-  const otherFavs = allTracks.filter(t => !recentFavIds.includes(t.id) && !playedIds.has(t.id));
+  const otherFavs = allTracks
+    .filter(t => !recentFavIdSet.has(t.id) && !playedIds.has(t.id))
+    .map(track => makeCandidate(track, 'library_deep', 'deep library'));
 
-  // 40%: Discovery
-  const discovery = recentFavs.length ? await discover(profile, weather, timeOfDay, hour, playedIds, config, mode) : [];
+  const [discovery, searchCandidates] = await Promise.all([
+    discover(profile, weather, timeOfDay, hour, playedIds, config, mode, conversationMood),
+    buildSearchCandidates(db, userMessage, config, playedIds, conversationMood)
+  ]);
+  const discoveryCandidates = discovery.map(track => makeCandidate(track, 'ai_discovery', 'profile discovery'));
 
-  const shuffle = (arr) => arr.sort(() => Math.random() - 0.5);
-  return [...shuffle(recentFavs).slice(0, 24), ...shuffle(otherFavs).slice(0, 48), ...shuffle(discovery).slice(0, 48)].slice(0, 120);
+  const rawCandidates = [...searchCandidates, ...discoveryCandidates, ...recentFavs, ...otherFavs];
+  const feedbackById = getFeedbackSummaryMap(db, rawCandidates.map(c => c.track?.id));
+  return rankAndSelectCandidates(rawCandidates, {
+    quotas: userMessage?.trim() || conversationMood?.searchHints?.length ? SEARCH_QUOTAS : AUTO_QUOTAS,
+    limit: CANDIDATE_LIMIT,
+    feedbackById,
+    artistPenaltyByName: getArtistPenaltyByName(db),
+    profile,
+    mode,
+    userMessage,
+    conversationMood,
+    seed: sessionId
+  });
 }
 
-async function discover(profile, weather, timeOfDay, hour, playedIds, config, mode) {
+async function buildSearchCandidates(db, userMessage, config, playedIds, conversationMood = null) {
+  const terms = conversationMood?.searchHints?.length
+    ? conversationMood.searchHints
+    : (userMessage?.trim() ? await generateSearchTerms(userMessage, config) : []);
+  if (!terms.length) return [];
+  const candidates = [];
+  const seen = new Set();
+  await Promise.all([...new Set(terms)].map(async (term) => {
+    try {
+      const searchResults = await searchOnline(term, 15);
+      for (const s of searchResults) {
+        if (seen.has(s.id) || playedIds.has(String(s.id))) continue;
+        seen.add(s.id);
+        saveTrack(db, s);
+        candidates.push(makeCandidate(s, 'community_search', term));
+      }
+    } catch {}
+  }));
+  return candidates;
+}
+
+function makeCandidate(track, source, sourceReason = '') {
+  return {
+    track,
+    source,
+    sourceReason,
+    score: 0,
+    scoreParts: {},
+    sources: [source]
+  };
+}
+
+export function rankAndSelectCandidates(candidates, {
+  quotas = AUTO_QUOTAS,
+  limit = CANDIDATE_LIMIT,
+  feedbackById = new Map(),
+  artistPenaltyByName = new Map(),
+  profile = {},
+  mode = {},
+  userMessage = '',
+  conversationMood = null,
+  seed = ''
+} = {}) {
+  const merged = new Map();
+
+  for (const candidate of candidates || []) {
+    const track = candidate?.track || candidate;
+    if (!track?.id) continue;
+    const source = candidate.source || 'library_deep';
+    const scored = {
+      ...candidate,
+      track,
+      source,
+      sourceReason: candidate.sourceReason || '',
+      sources: [...new Set([...(candidate.sources || []), source])]
+    };
+    const { score, scoreParts } = scoreCandidate(scored, {
+      feedback: feedbackById.get(String(track.id)),
+      artistPenaltyByName,
+      profile,
+      mode,
+      userMessage,
+      conversationMood,
+      seed
+    });
+    scored.score = score;
+    scored.scoreParts = scoreParts;
+
+    const existing = merged.get(String(track.id));
+    if (!existing || scored.score > existing.score) {
+      if (existing) scored.sources = [...new Set([...(existing.sources || []), ...(scored.sources || [])])];
+      merged.set(String(track.id), scored);
+    } else if (existing) {
+      existing.sources = [...new Set([...(existing.sources || []), ...(scored.sources || [])])];
+    }
+  }
+
+  const ranked = [...merged.values()].sort(compareCandidates);
+  const selected = [];
+  const selectedIds = new Set();
+
+  for (const [source, count] of Object.entries(quotas)) {
+    for (const candidate of ranked) {
+      if (selected.length >= limit) break;
+      if (selected.filter(c => c.source === source).length >= count) break;
+      if (candidate.source !== source || selectedIds.has(candidate.track.id)) continue;
+      selected.push(candidate);
+      selectedIds.add(candidate.track.id);
+    }
+  }
+
+  for (const candidate of ranked) {
+    if (selected.length >= limit) break;
+    if (selectedIds.has(candidate.track.id)) continue;
+    selected.push(candidate);
+    selectedIds.add(candidate.track.id);
+  }
+
+  return selected.slice(0, limit);
+}
+
+function scoreCandidate(candidate, { feedback, artistPenaltyByName, profile, mode, userMessage, conversationMood, seed }) {
+  const track = candidate.track || {};
+  const scoreParts = {
+    base: SOURCE_BASE_SCORES[candidate.source] ?? 30,
+    feedback: 0,
+    artistCooldown: 0,
+    profile: 0,
+    intent: 0,
+    variety: stableVariety(track.id, seed)
+  };
+
+  if (feedback) {
+    scoreParts.feedback += Math.min((Number(feedback.likes) || 0) * 30, 90);
+    scoreParts.feedback -= Math.min((Number(feedback.dislikes) || 0) * 60, 180);
+    scoreParts.feedback += Math.min((Number(feedback.completions) || 0) * 4, 20);
+    scoreParts.feedback -= Math.min((Number(feedback.skips) || 0) * 8, 30);
+  }
+
+  for (const artist of track.artists || []) {
+    const penalty = artistPenaltyByName.get(String(artist).toLowerCase()) || 0;
+    scoreParts.artistCooldown = Math.min(scoreParts.artistCooldown, penalty);
+  }
+
+  const modeText = String(mode?.genre || '').trim().toLowerCase();
+  const userText = String(userMessage || '').trim().toLowerCase();
+  const trackText = `${track.name || ''} ${(track.artists || []).join(' ')} ${track.album || ''} ${candidate.sourceReason || ''}`.toLowerCase();
+  scoreParts.profile += scoreStructuredProfile(track, trackText, profile);
+  if (candidate.source === 'community_search' && userText) scoreParts.intent += 20;
+  if (candidate.source === 'ai_discovery' && (modeText || userText)) scoreParts.intent += 10;
+  if (modeText && trackText.includes(modeText)) scoreParts.intent += 10;
+  if (conversationMood?.searchHints?.length) {
+    const hintText = conversationMood.searchHints.join(' ').toLowerCase();
+    if (candidate.source === 'community_search') scoreParts.intent += 18;
+    if (candidate.source === 'ai_discovery') scoreParts.intent += 12;
+    if (conversationMood.searchHints.some(hint => trackText.includes(String(hint).toLowerCase()))) scoreParts.intent += 14;
+    if (hintText && trackText.includes(String(conversationMood.mood || '').toLowerCase())) scoreParts.intent += 6;
+  }
+
+  const score = Object.values(scoreParts).reduce((sum, value) => sum + value, 0);
+  return { score, scoreParts };
+}
+
+function scoreStructuredProfile(track, trackText, profile = {}) {
+  const structured = profile?.structured || {};
+  if (!structured || !Object.keys(structured).length) return 0;
+
+  let score = 0;
+  const artistNames = new Set((track.artists || []).map(artist => String(artist).trim().toLowerCase()).filter(Boolean));
+  for (const item of structured.artists || []) {
+    const name = String(item?.name || '').trim().toLowerCase();
+    if (!name) continue;
+    if (artistNames.has(name)) score += 24 * weightOf(item);
+    else if (trackText.includes(name)) score += 10 * weightOf(item);
+  }
+
+  const album = String(track.album || '').trim().toLowerCase();
+  for (const item of structured.albums || []) {
+    const name = String(item?.name || '').trim().toLowerCase();
+    if (!name) continue;
+    if (album && album === name) score += 12 * weightOf(item);
+    else if (name.length >= 3 && trackText.includes(name)) score += 5 * weightOf(item);
+  }
+
+  const weakLists = [
+    [structured.genres, 8],
+    [structured.moods, 7],
+    [structured.scenes, 7],
+    [structured.languages, 5],
+    [structured.eras, 4],
+    [structured.energy, 5],
+    [structured.discoveryDirections, 9]
+  ];
+  for (const [items, base] of weakLists) {
+    for (const item of items || []) {
+      const name = String(item?.name || '').trim().toLowerCase();
+      if (name && trackText.includes(name)) score += base * weightOf(item);
+    }
+  }
+
+  for (const item of structured.avoidSignals || []) {
+    const name = String(item?.name || '').trim().toLowerCase();
+    if (name && trackText.includes(name)) score -= 45 * weightOf(item);
+  }
+
+  return score;
+}
+
+function weightOf(item) {
+  const weight = Number(item?.weight);
+  if (!Number.isFinite(weight)) return 0.4;
+  return Math.max(0, Math.min(1, weight));
+}
+
+function compareCandidates(a, b) {
+  if (b.score !== a.score) return b.score - a.score;
+  const aName = `${a.track?.name || ''}${a.track?.id || ''}`;
+  const bName = `${b.track?.name || ''}${b.track?.id || ''}`;
+  return aName.localeCompare(bName);
+}
+
+function stableVariety(id, seed) {
+  const text = `${seed || 'mymusic'}:${id || ''}`;
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) {
+    hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+  }
+  return (Math.abs(hash) % 400) / 100;
+}
+
+function getArtistPenaltyByName(db) {
+  const recent = listRecentPlays(db, 50);
+  const penalties = new Map();
+  const threeHoursAgo = Date.now() - 3 * 60 * 60 * 1000;
+
+  for (const play of recent.slice(0, 10)) {
+    for (const artist of play.artists || []) {
+      const key = String(artist).toLowerCase();
+      penalties.set(key, Math.min(penalties.get(key) || 0, -20));
+    }
+  }
+
+  for (const play of recent) {
+    const playedAt = new Date(play.played_at).getTime();
+    if (!Number.isFinite(playedAt) || playedAt < threeHoursAgo) continue;
+    for (const artist of play.artists || []) {
+      const key = String(artist).toLowerCase();
+      penalties.set(key, Math.min(penalties.get(key) || 0, -25));
+    }
+  }
+
+  return penalties;
+}
+
+function getStructuredDiscoveryKeywords(profile = {}, limit = 6) {
+  const structured = profile?.structured || {};
+  const groups = [
+    structured.discoveryDirections,
+    structured.genres,
+    structured.moods,
+    structured.scenes,
+    structured.languages
+  ];
+  const keywords = [];
+  for (const group of groups) {
+    for (const item of group || []) {
+      const name = String(item?.name || item || '').trim();
+      if (!name) continue;
+      keywords.push(name);
+      if (keywords.length >= limit) return [...new Set(keywords)].slice(0, limit);
+    }
+  }
+  return [...new Set(keywords)].slice(0, limit);
+}
+
+async function discover(profile, weather, timeOfDay, hour, playedIds, config, mode, conversationMood = null) {
   const results = []; const seen = new Set();
+
+  for (const kw of conversationMood?.searchHints || []) {
+    try {
+      const songs = await searchOnline(kw, 12);
+      for (const s of songs) {
+        if (!seen.has(s.id) && !playedIds.has(s.id)) { seen.add(s.id); results.push(s); }
+      }
+    } catch {}
+  }
+
+  for (const kw of getStructuredDiscoveryKeywords(profile, 6)) {
+    try {
+      const songs = await searchOnline(kw, 12);
+      for (const s of songs) {
+        if (!seen.has(s.id) && !playedIds.has(s.id)) { seen.add(s.id); results.push(s); }
+      }
+    } catch {}
+  }
 
   // 1. Genre-based discovery from RateYourMusic database
   const genreKeywords = getGenreDiscoveryKeywords(profile.summary, 6);
@@ -106,9 +632,12 @@ async function discover(profile, weather, timeOfDay, hour, playedIds, config, mo
   // 2. LLM-generated discovery keywords (mood/scene/context)
   if (config?.llm?.baseUrl) {
     const modeHint = mode?.genre ? `（当前偏好模式：${mode.genre}）` : '';
+    const moodHint = conversationMood?.mood
+      ? `对话情绪：${conversationMood.mood}；搜索提示：${(conversationMood.searchHints || []).join('、')}`
+      : '';
     const kwPrompt = [
       { role: 'system', content: `根据画像和氛围，生成 3 个搜索词用于发现新歌（不是流派名，是情绪/场景/语种等）。${modeHint}每个词 2-6 字，逗号分隔，只输出关键词。` },
-      { role: 'user', content: `画像：${profile.summary}\n氛围：${timeOfDay} ${hour}点，${weather}\n关键词：` }
+      { role: 'user', content: `画像：${profile.summary}\n氛围：${timeOfDay} ${hour}点，${weather}\n${moodHint}\n关键词：` }
     ];
     const kwText = await generateChatCompletion(config.llm, kwPrompt, () => null) || '';
     const moodKeywords = kwText.split(/[,，、\n]/).map(s => s.trim()).filter(Boolean).slice(0, 3);
@@ -126,29 +655,13 @@ async function discover(profile, weather, timeOfDay, hour, playedIds, config, mo
   return results;
 }
 
-async function callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage }) {
-  // If user mentions a specific artist/song/genre, search online
-  let extraCandidates = [];
-  if (userMessage?.trim()) {
-    // Let DeepSeek decide the optimal search terms
-    const searchTerms = await generateSearchTerms(userMessage, config);
-
-    const seen = new Set();
-    for (const term of [...new Set(searchTerms)]) {
-      try {
-        const searchResults = await searchOnline(term, 15);
-        for (const s of searchResults) {
-          if (!seen.has(s.id)) { seen.add(s.id); extraCandidates.push(s); saveTrack(db, s); }
-        }
-      } catch {}
-    }
-  }
-
-  const pool = [...extraCandidates, ...candidates].slice(0, 60);
-  const extraCount = Math.min(extraCandidates.length, pool.length);
-  const poolText = pool.map((t, i) =>
-    `${i}. ${t.name} —— ${(t.artists || []).join('、')}${t.album ? ' / ' + t.album : ''}`
-  ).join('\n');
+async function callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null }) {
+  const pool = candidates.slice(0, CANDIDATE_LIMIT);
+  const tracks = pool.map(candidate => candidate.track || candidate);
+  const extraCount = pool.filter(candidate => candidate.source === 'community_search').length;
+  const poolText = pool.map((candidate, i) => { const t = candidate.track || candidate; return (
+    `${i}. ${t.name} —— ${(t.artists || []).join('、')}${t.album ? ' / ' + t.album : ''}（来源：${candidate.source || 'library'}，分数：${Math.round(candidate.score || 0)}）`
+  ); }).join('\n');
   const searchNote = extraCount > 0
     ? `\n（候选 0-${extraCount - 1} 是针对"${userMessage?.slice(0, 20)}"的在线搜索结果，优先从这里选。结合你对每首歌的了解判断流派——例如牵丝戏是古风、Geisha是电子世界融合不是国风、半壶纱是中国风民谣）`
     : '';
@@ -159,6 +672,9 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
   const prefNote = prefs?.note ? `用户偏好：${prefs.note}` : '';
   const genreHints = getGenreDiscoveryKeywords(profile.summary, 10);
   const genreNote = genreHints.length ? `听众可能喜欢的音乐风格：${genreHints.join('、')}` : '';
+  const moodNote = conversationMood?.mood && conversationMood.mood !== 'random'
+    ? `最近对话情绪：${conversationMood.mood}，能量：${conversationMood.energy}，搜索提示：${(conversationMood.searchHints || []).join('、')}。推荐要贴合这段对话的情绪。`
+    : '';
 
   const systemPrompt = [
     '你是灿灿，私人电台 DJ。你的风格：温暖、真诚，像深夜电台的老朋友。',
@@ -169,6 +685,7 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
     modeText,
     prefNote,
     genreNote,
+    moodNote,
     '',
     '规则：',
     '- 先回应听众的话题（如果有），再自然引出推荐',
@@ -220,20 +737,20 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
   }
 
   // No song this turn — just chat
-  if (pick < 0 || pick >= pool.length) {
+  if (pick < 0 || pick >= tracks.length) {
     return { chatText, track: null, reason: '', newMode };
   }
 
-  let selectedTrack = pool[pick] || pool[0];
+  let selectedTrack = tracks[pick] || tracks[0];
   let finalChatText = chatText;
 
-  const playable = await resolvePlayableTrack(db, netease, selectedTrack);
+  const playable = await resolvePlayableTrack(db, netease, selectedTrack, { includeLyric: false });
   if (!playable?.playable) {
     let found = false;
     for (let offset = 1; offset <= 5; offset++) {
-      const nextTrack = pool[(pick + offset) % pool.length];
+      const nextTrack = tracks[(pick + offset) % tracks.length];
       if (nextTrack === selectedTrack) continue;
-      const nextPlayable = await resolvePlayableTrack(db, netease, nextTrack);
+      const nextPlayable = await resolvePlayableTrack(db, netease, nextTrack, { includeLyric: false });
       if (nextPlayable?.playable) {
         selectedTrack = nextPlayable;
         finalChatText = `来听一首 ${selectedTrack.name} 吧，${(selectedTrack.artists || []).join('、')}的。`;
@@ -241,7 +758,7 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
         break;
       }
     }
-    if (!found) selectedTrack = playable || pool[0];
+    if (!found) selectedTrack = playable || tracks[0];
   } else {
     selectedTrack = playable;
   }

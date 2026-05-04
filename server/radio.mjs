@@ -1,18 +1,18 @@
 // Radio routes — thin wrappers over the conversational DJ engine
 import crypto from 'node:crypto';
-import { djTurn } from './dj.mjs';
-import { nowIso } from './db.mjs';
+import { chatTurn, djTurn } from './dj.mjs';
+import { nowIso, recordTrackFeedback } from './db.mjs';
 
 export async function startRadio({ db, config, netease }) {
   const sessionId = crypto.randomUUID();
   const weather = await (await import('./ai.mjs')).getWeatherSummary(config.weather);
   db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
-    .run(sessionId, nowIso(), JSON.stringify({ weather, startedAt: nowIso() }), '[]');
+    .run(sessionId, nowIso(), JSON.stringify({ weather, weatherUpdatedAt: nowIso(), startedAt: nowIso() }), '[]');
   return djTurn({ db, config, netease, sessionId, userMessage: null });
 }
 
 export async function chatRadio({ db, config, netease, sessionId, message }) {
-  return djTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), userMessage: message || '' });
+  return chatTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), message: message || '' });
 }
 
 export async function nextRadioItem({ db, config, netease, sessionId, userMessage }) {
@@ -27,6 +27,24 @@ export async function reportPlay({ db, netease, payload }) {
     await netease.reportPlay({ songId: trackId, playTime: payload.playTime || Date.now(), duration: payload.duration || 0, playType: payload.playType || 'play', sourceType: payload.sourceType || 'mymusic' });
     return { ok: true };
   } catch (e) { return { ok: false, error: e.message }; }
+}
+
+export function submitFeedback({ db, payload }) {
+  try {
+    return {
+      ok: true,
+      feedback: recordTrackFeedback(db, {
+        trackId: payload.trackId || payload.songId,
+        eventType: payload.eventType,
+        sessionId: payload.sessionId,
+        elapsedMs: payload.elapsedMs,
+        durationMs: payload.durationMs,
+        source: payload.source
+      })
+    };
+  } catch (error) {
+    return { __error: true, ok: false, error: error.message, status: 400 };
+  }
 }
 
 export function getUserPrefs(db) {

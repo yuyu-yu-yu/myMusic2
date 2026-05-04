@@ -15,6 +15,7 @@
 | `docs/changelog-2026-05-04.md` | 本更新日志 |
 | `.claude/skills/music-genre-finder/` | RYM 流派数据（49 主分类 + 578 子分类） |
 | `.claude/skills/find-skills/` | Skill 发现工具 |
+| `.claude/settings.json` | 项目级权限配置（Bash 通配符） |
 
 ### 修改
 | 文件 | 改动 |
