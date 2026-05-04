@@ -600,57 +600,25 @@ function getStructuredDiscoveryKeywords(profile = {}, limit = 6) {
 async function discover(profile, weather, timeOfDay, hour, playedIds, config, mode, conversationMood = null) {
   const results = []; const seen = new Set();
 
-  for (const kw of conversationMood?.searchHints || []) {
+  // Collect all search keywords from 3 sources (no more LLM generation)
+  const keywords = [
+    ...(conversationMood?.searchHints || []),
+    ...getStructuredDiscoveryKeywords(profile, 6),
+    ...getGenreDiscoveryKeywords(profile.summary, 6)
+  ];
+
+  // Deduplicate
+  const unique = [...new Set(keywords.map(k => String(k).trim()).filter(Boolean))];
+
+  // Parallel search across ALL keywords
+  await Promise.all(unique.map(async (kw) => {
     try {
       const songs = await searchOnline(kw, 12);
       for (const s of songs) {
         if (!seen.has(s.id) && !playedIds.has(s.id)) { seen.add(s.id); results.push(s); }
       }
     } catch {}
-  }
-
-  for (const kw of getStructuredDiscoveryKeywords(profile, 6)) {
-    try {
-      const songs = await searchOnline(kw, 12);
-      for (const s of songs) {
-        if (!seen.has(s.id) && !playedIds.has(s.id)) { seen.add(s.id); results.push(s); }
-      }
-    } catch {}
-  }
-
-  // 1. Genre-based discovery from RateYourMusic database
-  const genreKeywords = getGenreDiscoveryKeywords(profile.summary, 6);
-  for (const kw of genreKeywords) {
-    try {
-      const songs = await searchOnline(kw, 12);
-      for (const s of songs) {
-        if (!seen.has(s.id) && !playedIds.has(s.id)) { seen.add(s.id); results.push(s); }
-      }
-    } catch {}
-  }
-
-  // 2. LLM-generated discovery keywords (mood/scene/context)
-  if (config?.llm?.baseUrl) {
-    const modeHint = mode?.genre ? `（当前偏好模式：${mode.genre}）` : '';
-    const moodHint = conversationMood?.mood
-      ? `对话情绪：${conversationMood.mood}；搜索提示：${(conversationMood.searchHints || []).join('、')}`
-      : '';
-    const kwPrompt = [
-      { role: 'system', content: `根据画像和氛围，生成 3 个搜索词用于发现新歌（不是流派名，是情绪/场景/语种等）。${modeHint}每个词 2-6 字，逗号分隔，只输出关键词。` },
-      { role: 'user', content: `画像：${profile.summary}\n氛围：${timeOfDay} ${hour}点，${weather}\n${moodHint}\n关键词：` }
-    ];
-    const kwText = await generateChatCompletion(config.llm, kwPrompt, () => null) || '';
-    const moodKeywords = kwText.split(/[,，、\n]/).map(s => s.trim()).filter(Boolean).slice(0, 3);
-
-    for (const kw of moodKeywords) {
-      try {
-        const songs = await searchOnline(kw, 12);
-        for (const s of songs) {
-          if (!seen.has(s.id) && !playedIds.has(s.id)) { seen.add(s.id); results.push(s); }
-        }
-      } catch {}
-    }
-  }
+  }));
 
   return results;
 }
