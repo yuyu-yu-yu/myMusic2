@@ -20,7 +20,7 @@ const template = document.querySelector('#player-template');
 
 window.addEventListener('popstate', render);
 document.addEventListener('click', (event) => {
-  const link = event.target.closest('[data-link]');
+  const link = event.target instanceof Element ? event.target.closest('[data-link]') : null;
   if (!link) return;
   event.preventDefault();
   history.pushState({}, '', link.href);
@@ -43,16 +43,16 @@ async function render() {
   return renderPlayer();
 }
 
+
 // --- Audio visualizer ---
-// Pre-built audio graph: one persistent AudioContext with both media element
-// sources connected through gain nodes to a single analyser. Switching is
-// done by toggling gain — no createMediaElementSource calls after init.
+// One persistent AudioContext. Sources created once per audio element and
+// cached. Switching disconnects old connections and reconnects the desired
+// source to a fresh analyser. No gain nodes.
 let audioCtx = null;
 let analyser = null;
-let hostGain = null;
-let songGain = null;
 let visualizerAnimId = null;
 let visualizerBuilt = false;
+const sourceCache = new Map();
 
 function initVisualizer() {
   const fallback = document.querySelector('#equalizer-fallback');
@@ -71,61 +71,44 @@ function buildAudioGraph() {
   const hostAudio = document.querySelector('#host-audio');
   const songAudio = document.querySelector('#song-audio');
   if (!hostAudio || !songAudio) return;
-
   try {
+    hostAudio.crossOrigin = 'anonymous';
+    songAudio.crossOrigin = 'anonymous';
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    analyser = audioCtx.createAnalyser();
-    analyser.fftSize = 64;
-    analyser.smoothingTimeConstant = 0.7;
-    analyser.connect(audioCtx.destination);
-
-    hostGain = audioCtx.createGain();
-    hostGain.gain.value = 0;
-    audioCtx.createMediaElementSource(hostAudio).connect(hostGain);
-    hostGain.connect(analyser);
-
-    songGain = audioCtx.createGain();
-    songGain.gain.value = 0;
-    audioCtx.createMediaElementSource(songAudio).connect(songGain);
-    songGain.connect(analyser);
-
+    sourceCache.set(hostAudio, audioCtx.createMediaElementSource(hostAudio));
+    sourceCache.set(songAudio, audioCtx.createMediaElementSource(songAudio));
     visualizerBuilt = true;
-  } catch {
-    // Web Audio not available — fallback bars only
+    console.log('[viz] graph built, sources cached:', sourceCache.size);
+  } catch(e) {
+    console.warn('[viz] Web Audio not available:', e.message);
     visualizerBuilt = false;
   }
 }
 
-function showVisualizer() {
-  const canvas = document.querySelector('#visualizer-canvas');
-  const fallback = document.querySelector('#equalizer-fallback');
-  if (visualizerBuilt) {
-    if (canvas) canvas.style.display = 'block';
-    if (fallback) fallback.style.display = 'none';
-    startDrawLoop(canvas);
-  } else {
-    if (canvas) canvas.style.display = 'none';
-    if (fallback) fallback.style.display = 'flex';
-  }
-}
-
 function switchVisualizerTo(kind) {
+  console.log('[viz] switchVisualizerTo(' + kind + ') built:', visualizerBuilt);
   if (!visualizerBuilt) {
-    if (kind !== 'off') {
-      const canvas = document.querySelector('#visualizer-canvas');
-      const fb = document.querySelector('#equalizer-fallback');
+    const canvas = document.querySelector('#visualizer-canvas');
+    const fb = document.querySelector('#equalizer-fallback');
+    if (kind === 'off') {
+      if (canvas) canvas.style.display = 'none';
+      if (fb) fb.style.display = 'none';
+    } else {
       if (canvas) canvas.style.display = 'none';
       if (fb) fb.style.display = 'flex';
-    } else {
-      stopVisualizer();
     }
     return;
   }
 
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+
+  for (const src of sourceCache.values()) {
+    try { src.disconnect(); } catch {}
+  }
+  if (analyser) { try { analyser.disconnect(); } catch {} analyser = null; }
+
   if (kind === 'off') {
     stopDrawLoop();
-    hostGain && (hostGain.gain.value = 0);
-    songGain && (songGain.gain.value = 0);
     const canvas = document.querySelector('#visualizer-canvas');
     const fb = document.querySelector('#equalizer-fallback');
     if (canvas) { canvas.style.display = 'none'; canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height); }
@@ -133,23 +116,51 @@ function switchVisualizerTo(kind) {
     return;
   }
 
-  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
-  hostGain && (hostGain.gain.value = kind === 'host' ? 1 : 0);
-  songGain && (songGain.gain.value = kind === 'song' ? 1 : 0);
-  showVisualizer();
+  const audioEl = kind === 'host'
+    ? document.querySelector('#host-audio')
+    : document.querySelector('#song-audio');
+  const source = sourceCache.get(audioEl);
+  console.log('[viz] source for ' + kind + ':', !!source, 'el src:', (audioEl?.src || '').slice(-40));
+  if (!source) return;
+
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = 64;
+  analyser.smoothingTimeConstant = 0.7;
+  source.connect(analyser);
+  analyser.connect(audioCtx.destination);
+
+  const canvas = document.querySelector('#visualizer-canvas');
+  const fb = document.querySelector('#equalizer-fallback');
+  if (canvas) canvas.style.display = 'block';
+  if (fb) fb.style.display = 'none';
+
+  stopDrawLoop();
+  startDrawLoop(canvas);
 }
+
+let _drawFrameCount = 0;
+let _drawLogged = false;
 
 function startDrawLoop(canvas) {
   if (visualizerAnimId || !canvas) return;
+  console.log('[viz] startDrawLoop, analyser:', !!analyser, 'built:', visualizerBuilt);
+  _drawFrameCount = 0;
+  _drawLogged = false;
   function frame() {
     visualizerAnimId = requestAnimationFrame(frame);
     if (!visualizerBuilt || !analyser) return;
+    _drawFrameCount++;
     const ctx = canvas.getContext('2d');
     const W = canvas.width;
     const H = canvas.height;
     const bufferLength = analyser.frequencyBinCount;
     const dataArray = new Uint8Array(bufferLength);
     analyser.getByteFrequencyData(dataArray);
+    if (!_drawLogged && _drawFrameCount % 30 === 0) {
+      const maxVal = Math.max(...dataArray);
+      console.log('[viz] frame #' + _drawFrameCount, 'max freq:', maxVal, 'first 5:', [...dataArray.slice(0, 5)]);
+      if (_drawFrameCount >= 120) _drawLogged = true;
+    }
     ctx.clearRect(0, 0, W, H);
 
     const barCount = Math.min(bufferLength, 18);
@@ -175,7 +186,6 @@ function stopDrawLoop() {
 function stopVisualizer() {
   switchVisualizerTo('off');
 }
-
 // --- Button press feedback ---
 
 function initButtonFeedback() {
@@ -423,6 +433,7 @@ async function updatePlayer(data, autoplay) {
 
   const songAudio = document.querySelector('#song-audio');
   if (track.playUrl) {
+    songAudio.crossOrigin = 'anonymous';
     songAudio.src = track.playUrl;
     songAudio.style.display = '';
   } else {
