@@ -9,6 +9,12 @@ const state = {
   activeLyricIndex: -1
 };
 
+// Module-level mutable state — MUST be declared before render() call at line ~30
+let statusLocked = false;
+let btnFeedbackReady = false;
+let loadingMsgIndex = 0;
+let loadingMsgTimer = null;
+
 const view = document.querySelector('#view');
 const template = document.querySelector('#player-template');
 
@@ -38,11 +44,15 @@ async function render() {
 }
 
 // --- Audio visualizer ---
+// Pre-built audio graph: one persistent AudioContext with both media element
+// sources connected through gain nodes to a single analyser. Switching is
+// done by toggling gain — no createMediaElementSource calls after init.
 let audioCtx = null;
 let analyser = null;
-let visualizerSource = null;
+let hostGain = null;
+let songGain = null;
 let visualizerAnimId = null;
-let visualizerMode = 'off';
+let visualizerBuilt = false;
 
 function initVisualizer() {
   const fallback = document.querySelector('#equalizer-fallback');
@@ -56,56 +66,95 @@ function initVisualizer() {
   }
 }
 
-function startVisualizer(audioEl) {
-  stopVisualizer();
-  const canvas = document.querySelector('#visualizer-canvas');
-  const fallback = document.querySelector('#equalizer-fallback');
-  if (!canvas) return;
+function buildAudioGraph() {
+  if (visualizerBuilt) return;
+  const hostAudio = document.querySelector('#host-audio');
+  const songAudio = document.querySelector('#song-audio');
+  if (!hostAudio || !songAudio) return;
 
   try {
     audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    if (audioCtx.state === 'suspended') audioCtx.resume();
-    visualizerSource = audioCtx.createMediaElementSource(audioEl);
     analyser = audioCtx.createAnalyser();
     analyser.fftSize = 64;
     analyser.smoothingTimeConstant = 0.7;
-    visualizerSource.connect(analyser);
     analyser.connect(audioCtx.destination);
-    visualizerMode = 'realtime';
-    canvas.style.display = 'block';
-    if (fallback) fallback.style.display = 'none';
-    drawVisualizer(canvas);
+
+    hostGain = audioCtx.createGain();
+    hostGain.gain.value = 0;
+    audioCtx.createMediaElementSource(hostAudio).connect(hostGain);
+    hostGain.connect(analyser);
+
+    songGain = audioCtx.createGain();
+    songGain.gain.value = 0;
+    audioCtx.createMediaElementSource(songAudio).connect(songGain);
+    songGain.connect(analyser);
+
+    visualizerBuilt = true;
   } catch {
-    startFallbackVisualizer();
+    // Web Audio not available — fallback bars only
+    visualizerBuilt = false;
   }
 }
 
-function startFallbackVisualizer() {
-  stopVisualizer();
+function showVisualizer() {
   const canvas = document.querySelector('#visualizer-canvas');
   const fallback = document.querySelector('#equalizer-fallback');
-  visualizerMode = 'fallback';
-  if (canvas) canvas.style.display = 'none';
-  if (fallback) fallback.style.display = 'flex';
+  if (visualizerBuilt) {
+    if (canvas) canvas.style.display = 'block';
+    if (fallback) fallback.style.display = 'none';
+    startDrawLoop(canvas);
+  } else {
+    if (canvas) canvas.style.display = 'none';
+    if (fallback) fallback.style.display = 'flex';
+  }
 }
 
-function drawVisualizer(canvas) {
-  if (visualizerMode !== 'realtime') return;
-  const ctx = canvas.getContext('2d');
-  const W = canvas.width;
-  const H = canvas.height;
-  const bufferLength = analyser.frequencyBinCount;
-  const dataArray = new Uint8Array(bufferLength);
+function switchVisualizerTo(kind) {
+  if (!visualizerBuilt) {
+    if (kind !== 'off') {
+      const canvas = document.querySelector('#visualizer-canvas');
+      const fb = document.querySelector('#equalizer-fallback');
+      if (canvas) canvas.style.display = 'none';
+      if (fb) fb.style.display = 'flex';
+    } else {
+      stopVisualizer();
+    }
+    return;
+  }
 
-  (function draw() {
-    visualizerAnimId = requestAnimationFrame(draw);
+  if (kind === 'off') {
+    stopDrawLoop();
+    hostGain && (hostGain.gain.value = 0);
+    songGain && (songGain.gain.value = 0);
+    const canvas = document.querySelector('#visualizer-canvas');
+    const fb = document.querySelector('#equalizer-fallback');
+    if (canvas) { canvas.style.display = 'none'; canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height); }
+    if (fb) fb.style.display = 'none';
+    return;
+  }
+
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+  hostGain && (hostGain.gain.value = kind === 'host' ? 1 : 0);
+  songGain && (songGain.gain.value = kind === 'song' ? 1 : 0);
+  showVisualizer();
+}
+
+function startDrawLoop(canvas) {
+  if (visualizerAnimId || !canvas) return;
+  function frame() {
+    visualizerAnimId = requestAnimationFrame(frame);
+    if (!visualizerBuilt || !analyser) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width;
+    const H = canvas.height;
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
     analyser.getByteFrequencyData(dataArray);
     ctx.clearRect(0, 0, W, H);
 
     const barCount = Math.min(bufferLength, 18);
     const barWidth = (W / barCount) - 2;
     let x = 1;
-
     for (let i = 0; i < barCount; i++) {
       const barHeight = Math.max(2, (dataArray[i] / 255) * (H - 4));
       const gradient = ctx.createLinearGradient(0, H, 0, H - barHeight);
@@ -115,23 +164,19 @@ function drawVisualizer(canvas) {
       ctx.fillRect(x, H - barHeight - 1, barWidth, barHeight);
       x += barWidth + 2;
     }
-  })();
+  }
+  visualizerAnimId = requestAnimationFrame(frame);
+}
+
+function stopDrawLoop() {
+  if (visualizerAnimId) { cancelAnimationFrame(visualizerAnimId); visualizerAnimId = null; }
 }
 
 function stopVisualizer() {
-  if (visualizerAnimId) { cancelAnimationFrame(visualizerAnimId); visualizerAnimId = null; }
-  visualizerMode = 'off';
-  const canvas = document.querySelector('#visualizer-canvas');
-  const fallback = document.querySelector('#equalizer-fallback');
-  if (canvas) { canvas.style.display = 'none'; canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height); }
-  if (fallback) fallback.style.display = 'none';
-  if (visualizerSource) { try { visualizerSource.disconnect(); } catch {} visualizerSource = null; }
-  if (audioCtx && audioCtx.state !== 'closed') { try { audioCtx.close(); } catch {} audioCtx = null; }
-  analyser = null;
+  switchVisualizerTo('off');
 }
 
 // --- Button press feedback ---
-let btnFeedbackReady = false;
 
 function initButtonFeedback() {
   if (btnFeedbackReady) return;
@@ -198,6 +243,10 @@ function renderPlayer() {
   startPlayerPolling();
   initButtonFeedback();
   initVisualizer();
+  // Build audio graph on first user gesture (start button click)
+  document.querySelector('#start-btn').addEventListener('click', () => {
+    if (!visualizerBuilt) buildAudioGraph();
+  }, { once: true });
 }
 
 function ensureFeedbackButtons() {
@@ -235,11 +284,9 @@ const loadingMessages = [
   '灿灿正在连接赛博音乐网络...',
 ];
 
-let loadingMsgIndex = 0;
-let loadingMsgTimer = null;
-
 function startLoadingMessages() {
   loadingMsgIndex = 0;
+  statusLocked = true;
   showLoadingMessage();
   loadingMsgTimer = setInterval(() => {
     loadingMsgIndex = (loadingMsgIndex + 1) % loadingMessages.length;
@@ -261,6 +308,7 @@ function showLoadingMessage() {
 }
 
 function stopLoadingMessages() {
+  statusLocked = false;
   if (loadingMsgTimer) { clearInterval(loadingMsgTimer); loadingMsgTimer = null; }
 }
 
@@ -333,14 +381,14 @@ function handleRadioResponse(data) {
   try {
     if (data.ttsUrl) {
       hostAudio.onended = () => startSongPlayback();
-      hostAudio.onplay = () => startVisualizer(hostAudio);
+      hostAudio.onplay = () => switchVisualizerTo('host');
       hostAudio.play();
     } else {
-      startFallbackVisualizer();
+      switchVisualizerTo('host');  // show fallback for SpeechSynthesis
       speakText(data.chatText || data.hostText, () => startSongPlayback());
     }
   } catch {
-    startFallbackVisualizer();
+    switchVisualizerTo('host');
     speakText(data.chatText || data.hostText, () => startSongPlayback());
   }
 }
@@ -472,7 +520,7 @@ async function startSongPlayback() {
   if (track?.playUrl) {
     markPlaybackStarted(track, 'browser');
     setPlayerStatus(`正在播放：${track.name || '未知歌曲'}`, 'playing');
-    startVisualizer(songAudio);
+    switchVisualizerTo('song');
     songAudio.play().catch(() => {});
     songAudio.onended = async () => {
       stopVisualizer();
@@ -487,7 +535,7 @@ async function startSongPlayback() {
   }
 
   // No direct URL, try ncm-cli via server
-  startFallbackVisualizer();
+  switchVisualizerTo('song');
   playCurrentTrack();
 }
 
@@ -562,6 +610,7 @@ function setHostText(text) {
 }
 
 function setPlayerStatus(text, kind = '') {
+  if (statusLocked) return;
   stopLoadingMessages();
   const el = document.querySelector('#player-status');
   if (!el) return;
@@ -639,6 +688,7 @@ function startPlayerPolling() {
 }
 
 async function pollPlayerState() {
+  if (statusLocked) return;
   const statusEl = document.querySelector('#player-status');
   if (!statusEl || statusEl.classList.contains('error')) return;
   try {
