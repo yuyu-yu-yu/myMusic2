@@ -2,7 +2,9 @@ const state = {
   sessionId: null,
   current: null,
   library: null,
-  playerPollTimer: null
+  playerPollTimer: null,
+  feedbackSent: new Set(),
+  activePlayback: null
 };
 
 const view = document.querySelector('#view');
@@ -42,15 +44,18 @@ function renderPlayer() {
   const resumeBtn = document.querySelector('#resume-btn');
   const chatForm = document.querySelector('#chat-form');
   const modeResetBtn = document.querySelector('#mode-reset-btn');
+  const { likeBtn, dislikeBtn } = ensureFeedbackButtons();
 
   startBtn.addEventListener('click', () => {
     api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
     startRadio();
   });
-  nextBtn.addEventListener('click', () => nextTrack());
+  nextBtn.addEventListener('click', () => nextTrack({ skipCurrent: true }));
   pauseBtn.addEventListener('click', () => pausePlayback());
   resumeBtn.addEventListener('click', () => resumePlayback());
   modeResetBtn.addEventListener('click', () => resetMode());
+  likeBtn.addEventListener('click', () => reportFeedback('like'));
+  dislikeBtn.addEventListener('click', () => reportFeedback('dislike'));
 
   chatForm.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -65,6 +70,29 @@ function renderPlayer() {
   startPlayerPolling();
 }
 
+function ensureFeedbackButtons() {
+  const transport = document.querySelector('.transport-mini');
+  let likeBtn = document.querySelector('#like-btn');
+  let dislikeBtn = document.querySelector('#dislike-btn');
+  if (!likeBtn) {
+    likeBtn = document.createElement('button');
+    likeBtn.id = 'like-btn';
+    likeBtn.type = 'button';
+    likeBtn.title = '喜欢';
+    likeBtn.textContent = '喜欢';
+    transport?.insertBefore(likeBtn, document.querySelector('#next-btn'));
+  }
+  if (!dislikeBtn) {
+    dislikeBtn = document.createElement('button');
+    dislikeBtn.id = 'dislike-btn';
+    dislikeBtn.type = 'button';
+    dislikeBtn.title = '不喜欢';
+    dislikeBtn.textContent = '不喜欢';
+    transport?.insertBefore(dislikeBtn, document.querySelector('#next-btn'));
+  }
+  return { likeBtn, dislikeBtn };
+}
+
 async function startRadio() {
   appendChat({ role: 'user', text: '启动电台' });
   setPlayerStatus('灿灿正在准备...', 'playing');
@@ -74,7 +102,8 @@ async function startRadio() {
   } catch (e) { setPlayerStatus(e.message, 'error'); }
 }
 
-async function nextTrack() {
+async function nextTrack({ skipCurrent = true } = {}) {
+  if (skipCurrent) await reportFeedback('skip');
   appendChat({ role: 'user', text: '下一首' });
   setPlayerStatus('灿灿正在想...', 'playing');
   try {
@@ -102,8 +131,10 @@ async function resetMode() {
 
 function handleRadioResponse(data) {
   state.sessionId = data.sessionId || state.sessionId;
-  state.current = data;
-  updatePlayer(data, false);
+  if (data.track) {
+    state.current = data;
+    updatePlayer(data, false);
+  }
 
   // Show DJ chat bubble with optional track card
   appendChat({
@@ -118,7 +149,7 @@ function handleRadioResponse(data) {
 
   // Only play if there's a track
   if (!data.track) {
-    setPlayerStatus('等待中', '');
+    setPlayerStatus(state.current?.track ? '继续播放中' : '等待中', '');
     return;
   }
 
@@ -180,9 +211,13 @@ async function startSongPlayback() {
 
   // If we have a direct URL, play it in browser
   if (track?.playUrl) {
+    markPlaybackStarted(track, 'browser');
     setPlayerStatus(`正在播放：${track.name || '未知歌曲'}`, 'playing');
     songAudio.play().catch(() => {});
-    songAudio.onended = () => nextTrack();
+    songAudio.onended = async () => {
+      await reportFeedback('complete');
+      nextTrack({ skipCurrent: false });
+    };
     songAudio.onplay = () => {
       api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
     };
@@ -204,6 +239,58 @@ function speakText(text, onEnd) {
   utterance.rate = 0.96;
   utterance.onend = () => onEnd?.();
   speechSynthesis.speak(utterance);
+}
+
+function markPlaybackStarted(track, source) {
+  if (!track?.id) return;
+  state.activePlayback = {
+    trackId: track.id,
+    source,
+    startedAt: Date.now(),
+    durationMs: Number(track.durationMs) || 0,
+    completed: false
+  };
+}
+
+async function reportFeedback(eventType) {
+  const track = state.current?.track;
+  if (!track?.id) return;
+  const playback = state.activePlayback?.trackId === track.id ? state.activePlayback : null;
+  const dedupeId = eventType === 'complete' || eventType === 'skip'
+    ? `${track.id}:${eventType}:${playback?.startedAt || 'manual'}`
+    : `${track.id}:${eventType}`;
+  if (state.feedbackSent.has(dedupeId)) return;
+
+  const elapsedMs = playback ? Date.now() - playback.startedAt : 0;
+  state.feedbackSent.add(dedupeId);
+  if (eventType === 'complete' && playback) playback.completed = true;
+
+  try {
+    await api('/api/feedback', {
+      method: 'POST',
+      body: {
+        trackId: track.id,
+        eventType,
+        sessionId: state.sessionId,
+        elapsedMs,
+        durationMs: track.durationMs || playback?.durationMs || 0,
+        source: playback?.source || 'ui'
+      }
+    });
+  } catch {
+    state.feedbackSent.delete(dedupeId);
+  }
+}
+
+function maybeReportInferredComplete() {
+  const playback = state.activePlayback;
+  const track = state.current?.track;
+  if (!playback || playback.completed || !track?.id || playback.trackId !== track.id) return;
+  if (playback.source !== 'ncm-cli') return;
+
+  const elapsedMs = Date.now() - playback.startedAt;
+  const threshold = playback.durationMs ? playback.durationMs * 0.7 : 180000;
+  if (elapsedMs >= threshold) reportFeedback('complete');
 }
 
 function setHostText(text) {
@@ -232,6 +319,7 @@ async function playCurrentTrack() {
       state.current.track = result.track;
       updatePlayer(state.current, false);
     }
+    markPlaybackStarted(result.track || track, 'ncm-cli');
     const skipped = result.skipped?.length ? `，已跳过 ${result.skipped.length} 首不可播歌曲` : '';
     setPlayerStatus(`正在播放：${result.track?.name || track.name}${skipped}`, 'playing');
     api('/api/play/report', { method: 'POST', body: { trackId: result.track?.id || track.id, playType: 'play' } }).catch(() => {});
@@ -289,6 +377,7 @@ async function pollPlayerState() {
   try {
     const data = await api('/api/player/state');
     const status = data.state?.status || data.state?.playerState || 'unknown';
+    if (status === 'playing') maybeReportInferredComplete();
     if (status === 'playing') setPlayerStatus('ncm-cli 正在播放', 'playing');
     if (status === 'paused') setPlayerStatus('ncm-cli 已暂停', '');
     if (status === 'stopped') setPlayerStatus('ncm-cli 播放器待命', '');
@@ -300,10 +389,19 @@ async function pollPlayerState() {
 async function renderLibrary() {
   const data = await api('/api/library');
   state.library = data;
+  const structured = data.profile?.structured || {};
   view.innerHTML = `
     <section class="page-panel">
       <p class="eyebrow">Library</p>
       <h1 class="page-title">私人曲库</h1>
+      <div class="grid" style="margin: 0 0 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));">
+        ${profileBlock('Top 流派', structured.genres)}
+        ${profileBlock('Top 情绪', structured.moods)}
+        ${profileBlock('常听艺人', structured.artists)}
+        ${profileBlock('推荐场景', structured.scenes)}
+        ${profileBlock('探索方向', structured.discoveryDirections)}
+      </div>
+      <p class="muted">长期画像只基于用户主动同步的网易云歌单，不使用电台推荐、在线搜索、播放记录或最近播放。</p>
       <p class="reason" style="white-space: pre-wrap; line-height: 1.85">${escapeHtml(data.profile.summary)}</p>
       <div class="tags">${(data.profile.tags || []).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}</div>
       <div class="stats">
@@ -423,6 +521,24 @@ async function pollQrStatus(key, statusEl) {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function profileBlock(title, items = []) {
+  const values = (items || [])
+    .map(item => typeof item === 'string' ? { name: item } : item)
+    .filter(item => item?.name)
+    .slice(0, 6);
+  const tags = values.length
+    ? values.map(item => `<span class="tag">${escapeHtml(item.name)}</span>`).join('')
+    : '<span class="muted">暂无明显信号</span>';
+  return `
+    <article class="list-item" style="align-items:flex-start">
+      <div>
+        <h3>${escapeHtml(title)}</h3>
+        <div class="tags">${tags}</div>
+      </div>
+    </article>
+  `;
 }
 
 function trackItem(track) {

@@ -67,6 +67,9 @@ export async function playTrackWithFallback({ db, runner = runNcmCli, trackId, m
 
 export async function playOneTrack(runner, track) {
   if (!track?.id) throw new Error('Track id is required.');
+  if (!track.playUrl && !track.originalId) {
+    throw new Error(`Track cannot be played without playUrl or originalId: ${track.name || track.id}`);
+  }
 
   await runner(['stop', '--output', 'json']).catch(() => {});
 

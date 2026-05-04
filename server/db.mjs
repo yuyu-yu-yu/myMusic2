@@ -10,6 +10,7 @@ export function openDatabase(rootDir = process.cwd()) {
   db.exec('PRAGMA foreign_keys = ON');
   // Migration: add mode_json to existing radio_sessions
   try { db.exec("ALTER TABLE radio_sessions ADD COLUMN mode_json TEXT NOT NULL DEFAULT '{}'"); } catch {}
+  try { db.exec("ALTER TABLE music_profile ADD COLUMN profile_json TEXT NOT NULL DEFAULT '{}'"); } catch {}
   migrate(db);
   return db;
 }
@@ -79,6 +80,7 @@ function migrate(db) {
       id INTEGER PRIMARY KEY CHECK (id = 1),
       summary TEXT NOT NULL,
       tags_json TEXT NOT NULL DEFAULT '[]',
+      profile_json TEXT NOT NULL DEFAULT '{}',
       updated_at TEXT NOT NULL
     );
 
@@ -98,6 +100,26 @@ function migrate(db) {
       provider TEXT,
       audio_path TEXT,
       created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS track_feedback_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      track_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      session_id TEXT,
+      elapsed_ms INTEGER,
+      duration_ms INTEGER,
+      source TEXT,
+      created_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS track_feedback_summary (
+      track_id TEXT PRIMARY KEY,
+      likes INTEGER NOT NULL DEFAULT 0,
+      dislikes INTEGER NOT NULL DEFAULT 0,
+      completions INTEGER NOT NULL DEFAULT 0,
+      skips INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL
     );
   `);
 }
@@ -119,6 +141,72 @@ export function getSessionMode(db, sessionId) {
     const row = db.prepare('SELECT mode_json FROM radio_sessions WHERE id = ?').get(sessionId);
     return row ? JSON.parse(row.mode_json || '{}') : {};
   } catch { return {}; }
+}
+
+const feedbackColumns = {
+  like: 'likes',
+  dislike: 'dislikes',
+  complete: 'completions',
+  skip: 'skips'
+};
+
+export function recordTrackFeedback(db, {
+  trackId,
+  eventType,
+  sessionId = null,
+  elapsedMs = null,
+  durationMs = null,
+  source = null
+} = {}) {
+  const id = String(trackId || '').trim();
+  const type = String(eventType || '').trim();
+  const column = feedbackColumns[type];
+  if (!id) throw new Error('trackId is required');
+  if (!column) throw new Error('eventType must be one of like, dislike, complete, skip');
+
+  const now = nowIso();
+  db.prepare(`
+    INSERT INTO track_feedback_events (track_id, event_type, session_id, elapsed_ms, duration_ms, source, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    id,
+    type,
+    sessionId ? String(sessionId) : null,
+    elapsedMs === null || elapsedMs === undefined ? null : Math.max(0, Number(elapsedMs) || 0),
+    durationMs === null || durationMs === undefined ? null : Math.max(0, Number(durationMs) || 0),
+    source ? String(source) : null,
+    now
+  );
+
+  db.prepare(`
+    INSERT INTO track_feedback_summary (track_id, ${column}, updated_at)
+    VALUES (?, 1, ?)
+    ON CONFLICT(track_id) DO UPDATE SET
+      ${column} = ${column} + 1,
+      updated_at = excluded.updated_at
+  `).run(id, now);
+
+  return getTrackFeedbackSummary(db, id);
+}
+
+export function getTrackFeedbackSummary(db, trackId) {
+  return db.prepare(`
+    SELECT track_id AS trackId, likes, dislikes, completions, skips, updated_at AS updatedAt
+    FROM track_feedback_summary
+    WHERE track_id = ?
+  `).get(String(trackId));
+}
+
+export function getFeedbackSummaryMap(db, trackIds) {
+  const ids = [...new Set((trackIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
+  if (!ids.length) return new Map();
+  const placeholders = ids.map(() => '?').join(',');
+  const rows = db.prepare(`
+    SELECT track_id AS trackId, likes, dislikes, completions, skips, updated_at AS updatedAt
+    FROM track_feedback_summary
+    WHERE track_id IN (${placeholders})
+  `).all(...ids);
+  return new Map(rows.map((row) => [String(row.trackId), row]));
 }
 
 export function setSessionMode(db, sessionId, mode) {

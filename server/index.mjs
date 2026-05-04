@@ -7,7 +7,7 @@ import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
 import { openDatabase, seedDemoLibrary, getSetting, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { getLibrary, getProfile, syncLibrary, updateProfile } from './library.mjs';
-import { chatRadio, nextRadioItem, reportPlay, startRadio } from './radio.mjs';
+import { chatRadio, nextRadioItem, reportPlay, startRadio, submitFeedback } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
 import { loadCookie } from './community.mjs';
@@ -70,6 +70,10 @@ const routes = {
   'POST /api/play/report': async (req) => {
     const body = await readJson(req);
     return reportPlay({ db, netease, payload: body });
+  },
+  'POST /api/feedback': async (req) => {
+    const body = await readJson(req);
+    return submitFeedback({ db, payload: body });
   },
   'POST /api/player/play': async (req) => {
     const body = await readJson(req);
