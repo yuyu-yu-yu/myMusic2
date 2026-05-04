@@ -37,6 +37,132 @@ async function render() {
   return renderPlayer();
 }
 
+// --- Audio visualizer ---
+let audioCtx = null;
+let analyser = null;
+let visualizerSource = null;
+let visualizerAnimId = null;
+let visualizerMode = 'off';
+
+function initVisualizer() {
+  const fallback = document.querySelector('#equalizer-fallback');
+  if (!fallback) return;
+  for (let i = 0; i < 20; i++) {
+    const bar = document.createElement('span');
+    bar.className = 'bar';
+    bar.style.animationDelay = (i * 0.07) + 's';
+    bar.style.animationDuration = (0.5 + Math.random() * 0.8) + 's';
+    fallback.appendChild(bar);
+  }
+}
+
+function startVisualizer(audioEl) {
+  stopVisualizer();
+  const canvas = document.querySelector('#visualizer-canvas');
+  const fallback = document.querySelector('#equalizer-fallback');
+  if (!canvas) return;
+
+  try {
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    visualizerSource = audioCtx.createMediaElementSource(audioEl);
+    analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 64;
+    analyser.smoothingTimeConstant = 0.7;
+    visualizerSource.connect(analyser);
+    analyser.connect(audioCtx.destination);
+    visualizerMode = 'realtime';
+    canvas.style.display = 'block';
+    if (fallback) fallback.style.display = 'none';
+    drawVisualizer(canvas);
+  } catch {
+    startFallbackVisualizer();
+  }
+}
+
+function startFallbackVisualizer() {
+  stopVisualizer();
+  const canvas = document.querySelector('#visualizer-canvas');
+  const fallback = document.querySelector('#equalizer-fallback');
+  visualizerMode = 'fallback';
+  if (canvas) canvas.style.display = 'none';
+  if (fallback) fallback.style.display = 'flex';
+}
+
+function drawVisualizer(canvas) {
+  if (visualizerMode !== 'realtime') return;
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width;
+  const H = canvas.height;
+  const bufferLength = analyser.frequencyBinCount;
+  const dataArray = new Uint8Array(bufferLength);
+
+  (function draw() {
+    visualizerAnimId = requestAnimationFrame(draw);
+    analyser.getByteFrequencyData(dataArray);
+    ctx.clearRect(0, 0, W, H);
+
+    const barCount = Math.min(bufferLength, 18);
+    const barWidth = (W / barCount) - 2;
+    let x = 1;
+
+    for (let i = 0; i < barCount; i++) {
+      const barHeight = Math.max(2, (dataArray[i] / 255) * (H - 4));
+      const gradient = ctx.createLinearGradient(0, H, 0, H - barHeight);
+      gradient.addColorStop(0, '#00f0ff');
+      gradient.addColorStop(1, '#ff00ff');
+      ctx.fillStyle = gradient;
+      ctx.fillRect(x, H - barHeight - 1, barWidth, barHeight);
+      x += barWidth + 2;
+    }
+  })();
+}
+
+function stopVisualizer() {
+  if (visualizerAnimId) { cancelAnimationFrame(visualizerAnimId); visualizerAnimId = null; }
+  visualizerMode = 'off';
+  const canvas = document.querySelector('#visualizer-canvas');
+  const fallback = document.querySelector('#equalizer-fallback');
+  if (canvas) { canvas.style.display = 'none'; canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height); }
+  if (fallback) fallback.style.display = 'none';
+  if (visualizerSource) { try { visualizerSource.disconnect(); } catch {} visualizerSource = null; }
+  if (audioCtx && audioCtx.state !== 'closed') { try { audioCtx.close(); } catch {} audioCtx = null; }
+  analyser = null;
+}
+
+// --- Button press feedback ---
+let btnFeedbackReady = false;
+
+function initButtonFeedback() {
+  if (btnFeedbackReady) return;
+  btnFeedbackReady = true;
+
+  document.addEventListener('mousedown', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    btn.classList.add('btn-pressed');
+  });
+  document.addEventListener('mouseup', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    btn.classList.remove('btn-pressed');
+  });
+  document.addEventListener('mouseleave', (e) => {
+    const btn = e.target.closest('button');
+    if (btn) btn.classList.remove('btn-pressed');
+  }, true);
+  document.addEventListener('touchstart', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    btn.classList.add('btn-pressed');
+  }, { passive: true });
+  document.addEventListener('touchend', (e) => {
+    const btn = e.target.closest('button');
+    if (!btn) return;
+    btn.classList.remove('btn-pressed');
+  });
+}
+
 function renderPlayer() {
   view.innerHTML = '';
   view.append(template.content.cloneNode(true));
@@ -70,6 +196,8 @@ function renderPlayer() {
 
   if (state.current) updatePlayer(state.current, false);
   startPlayerPolling();
+  initButtonFeedback();
+  initVisualizer();
 }
 
 function ensureFeedbackButtons() {
@@ -95,32 +223,74 @@ function ensureFeedbackButtons() {
   return { likeBtn, dislikeBtn };
 }
 
+// --- Loading message rotator ---
+const loadingMessages = [
+  '灿灿正在帮你挑选歌曲...',
+  '灿灿正在翻阅你的音乐记忆...',
+  '灿灿正在感受今晚的氛围...',
+  '灿灿正在计算最佳频率...',
+  '灿灿正在解码你的音乐DNA...',
+  '灿灿正在扫描地下电台信号...',
+  '灿灿正在校准音频矩阵...',
+  '灿灿正在连接赛博音乐网络...',
+];
+
+let loadingMsgIndex = 0;
+let loadingMsgTimer = null;
+
+function startLoadingMessages() {
+  loadingMsgIndex = 0;
+  showLoadingMessage();
+  loadingMsgTimer = setInterval(() => {
+    loadingMsgIndex = (loadingMsgIndex + 1) % loadingMessages.length;
+    showLoadingMessage();
+  }, 2800);
+}
+
+function showLoadingMessage() {
+  const el = document.querySelector('#player-status');
+  if (!el) return;
+  const msg = loadingMessages[loadingMsgIndex];
+  el.innerHTML = `
+    <span class="glitch-text" data-text="${escapeHtml(msg)}">${escapeHtml(msg)}</span>
+    <span class="loading-dots">
+      <span></span><span></span><span></span>
+    </span>
+  `;
+  el.classList.add('playing');
+}
+
+function stopLoadingMessages() {
+  if (loadingMsgTimer) { clearInterval(loadingMsgTimer); loadingMsgTimer = null; }
+}
+
 async function startRadio() {
   appendChat({ role: 'user', text: '启动电台' });
-  setPlayerStatus('灿灿正在准备...', 'playing');
+  startLoadingMessages();
   try {
     const data = await api('/api/radio/start', { method: 'POST', body: {} });
     handleRadioResponse(data);
-  } catch (e) { setPlayerStatus(e.message, 'error'); }
+  } catch (e) { stopLoadingMessages(); setPlayerStatus(e.message, 'error'); }
 }
 
 async function nextTrack({ skipCurrent = true } = {}) {
   if (skipCurrent) await reportFeedback('skip');
   appendChat({ role: 'user', text: '下一首' });
-  setPlayerStatus('灿灿正在想...', 'playing');
+  startLoadingMessages();
   try {
     const data = await api('/api/radio/next', { method: 'POST', body: { sessionId: state.sessionId } });
     handleRadioResponse(data);
-  } catch (e) { setPlayerStatus(e.message, 'error'); }
+  } catch (e) { stopLoadingMessages(); setPlayerStatus(e.message, 'error'); }
 }
 
 async function sendChat(msg) {
   appendChat({ role: 'user', text: msg });
-  setPlayerStatus('灿灿正在回复...', 'playing');
+  startLoadingMessages();
   try {
     const data = await api('/api/radio/chat', { method: 'POST', body: { sessionId: state.sessionId, message: msg } });
     handleRadioResponse(data);
   } catch (e) {
+    stopLoadingMessages();
     appendChat({ role: 'dj', text: '抱歉，出了一点问题：' + e.message });
   }
 }
@@ -132,6 +302,8 @@ async function resetMode() {
 }
 
 function handleRadioResponse(data) {
+  stopLoadingMessages();
+  stopVisualizer();
   state.sessionId = data.sessionId || state.sessionId;
   if (data.track) {
     state.current = data;
@@ -161,11 +333,14 @@ function handleRadioResponse(data) {
   try {
     if (data.ttsUrl) {
       hostAudio.onended = () => startSongPlayback();
+      hostAudio.onplay = () => startVisualizer(hostAudio);
       hostAudio.play();
     } else {
+      startFallbackVisualizer();
       speakText(data.chatText || data.hostText, () => startSongPlayback());
     }
   } catch {
+    startFallbackVisualizer();
     speakText(data.chatText || data.hostText, () => startSongPlayback());
   }
 }
@@ -297,8 +472,10 @@ async function startSongPlayback() {
   if (track?.playUrl) {
     markPlaybackStarted(track, 'browser');
     setPlayerStatus(`正在播放：${track.name || '未知歌曲'}`, 'playing');
+    startVisualizer(songAudio);
     songAudio.play().catch(() => {});
     songAudio.onended = async () => {
+      stopVisualizer();
       await reportFeedback('complete');
       nextTrack({ skipCurrent: false });
     };
@@ -310,6 +487,7 @@ async function startSongPlayback() {
   }
 
   // No direct URL, try ncm-cli via server
+  startFallbackVisualizer();
   playCurrentTrack();
 }
 
@@ -384,9 +562,10 @@ function setHostText(text) {
 }
 
 function setPlayerStatus(text, kind = '') {
+  stopLoadingMessages();
   const el = document.querySelector('#player-status');
   if (!el) return;
-  el.textContent = text || 'ncm-cli 播放器待命';
+  el.innerHTML = escapeHtml(text || 'ncm-cli 播放器待命');
   el.classList.toggle('error', kind === 'error');
   el.classList.toggle('playing', kind === 'playing');
 }
@@ -414,6 +593,7 @@ async function playCurrentTrack() {
 }
 
 async function pausePlayback() {
+  stopVisualizer();
   document.querySelector('#host-audio')?.pause();
   document.querySelector('#song-audio')?.pause();
   window.speechSynthesis?.cancel?.();
@@ -426,6 +606,7 @@ async function pausePlayback() {
 async function resumePlayback() {
   const songAudio = document.querySelector('#song-audio');
   if (songAudio?.src) {
+    startVisualizer(songAudio);
     songAudio.play().catch(() => {});
     setPlayerStatus('继续播放', 'playing');
     return;
@@ -439,6 +620,7 @@ async function resumePlayback() {
 }
 
 async function stopPlayback() {
+  stopVisualizer();
   document.querySelector('#host-audio')?.pause();
   const songAudio = document.querySelector('#song-audio');
   songAudio?.pause();

@@ -3,12 +3,13 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#10131a" />
+    <meta name="theme-color" content="#06060e" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="stylesheet" href="/styles.css" />
     <title>myMusic</title>
   </head>
   <body>
+    <div id="crt-overlay"></div>
     <div id="app">
       <header class="topbar">
         <a class="brand" href="/" data-link>
@@ -42,6 +43,8 @@
           </div>
           <audio id="host-audio"></audio>
           <audio id="song-audio" controls></audio>
+          <canvas id="visualizer-canvas" width="600" height="52"></canvas>
+          <div id="equalizer-fallback" class="equalizer-fallback" style="display:none"></div>
           <div id="player-status" class="player-status">等待启动</div>
           <button id="start-btn" class="primary start-wide">启动电台</button>
           <div id="lyric" class="lyric"></div>
