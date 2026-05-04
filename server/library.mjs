@@ -1,5 +1,6 @@
 import { listRecentPlays, listTracks, linkPlaylistTrack, normalizeTrack, nowIso, savePlaylist, saveTrack, seedDemoLibrary } from './db.mjs';
 import { getSongUrl, getLyric as getCommunityLyric } from './community.mjs';
+import { generateChatCompletion } from './ai.mjs';
 
 export async function syncLibrary(db, netease) {
   const result = {
@@ -71,8 +72,11 @@ export async function syncLibrary(db, netease) {
   return result;
 }
 
-export async function updateProfile(db) {
-  const tracks = listTracks(db, 5000);
+export async function updateProfile(db, llmConfig) {
+  // Only analyze tracks the user actually synced from NetEase playlists (not AI recs or test searches)
+  const ownedIds = db.prepare('SELECT DISTINCT track_id FROM playlist_tracks').all().map(r => r.track_id);
+  const ownedIdSet = new Set(ownedIds);
+  const tracks = listTracks(db, 5000).filter(t => ownedIdSet.has(t.id));
   const recent = listRecentPlays(db, 50);
   const artistCounts = new Map();
   const albumCounts = new Map();
@@ -84,9 +88,26 @@ export async function updateProfile(db) {
   const topAlbums = [...albumCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([name]) => name);
   const tags = inferTags(tracks, recent);
   const totalCount = db.prepare('SELECT COUNT(*) AS count FROM tracks').get().count;
-  const summary = totalCount
+
+  // Basic summary (fallback)
+  let summary = totalCount
     ? `已收录 ${totalCount} 首歌。常听艺人：${topArtists.join('、') || '待补充'}。常见专辑/歌单线索：${topAlbums.join('、') || '待补充'}。近期适合按 ${tags.join('、')} 来组织推荐。`
     : '还没有同步到音乐数据。启动同步后，我会根据红心、歌单和最近播放总结你的音乐画像。';
+
+  // LLM enriched profile — only regenerate when needed
+  const existing = getProfile(db);
+  const lastUpdated = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
+  const hoursSinceUpdate = (Date.now() - lastUpdated) / 3600000;
+  const trackCountChanged = existing?.summary && existing.summary.includes(String(totalCount))
+    ? false : Math.abs((totalCount - (existing?.summary?.match(/(\d+)\s*首/) || [])[1] || totalCount)) > totalCount * 0.05;
+
+  if (llmConfig?.baseUrl && (hoursSinceUpdate > 24 || trackCountChanged || existing.summary.length < 150)) {
+    const enriched = await generateAIPortrait(tracks, topArtists, totalCount, llmConfig);
+    if (enriched) summary = enriched;
+  } else if (existing?.summary && existing.summary.length > 50) {
+    // Reuse existing enriched profile, update only tags/artists stats
+    summary = existing.summary;
+  }
 
   db.prepare(`
     INSERT INTO music_profile (id, summary, tags_json, updated_at)
@@ -97,6 +118,42 @@ export async function updateProfile(db) {
       updated_at = excluded.updated_at
   `).run(summary, JSON.stringify(tags), nowIso());
   return { summary, tags, topArtists, topAlbums, trackCount: tracks.length };
+}
+
+async function generateAIPortrait(tracks, topArtists, totalCount, llmConfig) {
+  // Use user's curated tracks (playlist-synced only, no AI recs)
+  const sample = tracks.slice(0, 60).map(t => `${t.name} - ${(t.artists || []).join('/')}`).join('、');
+  const artistSummary = topArtists.slice(0, 15).join('、');
+
+  const text = await generateChatCompletion(llmConfig, [
+    {
+      role: 'system',
+      content: [
+        '你是音乐分析师。以下是用户主动收藏入库的歌曲（来自网易云歌单同步，不含AI推荐），请客观分析他的音乐口味。',
+        '直接输出以下格式，不要打招呼：',
+        '',
+        '【整体风格】基于曲库数据的客观风格概括',
+        '【流派偏好】3-5个常听流派+各举一首典型曲目',
+        '【情绪倾向】从歌单中可观察到的情绪偏好，不要编造行为场景',
+        '【艺人偏好】常听艺人共同特点（国籍、语种、年代、风格等）',
+        '【风格分布】不同风格在曲库中的占比估算',
+        '【惊喜建议】2-3个可探索的新方向',
+        '【补充】曲库中明显的风格反差（如有）',
+        '',
+        '重要：不要编造用户行为、习惯、作息。只分析歌曲本身。250-400字。'
+      ].join('\n')
+    },
+    {
+      role: 'user',
+      content: [
+        `曲库总量：${totalCount} 首（全部来自用户歌单同步，非AI推荐）`,
+        `常听艺人 Top 15：${artistSummary}`,
+        `曲库样本（随机 60 首）：${sample}`
+      ].join('\n')
+    }
+  ], () => null);
+
+  return text || null;
 }
 
 export function getProfile(db) {

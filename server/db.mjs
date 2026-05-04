@@ -8,6 +8,8 @@ export function openDatabase(rootDir = process.cwd()) {
   const db = new DatabaseSync(path.join(dataDir, 'mymusic.sqlite'));
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
+  // Migration: add mode_json to existing radio_sessions
+  try { db.exec("ALTER TABLE radio_sessions ADD COLUMN mode_json TEXT NOT NULL DEFAULT '{}'"); } catch {}
   migrate(db);
   return db;
 }
@@ -61,7 +63,8 @@ function migrate(db) {
       id TEXT PRIMARY KEY,
       created_at TEXT NOT NULL,
       context_json TEXT NOT NULL DEFAULT '{}',
-      queue_json TEXT NOT NULL DEFAULT '[]'
+      queue_json TEXT NOT NULL DEFAULT '[]',
+	      mode_json TEXT NOT NULL DEFAULT '{}'
     );
 
     CREATE TABLE IF NOT EXISTS messages (
@@ -109,6 +112,18 @@ export function setSetting(db, key, value) {
     INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
   `).run(key, value, nowIso());
+}
+
+export function getSessionMode(db, sessionId) {
+  try {
+    const row = db.prepare('SELECT mode_json FROM radio_sessions WHERE id = ?').get(sessionId);
+    return row ? JSON.parse(row.mode_json || '{}') : {};
+  } catch { return {}; }
+}
+
+export function setSessionMode(db, sessionId, mode) {
+  db.prepare('UPDATE radio_sessions SET mode_json = ? WHERE id = ?')
+    .run(JSON.stringify(mode || {}), sessionId);
 }
 
 export function nowIso() {

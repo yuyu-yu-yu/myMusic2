@@ -26,34 +26,41 @@
     </div>
     <template id="player-template">
       <section class="player-shell">
-        <div class="now-panel">
-          <img id="cover" class="cover" src="/assets/cover-1.svg" alt="cover" />
-          <div class="track-meta">
-            <p class="eyebrow">AI PRIVATE RADIO</p>
-            <h1 id="track-title">myMusic</h1>
-            <p id="track-artist" class="muted">等待启动</p>
-            <p id="reason" class="reason">点击启动后，电台会根据你的收藏、时间、天气和对话自动推荐。</p>
+        <div class="left-col">
+          <div class="now-panel">
+            <img id="cover" class="cover" src="/assets/cover-1.svg" alt="cover" />
+            <div class="track-meta">
+              <p class="eyebrow">AI PRIVATE RADIO</p>
+              <h1 id="track-title">myMusic</h1>
+              <p id="track-artist" class="muted">等待启动</p>
+              <div class="transport transport-mini">
+                <button id="pause-btn">暂停</button>
+                <button id="resume-btn">继续</button>
+                <button id="next-btn">下一首</button>
+              </div>
+            </div>
           </div>
+          <audio id="host-audio"></audio>
+          <audio id="song-audio" controls></audio>
+          <div id="player-status" class="player-status">等待启动</div>
+          <button id="start-btn" class="primary start-wide">启动电台</button>
+          <div id="lyric" class="lyric"></div>
         </div>
-        <div class="host-panel">
-          <p class="eyebrow">主持人</p>
-          <p id="host-text" class="host-text">准备好以后，我会先说一小段，再放歌。</p>
+        <div class="chat-panel">
+          <div class="chat-header">
+            <span class="eyebrow">灿灿 · AI DJ</span>
+            <button id="mode-reset-btn" class="ghost" title="恢复正常推荐" style="display:none">恢复正常</button>
+          </div>
+          <div id="chat-messages" class="chat-messages">
+            <div class="chat-msg dj-msg">
+              <p>准备好以后点击启动电台，我会根据你的收藏、时间和心情来推荐音乐。你也可以随时跟我聊天。</p>
+            </div>
+          </div>
+          <form id="chat-form" class="chat-form chat-form-inline">
+            <input id="chat-input" autocomplete="off" placeholder="和灿灿聊聊..." />
+            <button type="submit">发送</button>
+          </form>
         </div>
-        <div class="transport">
-          <button id="start-btn" class="primary">启动电台</button>
-          <button id="next-btn">下一首</button>
-          <button id="pause-btn">暂停</button>
-          <button id="resume-btn">继续</button>
-          <button id="stop-btn">停止</button>
-        </div>
-        <audio id="host-audio"></audio>
-        <audio id="song-audio" controls></audio>
-        <div id="player-status" class="player-status">等待启动</div>
-        <form id="chat-form" class="chat-form">
-          <input id="chat-input" autocomplete="off" placeholder="告诉它你现在想听什么" />
-          <button type="submit">发送</button>
-        </form>
-        <div id="lyric" class="lyric"></div>
       </section>
     </template>
     <script type="module" src="/app.js"></script>

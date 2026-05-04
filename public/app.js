@@ -40,80 +40,137 @@ function renderPlayer() {
   const nextBtn = document.querySelector('#next-btn');
   const pauseBtn = document.querySelector('#pause-btn');
   const resumeBtn = document.querySelector('#resume-btn');
-  const stopBtn = document.querySelector('#stop-btn');
   const chatForm = document.querySelector('#chat-form');
+  const modeResetBtn = document.querySelector('#mode-reset-btn');
 
   startBtn.addEventListener('click', () => {
     api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
-    runRadio('/api/radio/start', {});
+    startRadio();
   });
-  nextBtn.addEventListener('click', () => {
-    api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
-    runRadio('/api/radio/next', { sessionId: state.sessionId });
-  });
+  nextBtn.addEventListener('click', () => nextTrack());
   pauseBtn.addEventListener('click', () => pausePlayback());
   resumeBtn.addEventListener('click', () => resumePlayback());
-  stopBtn.addEventListener('click', () => stopPlayback());
+  modeResetBtn.addEventListener('click', () => resetMode());
+
   chatForm.addEventListener('submit', (event) => {
     event.preventDefault();
     const input = document.querySelector('#chat-input');
-    const message = input.value.trim();
-    if (!message) return;
+    const msg = input.value.trim();
+    if (!msg) return;
     input.value = '';
-    runRadio('/api/radio/chat', { sessionId: state.sessionId, message });
+    sendChat(msg);
   });
 
   if (state.current) updatePlayer(state.current, false);
   startPlayerPolling();
 }
 
-async function runRadio(path, body) {
-  setHostText('正在为你组织下一段电台...');
-  setPlayerStatus('正在准备电台...', 'playing');
+async function startRadio() {
+  appendChat({ role: 'user', text: '启动电台' });
+  setPlayerStatus('灿灿正在准备...', 'playing');
   try {
-    const data = await api(path, { method: 'POST', body });
-    state.sessionId = data.sessionId || state.sessionId;
-    state.current = data;
-    updatePlayer(data, true);
-  } catch (error) {
-    setPlayerStatus(error.message, 'error');
+    const data = await api('/api/radio/start', { method: 'POST', body: {} });
+    handleRadioResponse(data);
+  } catch (e) { setPlayerStatus(e.message, 'error'); }
+}
+
+async function nextTrack() {
+  appendChat({ role: 'user', text: '下一首' });
+  setPlayerStatus('灿灿正在想...', 'playing');
+  try {
+    const data = await api('/api/radio/next', { method: 'POST', body: { sessionId: state.sessionId } });
+    handleRadioResponse(data);
+  } catch (e) { setPlayerStatus(e.message, 'error'); }
+}
+
+async function sendChat(msg) {
+  appendChat({ role: 'user', text: msg });
+  setPlayerStatus('灿灿正在回复...', 'playing');
+  try {
+    const data = await api('/api/radio/chat', { method: 'POST', body: { sessionId: state.sessionId, message: msg } });
+    handleRadioResponse(data);
+  } catch (e) {
+    appendChat({ role: 'dj', text: '抱歉，出了一点问题：' + e.message });
   }
+}
+
+async function resetMode() {
+  await api('/api/radio/chat', { method: 'POST', body: { sessionId: state.sessionId, message: '恢复正常推荐，取消所有偏好模式' } });
+  document.querySelector('#mode-reset-btn').style.display = 'none';
+  appendChat({ role: 'dj', text: '好的，恢复正常推荐模式。' });
+}
+
+function handleRadioResponse(data) {
+  state.sessionId = data.sessionId || state.sessionId;
+  state.current = data;
+  updatePlayer(data, false);
+
+  // Show DJ chat bubble with optional track card
+  appendChat({
+    role: 'dj',
+    text: data.chatText || data.hostText || '',
+    track: data.track
+  });
+
+  // Show/hide mode reset button
+  const hasMode = data.mode?.genre;
+  document.querySelector('#mode-reset-btn').style.display = hasMode ? '' : 'none';
+
+  // Only play if there's a track
+  if (!data.track) {
+    setPlayerStatus('等待中', '');
+    return;
+  }
+
+  const hostAudio = document.querySelector('#host-audio');
+  hostAudio.src = data.ttsUrl || '';
+  setPlayerStatus('歌曲就绪', 'playing');
+  try {
+    if (data.ttsUrl) {
+      hostAudio.onended = () => startSongPlayback();
+      hostAudio.play();
+    } else {
+      speakText(data.chatText || data.hostText, () => startSongPlayback());
+    }
+  } catch {
+    speakText(data.chatText || data.hostText, () => startSongPlayback());
+  }
+}
+
+function appendChat({ role, text, track }) {
+  if (!text && !track) return;
+  const container = document.querySelector('#chat-messages');
+  const cls = role === 'user' ? 'user-msg' : 'dj-msg';
+
+  let html = `<div class="chat-msg ${cls}">`;
+  if (text) html += `<p>${escapeHtml(text)}</p>`;
+  if (track?.name) {
+    html += `<div class="track-card" onclick="document.querySelector('#song-audio')?.play()">
+      <img src="${escapeAttr(track.coverUrl || '/assets/cover-1.svg')}" alt="" />
+      <div class="track-card-text">
+        <h4>${escapeHtml(track.name)}</h4>
+        <p>${escapeHtml((track.artists || []).join(' / '))}</p>
+      </div>
+    </div>`;
+  }
+  html += '</div>';
+  container.insertAdjacentHTML('beforeend', html);
+  container.scrollTop = container.scrollHeight;
 }
 
 async function updatePlayer(data, autoplay) {
   const track = data.track || {};
   document.querySelector('#cover').src = track.coverUrl || '/assets/cover-1.svg';
-  document.querySelector('#track-title').textContent = track.name || '未知歌曲';
-  document.querySelector('#track-artist').textContent = (track.artists || []).join(' / ') || track.album || '未知艺人';
-  document.querySelector('#reason').textContent = data.reason || '';
-  document.querySelector('#host-text').textContent = data.hostText || '';
+  document.querySelector('#track-title').textContent = track.name || 'myMusic';
+  document.querySelector('#track-artist').textContent = (track.artists || []).join(' / ') || '等待启动';
   document.querySelector('#lyric').textContent = data.track?.lyric || '';
 
-  const hostAudio = document.querySelector('#host-audio');
-  hostAudio.src = data.ttsUrl || '';
-
-  // Set up song audio source
   const songAudio = document.querySelector('#song-audio');
   if (track.playUrl) {
     songAudio.src = track.playUrl;
     songAudio.style.display = '';
-    setPlayerStatus('歌曲就绪', 'playing');
   } else {
-    songAudio.src = '';
     songAudio.style.display = 'none';
-    setPlayerStatus(track.playbackError || '等待 ncm-cli 播放', track.playable === false ? 'error' : '');
-  }
-
-  if (!autoplay) return;
-  try {
-    if (data.ttsUrl) {
-      hostAudio.onended = () => startSongPlayback();
-      await hostAudio.play();
-    } else {
-      speakText(data.hostText, () => startSongPlayback());
-    }
-  } catch {
-    speakText(data.hostText, () => startSongPlayback());
   }
 }
 
@@ -125,7 +182,7 @@ async function startSongPlayback() {
   if (track?.playUrl) {
     setPlayerStatus(`正在播放：${track.name || '未知歌曲'}`, 'playing');
     songAudio.play().catch(() => {});
-    songAudio.onended = () => runRadio('/api/radio/next', { sessionId: state.sessionId });
+    songAudio.onended = () => nextTrack();
     songAudio.onplay = () => {
       api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
     };
@@ -247,7 +304,7 @@ async function renderLibrary() {
     <section class="page-panel">
       <p class="eyebrow">Library</p>
       <h1 class="page-title">私人曲库</h1>
-      <p class="reason">${escapeHtml(data.profile.summary)}</p>
+      <p class="reason" style="white-space: pre-wrap; line-height: 1.85">${escapeHtml(data.profile.summary)}</p>
       <div class="tags">${(data.profile.tags || []).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}</div>
       <div class="stats">
         <div class="stat"><span class="muted">歌曲</span><strong>${data.totalTracks || data.tracks.length}</strong></div>
