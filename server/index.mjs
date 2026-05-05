@@ -7,7 +7,7 @@ import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
 import { openDatabase, seedDemoLibrary, getSetting, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { getLibrary, getProfile, syncLibrary, updateProfile } from './library.mjs';
-import { chatRadio, getMemories, nextRadioItem, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback } from './radio.mjs';
+import { chatRadio, getMemories, getPreferences, nextRadioItem, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
 import { loadCookie } from './community.mjs';
@@ -77,6 +77,11 @@ const routes = {
   },
   'GET /api/memories': async () => getMemories({ db }),
   'DELETE /api/memories': async () => removeAllMemories({ db }),
+  'GET /api/preferences': async () => getPreferences({ db }),
+  'PUT /api/preferences': async (req) => {
+    const body = await readJson(req);
+    return updatePreferences({ db, payload: body });
+  },
   'POST /api/player/play': async (req) => {
     const body = await readJson(req);
     if (!body.trackId) return jsonError('trackId is required', 400);

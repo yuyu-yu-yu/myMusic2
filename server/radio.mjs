@@ -86,6 +86,70 @@ export function setUserPrefs(db, prefs) {
     .run('user_preferences', JSON.stringify(prefs), nowIso());
 }
 
+export function getPreferences({ db }) {
+  return {
+    ok: true,
+    preferences: normalizePreferences(getUserPrefs(db)),
+    feedbackSummary: getFeedbackSummary(db)
+  };
+}
+
+export function updatePreferences({ db, payload }) {
+  const next = normalizePreferences({ ...getUserPrefs(db), ...(payload || {}) });
+  setUserPrefs(db, next);
+  return {
+    ok: true,
+    preferences: next,
+    feedbackSummary: getFeedbackSummary(db)
+  };
+}
+
+function normalizePreferences(raw = {}) {
+  const pick = (value, allowed, fallback) => allowed.includes(value) ? value : fallback;
+  return {
+    chatMusicBalance: pick(raw.chatMusicBalance, ['friend', 'balanced', 'dj'], 'friend'),
+    recommendationFrequency: pick(raw.recommendationFrequency, ['low', 'medium', 'high'], 'medium'),
+    voiceMode: pick(raw.voiceMode, ['off', 'recommendations', 'all'], 'recommendations'),
+    moodMode: pick(raw.moodMode, ['auto', 'comfort', 'focus', 'calm', 'night', 'random'], 'auto'),
+    note: String(raw.note || '').slice(0, 500)
+  };
+}
+
+function getFeedbackSummary(db) {
+  const totals = db.prepare(`
+    SELECT
+      COALESCE(SUM(likes), 0) AS likes,
+      COALESCE(SUM(dislikes), 0) AS dislikes,
+      COALESCE(SUM(completions), 0) AS completions,
+      COALESCE(SUM(skips), 0) AS skips
+    FROM track_feedback_summary
+  `).get();
+  const topRows = db.prepare(`
+    SELECT s.track_id AS trackId, s.likes, s.dislikes, s.completions, s.skips,
+           t.name, t.artists, t.cover_url AS coverUrl
+    FROM track_feedback_summary s
+    LEFT JOIN tracks t ON t.id = s.track_id
+    ORDER BY (s.likes * 3 + s.completions - s.dislikes * 2 - s.skips) DESC,
+             s.updated_at DESC
+    LIMIT 8
+  `).all();
+  return {
+    totals,
+    tracks: topRows.map((row) => ({
+      ...row,
+      artists: safeJson(row.artists, [])
+    }))
+  };
+}
+
+function safeJson(value, fallback) {
+  try {
+    return JSON.parse(value || '');
+  } catch {
+    return fallback;
+  }
+}
+
 function maybeRecordFeedbackMemory(db, { trackId, eventType, sessionId, feedback }) {
   const type = String(eventType || '');
   const likes = Number(feedback?.likes || 0);

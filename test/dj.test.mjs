@@ -23,7 +23,7 @@ import {
   rankAndSelectCandidates,
   TURN_ACTIONS
 } from '../server/dj.mjs';
-import { getMemories, removeAllMemories, removeMemory, submitFeedback } from '../server/radio.mjs';
+import { getMemories, getPreferences, removeAllMemories, removeMemory, submitFeedback, updatePreferences } from '../server/radio.mjs';
 
 function candidate(id, source, artists = ['Artist']) {
   return {
@@ -159,6 +159,54 @@ test('feedback API handler records valid events and rejects invalid payloads', (
   const badType = submitFeedback({ db, payload: { trackId: 'track-1', eventType: 'favorite' } });
   assert.equal(badType.ok, false);
   assert.equal(badType.status, 400);
+});
+
+test('preferences API helpers read defaults, persist updates, and sanitize invalid values', (t) => {
+  const db = testDb(t);
+
+  const initial = getPreferences({ db });
+  assert.equal(initial.ok, true);
+  assert.deepEqual(initial.preferences, {
+    chatMusicBalance: 'friend',
+    recommendationFrequency: 'medium',
+    voiceMode: 'recommendations',
+    moodMode: 'auto',
+    note: ''
+  });
+
+  const saved = updatePreferences({
+    db,
+    payload: {
+      chatMusicBalance: 'dj',
+      recommendationFrequency: 'low',
+      voiceMode: 'all',
+      moodMode: 'focus',
+      note: '多一点像朋友一样聊天。'
+    }
+  });
+  assert.equal(saved.preferences.chatMusicBalance, 'dj');
+  assert.equal(saved.preferences.recommendationFrequency, 'low');
+  assert.equal(saved.preferences.voiceMode, 'all');
+  assert.equal(saved.preferences.moodMode, 'focus');
+
+  const loaded = getPreferences({ db });
+  assert.equal(loaded.preferences.note, '多一点像朋友一样聊天。');
+
+  const sanitized = updatePreferences({
+    db,
+    payload: {
+      chatMusicBalance: 'loud',
+      recommendationFrequency: 'always',
+      voiceMode: 'robot',
+      moodMode: 'chaos',
+      note: 'x'.repeat(600)
+    }
+  });
+  assert.equal(sanitized.preferences.chatMusicBalance, 'friend');
+  assert.equal(sanitized.preferences.recommendationFrequency, 'medium');
+  assert.equal(sanitized.preferences.voiceMode, 'recommendations');
+  assert.equal(sanitized.preferences.moodMode, 'auto');
+  assert.equal(sanitized.preferences.note.length, 500);
 });
 
 test('user memories can be recorded, merged, retrieved, deleted, and cleared', (t) => {
