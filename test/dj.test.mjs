@@ -15,13 +15,9 @@ import {
 import {
   analyzeConversationMood,
   buildMemoryContext,
-  canProactivelyRecommend,
   chatTurn,
-  decideTurnAction,
   extractAndStoreMemories,
-  hasExplicitMusicIntent,
-  rankAndSelectCandidates,
-  TURN_ACTIONS
+  rankAndSelectCandidates
 } from '../server/dj.mjs';
 import { getMemories, getPreferences, removeAllMemories, removeMemory, submitFeedback, updatePreferences } from '../server/radio.mjs';
 
@@ -301,16 +297,7 @@ test('chat decision prompt receives relevant long-term memory without selecting 
     return new Response(JSON.stringify({
       choices: [{
         message: {
-          content: JSON.stringify({
-            chatText: '我记得你这种时候更需要有人陪着。我们先慢慢聊，不急着切歌。',
-            shouldRecommend: false,
-            mood: 'night',
-            energy: 'low',
-            intent: 'chat',
-            searchHints: ['陪伴'],
-            reason: '长期记忆提示先陪伴',
-            mode: null
-          })
+          content: '<CHAT>我记得你这种时候更需要有人陪着。我们先慢慢聊，不急着切歌。</CHAT><JSON>{"pick":null,"reason":"长期记忆提示先陪伴","mode":null}</JSON>'
         }
       }]
     }), { status: 200, headers: { 'content-type': 'application/json' } });
@@ -326,7 +313,9 @@ test('chat decision prompt receives relevant long-term memory without selecting 
 
   assert.equal(result.track, null);
   assert.equal(result.intent, 'chat');
-  assert.match(JSON.stringify(requests[0].messages), /用户深夜睡不着时更需要先被陪伴/);
+  const promptText = JSON.stringify(requests[0].messages);
+  assert.match(promptText, /用户深夜睡不着时更需要先被陪伴/);
+  assert.match(promptText, /先倾听和陪伴/);
 });
 
 test('memory extraction failure does not block or write invalid memories', async (t) => {
@@ -349,45 +338,7 @@ test('memory extraction failure does not block or write invalid memories', async
   assert.equal(listUserMemories(db).length, 0);
 });
 
-test('turn action gate separates self-disclosure, fatigue, music requests, and rejection', () => {
-  assert.equal(decideTurnAction({
-    userMessage: '我是大学生，软件工程专业的',
-    baseMood: {}
-  }).action, TURN_ACTIONS.ASK_FOLLOWUP);
-
-  assert.equal(decideTurnAction({
-    userMessage: '今天写代码写麻了',
-    baseMood: { shouldRecommend: true, mood: 'calm', searchHints: ['放松'] },
-    canSuggest: true,
-    currentTrack: { id: 'current' }
-  }).action, TURN_ACTIONS.ASK_FOLLOWUP);
-
-  assert.equal(decideTurnAction({
-    userMessage: '来首适合写代码的',
-    explicitIntent: true,
-    baseMood: {}
-  }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
-
-  assert.equal(decideTurnAction({
-    userMessage: '别放歌，先聊聊',
-    explicitIntent: false,
-    baseMood: {}
-  }).action, TURN_ACTIONS.CHAT_ONLY);
-
-  assert.equal(decideTurnAction({
-    userMessage: '下一首',
-    explicitIntent: true,
-    baseMood: {}
-  }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
-
-  assert.equal(decideTurnAction({
-    userMessage: '恢复正常推荐，取消所有偏好模式',
-    explicitIntent: true,
-    baseMood: {}
-  }).action, TURN_ACTIONS.CHAT_ONLY);
-});
-
-test('self-disclosure chat does not select a track and forbids song recommendation in prompt', async (t) => {
+test('safety valve: emotional distress without music intent stays in accompany mode', async (t) => {
   const db = testDb(t);
   const originalFetch = globalThis.fetch;
   const requests = [];
@@ -397,15 +348,7 @@ test('self-disclosure chat does not select a track and forbids song recommendati
     return new Response(JSON.stringify({
       choices: [{
         message: {
-          content: JSON.stringify({
-            chatText: '原来你是软件工程专业的大学生啊。你平时更喜欢做能马上看到效果的前端，还是偏逻辑的后端？',
-            mood: 'random',
-            energy: 'medium',
-            intent: 'chat',
-            searchHints: [],
-            reason: '自我介绍',
-            mode: null
-          })
+          content: '<CHAT>听起来你今天被代码榨干了。先缓口气，我在这儿陪着。</CHAT><JSON>{"pick":null,"reason":"先陪伴","mode":null}</JSON>'
         }
       }]
     }), { status: 200, headers: { 'content-type': 'application/json' } });
@@ -415,25 +358,21 @@ test('self-disclosure chat does not select a track and forbids song recommendati
     db,
     config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' }, tts: {}, weather: {} },
     netease: { isConfigured: () => false },
-    sessionId: 'self-disclosure',
-    message: '我是一名大学生，软件工程专业的'
+    sessionId: 'fatigue-safety',
+    message: '今天心情很难受'
   });
 
   assert.equal(result.track, null);
-  assert.equal(result.turnAction.action, TURN_ACTIONS.ASK_FOLLOWUP);
+  assert.equal(result.intent, 'chat');
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM plays').get().count, 0);
-  assert.match(JSON.stringify(requests[0].messages), /禁止推荐歌曲/);
+  // Safety valve mode: buildLightPool makes no API calls, so the only request is callDJ
+  const promptText = JSON.stringify(requests[0].messages);
+  assert.match(promptText, /你是灿灿/);
+  assert.match(promptText, /先倾听和陪伴/);
 });
 
-test('ordinary chat hides current track details from prompt', async (t) => {
+test('safety valve: explicit music rejection stays in chat-only mode', async (t) => {
   const db = testDb(t);
-  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
-    .run('hide-current-track', new Date().toISOString(), '{}', '[]');
-  db.prepare('INSERT INTO tracks (id, name, artists, album, cover_url, duration_ms, raw_json, updated_at) VALUES (?,?,?,?,?,?,?,?)')
-    .run('current-1', '几分之几', JSON.stringify(['卢广仲']), 'Album', null, 180000, '{}', new Date().toISOString());
-  db.prepare('INSERT INTO plays (track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?)')
-    .run('current-1', new Date().toISOString(), 'radio', 'test', 'pending');
-
   const originalFetch = globalThis.fetch;
   const requests = [];
   t.after(() => { globalThis.fetch = originalFetch; });
@@ -442,15 +381,7 @@ test('ordinary chat hides current track details from prompt', async (t) => {
     return new Response(JSON.stringify({
       choices: [{
         message: {
-          content: JSON.stringify({
-            chatText: '写 AI DJ 项目听起来很有意思，你现在最想先做好聊天感，还是推荐准确度？',
-            mood: 'random',
-            energy: 'medium',
-            intent: 'chat',
-            searchHints: [],
-            reason: 'ordinary chat',
-            mode: null
-          })
+          content: '<CHAT>好的，不急着放歌。你想聊什么？</CHAT><JSON>{"pick":null,"reason":"","mode":null}</JSON>'
         }
       }]
     }), { status: 200, headers: { 'content-type': 'application/json' } });
@@ -460,26 +391,48 @@ test('ordinary chat hides current track details from prompt', async (t) => {
     db,
     config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' }, tts: {}, weather: {} },
     netease: { isConfigured: () => false },
-    sessionId: 'hide-current-track',
+    sessionId: 'reject-music',
+    message: '别放歌，先聊聊'
+  });
+
+  assert.equal(result.track, null);
+  assert.equal(result.intent, 'chat');
+  const promptText = JSON.stringify(requests[0].messages);
+  assert.match(promptText, /不想听歌/);
+});
+
+test('unified chat: casual conversation lets LLM decide whether to recommend', async (t) => {
+  const db = testDb(t);
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url, options) => {
+    requests.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: '<CHAT>写 AI DJ 项目听起来很有意思。你现在最想先做好聊天感，还是推荐准确度？</CHAT><JSON>{"pick":null,"reason":"","mode":null}</JSON>'
+        }
+      }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const result = await chatTurn({
+    db,
+    config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' }, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'casual-chat',
     message: '我最近在写一个 AI DJ 项目'
   });
 
-  const promptText = JSON.stringify(requests[0].messages);
   assert.equal(result.track, null);
-  assert.doesNotMatch(promptText, /几分之几/);
-  assert.doesNotMatch(promptText, /卢广仲/);
-  assert.match(promptText, /不要主动提及歌名/);
+  assert.equal(result.intent, 'chat');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM plays').get().count, 0);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?').get('casual-chat').count, 2);
 });
 
-test('current track details are exposed when user asks about the current song', async (t) => {
+test('unified chat: empty message triggers auto-continue recommendation', async (t) => {
   const db = testDb(t);
-  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
-    .run('ask-current-track', new Date().toISOString(), '{}', '[]');
-  db.prepare('INSERT INTO tracks (id, name, artists, album, cover_url, duration_ms, raw_json, updated_at) VALUES (?,?,?,?,?,?,?,?)')
-    .run('current-2', '几分之几', JSON.stringify(['卢广仲']), 'Album', null, 180000, '{}', new Date().toISOString());
-  db.prepare('INSERT INTO plays (track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?)')
-    .run('current-2', new Date().toISOString(), 'radio', 'test', 'pending');
-
   const originalFetch = globalThis.fetch;
   const requests = [];
   t.after(() => { globalThis.fetch = originalFetch; });
@@ -488,103 +441,71 @@ test('current track details are exposed when user asks about the current song', 
     return new Response(JSON.stringify({
       choices: [{
         message: {
-          content: JSON.stringify({
-            chatText: '现在放的是《几分之几》，卢广仲的。',
-            mood: 'random',
-            energy: 'medium',
-            intent: 'chat',
-            searchHints: [],
-            reason: 'user asked current song',
-            mode: null
-          })
+          content: '<CHAT>来，下一首歌。</CHAT><JSON>{"pick":null,"reason":"","mode":null}</JSON>'
         }
       }]
     }), { status: 200, headers: { 'content-type': 'application/json' } });
   };
 
-  await chatTurn({
+  const result = await chatTurn({
     db,
     config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' }, tts: {}, weather: {} },
     netease: { isConfigured: () => false },
-    sessionId: 'ask-current-track',
-    message: '现在放的是什么歌？'
+    sessionId: 'auto-continue',
+    message: ''
   });
 
+  assert.equal(result.track, null);
   const promptText = JSON.stringify(requests[0].messages);
-  assert.match(promptText, /几分之几/);
-  assert.match(promptText, /卢广仲/);
+  assert.match(promptText, /自然推荐下一首/);
 });
 
-test('ambiguous fatigue chat does not build candidates or create plays', async (t) => {
+test('unified chat: explicit music request goes through full candidate search', async (t) => {
   const db = testDb(t);
   const originalFetch = globalThis.fetch;
+  const requests = [];
   t.after(() => { globalThis.fetch = originalFetch; });
-  globalThis.fetch = async () => new Response(JSON.stringify({
-    choices: [{
-      message: {
-        content: JSON.stringify({
-          chatText: '听起来你今天被代码榨干了一点。先缓口气，最卡你的地方是 bug 还是项目压力？',
-          mood: 'calm',
-          energy: 'low',
-          intent: 'chat',
-          searchHints: ['放松'],
-          reason: '先陪聊',
-          mode: null
-        })
-      }
-    }]
-  }), { status: 200, headers: { 'content-type': 'application/json' } });
+  globalThis.fetch = async (url, options) => {
+    requests.push(JSON.parse(options.body));
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: '<CHAT>好嘞，来首陈奕迅的。</CHAT><JSON>{"pick":null,"reason":"","mode":null}</JSON>'
+        }
+      }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
 
   const result = await chatTurn({
     db,
     config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' }, tts: {}, weather: {} },
     netease: { isConfigured: () => false },
-    sessionId: 'fatigue-chat',
-    message: '今天写代码写麻了'
+    sessionId: 'music-request',
+    message: '放首陈奕迅的歌'
   });
 
-  assert.equal(result.track, null);
-  assert.equal(result.turnAction.action, TURN_ACTIONS.ASK_FOLLOWUP);
-  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM plays').get().count, 0);
+  assert.equal(result.intent, 'chat');
+  const promptText = JSON.stringify(requests[0].messages);
+  // Should NOT have safety note (not emotional, not rejection)
+  assert.doesNotMatch(promptText, /先倾听和陪伴/);
+  assert.doesNotMatch(promptText, /不想听歌/);
 });
 
-test('chat LLM timeout falls back quickly without playing music', async (t) => {
-  const db = testDb(t);
-  const originalFetch = globalThis.fetch;
-  t.after(() => { globalThis.fetch = originalFetch; });
-  globalThis.fetch = async () => new Promise(() => {});
-
-  const startedAt = Date.now();
-  const result = await chatTurn({
-    db,
-    config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' }, tts: {}, weather: {} },
-    netease: { isConfigured: () => false },
-    sessionId: 'timeout-chat',
-    message: '我是软件工程专业的学生'
-  });
-  const elapsedMs = Date.now() - startedAt;
-
-  assert.equal(result.track, null);
-  assert.equal(result.turnAction.action, TURN_ACTIONS.ASK_FOLLOWUP);
-  assert.equal(elapsedMs < 3300, true);
-  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM plays').get().count, 0);
-});
-
-test('light chat returns text without selecting a track', async (t) => {
+test('chat without LLM config uses fallback greeting', async (t) => {
   const db = testDb(t);
   const result = await chatTurn({
     db,
     config: { llm: {}, tts: {}, weather: {} },
     netease: { isConfigured: () => false },
-    sessionId: 'chat-session',
+    sessionId: 'no-llm-chat',
     message: '今天看到一部电影，想随便聊聊'
   });
 
   assert.equal(result.track, null);
-  assert.equal(result.ttsUrl, null);
   assert.equal(result.intent, 'chat');
+  assert.equal(result.chatText.length > 0, true);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM plays').get().count, 0);
-  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?').get('chat-session').count, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?').get('no-llm-chat').count, 2);
 });
 
 test('conversation mood detects comfort needs from recent chat', () => {
@@ -598,28 +519,6 @@ test('conversation mood detects comfort needs from recent chat', () => {
   assert.equal(mood.mood, 'comfort');
   assert.equal(mood.energy, 'low');
   assert.equal(mood.searchHints.includes('治愈'), true);
-});
-
-test('recommendation trigger policy distinguishes chat from music intent', () => {
-  assert.equal(hasExplicitMusicIntent('换一首，来点国风'), true);
-  assert.equal(hasExplicitMusicIntent('只是想和你说句话'), false);
-
-  assert.equal(canProactivelyRecommend({
-    userMessageCount: 2,
-    currentTrack: { id: 'current' },
-    mood: { shouldRecommend: true }
-  }), false);
-  assert.equal(canProactivelyRecommend({
-    userMessageCount: 3,
-    currentTrack: { id: 'current' },
-    mood: { shouldRecommend: true }
-  }), true);
-  assert.equal(canProactivelyRecommend({
-    userMessageCount: 4,
-    lastSuggestedAtUserCount: 2,
-    currentTrack: { id: 'current' },
-    mood: { shouldRecommend: true }
-  }), false);
 });
 
 test('conversation mood boosts matching candidates', () => {

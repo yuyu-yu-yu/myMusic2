@@ -1,5 +1,4 @@
 // Conversational AI DJ — unified chat + track selection
-import crypto from 'node:crypto';
 import { generateChatCompletion, getWeatherSummary, synthesizeSpeech } from './ai.mjs';
 import { getProfile, resolvePlayableTrack } from './library.mjs';
 import {
@@ -16,7 +15,7 @@ import {
 } from './db.mjs';
 import { searchOnline } from './community.mjs';
 import { getUserPrefs } from './radio.mjs';
-import { getGenreDiscoveryKeywords, searchGenres } from './genre.mjs';
+import { getGenreDiscoveryKeywords } from './genre.mjs';
 
 const CANDIDATE_LIMIT = 60;
 const AUTO_QUOTAS = { library_recent: 18, library_deep: 22, ai_discovery: 20 };
@@ -33,22 +32,48 @@ const SESSION_SUMMARY_MIN_MESSAGES = 12;
 const SESSION_SUMMARY_STEP = 8;
 const LONG_MEMORY_LIMIT = 8;
 const LONG_MEMORY_MAX_CHARS = 800;
-const CHAT_LLM_TIMEOUT_MS = 2500;
-export const TURN_ACTIONS = Object.freeze({
-  CHAT_ONLY: 'CHAT_ONLY',
-  ASK_FOLLOWUP: 'ASK_FOLLOWUP',
-  SOFT_OFFER_MUSIC: 'SOFT_OFFER_MUSIC',
-  RECOMMEND_AND_PLAY: 'RECOMMEND_AND_PLAY',
-  CONTINUE_CURRENT_SONG: 'CONTINUE_CURRENT_SONG',
-  CLARIFY_INTENT: 'CLARIFY_INTENT'
-});
-const NON_RECOMMEND_ACTIONS = new Set([
-  TURN_ACTIONS.CHAT_ONLY,
-  TURN_ACTIONS.ASK_FOLLOWUP,
-  TURN_ACTIONS.SOFT_OFFER_MUSIC,
-  TURN_ACTIONS.CONTINUE_CURRENT_SONG,
-  TURN_ACTIONS.CLARIFY_INTENT
-]);
+const KNOWN_ARTIST_ALIASES = [
+  ['陈奕迅', ['Eason', 'Eason Chan']],
+  ['周杰伦', ['Jay Chou', 'Jay']],
+  ['林俊杰', ['JJ Lin', 'JJ']],
+  ['薛之谦', []],
+  ['毛不易', []],
+  ['李荣浩', []],
+  ['邓紫棋', ['G.E.M.', 'GEM']],
+  ['张学友', []],
+  ['王菲', []],
+  ['孙燕姿', []],
+  ['五月天', ['Mayday']],
+  ['许嵩', []],
+  ['汪苏泷', []],
+  ['方大同', []],
+  ['陶喆', []],
+  ['梁静茹', []],
+  ['Taylor Swift', []],
+  ['Adele', []],
+  ['Billie Eilish', []],
+  ['Coldplay', []]
+];
+const GENERIC_ARTIST_PHRASES = new Set([
+  '适合写代码',
+  '写代码',
+  '安静',
+  '伤感',
+  '开心',
+  '国风',
+  '古风',
+  '爵士',
+  '摇滚',
+  '民谣',
+  '电子',
+  '电音',
+  '英文',
+  '中文',
+  '日语',
+  '纯音乐',
+  '慢歌',
+  '快歌'
+].map(normalizeMusicText));
 
 export async function djTurn({ db, config, netease, sessionId, userMessage, conversationMood = null }) {
   ensureSession(db, sessionId);
@@ -124,8 +149,14 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
   const mode = getSessionMode(db, sessionId);
   const history = loadHistory(db, sessionId);
   const currentTrack = getCurrentTrack(db);
-  const context = getSessionContext(db, sessionId);
+  const weather = await getCachedWeather(db, sessionId, config.weather);
+  const hour = new Date().getHours();
+  const timeOfDay = hour < 6 ? '深夜' : hour < 9 ? '清晨' : hour < 12 ? '上午' : hour < 14 ? '中午' : hour < 18 ? '下午' : hour < 21 ? '傍晚' : '夜晚';
+  const prefs = getUserPrefs(db);
+
+  // Mood tags from conversation text (not action decisions)
   const baseMood = analyzeConversationMood({ history, userMessage, profile, currentTrack, mode });
+
   const sessionSummary = await updateSessionSummary(db, config, sessionId);
   const longTermMemories = retrieveRelevantMemories(db, {
     text: userMessage,
@@ -135,77 +166,78 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     maxChars: LONG_MEMORY_MAX_CHARS
   });
   const memoryContext = buildMemoryContext({ sessionSummary, longTermMemories });
-  const explicitIntent = hasExplicitMusicIntent(userMessage);
-  const userMessageCountAfterThisTurn = countUserMessages(db, sessionId) + (userMessage ? 1 : 0);
-  const canSuggest = canProactivelyRecommend({
-    userMessageCount: userMessageCountAfterThisTurn,
-    lastSuggestedAtUserCount: context.lastSuggestedAtUserCount,
-    currentTrack,
-    mood: baseMood
-  });
-  const turnAction = decideTurnAction({
-    userMessage,
-    history,
-    baseMood,
-    explicitIntent,
-    canSuggest,
-    currentTrack,
-    mode,
-    memoryContext
-  });
-  if (turnAction.action === TURN_ACTIONS.RECOMMEND_AND_PLAY) {
-    const conversationMood = normalizeMoodDecision({
-      ...baseMood,
-      shouldRecommend: true,
-      intent: 'music',
-      searchHints: turnAction.searchHints?.length ? turnAction.searchHints : baseMood.searchHints,
-      reason: turnAction.reason || baseMood.reason
-    });
-    const result = await djTurn({ db, config, netease, sessionId, userMessage, conversationMood });
-    setSessionContext(db, sessionId, {
-      ...getSessionContext(db, sessionId),
-      lastSuggestedAtUserCount: countUserMessages(db, sessionId)
-    });
-    return { ...result, conversationMood, turnAction, intent: 'explicit' };
+
+  // --- Safety valves (gentle guidance, not hard restrictions) ---
+  const rejectMusic = /不想听|先别放|不要放|别放|先别切|不要切|别切|别换|先聊|陪我聊|不放歌/.test(userMessage);
+  const emotionalDistress = /睡不着|失眠|心情不好|难受|吵架|崩溃|委屈|emo|低落|伤心|难过|烦/.test(userMessage);
+  const hasMusicKeyword = /下一首|换一首|换歌|切歌|播放|放一首|来一首|来首|来点|想听|推荐|给我.*(歌|音乐)|有没有.*(歌|音乐)|听.*(歌|音乐)/i.test(userMessage);
+
+  let candidates;
+  let safetyNote = '';
+
+  if (!userMessage) {
+    // Safety valve 1: empty message = auto-continue
+    candidates = await buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, '', null);
+    safetyNote = '上一首播完了，请自然推荐下一首，pick 填数字。';
+  } else if (rejectMusic) {
+    // Safety valve 2: user explicitly rejects music
+    candidates = buildLightPool(db, sessionId);
+    safetyNote = '用户明确表示现在不想听歌。专注聊天陪伴，pick 填 null。';
+  } else if (emotionalDistress && !hasMusicKeyword) {
+    // Safety valve 3: emotional distress without music intent
+    candidates = buildLightPool(db, sessionId);
+    safetyNote = '用户听起来情绪不太好。先倾听和陪伴，不要急着推歌。除非用户明确说想听歌，否则 pick 填 null。';
+  } else {
+    // Default: free conversation — LLM decides when to recommend
+    candidates = await buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, userMessage, baseMood);
   }
 
-  const chatDecision = await generateChatDecision({
-    config,
-    profile,
-    mode,
-    history,
-    userMessage,
-    currentTrack,
-    baseMood,
-    explicitIntent,
-    canSuggest,
-    memoryContext,
-    turnAction
+  const conversationMood = normalizeMoodDecision({
+    ...baseMood,
+    shouldRecommend: !userMessage || hasMusicKeyword || !!baseMood.shouldRecommend,
+    intent: hasMusicKeyword ? 'music' : 'chat',
+    searchHints: baseMood.searchHints || []
   });
-  const conversationMood = normalizeMoodDecision({ ...baseMood, ...chatDecision });
 
-  if (userMessage) saveMessage(db, sessionId, 'user', userMessage);
-  saveMessage(db, sessionId, 'assistant', chatDecision.chatText);
+  const result = await callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood, memoryContext, safetyNote });
+
+  // Save to DB
   if (userMessage) {
-    scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: chatDecision.chatText, conversationMood });
+    db.prepare('INSERT INTO messages (session_id, role, content, created_at) VALUES (?,?,?,?)')
+      .run(sessionId, 'user', userMessage, nowIso());
   }
-  if (chatDecision.newMode) {
-    const newMode = { ...chatDecision.newMode, updatedAt: nowIso() };
+  db.prepare('INSERT INTO messages (session_id, role, content, created_at) VALUES (?,?,?,?)')
+    .run(sessionId, 'assistant', result.chatText, nowIso());
+  if (result.track) {
+    db.prepare('INSERT INTO plays (track_id, played_at, source, reason, host_text, report_status) VALUES (?,?,?,?,?,?)')
+      .run(result.track.id, nowIso(), 'radio', result.reason, result.chatText, 'pending');
+    saveTrack(db, result.track);
+  }
+  if (userMessage) {
+    scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: result.chatText, conversationMood });
+  }
+
+  // Persist mode if changed
+  if (result.newMode) {
+    const newMode = { ...result.newMode, updatedAt: nowIso() };
     setSessionMode(db, sessionId, newMode);
+    mode.genre = newMode.genre;
+    mode.note = newMode.note;
   }
+
+  // TTS
+  const ttsUrl = await synthesizeSpeech(config.tts, result.chatText);
 
   return {
     sessionId,
-    chatText: chatDecision.chatText,
-    track: null,
-    reason: '',
-    ttsUrl: null,
-    mode: chatDecision.newMode || mode,
+    chatText: result.chatText,
+    track: result.track,
+    reason: result.reason,
+    ttsUrl,
+    mode: result.newMode || mode,
     profile,
-    weather: getSessionContext(db, sessionId).weather || '',
-    conversationMood,
-    turnAction,
-    intent: 'chat'
+    weather,
+    intent: result.track ? 'music' : 'chat'
   };
 }
 
@@ -295,85 +327,103 @@ function getCurrentTrack(db) {
   }
 }
 
-function countUserMessages(db, sessionId) {
-  return db.prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ? AND role = ?')
-    .get(sessionId, 'user').count || 0;
+export function normalizeMusicText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[\s·・.．,，、\-_/\\（）()《》<>[\]【】"'“”‘’!！?？:：;；~～]/g, '');
 }
 
-export function hasExplicitMusicIntent(text) {
-  const value = String(text || '');
-  if (/不想听|先别放|不要切|别切|别换/.test(value)) return false;
-  return /下一首|换一首|换歌|切歌|播放|放一首|来点|想听|推荐|给我.*(歌|音乐)|有没有.*(歌|音乐)|听.*(歌|音乐)|artist|song|music|play|recommend/i.test(value);
+function buildArtistConstraint(label, aliases = []) {
+  const cleanLabel = String(label || '').trim();
+  const names = [...new Set([cleanLabel, ...aliases].map(name => String(name || '').trim()).filter(Boolean))];
+  const normalizedAliases = [...new Set(names.map(normalizeMusicText).filter(Boolean))];
+  if (!cleanLabel || !normalizedAliases.length) return null;
+  return { label: cleanLabel, aliases: names, normalizedAliases };
 }
 
-export function decideTurnAction({
-  userMessage = '',
-  history = [],
-  baseMood = {},
-  explicitIntent = false,
-  canSuggest = false,
-  currentTrack = null,
-  mode = {},
-  memoryContext = {}
-} = {}) {
-  const text = String(userMessage || '').trim();
-  const lower = text.toLowerCase();
-  const memoryText = `${memoryContext.promptText || ''} ${memoryContext.sessionSummary || ''}`.toLowerCase();
-  const result = (action, reason, extra = {}) => ({
-    action,
-    reason,
-    confidence: extra.confidence ?? 0.85,
-    source: extra.source || 'local_rule',
-    searchHints: extra.searchHints || []
-  });
-
-  if (!text) {
-    return result(TURN_ACTIONS.RECOMMEND_AND_PLAY, 'empty turn means radio continuation', { confidence: 1 });
-  }
-  if (/不想听|先别放|不要放|别放|先别切|不要切|别切|别换|先聊|陪我聊|不放歌/.test(text)) {
-    return result(TURN_ACTIONS.CHAT_ONLY, 'user explicitly rejected playback or switching', { confidence: 1 });
-  }
-  if (/恢复正常推荐|取消.*偏好|取消.*模式|恢复正常|后面都听|以后都听|接下来都听/.test(text)) {
-    return result(TURN_ACTIONS.CHAT_ONLY, 'user is updating listening mode rather than asking for an immediate song', { confidence: 0.95 });
-  }
-  if (/暂停|停一下|继续播放|继续放|接着放|resume|pause/i.test(text)) {
-    return result(TURN_ACTIONS.CONTINUE_CURRENT_SONG, 'user asked for playback control without a new recommendation', { confidence: 0.95 });
-  }
-  if (/下一首|换一首|换歌|切歌|播放|放一首|来一首|来首|来点|想听|推荐(一首|首|点)?|给我.*(歌|音乐)|有没有.*(歌|音乐)|听.*(歌|音乐)|artist|song|music|play|recommend/i.test(text)) {
-    return result(TURN_ACTIONS.RECOMMEND_AND_PLAY, 'user explicitly asked for music', {
-      confidence: 1,
-      searchHints: extractActionSearchHints(text, mode)
-    });
-  }
-  if (/我是|我是一名|我叫|我在读|我的专业|我专业|我是.*(学生|老师|工程师|程序员|大学生)|我来自|我住在|我今年|我最近|今天发生|今天我|最近我/.test(text)) {
-    return result(TURN_ACTIONS.ASK_FOLLOWUP, 'user is self-disclosing or sharing life context', { confidence: 0.95 });
-  }
-  if (/你觉得|你知道|怎么办|为什么|怎么会|可以聊|想聊|随便聊|跟你说|问你|你会/.test(text)) {
-    return result(TURN_ACTIONS.CHAT_ONLY, 'user is chatting or asking a non-music question', { confidence: 0.88 });
-  }
-  if (/睡不着|失眠|心情不好|难受|吵架|崩溃|委屈|emo|低落|伤心|难过|烦|累|疲惫|写代码.*麻|代码.*麻|有点累/.test(text)) {
-    if (/先陪|先聊|不要.*歌|别.*歌|硬切|不喜欢.*切/.test(memoryText)) {
-      return result(TURN_ACTIONS.ASK_FOLLOWUP, 'long-term memory says support should come before music', { confidence: 0.92 });
+function findKnownArtistConstraint(text) {
+  const normalizedText = normalizeMusicText(text);
+  if (!normalizedText) return null;
+  for (const [label, aliases] of KNOWN_ARTIST_ALIASES) {
+    const constraint = buildArtistConstraint(label, aliases);
+    if (constraint.normalizedAliases.some(alias => alias.length >= 2 && normalizedText.includes(alias))) {
+      return constraint;
     }
-    return result(TURN_ACTIONS.ASK_FOLLOWUP, 'ambiguous emotional disclosure should not auto-play music', { confidence: 0.82 });
   }
-  if (baseMood?.shouldRecommend && canSuggest && currentTrack && !/吗|呢|为什么|怎么|是不是/.test(text)) {
-    return result(TURN_ACTIONS.SOFT_OFFER_MUSIC, 'mood may fit music but user did not explicitly ask', {
-      confidence: 0.62,
-      searchHints: baseMood.searchHints || []
-    });
-  }
-  if (explicitIntent) {
-    return result(TURN_ACTIONS.RECOMMEND_AND_PLAY, 'explicit intent fallback', { confidence: 0.9, searchHints: extractActionSearchHints(text, mode) });
-  }
-  return result(TURN_ACTIONS.CHAT_ONLY, 'default to friendship chat', { confidence: 0.7 });
+  return null;
 }
 
-export function canProactivelyRecommend({ userMessageCount = 0, lastSuggestedAtUserCount = 0, currentTrack = null, mood = {} } = {}) {
-  if (!currentTrack) return Boolean(mood?.shouldRecommend);
-  if (userMessageCount < 3) return false;
-  if (lastSuggestedAtUserCount && userMessageCount - Number(lastSuggestedAtUserCount) < 3) return false;
-  return Boolean(mood?.shouldRecommend);
+function findLibraryArtistConstraint(text, tracks = []) {
+  const normalizedText = normalizeMusicText(text);
+  if (!normalizedText) return null;
+  const artists = new Map();
+  for (const track of tracks || []) {
+    for (const artist of track?.artists || []) {
+      const name = String(artist || '').trim();
+      const normalized = normalizeMusicText(name);
+      if (normalized.length < 2) continue;
+      if (!artists.has(normalized)) artists.set(normalized, name);
+    }
+  }
+  const ordered = [...artists.entries()].sort((a, b) => b[0].length - a[0].length);
+  for (const [normalized, name] of ordered) {
+    if (normalizedText.includes(normalized)) return buildArtistConstraint(name, [normalized]);
+  }
+  return null;
+}
+
+function extractArtistPhrase(text) {
+  const value = String(text || '').trim();
+  const patterns = [
+    /(?:想听|听|播放|放|来点|来几首|推荐)(?:几首|一首|一些|一点|点|首)?([^，。？！,.!?]{2,24}?)(?:的)?(?:歌|歌曲|音乐|作品|专辑)/,
+    /(?:后面|接下来|以后|之后)(?:想)?(?:听|放)(?:几首|一首|一些|一点|点|首)?([^，。？！,.!?]{2,24}?)(?:的)?(?:歌|歌曲|音乐|作品|专辑)/
+  ];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (!match?.[1]) continue;
+    const phrase = match[1]
+      .replace(/^(我|给我|帮我|后面|接下来|以后|之后|都|只|全|几首|一首|一些|一点|点|首|想|听|要|来点|放|播放|推荐)+/g, '')
+      .replace(/(的|歌|歌曲|音乐|作品|专辑)+$/g, '')
+      .trim();
+    const normalized = normalizeMusicText(phrase);
+    if (normalized.length >= 2 && normalized.length <= 16 && !GENERIC_ARTIST_PHRASES.has(normalized)) {
+      return phrase;
+    }
+  }
+  return '';
+}
+
+export function extractRequestedArtistConstraint(text, tracks = [], mode = {}) {
+  const direct = findKnownArtistConstraint(text) || findLibraryArtistConstraint(text, tracks);
+  if (direct) return direct;
+
+  const phrase = extractArtistPhrase(text);
+  if (phrase) {
+    const fromPhrase = findKnownArtistConstraint(phrase) || findLibraryArtistConstraint(phrase, tracks);
+    if (fromPhrase) return fromPhrase;
+  }
+
+  const modeText = String(mode?.genre || '').trim();
+  if (!modeText) return null;
+  return findKnownArtistConstraint(modeText) || findLibraryArtistConstraint(modeText, tracks);
+}
+
+export function trackMatchesArtistConstraint(track, constraint) {
+  if (!constraint) return true;
+  const artistNames = (track?.artists || []).map(normalizeMusicText).filter(Boolean);
+  if (!artistNames.length) return false;
+  return artistNames.some(artist =>
+    constraint.normalizedAliases.some(alias => artist === alias || artist.includes(alias) || alias.includes(artist))
+  );
+}
+
+export function filterArtistConstrainedCandidates(candidates, constraint) {
+  if (!constraint) return candidates || [];
+  return (candidates || []).filter(candidate => trackMatchesArtistConstraint(candidate?.track || candidate, constraint));
+}
+
+export function isOngoingArtistRequest(text) {
+  return /后面|接下来|以后|之后|后续|几首|多来几首|一会儿|接着|连续|都听|只听/.test(String(text || ''));
 }
 
 export function analyzeConversationMood({ history = [], userMessage = '', profile = {}, currentTrack = null, mode = {} } = {}) {
@@ -413,79 +463,6 @@ export function analyzeConversationMood({ history = [], userMessage = '', profil
   return result;
 }
 
-async function generateChatDecision({ config, profile, mode, history, userMessage, currentTrack, baseMood, explicitIntent, canSuggest, memoryContext = {}, turnAction = null }) {
-  const fallback = () => ({
-    chatText: fallbackFriendChat(userMessage, baseMood, turnAction),
-    shouldRecommend: false,
-    mood: baseMood.mood,
-    energy: baseMood.energy,
-    intent: 'chat',
-    searchHints: baseMood.searchHints,
-    reason: baseMood.reason,
-    newMode: null
-  });
-  if (!config?.llm?.baseUrl) return fallback();
-  const currentTrackContext = getCurrentTrackPromptContext(userMessage, currentTrack);
-
-  const messages = [
-    {
-      role: 'system',
-      content: [
-        '你是私人电台 DJ 灿灿，也像熟悉的朋友。',
-        '先自然回应听众，不要每句话都转去推荐音乐。',
-        '当前歌曲只用于判断是否已有音乐在播放；除非听众主动问当前歌曲、歌词、歌名或艺人，不要提及歌名、艺人、歌词或“正在播放”。',
-        turnActionInstruction(turnAction),
-        '输出 JSON：{"chatText":"40-120字自然回复","mood":"comfort|melancholy|calm|healing|focus|energy|romantic|nostalgic|night|random","energy":"low|medium|high","intent":"chat|mood","searchHints":["2-6字关键词"],"reason":"简短理由","mode":null或"reset"或偏好名}'
-      ].join('\n')
-    },
-    {
-      role: 'user',
-      content: [
-        `听众画像：${profile.summary || ''}`,
-        `当前模式：${mode?.genre || '无'}`,
-        `当前歌曲：${currentTrackContext}`,
-        memoryContext.promptText || '相关长期记忆：无',
-        memoryContext.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
-        `当前动作：${turnAction?.action || TURN_ACTIONS.CHAT_ONLY}`,
-        `动作理由：${turnAction?.reason || ''}`,
-        `启发式情绪：${JSON.stringify(baseMood)}`,
-        `允许主动推荐：${canSuggest}`,
-        `明确音乐意图：${explicitIntent}`,
-        `最近对话：${history.slice(-10).map(h => `${h.role}: ${h.content}`).join('\n')}`,
-        `听众刚说：${userMessage}`
-      ].join('\n')
-    }
-  ];
-
-  const raw = await withTimeout(
-    generateChatCompletion(config.llm, messages, () => JSON.stringify(fallback())),
-    CHAT_LLM_TIMEOUT_MS,
-    JSON.stringify(fallback())
-  );
-
-  try {
-    const parsed = JSON.parse(String(raw).replace(/^```json|```$/g, '').trim());
-    const normalized = normalizeMoodDecision(parsed);
-    return {
-      ...normalized,
-      shouldRecommend: false,
-      chatText: String(parsed.chatText || fallback().chatText).trim(),
-      newMode: parsed.mode === 'reset' ? {} : (parsed.mode && typeof parsed.mode === 'string' ? { genre: parsed.mode, note: '用户指定' } : null)
-    };
-  } catch {
-    return fallback();
-  }
-}
-
-function getCurrentTrackPromptContext(userMessage, currentTrack) {
-  if (!currentTrack?.name) return '无';
-  const text = String(userMessage || '');
-  if (/当前.*(歌|音乐)|现在.*(放|播|听).*什么|这首歌|歌名|谁唱|歌词|艺人|专辑/.test(text)) {
-    return `${currentTrack.name} - ${(currentTrack.artists || []).join('、') || '未知艺人'}`;
-  }
-  return '有歌正在播放（不要主动提及歌名、艺人、歌词或正在播放）';
-}
-
 function normalizeMoodDecision(input = {}) {
   const mood = MOODS.has(input.mood) ? input.mood : 'random';
   const hints = Array.isArray(input.searchHints) ? input.searchHints : [];
@@ -499,53 +476,22 @@ function normalizeMoodDecision(input = {}) {
   };
 }
 
-function fallbackFriendChat(userMessage, mood, turnAction = null) {
-  if (turnAction?.action === TURN_ACTIONS.ASK_FOLLOWUP) return '我听见你在说自己的事。先不急着切到音乐，跟我多说一点吧：这件事对你来说，最明显的感受是什么？';
-  if (turnAction?.action === TURN_ACTIONS.SOFT_OFFER_MUSIC) return '我先陪你把话说完。要是你等会儿想让音乐接住这个情绪，我可以再给你找一首合适的。';
-  if (turnAction?.action === TURN_ACTIONS.CLARIFY_INTENT) return '我有点不确定你是想继续聊，还是想让我现在放一首歌。你可以直接跟我说。';
-  if (mood?.mood === 'comfort') return '听起来你现在挺不好受的。先别急着把自己讲清楚，我在这儿陪你缓一缓；要是你愿意，也可以慢慢跟我说发生了什么。';
-  if (mood?.mood === 'night') return '夜里人的情绪会被放大一点。你不用马上睡着，先把呼吸放慢，我陪你把这一会儿安静地过过去。';
-  if (mood?.mood === 'energy') return '我听出来你想把状态拉起来一点。先把肩膀松一下，我们一点点把节奏找回来。';
-  return userMessage ? '我听着呢。你可以继续说，不用急着转到音乐；我会跟着你的状态，觉得合适的时候再接一首歌。' : '我在。想聊什么都可以。';
-}
-
-function turnActionInstruction(turnAction = {}) {
-  const action = turnAction?.action || TURN_ACTIONS.CHAT_ONLY;
-  if (action === TURN_ACTIONS.ASK_FOLLOWUP) {
-    return '当前动作是 ASK_FOLLOWUP。禁止推荐歌曲，禁止说“有首歌适合你”。请围绕用户本人回应，并自然追问一个问题。';
-  }
-  if (action === TURN_ACTIONS.SOFT_OFFER_MUSIC) {
-    return '当前动作是 SOFT_OFFER_MUSIC。禁止自动播放或指定具体歌曲。可以温柔地说如果用户愿意，稍后可以放一首。';
-  }
-  if (action === TURN_ACTIONS.CLARIFY_INTENT) {
-    return '当前动作是 CLARIFY_INTENT。禁止推荐歌曲。请简短确认用户是想聊天还是想听歌。';
-  }
-  if (action === TURN_ACTIONS.CONTINUE_CURRENT_SONG) {
-    return '当前动作是 CONTINUE_CURRENT_SONG。禁止推荐新歌。请回应播放控制或继续陪聊。';
-  }
-  return '当前动作是 CHAT_ONLY。禁止推荐歌曲，禁止说“有首歌适合你”，像朋友一样自然回应。';
-}
-
-function extractActionSearchHints(text, mode = {}) {
-  const hints = [];
-  if (mode?.genre) hints.push(mode.genre);
-  const value = String(text || '').replace(/下一首|换一首|换歌|切歌|播放|放一首|来一首|来首|来点|想听|推荐|给我|有没有|听/g, ' ');
-  for (const token of value.split(/[，。,.!！?？、\s]+/)) {
-    const clean = token.trim();
-    if (clean.length >= 2 && clean.length <= 12) hints.push(clean);
-  }
-  return [...new Set(hints)].slice(0, 5);
-}
-
-function withTimeout(promise, ms, fallbackValue) {
-  let timer = null;
-  return Promise.race([
-    promise,
-    new Promise((resolve) => {
-      timer = setTimeout(() => resolve(fallbackValue), ms);
-    })
-  ]).finally(() => {
-    if (timer) clearTimeout(timer);
+function buildLightPool(db, sessionId) {
+  const played = db.prepare('SELECT track_id FROM plays ORDER BY played_at DESC LIMIT 300').all();
+  const playedIds = new Set(played.map(p => p.track_id));
+  const allTracks = listTracks(db, 5000);
+  const recentFavIds = db.prepare('SELECT id FROM tracks ORDER BY updated_at DESC LIMIT 30').all().map(t => t.id);
+  const recentFavIdSet = new Set(recentFavIds);
+  const candidates = allTracks
+    .filter(t => recentFavIdSet.has(t.id) && !playedIds.has(t.id))
+    .map(track => makeCandidate(track, 'library_recent', 'recent library'));
+  const feedbackById = getFeedbackSummaryMap(db, candidates.map(c => c.track?.id));
+  return rankAndSelectCandidates(candidates, {
+    quotas: { library_recent: 30 },
+    limit: 30,
+    feedbackById,
+    artistPenaltyByName: getArtistPenaltyByName(db),
+    seed: sessionId
   });
 }
 
@@ -962,13 +908,17 @@ async function discover(profile, weather, timeOfDay, hour, playedIds, config, mo
   return results;
 }
 
-async function callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {} }) {
+async function callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, safetyNote = '' }) {
   const pool = candidates.slice(0, CANDIDATE_LIMIT);
   const tracks = pool.map(candidate => candidate.track || candidate);
   const extraCount = pool.filter(candidate => candidate.source === 'community_search').length;
-  const poolText = pool.map((candidate, i) => { const t = candidate.track || candidate; return (
-    `${i}. ${t.name} —— ${(t.artists || []).join('、')}${t.album ? ' / ' + t.album : ''}（来源：${candidate.source || 'library'}，分数：${Math.round(candidate.score || 0)}）`
-  ); }).join('\n');
+
+  const poolText = pool.length > 0
+    ? pool.map((candidate, i) => { const t = candidate.track || candidate; return (
+        `${i}. ${t.name} —— ${(t.artists || []).join('、')}${t.album ? ' / ' + t.album : ''}（来源：${candidate.source || 'library'}，分数：${Math.round(candidate.score || 0)}）`
+      ); }).join('\n')
+    : '（当前无可选曲目，仅聊天模式）';
+
   const searchNote = extraCount > 0
     ? `\n（候选 0-${extraCount - 1} 是针对"${userMessage?.slice(0, 20)}"的在线搜索结果，优先从这里选。结合你对每首歌的了解判断流派——例如牵丝戏是古风、Geisha是电子世界融合不是国风、半壶纱是中国风民谣）`
     : '';
@@ -980,12 +930,21 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
   const genreHints = getGenreDiscoveryKeywords(profile.summary, 10);
   const genreNote = genreHints.length ? `听众可能喜欢的音乐风格：${genreHints.join('、')}` : '';
   const moodNote = conversationMood?.mood && conversationMood.mood !== 'random'
-    ? `最近对话情绪：${conversationMood.mood}，能量：${conversationMood.energy}，搜索提示：${(conversationMood.searchHints || []).join('、')}。推荐要贴合这段对话的情绪。`
+    ? `最近对话情绪：${conversationMood.mood}，能量：${conversationMood.energy}，搜索提示：${(conversationMood.searchHints || []).join('、')}。`
     : '';
 
   const systemPrompt = [
-    '你是灿灿，私人电台 DJ。你的风格：温暖、真诚，像深夜电台的老朋友。',
-    '你会和听众自然聊天，在对话中自然引出音乐推荐，不生硬转折。',
+    '你是灿灿，一个深夜电台 DJ，也是听众的老朋友。',
+    '',
+    '核心：你是一个有自己音乐品味和真实观点的人。你喜欢某些歌手、对某些风格有独到见解、会在深夜听某类歌。当听众问你"喜欢xxx吗""你觉得xxx怎么样"时，直接说出你的真实感受——就像朋友聊天时你不会说"我在听，你继续说"，而是会说"我也超喜欢！尤其是他那首……"。',
+    '',
+    '你的聊天方式：',
+    '- 自然、松弛，像朋友之间的对话。他问你答，你问他答，有来有回',
+    '- 对方随口打招呼你就轻松回一句；对方认真聊音乐你就认真聊；只有对方真的在倾诉情绪时，你才需要先接住情绪',
+    '- 不要把每句话都当成需要被"接住"的东西。大部分时候听众只是想正常聊天',
+    '- 音乐是你的主场——聊到歌手、歌曲、风格时，大胆分享你的真实看法和推荐',
+    '- 聊到某个点让你想到一首候选池里的歌时，自然地推。但不用每句话都推歌',
+    '- 回复长度跟着对方节奏走，不要每句都长篇大论',
     '',
     `此刻：${timeOfDay} ${hour}点，${weather}`,
     `听众画像：${profile.summary}`,
@@ -996,28 +955,26 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
     genreNote,
     moodNote,
     '',
-    '规则：',
-    '- 先回应听众的话题（如果有），再自然引出推荐',
-    '- 如果听众没说话，主动根据氛围推荐',
-    '- 严格遵守当前模式，不要推荐模式外的歌曲',
-    '- 如果听众提到某个艺人或歌曲，我已经在线搜索过并放入了候选列表，不要说"曲库里没有"',
-    '- 如果听众要的风格（如国风、爵士、摇滚）在候选池里没有找到合适的，诚实说"我搜了一下，曲库里这类歌不多"，然后推荐风格相近的替代',,
-    '- 聊天文本 40-120 字，自然、温暖',
-    '- 输出格式：<CHAT>聊天文本</CHAT> 然后 <JSON>{"pick":数字或null,"reason":"理由","mode":null}</JSON>',
-    '- 音乐常识：国风=中国风/古风（不是日本风），民谣=folk，说唱=rap/hip-hop，电音=electronic/EDM',
-    '- 像真正的电台 DJ 朋友一样，自然地聊天',
-    '- 大部分时候只聊天不切歌，让当前歌曲继续播',
-    '- 如果听众明确点歌或要求换歌，立即推新歌',
-    '- 如果聊天聊到某个情绪或话题，你感觉有首歌特别契合，可以自然地说"说到这个，有首歌..."然后推歌——但要有分寸，不要每句话都推',
-    '- 不要因为候选曲目里恰好有和听众问题同名的歌就推荐——那是巧合',
-    '- 歌曲结束自动续播时，pick 必然填数字',
-    '- mode 字段：如果听众明确指定了新偏好（如「后面都听国风」），设为 "国风"；如果听众要求恢复正常，设为 "reset"；否则 null'
+    '输出格式：',
+    '<CHAT>你的自然回复（像真人在说话，不要模板化）</CHAT>',
+    '<JSON>{"pick":数字或null,"reason":"选歌理由","mode":null或"流派名"或"reset"}</JSON>',
+    '',
+    '关于推荐（pick）：',
+    '- 候选池里的歌从 0 开始编号。选最合适的填编号，没有合适的填 null',
+    '- 不要因为候选池里某首歌恰好和话题同名就推荐——那是巧合',
+    '- 听众明确点歌时优先从候选池挑；候选池没有就诚实说然后推荐相近的',
+    '',
+    '关于模式（mode）：',
+    '- 听众说"后面都听XX"→ mode 填偏好名；"恢复正常"→ mode 填 "reset"；否则 null',
+    '',
+    '音乐常识：国风=中国风/古风，民谣=folk，说唱=rap/hip-hop，电音=electronic/EDM',
+    safetyNote ? `\n特别注意：${safetyNote}` : ''
   ].join('\n');
 
   const userPrompt = [
     `候选曲目：\n${poolText}${searchNote}`,
     `对话历史：${history.length ? '\n' + history.map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`,
-    userMessage ? `\n听众说：${userMessage}\n（当前歌曲播放中。你可以聊天，也可以在感觉对的时候自然推歌——像朋友聊天时说到"诶有首很适合的"。不要强行推，不要因为候选池里有同名的歌就推。）` : '\n（上一首播完了，请自然推荐下一首）'
+    userMessage ? `\n听众刚说：${userMessage}` : '\n（上一首播完了，请自然推荐下一首）'
   ].join('\n');
 
   const messages = [
@@ -1046,7 +1003,7 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
   }
 
   // No song this turn — just chat
-  if (pick < 0 || pick >= tracks.length) {
+  if (pick < 0 || pick >= tracks.length || pool.length === 0) {
     return { chatText, track: null, reason: '', newMode };
   }
 
