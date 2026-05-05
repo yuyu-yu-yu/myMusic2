@@ -631,7 +631,7 @@ audio {
 
 /* ----- Equalizer Fallback ----- */
 .equalizer-fallback {
-  display: flex;
+  display: none;
   align-items: flex-end;
   justify-content: center;
   gap: 2px;
