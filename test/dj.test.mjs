@@ -20,7 +20,9 @@ import {
   chatTurn,
   decideTurnAction,
   extractAndStoreMemories,
+  ensureRecommendationTextMatchesTrack,
   hasExplicitMusicIntent,
+  recommendationTextMentionsDifferentTrack,
   rankAndSelectCandidates,
   TURN_ACTIONS
 } from '../server/dj.mjs';
@@ -117,6 +119,24 @@ test('candidate ranking deduplicates tracks and keeps highest scoring source', (
   assert.equal(selected.find(item => item.track.id === 'same-track').source, 'community_search');
 });
 
+test('recommendation text is forced to match the final playable track', () => {
+  const selected = { id: 'quiet', name: '安静', artists: ['海洋'], album: 'Album' };
+  const candidates = [
+    { id: 'angel', name: 'Angel (Live)', artists: ['陶喆'], album: 'Album' },
+    selected
+  ];
+
+  assert.equal(
+    recommendationTextMentionsDifferentTrack('今晚适合听 Angel，陶喆这版很柔和。', selected, candidates),
+    true
+  );
+
+  const text = ensureRecommendationTextMatchesTrack('今晚适合听 Angel，陶喆这版很柔和。', selected, candidates);
+  assert.match(text, /安静/);
+  assert.match(text, /海洋/);
+  assert.doesNotMatch(text, /Angel|陶喆/);
+});
+
 test('feedback and artist cooldown change candidate order', () => {
   const feedbackById = new Map([
     ['liked', { likes: 1, dislikes: 0, completions: 2, skips: 0 }],
@@ -192,6 +212,20 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
 
   const loaded = getPreferences({ db });
   assert.equal(loaded.preferences.note, '多一点像朋友一样聊天。');
+
+  const mixerSaved = updatePreferences({
+    db,
+    payload: {
+      chatMusicBalance: 'friend',
+      recommendationFrequency: 'high',
+      voiceMode: 'off',
+      moodMode: 'random'
+    }
+  });
+  assert.equal(mixerSaved.preferences.chatMusicBalance, 'friend');
+  assert.equal(mixerSaved.preferences.recommendationFrequency, 'high');
+  assert.equal(mixerSaved.preferences.voiceMode, 'off');
+  assert.equal(mixerSaved.preferences.moodMode, 'random');
 
   const sanitized = updatePreferences({
     db,
