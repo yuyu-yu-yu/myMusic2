@@ -3,101 +3,78 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#050505" />
+    <meta name="theme-color" content="#06060e" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="stylesheet" href="/styles.css" />
     <title>myMusic</title>
   </head>
   <body>
     <div id="crt-overlay"></div>
-    <div id="cursor-spotlight" aria-hidden="true"></div>
-    <div id="route-wipe" aria-hidden="true"></div>
     <div id="app">
       <header class="topbar">
         <a class="brand" href="/" data-link>
           <span class="brand-mark">m</span>
-          <span class="brand-copy">
-            <strong>myMusic</strong>
-            <small>Canchan Signal Deck</small>
-          </span>
+          <span>myMusic</span>
         </a>
-        <nav class="nav" aria-label="主导航">
+        <nav class="nav">
           <a href="/" data-link>电台</a>
           <a href="/library" data-link>曲库</a>
-          <a href="/tuning" data-link>调音台</a>
+          <a href="/diary" data-link>日记</a>
           <a href="/settings" data-link>设置</a>
         </nav>
       </header>
-
+      <!-- Persistent audio layer — survives SPA navigation -->
       <div id="audio-layer" style="display:none">
         <audio id="host-audio"></audio>
         <audio id="song-audio" crossOrigin="anonymous"></audio>
-        <canvas id="visualizer-canvas" width="1280" height="720"></canvas>
+        <canvas id="visualizer-canvas" width="600" height="52"></canvas>
         <div id="equalizer-fallback" class="equalizer-fallback" style="display:none"></div>
       </div>
-
       <main id="view" class="view"></main>
     </div>
-
     <template id="player-template">
-      <section class="signal-deck">
-        <div class="signal-stage" data-magnetic>
-          <div class="stage-grid" aria-hidden="true"></div>
-          <div class="stage-orbit" aria-hidden="true">
-            <span></span><span></span><span></span>
-          </div>
-          <div id="signal-visual-slot" class="signal-visual-slot"></div>
-          <div class="stage-copy">
-            <p class="eyebrow">01 / Live Signal</p>
-            <h1 id="track-title">myMusic</h1>
-            <div class="stage-meta">
-              <span id="track-artist">等待启动</span>
-              <span id="stage-clock">--:--</span>
-              <span>AI DJ 灿灿</span>
+      <section class="player-shell">
+        <div class="left-col">
+          <div class="now-panel">
+            <img id="cover" class="cover" src="/assets/cover-1.svg" alt="cover" />
+            <div class="track-meta">
+              <p class="eyebrow">AI PRIVATE RADIO</p>
+              <h1 id="track-title">myMusic</h1>
+              <p id="track-artist" class="muted">等待启动</p>
+              <div class="transport transport-mini">
+                <button id="pause-btn">暂停</button>
+                <button id="resume-btn">继续</button>
+                <button id="next-btn">下一首</button>
+              </div>
             </div>
           </div>
-          <div class="signal-readout" aria-hidden="true">
-            <span id="signal-initial">M</span>
-            <small>NO COVER<br />SIGNAL ONLY</small>
+          <div id="progress-container" class="progress-container">
+            <span id="progress-current" class="progress-time">00:00</span>
+            <div id="progress-bar" class="progress-bar">
+              <div id="progress-fill" class="progress-fill"></div>
+            </div>
+            <span id="progress-duration" class="progress-time">00:00</span>
           </div>
+          <button id="start-btn" class="primary start-wide">启动电台</button>
+          <div id="lyric" class="lyric"></div>
         </div>
-
-        <aside class="canchan-console">
-          <div class="console-header">
-            <div>
-              <p class="eyebrow">02 / Canchan Console</p>
-              <h2>面对面通话</h2>
-            </div>
-            <button id="mode-reset-btn" class="ghost compact" title="恢复正常推荐" style="display:none">复位</button>
+        <div class="chat-panel">
+          <div class="chat-header">
+            <span class="eyebrow">灿灿 · AI DJ</span>
+            <button id="mode-reset-btn" class="ghost" title="恢复正常推荐" style="display:none">恢复正常</button>
           </div>
           <div id="chat-messages" class="chat-messages">
             <div class="chat-msg dj-msg">
-              <p>准备好以后启动电台。我会听你的状态，也会在合适的时候把音乐接进来。</p>
+              <p>准备好以后点击启动电台，我会根据你的收藏、时间和心情来推荐音乐。你也可以随时跟我聊天。</p>
             </div>
           </div>
-          <form id="chat-form" class="chat-form">
-            <input id="chat-input" autocomplete="off" placeholder="和灿灿说话..." />
+          <form id="chat-form" class="chat-form chat-form-inline">
+            <input id="chat-input" autocomplete="off" placeholder="和灿灿聊聊..." />
             <button type="submit">发送</button>
           </form>
-        </aside>
-
-        <div class="transcript-ticker">
-          <p class="eyebrow">03 / Transcript Ticker</p>
-          <div id="lyric" class="lyric"></div>
-        </div>
-
-        <div class="command-dock">
-          <div id="player-status" class="player-status">等待启动</div>
-          <div class="transport transport-mini">
-            <button id="start-btn" class="primary" type="button">启动电台</button>
-            <button id="pause-btn" type="button">暂停</button>
-            <button id="resume-btn" type="button">继续</button>
-            <button id="next-btn" type="button">下一首</button>
-          </div>
         </div>
       </section>
     </template>
-
     <script type="module" src="/app.js"></script>
   </body>
 </html>
