@@ -9,7 +9,8 @@ const state = {
   activePlayback: null,
   lyricLines: [],
   activeLyricIndex: -1,
-  avatarState: 'idle'
+  avatarState: 'idle',
+  preferences: null
 };
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
@@ -19,6 +20,7 @@ let loadingMsgIndex = 0;
 let loadingMsgTimer = null;
 let savedChatHTML = '';
 let avatarRestoreTimer = null;
+let preferencesLoadPromise = null;
 
 const avatarMotionMap = {
   idle: '/avatar/webm/idle.webm',
@@ -34,6 +36,7 @@ const avatarStateAliases = {
   searching_music: 'searching',
   reading_book: 'reading'
 };
+const SILENT_AUDIO_DATA_URI = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQQAAAAAAA==';
 
 const mixerOptions = {
   chatMusicBalance: [
@@ -328,34 +331,42 @@ function initButtonFeedback() {
   btnFeedbackReady = true;
 
   document.addEventListener('mousedown', (e) => {
-    const btn = e.target.closest('button');
+    const btn = closestButtonFromEvent(e);
     if (!btn) return;
     btn.classList.add('btn-pressed');
   });
   document.addEventListener('mouseup', (e) => {
-    const btn = e.target.closest('button');
+    const btn = closestButtonFromEvent(e);
     if (!btn) return;
     btn.classList.remove('btn-pressed');
   });
   document.addEventListener('mouseleave', (e) => {
-    const btn = e.target.closest('button');
+    const btn = closestButtonFromEvent(e);
     if (btn) btn.classList.remove('btn-pressed');
   }, true);
   document.addEventListener('touchstart', (e) => {
-    const btn = e.target.closest('button');
+    const btn = closestButtonFromEvent(e);
     if (!btn) return;
     btn.classList.add('btn-pressed');
   }, { passive: true });
   document.addEventListener('touchend', (e) => {
-    const btn = e.target.closest('button');
+    const btn = closestButtonFromEvent(e);
     if (!btn) return;
     btn.classList.remove('btn-pressed');
   });
 }
 
+function closestButtonFromEvent(event) {
+  const target = event?.target;
+  if (target instanceof Element) return target.closest('button');
+  const parent = target?.parentElement;
+  return parent instanceof Element ? parent.closest('button') : null;
+}
+
 function renderPlayer() {
   view.innerHTML = '';
   view.append(template.content.cloneNode(true));
+  loadPreferences().catch(() => {});
 
   // Move persistent audio elements into the player layout
   const leftCol = document.querySelector('.left-col');
@@ -602,32 +613,38 @@ function stopLoadingMessages() {
 }
 
 async function startRadio() {
+  primeVoicePlayback();
   setAvatarState('on_air');
   setRadioButtonState('loading');
   appendChat({ role: 'user', text: '启动电台' });
   startLoadingMessages();
   try {
+    await loadPreferences().catch(() => null);
     const data = await api('/api/radio/start', { method: 'POST', body: {} });
     handleRadioResponse(data);
   } catch (e) { stopLoadingMessages(); setAvatarState('idle'); setRadioButtonState(state.current?.track ? 'active' : 'idle'); setPlayerStatus(e.message, 'error'); }
 }
 
 async function nextTrack({ skipCurrent = true } = {}) {
+  primeVoicePlayback();
   setAvatarState('searching');
   setPlaybackToggleState(false);
   if (skipCurrent) await reportFeedback('skip');
   appendChat({ role: 'user', text: '下一首' });
   startLoadingMessages();
   try {
+    await loadPreferences().catch(() => null);
     const data = await api('/api/radio/next', { method: 'POST', body: { sessionId: state.sessionId } });
     handleRadioResponse(data);
   } catch (e) { stopLoadingMessages(); setAvatarState(getContextualAvatarState()); setPlayerStatus(e.message, 'error'); }
 }
 
 async function sendChat(msg) {
+  primeVoicePlayback();
   appendChat({ role: 'user', text: msg });
   startLoadingMessages('chat');
   try {
+    await loadPreferences().catch(() => null);
     const data = await api('/api/radio/chat', { method: 'POST', body: { sessionId: state.sessionId, message: msg } });
     handleRadioResponse(data);
   } catch (e) {
@@ -664,32 +681,120 @@ function handleRadioResponse(data) {
   const hasMode = data.mode?.genre;
   document.querySelector('#mode-reset-btn').style.display = hasMode ? '' : 'none';
 
-  // Only play if there's a track
   if (!data.track) {
     setPlayerStatus(state.current?.track ? '继续播放中' : '等待中', '');
+    if (responseShouldSpeak(data)) {
+      playHostSpeech(data, () => {
+        setAvatarState(getContextualAvatarState());
+        switchVisualizerTo(state.current?.track ? 'song' : 'off');
+      });
+    }
     return;
   }
 
-  const hostAudio = document.querySelector('#host-audio');
-  hostAudio.src = data.ttsUrl || '';
   setPlayerStatus('歌曲就绪', 'playing');
+  if (responseShouldSpeak(data)) playHostSpeech(data, () => startSongPlayback());
+  else startSongPlayback();
+}
+
+function responseShouldSpeak(data = {}) {
+  if (typeof data.speech?.shouldSpeak === 'boolean') return data.speech.shouldSpeak;
+  if (data.speech?.mode === 'off' || data.voiceMode === 'off') return false;
+  if (data.speech?.mode === 'all' || data.voiceMode === 'all') return true;
+  const localVoiceMode = state.preferences?.voiceMode;
+  if (localVoiceMode === 'off') return false;
+  if (localVoiceMode === 'all') return true;
+  return Boolean(data.track);
+}
+
+function playHostSpeech(data, onEnd) {
+  const text = data.chatText || data.hostText || '';
+  const hostAudio = document.querySelector('#host-audio');
+  if (!responseShouldSpeak(data) || !text) {
+    if (hostAudio) hostAudio.src = '';
+    onEnd?.();
+    return;
+  }
+
+  const finish = () => {
+    if (hostAudio) {
+      hostAudio.onended = null;
+      hostAudio.onplay = null;
+    }
+    onEnd?.();
+  };
+
+  setAvatarState('talking');
+  switchVisualizerTo('host');
+  if (data.track) setPlaybackToggleState(true);
+
   try {
-    if (data.ttsUrl) {
-      setAvatarState('talking');
-      hostAudio.onended = () => startSongPlayback();
-      hostAudio.onplay = () => { setAvatarState('talking'); switchVisualizerTo('host'); setPlaybackToggleState(true); };
-      hostAudio.play();
+    if (data.ttsUrl && hostAudio) {
+      hostAudio.muted = false;
+      hostAudio.src = data.ttsUrl;
+      hostAudio.onended = finish;
+      hostAudio.onplay = () => {
+        setAvatarState('talking');
+        switchVisualizerTo('host');
+        if (data.track) setPlaybackToggleState(true);
+      };
+      hostAudio.play().catch((error) => {
+        console.warn('[tts play fallback]', error?.message || error);
+        speakText(text, finish);
+      });
     } else {
-      setAvatarState('talking');
-      setPlaybackToggleState(true);
-      switchVisualizerTo('host');  // show fallback for SpeechSynthesis
-      speakText(data.chatText || data.hostText, () => startSongPlayback());
+      if (hostAudio) hostAudio.src = '';
+      speakText(text, finish);
     }
   } catch {
-    setAvatarState('talking');
-    switchVisualizerTo('host');
-    speakText(data.chatText || data.hostText, () => startSongPlayback());
+    speakText(text, finish);
   }
+}
+
+function primeVoicePlayback() {
+  const hostAudio = document.querySelector('#host-audio');
+  if (!hostAudio || hostAudio.dataset.voicePrimed === 'true') {
+    primeSpeechSynthesis();
+    return;
+  }
+  if (hostAudio.src && !hostAudio.paused && !hostAudio.ended) return;
+
+  const previousSrc = hostAudio.getAttribute('src') || '';
+  const previousMuted = hostAudio.muted;
+  hostAudio.dataset.voicePriming = 'true';
+  hostAudio.muted = true;
+  hostAudio.src = SILENT_AUDIO_DATA_URI;
+  hostAudio.play()
+    .then(() => {
+      hostAudio.pause();
+      hostAudio.currentTime = 0;
+      hostAudio.dataset.voicePrimed = 'true';
+      if (previousSrc) hostAudio.src = previousSrc;
+      else {
+        hostAudio.removeAttribute('src');
+        hostAudio.load();
+      }
+    })
+    .catch(() => {
+      if (previousSrc) hostAudio.src = previousSrc;
+      else hostAudio.removeAttribute('src');
+    })
+    .finally(() => {
+      hostAudio.muted = previousMuted;
+      delete hostAudio.dataset.voicePriming;
+    });
+  primeSpeechSynthesis();
+}
+
+function primeSpeechSynthesis() {
+  if (!('speechSynthesis' in window) || window.__speechSynthesisPrimed) return;
+  try {
+    const utterance = new SpeechSynthesisUtterance(' ');
+    utterance.volume = 0;
+    utterance.rate = 1;
+    speechSynthesis.speak(utterance);
+    window.__speechSynthesisPrimed = true;
+  } catch {}
 }
 
 function appendChat({ role, text, track }) {
@@ -1121,6 +1226,7 @@ async function renderMixer() {
     api('/api/memories').catch(() => ({ memories: [] }))
   ]);
   const preferences = prefData.preferences || {};
+  state.preferences = preferences;
   const feedback = prefData.feedbackSummary || {};
   const memories = (memoryData.memories || []).slice(0, 8);
 
@@ -1362,6 +1468,7 @@ function bindMixerControls(initialPreferences = {}) {
     try {
       const result = await api('/api/preferences', { method: 'PUT', body: preferences });
       preferences = result.preferences || preferences;
+      state.preferences = preferences;
       refresh();
       setMixerStatus('已保存到灿灿的运行参数', 'ok');
     } catch (error) {
@@ -1544,6 +1651,19 @@ async function api(path, options = {}) {
     throw new Error(data.error || `HTTP ${response.status}`);
   }
   return data;
+}
+
+async function loadPreferences({ force = false } = {}) {
+  if (state.preferences && !force) return state.preferences;
+  if (!preferencesLoadPromise || force) {
+    preferencesLoadPromise = api('/api/preferences')
+      .then((data) => {
+        state.preferences = data.preferences || state.preferences || {};
+        return state.preferences;
+      })
+      .finally(() => { preferencesLoadPromise = null; });
+  }
+  return preferencesLoadPromise;
 }
 
 function escapeHtml(value) {
