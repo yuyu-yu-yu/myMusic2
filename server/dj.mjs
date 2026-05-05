@@ -2,7 +2,18 @@
 import crypto from 'node:crypto';
 import { generateChatCompletion, getWeatherSummary, synthesizeSpeech } from './ai.mjs';
 import { getProfile, resolvePlayableTrack } from './library.mjs';
-import { listRecentPlays, listTracks, nowIso, saveTrack, getSessionMode, setSessionMode, getFeedbackSummaryMap } from './db.mjs';
+import {
+  listRecentPlays,
+  listTracks,
+  nowIso,
+  saveTrack,
+  getSessionMode,
+  setSessionMode,
+  getFeedbackSummaryMap,
+  recordOrMergeUserMemory,
+  retrieveRelevantMemories,
+  memoryKinds
+} from './db.mjs';
 import { searchOnline } from './community.mjs';
 import { getUserPrefs } from './radio.mjs';
 import { getGenreDiscoveryKeywords, searchGenres } from './genre.mjs';
@@ -18,6 +29,26 @@ const SOURCE_BASE_SCORES = {
 };
 const MOODS = new Set(['comfort', 'melancholy', 'calm', 'healing', 'focus', 'energy', 'romantic', 'nostalgic', 'night', 'random']);
 const WEATHER_CACHE_MS = 10 * 60 * 1000;
+const SESSION_SUMMARY_MIN_MESSAGES = 12;
+const SESSION_SUMMARY_STEP = 8;
+const LONG_MEMORY_LIMIT = 8;
+const LONG_MEMORY_MAX_CHARS = 800;
+const CHAT_LLM_TIMEOUT_MS = 2500;
+export const TURN_ACTIONS = Object.freeze({
+  CHAT_ONLY: 'CHAT_ONLY',
+  ASK_FOLLOWUP: 'ASK_FOLLOWUP',
+  SOFT_OFFER_MUSIC: 'SOFT_OFFER_MUSIC',
+  RECOMMEND_AND_PLAY: 'RECOMMEND_AND_PLAY',
+  CONTINUE_CURRENT_SONG: 'CONTINUE_CURRENT_SONG',
+  CLARIFY_INTENT: 'CLARIFY_INTENT'
+});
+const NON_RECOMMEND_ACTIONS = new Set([
+  TURN_ACTIONS.CHAT_ONLY,
+  TURN_ACTIONS.ASK_FOLLOWUP,
+  TURN_ACTIONS.SOFT_OFFER_MUSIC,
+  TURN_ACTIONS.CONTINUE_CURRENT_SONG,
+  TURN_ACTIONS.CLARIFY_INTENT
+]);
 
 export async function djTurn({ db, config, netease, sessionId, userMessage, conversationMood = null }) {
   ensureSession(db, sessionId);
@@ -30,12 +61,21 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
 
   // Load conversation history
   const history = loadHistory(db, sessionId);
+  const sessionSummary = await updateSessionSummary(db, config, sessionId);
+  const longTermMemories = retrieveRelevantMemories(db, {
+    text: userMessage || conversationMood?.reason || '',
+    mood: conversationMood,
+    mode,
+    limit: LONG_MEMORY_LIMIT,
+    maxChars: LONG_MEMORY_MAX_CHARS
+  });
+  const memoryContext = buildMemoryContext({ sessionSummary, longTermMemories });
 
   // Build candidates
   const candidates = await buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, userMessage, conversationMood);
 
   // Single LLM call: chat + pick
-  const result = await callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood });
+  const result = await callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood, memoryContext });
 
   // Save to DB
   if (userMessage) {
@@ -48,6 +88,9 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
     db.prepare('INSERT INTO plays (track_id, played_at, source, reason, host_text, report_status) VALUES (?,?,?,?,?,?)')
       .run(result.track.id, nowIso(), 'radio', result.reason, result.chatText, 'pending');
     saveTrack(db, result.track);
+  }
+  if (userMessage) {
+    scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: result.chatText, conversationMood });
   }
 
   // Persist mode if changed
@@ -83,6 +126,15 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
   const currentTrack = getCurrentTrack(db);
   const context = getSessionContext(db, sessionId);
   const baseMood = analyzeConversationMood({ history, userMessage, profile, currentTrack, mode });
+  const sessionSummary = await updateSessionSummary(db, config, sessionId);
+  const longTermMemories = retrieveRelevantMemories(db, {
+    text: userMessage,
+    mood: baseMood,
+    mode,
+    limit: LONG_MEMORY_LIMIT,
+    maxChars: LONG_MEMORY_MAX_CHARS
+  });
+  const memoryContext = buildMemoryContext({ sessionSummary, longTermMemories });
   const explicitIntent = hasExplicitMusicIntent(userMessage);
   const userMessageCountAfterThisTurn = countUserMessages(db, sessionId) + (userMessage ? 1 : 0);
   const canSuggest = canProactivelyRecommend({
@@ -91,6 +143,32 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     currentTrack,
     mood: baseMood
   });
+  const turnAction = decideTurnAction({
+    userMessage,
+    history,
+    baseMood,
+    explicitIntent,
+    canSuggest,
+    currentTrack,
+    mode,
+    memoryContext
+  });
+  if (turnAction.action === TURN_ACTIONS.RECOMMEND_AND_PLAY) {
+    const conversationMood = normalizeMoodDecision({
+      ...baseMood,
+      shouldRecommend: true,
+      intent: 'music',
+      searchHints: turnAction.searchHints?.length ? turnAction.searchHints : baseMood.searchHints,
+      reason: turnAction.reason || baseMood.reason
+    });
+    const result = await djTurn({ db, config, netease, sessionId, userMessage, conversationMood });
+    setSessionContext(db, sessionId, {
+      ...getSessionContext(db, sessionId),
+      lastSuggestedAtUserCount: countUserMessages(db, sessionId)
+    });
+    return { ...result, conversationMood, turnAction, intent: 'explicit' };
+  }
+
   const chatDecision = await generateChatDecision({
     config,
     profile,
@@ -100,22 +178,17 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     currentTrack,
     baseMood,
     explicitIntent,
-    canSuggest
+    canSuggest,
+    memoryContext,
+    turnAction
   });
   const conversationMood = normalizeMoodDecision({ ...baseMood, ...chatDecision });
-  const shouldRecommend = explicitIntent || (canSuggest && conversationMood.shouldRecommend);
-
-  if (shouldRecommend) {
-    const result = await djTurn({ db, config, netease, sessionId, userMessage, conversationMood });
-    setSessionContext(db, sessionId, {
-      ...getSessionContext(db, sessionId),
-      lastSuggestedAtUserCount: countUserMessages(db, sessionId)
-    });
-    return { ...result, conversationMood, intent: explicitIntent ? 'explicit' : 'proactive' };
-  }
 
   if (userMessage) saveMessage(db, sessionId, 'user', userMessage);
   saveMessage(db, sessionId, 'assistant', chatDecision.chatText);
+  if (userMessage) {
+    scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: chatDecision.chatText, conversationMood });
+  }
   if (chatDecision.newMode) {
     const newMode = { ...chatDecision.newMode, updatedAt: nowIso() };
     setSessionMode(db, sessionId, newMode);
@@ -131,8 +204,52 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     profile,
     weather: getSessionContext(db, sessionId).weather || '',
     conversationMood,
+    turnAction,
     intent: 'chat'
   };
+}
+
+export async function updateSessionSummary(db, config, sessionId) {
+  const context = getSessionContext(db, sessionId);
+  const stats = db.prepare('SELECT COUNT(*) AS count, MAX(id) AS latestId FROM messages WHERE session_id = ?')
+    .get(sessionId);
+  const count = Number(stats?.count || 0);
+  const latestId = Number(stats?.latestId || 0);
+  const summarizedId = Number(context.sessionSummaryMessageId || 0);
+  if (count < SESSION_SUMMARY_MIN_MESSAGES) return context.sessionSummary || '';
+  if (summarizedId && latestId - summarizedId < SESSION_SUMMARY_STEP) return context.sessionSummary || '';
+  if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return context.sessionSummary || '';
+
+  const rows = db.prepare(
+    'SELECT id, role, content FROM messages WHERE session_id = ? ORDER BY id DESC LIMIT 60'
+  ).all(sessionId).reverse();
+  const raw = await generateChatCompletion(config.llm, [
+    {
+      role: 'system',
+      content: [
+        '你是灿灿的会话记忆整理器。',
+        '把当前 session 压缩成 200-500 字中文摘要，保留用户最近状态、重要话题、偏好、边界和灿灿已回应过的内容。',
+        '不要加入长期音乐画像，不要编造。只输出摘要文本。'
+      ].join('\n')
+    },
+    {
+      role: 'user',
+      content: [
+        context.sessionSummary ? `已有摘要：${context.sessionSummary}` : '已有摘要：无',
+        `最近对话：\n${rows.map(row => `${row.role}: ${row.content}`).join('\n')}`
+      ].join('\n')
+    }
+  ], () => context.sessionSummary || '');
+
+  const summary = String(raw || '').trim().slice(0, 700);
+  if (!summary) return context.sessionSummary || '';
+  setSessionContext(db, sessionId, {
+    ...getSessionContext(db, sessionId),
+    sessionSummary: summary,
+    sessionSummaryMessageId: latestId,
+    sessionSummaryUpdatedAt: nowIso()
+  });
+  return summary;
 }
 
 function loadHistory(db, sessionId) {
@@ -189,6 +306,69 @@ export function hasExplicitMusicIntent(text) {
   return /下一首|换一首|换歌|切歌|播放|放一首|来点|想听|推荐|给我.*(歌|音乐)|有没有.*(歌|音乐)|听.*(歌|音乐)|artist|song|music|play|recommend/i.test(value);
 }
 
+export function decideTurnAction({
+  userMessage = '',
+  history = [],
+  baseMood = {},
+  explicitIntent = false,
+  canSuggest = false,
+  currentTrack = null,
+  mode = {},
+  memoryContext = {}
+} = {}) {
+  const text = String(userMessage || '').trim();
+  const lower = text.toLowerCase();
+  const memoryText = `${memoryContext.promptText || ''} ${memoryContext.sessionSummary || ''}`.toLowerCase();
+  const result = (action, reason, extra = {}) => ({
+    action,
+    reason,
+    confidence: extra.confidence ?? 0.85,
+    source: extra.source || 'local_rule',
+    searchHints: extra.searchHints || []
+  });
+
+  if (!text) {
+    return result(TURN_ACTIONS.RECOMMEND_AND_PLAY, 'empty turn means radio continuation', { confidence: 1 });
+  }
+  if (/不想听|先别放|不要放|别放|先别切|不要切|别切|别换|先聊|陪我聊|不放歌/.test(text)) {
+    return result(TURN_ACTIONS.CHAT_ONLY, 'user explicitly rejected playback or switching', { confidence: 1 });
+  }
+  if (/恢复正常推荐|取消.*偏好|取消.*模式|恢复正常|后面都听|以后都听|接下来都听/.test(text)) {
+    return result(TURN_ACTIONS.CHAT_ONLY, 'user is updating listening mode rather than asking for an immediate song', { confidence: 0.95 });
+  }
+  if (/暂停|停一下|继续播放|继续放|接着放|resume|pause/i.test(text)) {
+    return result(TURN_ACTIONS.CONTINUE_CURRENT_SONG, 'user asked for playback control without a new recommendation', { confidence: 0.95 });
+  }
+  if (/下一首|换一首|换歌|切歌|播放|放一首|来一首|来首|来点|想听|推荐(一首|首|点)?|给我.*(歌|音乐)|有没有.*(歌|音乐)|听.*(歌|音乐)|artist|song|music|play|recommend/i.test(text)) {
+    return result(TURN_ACTIONS.RECOMMEND_AND_PLAY, 'user explicitly asked for music', {
+      confidence: 1,
+      searchHints: extractActionSearchHints(text, mode)
+    });
+  }
+  if (/我是|我是一名|我叫|我在读|我的专业|我专业|我是.*(学生|老师|工程师|程序员|大学生)|我来自|我住在|我今年|我最近|今天发生|今天我|最近我/.test(text)) {
+    return result(TURN_ACTIONS.ASK_FOLLOWUP, 'user is self-disclosing or sharing life context', { confidence: 0.95 });
+  }
+  if (/你觉得|你知道|怎么办|为什么|怎么会|可以聊|想聊|随便聊|跟你说|问你|你会/.test(text)) {
+    return result(TURN_ACTIONS.CHAT_ONLY, 'user is chatting or asking a non-music question', { confidence: 0.88 });
+  }
+  if (/睡不着|失眠|心情不好|难受|吵架|崩溃|委屈|emo|低落|伤心|难过|烦|累|疲惫|写代码.*麻|代码.*麻|有点累/.test(text)) {
+    if (/先陪|先聊|不要.*歌|别.*歌|硬切|不喜欢.*切/.test(memoryText)) {
+      return result(TURN_ACTIONS.ASK_FOLLOWUP, 'long-term memory says support should come before music', { confidence: 0.92 });
+    }
+    return result(TURN_ACTIONS.ASK_FOLLOWUP, 'ambiguous emotional disclosure should not auto-play music', { confidence: 0.82 });
+  }
+  if (baseMood?.shouldRecommend && canSuggest && currentTrack && !/吗|呢|为什么|怎么|是不是/.test(text)) {
+    return result(TURN_ACTIONS.SOFT_OFFER_MUSIC, 'mood may fit music but user did not explicitly ask', {
+      confidence: 0.62,
+      searchHints: baseMood.searchHints || []
+    });
+  }
+  if (explicitIntent) {
+    return result(TURN_ACTIONS.RECOMMEND_AND_PLAY, 'explicit intent fallback', { confidence: 0.9, searchHints: extractActionSearchHints(text, mode) });
+  }
+  return result(TURN_ACTIONS.CHAT_ONLY, 'default to friendship chat', { confidence: 0.7 });
+}
+
 export function canProactivelyRecommend({ userMessageCount = 0, lastSuggestedAtUserCount = 0, currentTrack = null, mood = {} } = {}) {
   if (!currentTrack) return Boolean(mood?.shouldRecommend);
   if (userMessageCount < 3) return false;
@@ -233,27 +413,29 @@ export function analyzeConversationMood({ history = [], userMessage = '', profil
   return result;
 }
 
-async function generateChatDecision({ config, profile, mode, history, userMessage, currentTrack, baseMood, explicitIntent, canSuggest }) {
+async function generateChatDecision({ config, profile, mode, history, userMessage, currentTrack, baseMood, explicitIntent, canSuggest, memoryContext = {}, turnAction = null }) {
   const fallback = () => ({
-    chatText: fallbackFriendChat(userMessage, baseMood),
-    shouldRecommend: explicitIntent || (canSuggest && baseMood.shouldRecommend),
+    chatText: fallbackFriendChat(userMessage, baseMood, turnAction),
+    shouldRecommend: false,
     mood: baseMood.mood,
     energy: baseMood.energy,
-    intent: explicitIntent ? 'music' : 'chat',
+    intent: 'chat',
     searchHints: baseMood.searchHints,
     reason: baseMood.reason,
     newMode: null
   });
   if (!config?.llm?.baseUrl) return fallback();
+  const currentTrackContext = getCurrentTrackPromptContext(userMessage, currentTrack);
 
-  const raw = await generateChatCompletion(config.llm, [
+  const messages = [
     {
       role: 'system',
       content: [
         '你是私人电台 DJ 灿灿，也像熟悉的朋友。',
         '先自然回应听众，不要每句话都转去推荐音乐。',
-        '只有明确音乐请求，或情绪稳定到适合接一首歌时，才 shouldRecommend=true。',
-        '输出 JSON：{"chatText":"40-120字自然回复","shouldRecommend":boolean,"mood":"comfort|melancholy|calm|healing|focus|energy|romantic|nostalgic|night|random","energy":"low|medium|high","intent":"chat|music|mood","searchHints":["2-6字关键词"],"reason":"简短理由","mode":null或"reset"或偏好名}'
+        '当前歌曲只用于判断是否已有音乐在播放；除非听众主动问当前歌曲、歌词、歌名或艺人，不要提及歌名、艺人、歌词或“正在播放”。',
+        turnActionInstruction(turnAction),
+        '输出 JSON：{"chatText":"40-120字自然回复","mood":"comfort|melancholy|calm|healing|focus|energy|romantic|nostalgic|night|random","energy":"low|medium|high","intent":"chat|mood","searchHints":["2-6字关键词"],"reason":"简短理由","mode":null或"reset"或偏好名}'
       ].join('\n')
     },
     {
@@ -261,7 +443,11 @@ async function generateChatDecision({ config, profile, mode, history, userMessag
       content: [
         `听众画像：${profile.summary || ''}`,
         `当前模式：${mode?.genre || '无'}`,
-        `当前歌曲：${currentTrack?.name || '无'}`,
+        `当前歌曲：${currentTrackContext}`,
+        memoryContext.promptText || '相关长期记忆：无',
+        memoryContext.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
+        `当前动作：${turnAction?.action || TURN_ACTIONS.CHAT_ONLY}`,
+        `动作理由：${turnAction?.reason || ''}`,
         `启发式情绪：${JSON.stringify(baseMood)}`,
         `允许主动推荐：${canSuggest}`,
         `明确音乐意图：${explicitIntent}`,
@@ -269,19 +455,35 @@ async function generateChatDecision({ config, profile, mode, history, userMessag
         `听众刚说：${userMessage}`
       ].join('\n')
     }
-  ], () => JSON.stringify(fallback()));
+  ];
+
+  const raw = await withTimeout(
+    generateChatCompletion(config.llm, messages, () => JSON.stringify(fallback())),
+    CHAT_LLM_TIMEOUT_MS,
+    JSON.stringify(fallback())
+  );
 
   try {
     const parsed = JSON.parse(String(raw).replace(/^```json|```$/g, '').trim());
     const normalized = normalizeMoodDecision(parsed);
     return {
       ...normalized,
+      shouldRecommend: false,
       chatText: String(parsed.chatText || fallback().chatText).trim(),
       newMode: parsed.mode === 'reset' ? {} : (parsed.mode && typeof parsed.mode === 'string' ? { genre: parsed.mode, note: '用户指定' } : null)
     };
   } catch {
     return fallback();
   }
+}
+
+function getCurrentTrackPromptContext(userMessage, currentTrack) {
+  if (!currentTrack?.name) return '无';
+  const text = String(userMessage || '');
+  if (/当前.*(歌|音乐)|现在.*(放|播|听).*什么|这首歌|歌名|谁唱|歌词|艺人|专辑/.test(text)) {
+    return `${currentTrack.name} - ${(currentTrack.artists || []).join('、') || '未知艺人'}`;
+  }
+  return '有歌正在播放（不要主动提及歌名、艺人、歌词或正在播放）';
 }
 
 function normalizeMoodDecision(input = {}) {
@@ -297,11 +499,54 @@ function normalizeMoodDecision(input = {}) {
   };
 }
 
-function fallbackFriendChat(userMessage, mood) {
+function fallbackFriendChat(userMessage, mood, turnAction = null) {
+  if (turnAction?.action === TURN_ACTIONS.ASK_FOLLOWUP) return '我听见你在说自己的事。先不急着切到音乐，跟我多说一点吧：这件事对你来说，最明显的感受是什么？';
+  if (turnAction?.action === TURN_ACTIONS.SOFT_OFFER_MUSIC) return '我先陪你把话说完。要是你等会儿想让音乐接住这个情绪，我可以再给你找一首合适的。';
+  if (turnAction?.action === TURN_ACTIONS.CLARIFY_INTENT) return '我有点不确定你是想继续聊，还是想让我现在放一首歌。你可以直接跟我说。';
   if (mood?.mood === 'comfort') return '听起来你现在挺不好受的。先别急着把自己讲清楚，我在这儿陪你缓一缓；要是你愿意，也可以慢慢跟我说发生了什么。';
   if (mood?.mood === 'night') return '夜里人的情绪会被放大一点。你不用马上睡着，先把呼吸放慢，我陪你把这一会儿安静地过过去。';
   if (mood?.mood === 'energy') return '我听出来你想把状态拉起来一点。先把肩膀松一下，我们一点点把节奏找回来。';
   return userMessage ? '我听着呢。你可以继续说，不用急着转到音乐；我会跟着你的状态，觉得合适的时候再接一首歌。' : '我在。想聊什么都可以。';
+}
+
+function turnActionInstruction(turnAction = {}) {
+  const action = turnAction?.action || TURN_ACTIONS.CHAT_ONLY;
+  if (action === TURN_ACTIONS.ASK_FOLLOWUP) {
+    return '当前动作是 ASK_FOLLOWUP。禁止推荐歌曲，禁止说“有首歌适合你”。请围绕用户本人回应，并自然追问一个问题。';
+  }
+  if (action === TURN_ACTIONS.SOFT_OFFER_MUSIC) {
+    return '当前动作是 SOFT_OFFER_MUSIC。禁止自动播放或指定具体歌曲。可以温柔地说如果用户愿意，稍后可以放一首。';
+  }
+  if (action === TURN_ACTIONS.CLARIFY_INTENT) {
+    return '当前动作是 CLARIFY_INTENT。禁止推荐歌曲。请简短确认用户是想聊天还是想听歌。';
+  }
+  if (action === TURN_ACTIONS.CONTINUE_CURRENT_SONG) {
+    return '当前动作是 CONTINUE_CURRENT_SONG。禁止推荐新歌。请回应播放控制或继续陪聊。';
+  }
+  return '当前动作是 CHAT_ONLY。禁止推荐歌曲，禁止说“有首歌适合你”，像朋友一样自然回应。';
+}
+
+function extractActionSearchHints(text, mode = {}) {
+  const hints = [];
+  if (mode?.genre) hints.push(mode.genre);
+  const value = String(text || '').replace(/下一首|换一首|换歌|切歌|播放|放一首|来一首|来首|来点|想听|推荐|给我|有没有|听/g, ' ');
+  for (const token of value.split(/[，。,.!！?？、\s]+/)) {
+    const clean = token.trim();
+    if (clean.length >= 2 && clean.length <= 12) hints.push(clean);
+  }
+  return [...new Set(hints)].slice(0, 5);
+}
+
+function withTimeout(promise, ms, fallbackValue) {
+  let timer = null;
+  return Promise.race([
+    promise,
+    new Promise((resolve) => {
+      timer = setTimeout(() => resolve(fallbackValue), ms);
+    })
+  ]).finally(() => {
+    if (timer) clearTimeout(timer);
+  });
 }
 
 export async function buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, userMessage = '', conversationMood = null) {
@@ -361,6 +606,100 @@ async function buildSearchCandidates(db, userMessage, config, playedIds, convers
     } catch {}
   }));
   return candidates;
+}
+
+function scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText, conversationMood }) {
+  if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return;
+  void extractAndStoreMemories({ db, config, sessionId, userMessage, assistantText, conversationMood }).catch(() => {});
+}
+
+export async function extractAndStoreMemories({ db, config, sessionId, userMessage, assistantText = '', conversationMood = null }) {
+  if (!String(userMessage || '').trim()) return [];
+  const existing = retrieveRelevantMemories(db, {
+    text: userMessage,
+    mood: conversationMood,
+    limit: 6,
+    maxChars: 600
+  });
+  const raw = await generateChatCompletion(config.llm, [
+    {
+      role: 'system',
+      content: [
+        '你是私人电台 DJ 灿灿的长期记忆提炼器。',
+        '只提炼值得长期记住、以后能帮助灿灿像朋友一样理解用户的内容。',
+        '不要把一次性情绪误判为长期状态；不要记录敏感细节，除非用户明确表达希望被记住。',
+        '如果用户纠正了旧印象或表达不希望某种方式，提炼为 boundary。',
+        '只输出严格 JSON 数组，不要 Markdown。',
+        '每项 schema: {"kind":"emotion_pattern|need|preference|boundary|life_context|music_preference","content":"20-80字中文短句","tags":["2-6个短标签"],"confidence":0-1,"importance":0-1}',
+        '如果没有值得记住的内容，输出 []。'
+      ].join('\n')
+    },
+    {
+      role: 'user',
+      content: [
+        existing.length ? `已有相关记忆：\n${formatMemoryLines(existing)}` : '已有相关记忆：无',
+        conversationMood ? `当前情绪判断：${JSON.stringify(conversationMood)}` : '当前情绪判断：无',
+        `用户刚说：${userMessage}`,
+        `灿灿刚回应：${assistantText}`
+      ].join('\n')
+    }
+  ], () => '[]');
+
+  const parsed = parseJsonArray(raw);
+  if (!Array.isArray(parsed)) return [];
+  const saved = [];
+  for (const item of parsed.slice(0, 5)) {
+    try {
+      if (!memoryKinds.has(item?.kind)) continue;
+      const content = String(item.content || '').trim();
+      if (content.length < 8) continue;
+      saved.push(recordOrMergeUserMemory(db, {
+        kind: item.kind,
+        content: content.slice(0, 140),
+        tags: Array.isArray(item.tags) ? item.tags : [],
+        confidence: item.confidence,
+        importance: item.importance,
+        sourceSessionId: sessionId
+      }));
+    } catch {}
+  }
+  return saved;
+}
+
+export function buildMemoryContext({ sessionSummary = '', longTermMemories = [] } = {}) {
+  const promptText = longTermMemories.length
+    ? `相关长期记忆：\n${formatMemoryLines(longTermMemories, LONG_MEMORY_MAX_CHARS)}`
+    : '相关长期记忆：无';
+  return {
+    sessionSummary: String(sessionSummary || '').trim(),
+    longTermMemories,
+    promptText
+  };
+}
+
+function formatMemoryLines(memories, maxChars = LONG_MEMORY_MAX_CHARS) {
+  const lines = [];
+  let chars = 0;
+  for (const memory of memories || []) {
+    const line = `- [${memory.kind}] ${memory.content}`;
+    if (lines.length && chars + line.length > maxChars) break;
+    lines.push(line);
+    chars += line.length;
+  }
+  return lines.join('\n');
+}
+
+function parseJsonArray(text) {
+  const value = String(text || '').trim().replace(/^```json\s*/i, '').replace(/^```\s*/i, '').replace(/\s*```$/i, '');
+  const start = value.indexOf('[');
+  const end = value.lastIndexOf(']');
+  if (start < 0 || end <= start) return [];
+  try {
+    const parsed = JSON.parse(value.slice(start, end + 1));
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
 }
 
 function makeCandidate(track, source, sourceReason = '') {
@@ -623,7 +962,7 @@ async function discover(profile, weather, timeOfDay, hour, playedIds, config, mo
   return results;
 }
 
-async function callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null }) {
+async function callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {} }) {
   const pool = candidates.slice(0, CANDIDATE_LIMIT);
   const tracks = pool.map(candidate => candidate.track || candidate);
   const extraCount = pool.filter(candidate => candidate.source === 'community_search').length;
@@ -650,6 +989,8 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
     '',
     `此刻：${timeOfDay} ${hour}点，${weather}`,
     `听众画像：${profile.summary}`,
+    memoryContext.promptText || '相关长期记忆：无',
+    memoryContext.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
     modeText,
     prefNote,
     genreNote,

@@ -7,7 +7,7 @@ import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
 import { openDatabase, seedDemoLibrary, getSetting, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { getLibrary, getProfile, syncLibrary, updateProfile } from './library.mjs';
-import { chatRadio, nextRadioItem, reportPlay, startRadio, submitFeedback } from './radio.mjs';
+import { chatRadio, getMemories, nextRadioItem, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
 import { loadCookie } from './community.mjs';
@@ -75,6 +75,8 @@ const routes = {
     const body = await readJson(req);
     return submitFeedback({ db, payload: body });
   },
+  'GET /api/memories': async () => getMemories({ db }),
+  'DELETE /api/memories': async () => removeAllMemories({ db }),
   'POST /api/player/play': async (req) => {
     const body = await readJson(req);
     if (!body.trackId) return jsonError('trackId is required', 400);
@@ -136,7 +138,11 @@ async function tryRefreshToken(db, netease) {
 const server = http.createServer(async (req, res) => {
   try {
     if (req.url.startsWith('/api/tts/')) return serveTts(req, res);
-    const key = `${req.method} ${new URL(req.url, 'http://local').pathname}`;
+    const pathname = new URL(req.url, 'http://local').pathname;
+    if (req.method === 'DELETE' && /^\/api\/memories\/\d+$/.test(pathname)) {
+      return sendJson(res, removeMemory({ db, id: pathname.split('/').pop() }));
+    }
+    const key = `${req.method} ${pathname}`;
     if (routes[key]) {
       const result = await routes[key](req, res);
       if (result?.__error) return sendJson(res, result, result.status);

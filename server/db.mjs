@@ -121,6 +121,20 @@ function migrate(db) {
       skips INTEGER NOT NULL DEFAULT 0,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS user_memories (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      kind TEXT NOT NULL,
+      content TEXT NOT NULL,
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      confidence REAL NOT NULL DEFAULT 0.5,
+      importance REAL NOT NULL DEFAULT 0.5,
+      evidence_count INTEGER NOT NULL DEFAULT 1,
+      source_session_id TEXT,
+      first_seen_at TEXT NOT NULL,
+      last_seen_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 }
 
@@ -209,9 +223,222 @@ export function getFeedbackSummaryMap(db, trackIds) {
   return new Map(rows.map((row) => [String(row.trackId), row]));
 }
 
+export const memoryKinds = new Set([
+  'emotion_pattern',
+  'need',
+  'preference',
+  'boundary',
+  'life_context',
+  'music_preference'
+]);
+
+export function recordOrMergeUserMemory(db, {
+  kind,
+  content,
+  tags = [],
+  confidence = 0.5,
+  importance = 0.5,
+  sourceSessionId = null
+} = {}) {
+  const normalizedKind = memoryKinds.has(kind) ? kind : null;
+  const normalizedContent = String(content || '').trim();
+  if (!normalizedKind) throw new Error('invalid memory kind');
+  if (!normalizedContent) throw new Error('memory content is required');
+
+  const cleanTags = normalizeTags(tags);
+  const now = nowIso();
+  const existing = findMergeCandidate(db, normalizedKind, normalizedContent, cleanTags);
+
+  if (existing) {
+    const mergedTags = [...new Set([...safeJson(existing.tagsJson, []), ...cleanTags])].slice(0, 12);
+    const evidenceCount = Number(existing.evidenceCount || 0) + 1;
+    const nextConfidence = clamp01(Math.max(Number(existing.confidence) || 0, Number(confidence) || 0) + 0.05);
+    const nextImportance = clamp01(Math.max(Number(existing.importance) || 0, Number(importance) || 0));
+    db.prepare(`
+      UPDATE user_memories
+      SET content = ?, tags_json = ?, confidence = ?, importance = ?,
+          evidence_count = ?, last_seen_at = ?, updated_at = ?
+      WHERE id = ?
+    `).run(
+      preferMemoryContent(existing.content, normalizedContent),
+      JSON.stringify(mergedTags),
+      nextConfidence,
+      nextImportance,
+      evidenceCount,
+      now,
+      now,
+      existing.id
+    );
+    return getUserMemory(db, existing.id);
+  }
+
+  const result = db.prepare(`
+    INSERT INTO user_memories (
+      kind, content, tags_json, confidence, importance, evidence_count,
+      source_session_id, first_seen_at, last_seen_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    normalizedKind,
+    normalizedContent,
+    JSON.stringify(cleanTags),
+    clamp01(confidence),
+    clamp01(importance),
+    1,
+    sourceSessionId ? String(sourceSessionId) : null,
+    now,
+    now,
+    now
+  );
+  return getUserMemory(db, result.lastInsertRowid);
+}
+
+export function listUserMemories(db, limit = 200) {
+  return db.prepare(`
+    SELECT id, kind, content, tags_json AS tagsJson, confidence, importance,
+           evidence_count AS evidenceCount, source_session_id AS sourceSessionId,
+           first_seen_at AS firstSeenAt, last_seen_at AS lastSeenAt, updated_at AS updatedAt
+    FROM user_memories
+    ORDER BY importance DESC, confidence DESC, updated_at DESC
+    LIMIT ?
+  `).all(Math.max(1, Number(limit) || 200)).map(hydrateMemoryRow);
+}
+
+export function getUserMemory(db, id) {
+  const row = db.prepare(`
+    SELECT id, kind, content, tags_json AS tagsJson, confidence, importance,
+           evidence_count AS evidenceCount, source_session_id AS sourceSessionId,
+           first_seen_at AS firstSeenAt, last_seen_at AS lastSeenAt, updated_at AS updatedAt
+    FROM user_memories
+    WHERE id = ?
+  `).get(Number(id));
+  return row ? hydrateMemoryRow(row) : null;
+}
+
+export function deleteUserMemory(db, id) {
+  const result = db.prepare('DELETE FROM user_memories WHERE id = ?').run(Number(id));
+  return { ok: true, deleted: result.changes || 0 };
+}
+
+export function clearUserMemories(db) {
+  const result = db.prepare('DELETE FROM user_memories').run();
+  return { ok: true, deleted: result.changes || 0 };
+}
+
+export function retrieveRelevantMemories(db, {
+  text = '',
+  mood = null,
+  mode = null,
+  limit = 8,
+  maxChars = 800
+} = {}) {
+  const memories = listUserMemories(db, 300);
+  if (!memories.length) return [];
+  const queryTerms = extractMemoryTerms([text, mood?.mood, ...(mood?.searchHints || []), mode?.genre].filter(Boolean).join(' '));
+  const scored = memories.map((memory) => ({
+    memory,
+    score: scoreMemory(memory, queryTerms)
+  }));
+  const ranked = scored
+    .filter(item => queryTerms.length ? item.score > 0.1 : item.score > 0)
+    .sort((a, b) => b.score - a.score || b.memory.updatedAt.localeCompare(a.memory.updatedAt));
+
+  const selected = [];
+  let chars = 0;
+  for (const { memory } of ranked) {
+    const lineLength = memory.content.length + memory.kind.length + 8;
+    if (selected.length >= limit) break;
+    if (selected.length && chars + lineLength > maxChars) break;
+    selected.push(memory);
+    chars += lineLength;
+  }
+  return selected;
+}
+
 export function setSessionMode(db, sessionId, mode) {
   db.prepare('UPDATE radio_sessions SET mode_json = ? WHERE id = ?')
     .run(JSON.stringify(mode || {}), sessionId);
+}
+
+function findMergeCandidate(db, kind, content, tags) {
+  const rows = db.prepare(`
+    SELECT id, kind, content, tags_json AS tagsJson, confidence, importance,
+           evidence_count AS evidenceCount
+    FROM user_memories
+    WHERE kind = ?
+    ORDER BY updated_at DESC
+    LIMIT 100
+  `).all(kind);
+  const normalizedContent = normalizeMemoryText(content);
+  let best = null;
+  let bestScore = 0;
+  for (const row of rows) {
+    const existingTags = safeJson(row.tagsJson, []);
+    const score = memorySimilarity(normalizedContent, normalizeMemoryText(row.content), tags, existingTags);
+    if (score > bestScore) {
+      best = row;
+      bestScore = score;
+    }
+  }
+  return bestScore >= 0.62 ? best : null;
+}
+
+function memorySimilarity(a, b, tagsA, tagsB) {
+  if (!a || !b) return 0;
+  if (a === b) return 1;
+  const contentScore = a.includes(b) || b.includes(a) ? 0.7 : 0;
+  const setA = new Set(tagsA.map(tag => tag.toLowerCase()));
+  const setB = new Set(tagsB.map(tag => tag.toLowerCase()));
+  const overlap = [...setA].filter(tag => setB.has(tag)).length;
+  const tagScore = overlap ? overlap / Math.max(setA.size, setB.size, 1) : 0;
+  return Math.max(contentScore, tagScore);
+}
+
+function scoreMemory(memory, terms) {
+  const haystack = `${memory.kind} ${memory.content} ${(memory.tags || []).join(' ')}`.toLowerCase();
+  const matched = terms.filter(term => haystack.includes(term.toLowerCase())).length;
+  const relevance = terms.length ? matched / terms.length : 0.2;
+  const updatedAt = new Date(memory.updatedAt || memory.lastSeenAt || 0).getTime();
+  const ageDays = Number.isFinite(updatedAt) ? Math.max(0, (Date.now() - updatedAt) / 86400000) : 365;
+  const recency = Math.max(0, 1 - ageDays / 90);
+  return relevance * 4 + Number(memory.importance || 0) * 1.5 + Number(memory.confidence || 0) + recency * 0.5;
+}
+
+function extractMemoryTerms(text) {
+  const value = String(text || '').toLowerCase();
+  const words = value.match(/[\u4e00-\u9fff]{2,}|[a-z0-9_-]{3,}/g) || [];
+  return [...new Set(words)].slice(0, 20);
+}
+
+function hydrateMemoryRow(row) {
+  return {
+    ...row,
+    tags: safeJson(row.tagsJson, []),
+    confidence: Number(row.confidence),
+    importance: Number(row.importance),
+    evidenceCount: Number(row.evidenceCount || 0)
+  };
+}
+
+function normalizeTags(tags) {
+  const values = Array.isArray(tags) ? tags : String(tags || '').split(/[,，、\s]+/);
+  return [...new Set(values.map(tag => String(tag || '').trim()).filter(Boolean))].slice(0, 12);
+}
+
+function normalizeMemoryText(text) {
+  return String(text || '').toLowerCase().replace(/\s+/g, '').replace(/[，。,.!！?？、]/g, '');
+}
+
+function preferMemoryContent(existing, incoming) {
+  const a = String(existing || '').trim();
+  const b = String(incoming || '').trim();
+  if (b.length > a.length && b.length <= 120) return b;
+  return a;
+}
+
+function clamp01(value) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return 0.5;
+  return Math.max(0, Math.min(1, Math.round(number * 100) / 100));
 }
 
 export function nowIso() {

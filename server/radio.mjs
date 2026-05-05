@@ -1,7 +1,15 @@
 // Radio routes — thin wrappers over the conversational DJ engine
 import crypto from 'node:crypto';
 import { chatTurn, djTurn } from './dj.mjs';
-import { nowIso, recordTrackFeedback } from './db.mjs';
+import {
+  clearUserMemories,
+  deleteUserMemory,
+  getTrackById,
+  listUserMemories,
+  nowIso,
+  recordOrMergeUserMemory,
+  recordTrackFeedback
+} from './db.mjs';
 
 export async function startRadio({ db, config, netease }) {
   const sessionId = crypto.randomUUID();
@@ -31,20 +39,39 @@ export async function reportPlay({ db, netease, payload }) {
 
 export function submitFeedback({ db, payload }) {
   try {
+    const feedback = recordTrackFeedback(db, {
+      trackId: payload.trackId || payload.songId,
+      eventType: payload.eventType,
+      sessionId: payload.sessionId,
+      elapsedMs: payload.elapsedMs,
+      durationMs: payload.durationMs,
+      source: payload.source
+    });
+    maybeRecordFeedbackMemory(db, {
+      trackId: payload.trackId || payload.songId,
+      eventType: payload.eventType,
+      sessionId: payload.sessionId,
+      feedback
+    });
     return {
       ok: true,
-      feedback: recordTrackFeedback(db, {
-        trackId: payload.trackId || payload.songId,
-        eventType: payload.eventType,
-        sessionId: payload.sessionId,
-        elapsedMs: payload.elapsedMs,
-        durationMs: payload.durationMs,
-        source: payload.source
-      })
+      feedback
     };
   } catch (error) {
     return { __error: true, ok: false, error: error.message, status: 400 };
   }
+}
+
+export function getMemories({ db }) {
+  return { ok: true, memories: listUserMemories(db) };
+}
+
+export function removeMemory({ db, id }) {
+  return deleteUserMemory(db, id);
+}
+
+export function removeAllMemories({ db }) {
+  return clearUserMemories(db);
 }
 
 export function getUserPrefs(db) {
@@ -57,4 +84,48 @@ export function getUserPrefs(db) {
 export function setUserPrefs(db, prefs) {
   db.prepare('INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at')
     .run('user_preferences', JSON.stringify(prefs), nowIso());
+}
+
+function maybeRecordFeedbackMemory(db, { trackId, eventType, sessionId, feedback }) {
+  const type = String(eventType || '');
+  const likes = Number(feedback?.likes || 0);
+  const dislikes = Number(feedback?.dislikes || 0);
+  const skips = Number(feedback?.skips || 0);
+  const completions = Number(feedback?.completions || 0);
+  const track = getTrackById(db, trackId);
+  const title = track?.name ? `《${track.name}》` : '这类歌曲';
+  const artists = track?.artists?.length ? `（${track.artists.join('、')}）` : '';
+
+  try {
+    if (type === 'like' && likes >= 3) {
+      recordOrMergeUserMemory(db, {
+        kind: 'music_preference',
+        content: `用户多次喜欢 ${title}${artists}，后续可把相近气质的歌曲作为安全推荐方向。`,
+        tags: ['喜欢', track?.name, ...(track?.artists || [])].filter(Boolean),
+        confidence: 0.72,
+        importance: 0.62,
+        sourceSessionId: sessionId
+      });
+    } else if (type === 'complete' && completions >= 4) {
+      recordOrMergeUserMemory(db, {
+        kind: 'music_preference',
+        content: `用户多次完整听完 ${title}${artists}，这类歌曲可作为较稳妥的陪伴选择。`,
+        tags: ['完整听完', track?.name, ...(track?.artists || [])].filter(Boolean),
+        confidence: 0.65,
+        importance: 0.55,
+        sourceSessionId: sessionId
+      });
+    } else if ((type === 'skip' && skips >= 3) || (type === 'dislike' && dislikes >= 2)) {
+      recordOrMergeUserMemory(db, {
+        kind: 'music_preference',
+        content: `用户多次跳过或不喜欢 ${title}${artists}，后续推荐相近歌曲时要谨慎。`,
+        tags: ['跳过', '不喜欢', track?.name, ...(track?.artists || [])].filter(Boolean),
+        confidence: 0.7,
+        importance: 0.68,
+        sourceSessionId: sessionId
+      });
+    }
+  } catch {
+    // Feedback must never fail because a memory could not be written.
+  }
 }

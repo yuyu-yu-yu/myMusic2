@@ -159,6 +159,12 @@ button:hover {
   color: #fff;
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+  box-shadow: none;
+}
+
 button:active,
 button.btn-pressed {
   animation: btn-press 0.2s ease;
@@ -206,6 +212,16 @@ button.ghost:active,
 button.ghost.btn-pressed {
   animation: btn-press 0.2s ease;
   color: var(--magenta);
+}
+
+button.danger {
+  color: #ff6b8a;
+}
+
+button.danger:hover {
+  border-color: #ff6b8a;
+  box-shadow: 0 0 10px rgba(255, 107, 138, 0.28);
+  color: #fff;
 }
 
 .topbar {
@@ -824,6 +840,12 @@ audio {
   font-weight: 600;
 }
 
+.tag.subtle {
+  color: var(--cyan);
+  background: rgba(0, 240, 255, 0.08);
+  border: 1px solid var(--line);
+}
+
 .diary-card {
   padding: 18px 0;
   border-bottom: 1px solid var(--line);
@@ -854,6 +876,62 @@ audio {
   flex-wrap: wrap;
   gap: 10px;
   align-items: center;
+}
+
+.memory-panel {
+  margin-top: 16px;
+}
+
+.panel-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.panel-header h2 {
+  margin: 0;
+}
+
+.memory-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 16px;
+}
+
+.memory-item {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: rgba(18, 18, 42, 0.55);
+}
+
+.memory-main {
+  min-width: 0;
+}
+
+.memory-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+
+.memory-item p {
+  margin: 10px 0;
+  line-height: 1.65;
+}
+
+.memory-time {
+  font-size: 12px;
+}
+
+.memory-empty {
+  margin: 0;
 }
 
 .qr-img {
