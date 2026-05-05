@@ -315,7 +315,7 @@ test('chat decision prompt receives relevant long-term memory without selecting 
   assert.equal(result.intent, 'chat');
   const promptText = JSON.stringify(requests[0].messages);
   assert.match(promptText, /用户深夜睡不着时更需要先被陪伴/);
-  assert.match(promptText, /先倾听和陪伴/);
+  assert.match(promptText, /情绪可能不太好/);
 });
 
 test('memory extraction failure does not block or write invalid memories', async (t) => {
@@ -368,7 +368,7 @@ test('safety valve: emotional distress without music intent stays in accompany m
   // Safety valve mode: buildLightPool makes no API calls, so the only request is callDJ
   const promptText = JSON.stringify(requests[0].messages);
   assert.match(promptText, /你是灿灿/);
-  assert.match(promptText, /先倾听和陪伴/);
+  assert.match(promptText, /情绪可能不太好/);
 });
 
 test('safety valve: explicit music rejection stays in chat-only mode', async (t) => {
@@ -457,7 +457,7 @@ test('unified chat: empty message triggers auto-continue recommendation', async 
 
   assert.equal(result.track, null);
   const promptText = JSON.stringify(requests[0].messages);
-  assert.match(promptText, /自然推荐下一首/);
+  assert.match(promptText, /pick 填数字/);
 });
 
 test('unified chat: explicit music request goes through full candidate search', async (t) => {
@@ -487,7 +487,7 @@ test('unified chat: explicit music request goes through full candidate search', 
   assert.equal(result.intent, 'chat');
   const promptText = JSON.stringify(requests[0].messages);
   // Should NOT have safety note (not emotional, not rejection)
-  assert.doesNotMatch(promptText, /先倾听和陪伴/);
+  assert.doesNotMatch(promptText, /情绪可能不太好/);
   assert.doesNotMatch(promptText, /不想听歌/);
 });
 
