@@ -298,7 +298,7 @@ export function listUserMemories(db, limit = 200) {
            evidence_count AS evidenceCount, source_session_id AS sourceSessionId,
            first_seen_at AS firstSeenAt, last_seen_at AS lastSeenAt, updated_at AS updatedAt
     FROM user_memories
-    ORDER BY importance DESC, confidence DESC, updated_at DESC
+    ORDER BY updated_at DESC, importance DESC, confidence DESC
     LIMIT ?
   `).all(Math.max(1, Number(limit) || 200)).map(hydrateMemoryRow);
 }

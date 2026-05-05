@@ -55,7 +55,9 @@ export function submitFeedback({ db, payload }) {
     });
     return {
       ok: true,
-      feedback
+      feedback,
+      feedbackSummary: getFeedbackSummary(db),
+      memories: listUserMemories(db, 8)
     };
   } catch (error) {
     return { __error: true, ok: false, error: error.message, status: 400 };
@@ -63,7 +65,12 @@ export function submitFeedback({ db, payload }) {
 }
 
 export function getMemories({ db }) {
-  return { ok: true, memories: listUserMemories(db) };
+  const memories = listUserMemories(db);
+  return {
+    ok: true,
+    memories,
+    updatedAt: memories[0]?.updatedAt || null
+  };
 }
 
 export function removeMemory({ db, id }) {
@@ -116,25 +123,44 @@ function normalizePreferences(raw = {}) {
 }
 
 function getFeedbackSummary(db) {
+  const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   const totals = db.prepare(`
     SELECT
-      COALESCE(SUM(likes), 0) AS likes,
-      COALESCE(SUM(dislikes), 0) AS dislikes,
-      COALESCE(SUM(completions), 0) AS completions,
-      COALESCE(SUM(skips), 0) AS skips
-    FROM track_feedback_summary
-  `).get();
+      COALESCE(SUM(CASE WHEN event_type = 'like' THEN 1 ELSE 0 END), 0) AS likes,
+      COALESCE(SUM(CASE WHEN event_type = 'dislike' THEN 1 ELSE 0 END), 0) AS dislikes,
+      COALESCE(SUM(CASE WHEN event_type = 'complete' THEN 1 ELSE 0 END), 0) AS completions,
+      COALESCE(SUM(CASE WHEN event_type = 'skip' THEN 1 ELSE 0 END), 0) AS skips,
+      COUNT(*) AS events,
+      MAX(created_at) AS updatedAt
+    FROM track_feedback_events
+    WHERE created_at >= ?
+  `).get(cutoff);
   const topRows = db.prepare(`
-    SELECT s.track_id AS trackId, s.likes, s.dislikes, s.completions, s.skips,
+    SELECT e.track_id AS trackId,
+           COALESCE(SUM(CASE WHEN e.event_type = 'like' THEN 1 ELSE 0 END), 0) AS likes,
+           COALESCE(SUM(CASE WHEN e.event_type = 'dislike' THEN 1 ELSE 0 END), 0) AS dislikes,
+           COALESCE(SUM(CASE WHEN e.event_type = 'complete' THEN 1 ELSE 0 END), 0) AS completions,
+           COALESCE(SUM(CASE WHEN e.event_type = 'skip' THEN 1 ELSE 0 END), 0) AS skips,
+           MAX(e.created_at) AS updatedAt,
            t.name, t.artists, t.cover_url AS coverUrl
-    FROM track_feedback_summary s
-    LEFT JOIN tracks t ON t.id = s.track_id
-    ORDER BY (s.likes * 3 + s.completions - s.dislikes * 2 - s.skips) DESC,
-             s.updated_at DESC
+    FROM track_feedback_events e
+    LEFT JOIN tracks t ON t.id = e.track_id
+    WHERE e.created_at >= ?
+    GROUP BY e.track_id
+    ORDER BY (likes * 3 + completions - dislikes * 2 - skips) DESC,
+             updatedAt DESC
     LIMIT 8
-  `).all();
+  `).all(cutoff);
   return {
-    totals,
+    totals: {
+      likes: Number(totals?.likes || 0),
+      dislikes: Number(totals?.dislikes || 0),
+      completions: Number(totals?.completions || 0),
+      skips: Number(totals?.skips || 0),
+      events: Number(totals?.events || 0),
+      updatedAt: totals?.updatedAt || null
+    },
+    windowDays: 30,
     tracks: topRows.map((row) => ({
       ...row,
       artists: safeJson(row.artists, [])

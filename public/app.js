@@ -10,7 +10,10 @@ const state = {
   lyricLines: [],
   activeLyricIndex: -1,
   avatarState: 'idle',
-  preferences: null
+  preferences: null,
+  feedbackSummary: null,
+  memories: [],
+  mixerRefreshTimer: null
 };
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
@@ -91,6 +94,10 @@ async function render() {
 
   if (location.pathname === '/diary') {
     history.replaceState({}, '', '/mixer');
+  }
+  if (state.mixerRefreshTimer && location.pathname !== '/mixer') {
+    clearInterval(state.mixerRefreshTimer);
+    state.mixerRefreshTimer = null;
   }
 
   document.querySelectorAll('.nav a').forEach((link) => {
@@ -676,6 +683,7 @@ function handleRadioResponse(data) {
     text: data.chatText || data.hostText || '',
     track: data.track
   });
+  scheduleUsageInsightsRefresh(data.track ? 800 : 3200);
 
   // Show/hide mode reset button
   const hasMode = data.mode?.genre;
@@ -989,9 +997,7 @@ async function reportFeedback(eventType) {
   const track = state.current?.track;
   if (!track?.id) return;
   const playback = state.activePlayback?.trackId === track.id ? state.activePlayback : null;
-  const dedupeId = eventType === 'complete' || eventType === 'skip'
-    ? `${track.id}:${eventType}:${playback?.startedAt || 'manual'}`
-    : `${track.id}:${eventType}`;
+  const dedupeId = `${track.id}:${eventType}:${playback?.startedAt || 'manual'}`;
   if (state.feedbackSent.has(dedupeId)) return;
 
   const elapsedMs = playback ? Date.now() - playback.startedAt : 0;
@@ -999,7 +1005,7 @@ async function reportFeedback(eventType) {
   if (eventType === 'complete' && playback) playback.completed = true;
 
   try {
-    await api('/api/feedback', {
+    const result = await api('/api/feedback', {
       method: 'POST',
       body: {
         trackId: track.id,
@@ -1010,6 +1016,7 @@ async function reportFeedback(eventType) {
         source: playback?.source || 'ui'
       }
     });
+    applyUsageInsights(result);
   } catch {
     state.feedbackSent.delete(dedupeId);
   }
@@ -1024,6 +1031,59 @@ function maybeReportInferredComplete() {
   const elapsedMs = Date.now() - playback.startedAt;
   const threshold = playback.durationMs ? playback.durationMs * 0.7 : 180000;
   if (elapsedMs >= threshold) reportFeedback('complete');
+}
+
+function applyUsageInsights(data = {}) {
+  if (data.feedbackSummary) state.feedbackSummary = data.feedbackSummary;
+  if (Array.isArray(data.memories)) state.memories = data.memories;
+  refreshMixerUsagePanels();
+}
+
+async function refreshUsageInsights() {
+  if (location.pathname !== '/mixer') return;
+  try {
+    const [prefData, memoryData] = await Promise.all([
+      api('/api/preferences'),
+      api('/api/memories').catch(() => ({ memories: state.memories || [] }))
+    ]);
+    state.feedbackSummary = prefData.feedbackSummary || state.feedbackSummary || {};
+    state.preferences = prefData.preferences || state.preferences;
+    state.memories = memoryData.memories || state.memories || [];
+    refreshMixerUsagePanels();
+  } catch {
+    // Usage panels should not interrupt playback or chat.
+  }
+}
+
+function scheduleUsageInsightsRefresh(delayMs = 2200) {
+  if (location.pathname !== '/mixer') return;
+  setTimeout(() => refreshUsageInsights(), delayMs);
+}
+
+function startMixerUsageAutoRefresh() {
+  if (state.mixerRefreshTimer) clearInterval(state.mixerRefreshTimer);
+  state.mixerRefreshTimer = setInterval(() => {
+    if (location.pathname !== '/mixer') {
+      clearInterval(state.mixerRefreshTimer);
+      state.mixerRefreshTimer = null;
+      return;
+    }
+    refreshUsageInsights();
+  }, 12000);
+}
+
+function refreshMixerUsagePanels() {
+  const feedback = state.feedbackSummary;
+  const memories = state.memories || [];
+  const feedbackMeterEl = document.querySelector('[data-feedback-meter]');
+  const feedbackTracksEl = document.querySelector('[data-feedback-tracks]');
+  const memoryListEl = document.querySelector('[data-memory-list]');
+
+  if (feedback && feedbackMeterEl) feedbackMeterEl.innerHTML = feedbackMeter(feedback);
+  if (feedback && feedbackTracksEl) feedbackTracksEl.innerHTML = feedbackTracks(feedback);
+  if (memoryListEl) memoryListEl.innerHTML = memories.length
+    ? memories.slice(0, 8).map(memorySummaryItem).join('')
+    : '<p class="muted memory-empty">暂时还没有长期记忆。继续和灿灿聊天后，这里会出现稳定偏好、需求和边界。</p>';
 }
 
 function setHostText(text) {
@@ -1229,6 +1289,8 @@ async function renderMixer() {
   state.preferences = preferences;
   const feedback = prefData.feedbackSummary || {};
   const memories = (memoryData.memories || []).slice(0, 8);
+  state.feedbackSummary = feedback;
+  state.memories = memories;
 
   view.innerHTML = `
     <section class="mixer-hero page-panel">
@@ -1270,8 +1332,10 @@ async function renderMixer() {
               <h2>近期反馈趋势</h2>
             </div>
           </div>
-          ${feedbackMeter(feedback)}
-          <div class="feedback-track-list">
+          <div data-feedback-meter>
+            ${feedbackMeter(feedback)}
+          </div>
+          <div class="feedback-track-list" data-feedback-tracks>
             ${feedbackTracks(feedback)}
           </div>
         </article>
@@ -1283,7 +1347,7 @@ async function renderMixer() {
             </div>
             <a class="ghost-link" href="/settings" data-link>危险操作</a>
           </div>
-          <div class="memory-list compact">
+          <div class="memory-list compact" data-memory-list>
             ${memories.length ? memories.map(memorySummaryItem).join('') : '<p class="muted memory-empty">暂时还没有长期记忆。继续和灿灿聊天后，这里会出现稳定偏好、需求和边界。</p>'}
           </div>
         </article>
@@ -1292,6 +1356,7 @@ async function renderMixer() {
   `;
 
   bindMixerControls(preferences);
+  startMixerUsageAutoRefresh();
 }
 
 async function renderSettings() {
@@ -1659,6 +1724,7 @@ async function loadPreferences({ force = false } = {}) {
     preferencesLoadPromise = api('/api/preferences')
       .then((data) => {
         state.preferences = data.preferences || state.preferences || {};
+        if (data.feedbackSummary) state.feedbackSummary = data.feedbackSummary;
         return state.preferences;
       })
       .finally(() => { preferencesLoadPromise = null; });
