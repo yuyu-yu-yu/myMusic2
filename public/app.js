@@ -586,7 +586,6 @@ async function nextTrack({ skipCurrent = true } = {}) {
 async function sendChat(msg) {
   appendChat({ role: 'user', text: msg });
   startLoadingMessages('chat');
-  setAvatarState('reading');
   try {
     const data = await api('/api/radio/chat', { method: 'POST', body: { sessionId: state.sessionId, message: msg } });
     handleRadioResponse(data);
@@ -626,16 +625,6 @@ function handleRadioResponse(data) {
 
   // Only play if there's a track
   if (!data.track) {
-    if (data.ttsUrl) {
-      const hostAudio = document.querySelector('#host-audio');
-      hostAudio.src = data.ttsUrl;
-      setAvatarState('talking');
-      hostAudio.onended = () => setAvatarState(getContextualAvatarState());
-      hostAudio.onplay = () => { setAvatarState('talking'); switchVisualizerTo('host'); };
-      hostAudio.play().catch(() => setAvatarState(getContextualAvatarState()));
-    } else {
-      setAvatarState(getContextualAvatarState());
-    }
     setPlayerStatus(state.current?.track ? '继续播放中' : '等待中', '');
     return;
   }
