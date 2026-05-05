@@ -1,6 +1,6 @@
 // Community API wrapper - uses NeteaseCloudMusicApi module for play URLs
 import { createRequire } from 'node:module';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 const apiPath = process.env.APPDATA + '\\npm\\node_modules\\NeteaseCloudMusicApi\\main.js';
@@ -83,4 +83,49 @@ export async function getLyric(songId) {
   } catch {
     return null;
   }
+}
+
+export async function generateQrKey() {
+  try {
+    const ts = Date.now();
+    const res = await fetch(`http://127.0.0.1:4000/login/qr/key?timestamp=${ts}`);
+    const json = await res.json();
+    if (json?.data?.unikey) {
+      return {
+        unikey: json.data.unikey,
+        qrUrl: `https://music.163.com/login?codekey=${json.data.unikey}`
+      };
+    }
+  } catch (e) {
+    console.warn('[community] qr key failed:', e.message);
+  }
+  return null;
+}
+
+export async function checkQrStatus(unikey) {
+  try {
+    const ts = Date.now();
+    const res = await fetch(`http://127.0.0.1:4000/login/qr/check?key=${unikey}&timestamp=${ts}`);
+    return await res.json();
+  } catch (e) {
+    console.warn('[community] qr check failed:', e.message);
+    return { code: -1, message: e.message };
+  }
+}
+
+export function saveCookieFromQr(result) {
+  const cookie = result?.cookie;
+  if (!cookie || typeof cookie !== 'string') return false;
+  const match = cookie.match(/MUSIC_U=([^;]+)/);
+  if (!match) return false;
+  const musicU = match[1];
+  const fullCookie = `MUSIC_U=${musicU}`;
+  _cookie = fullCookie;
+  if (_cookiePath) {
+    try {
+      writeFileSync(_cookiePath, fullCookie, 'utf8');
+      console.log('[community] cookie saved from QR login');
+    } catch {}
+  }
+  return true;
 }

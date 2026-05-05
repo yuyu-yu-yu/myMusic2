@@ -10,7 +10,7 @@ import { getLibrary, getProfile, syncLibrary, updateProfile } from './library.mj
 import { chatRadio, getMemories, getPreferences, nextRadioItem, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
-import { loadCookie } from './community.mjs';
+import { loadCookie, generateQrKey, checkQrStatus, saveCookieFromQr } from './community.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 loadEnv(rootDir);
@@ -38,13 +38,19 @@ const cacheDir = path.join(rootDir, 'cache', 'tts');
 const routes = {
   'GET /api/health': async () => ({ ok: true, config: tokenStatus(publicConfigStatus(config)) }),
   'GET /api/config/status': async () => tokenStatus(publicConfigStatus(config)),
-  'POST /api/auth/netease/qrcode': async () => netease.qrcode(),
+  'POST /api/auth/netease/qrcode': async () => {
+    const qr = await generateQrKey();
+    if (!qr) return jsonError('Failed to generate QR code', 500);
+    return { code: 200, data: { qrCodeUrl: qr.qrUrl, qrCodeKey: qr.unikey } };
+  },
   'POST /api/auth/netease/qrcode/check': async (req) => {
     const body = await readJson(req);
     const key = body.key || body.qrCodeKey;
     if (!key) return jsonError('qrCodeKey is required', 400);
-    const result = await netease.qrcodeStatus(key);
-    tryNeteaseLogin(db, netease, result);
+    const result = await checkQrStatus(key);
+    if (result?.code === 803) {
+      saveCookieFromQr(result);
+    }
     return result;
   },
   'GET /api/auth/netease/token-status': async () => ({
