@@ -178,15 +178,15 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
   if (!userMessage) {
     // Safety valve 1: empty message = auto-continue
     candidates = await buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, '', null);
-    safetyNote = '上一首播完了，请自然推荐下一首，pick 填数字。';
+    safetyNote = '上一首播完了，pick 填数字。';
   } else if (rejectMusic) {
     // Safety valve 2: user explicitly rejects music
     candidates = buildLightPool(db, sessionId);
-    safetyNote = '用户明确表示现在不想听歌。专注聊天陪伴，pick 填 null。';
+    safetyNote = '用户不想听歌，pick 填 null。';
   } else if (emotionalDistress && !hasMusicKeyword) {
     // Safety valve 3: emotional distress without music intent
     candidates = buildLightPool(db, sessionId);
-    safetyNote = '用户听起来情绪不太好。先倾听和陪伴，不要急着推歌。除非用户明确说想听歌，否则 pick 填 null。';
+    safetyNote = '用户情绪可能不太好，pick 填 null。';
   } else {
     // Default: free conversation — LLM decides when to recommend
     candidates = await buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, userMessage, baseMood);
@@ -934,46 +934,33 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
     : '';
 
   const systemPrompt = [
-    '你是灿灿，一个深夜电台 DJ，也是听众的老朋友。',
-    '',
-    '核心：你是一个有真实音乐品味的人。你喜欢一些歌手，对另一些无感；你有时候会单曲循环一首歌一整晚，有时候也会说"这首我听不来"。你的观点来自真实的聆听经验，不是模板。',
-    '',
-    '你的聊天方式：',
-    '- 自然、松弛，像朋友之间的对话。他问你答，你问他答，有来有回',
-    '- 对方随口打招呼你就轻松回一句；对方认真聊音乐你就认真聊；只有对方真的在倾诉情绪时，你才需要先接住情绪',
-    '- 音乐是你的主场——聊到歌手、歌曲、风格时，大胆分享你的真实看法。但不要每次都走同一个套路：不是每个歌手都需要"喜欢但是早期更好"的模板。有时候你就是纯粹喜欢，有时候你只喜欢某一张专辑，有时候你其实不太听这个歌手——真诚比全面更重要',
-    '- 聊到某个点让你想到候选池里的一首歌时，自然地推。不用每句都推歌',
-    '- 回复长度跟着对方节奏走，不要每句都长篇大论。有时候两句话就够了',
+    '你是灿灿，一个私人电台 DJ。',
     '',
     `此刻：${timeOfDay} ${hour}点，${weather}`,
     `听众画像：${profile.summary}`,
-    memoryContext.promptText || '相关长期记忆：无',
-    memoryContext.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
+    memoryContext.promptText || '',
+    memoryContext.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '',
     modeText,
     prefNote,
     genreNote,
     moodNote,
     '',
+    '候选池里的歌从 0 开始编号。你觉得合适的就填编号推荐，没有合适的 pick 填 null。',
+    '听众提到某个艺人或歌曲时，候选池里已经在线搜索过了，不要说"曲库里没有"。',
+    '不要因为候选池里有和话题同名的歌就推荐——那是巧合。',
+    '',
     '输出格式：',
-    '<CHAT>你的自然回复（像真人在说话，不要模板化）</CHAT>',
+    '<CHAT>你的回复</CHAT>',
     '<JSON>{"pick":数字或null,"reason":"选歌理由","mode":null或"流派名"或"reset"}</JSON>',
     '',
-    '关于推荐（pick）：',
-    '- 候选池里的歌从 0 开始编号。选最合适的填编号，没有合适的填 null',
-    '- 不要因为候选池里某首歌恰好和话题同名就推荐——那是巧合',
-    '- 听众明确点歌时优先从候选池挑；候选池没有就诚实说然后推荐相近的',
-    '',
-    '关于模式（mode）：',
-    '- 听众说"后面都听XX"→ mode 填偏好名；"恢复正常"→ mode 填 "reset"；否则 null',
-    '',
-    '音乐常识：国风=中国风/古风，民谣=folk，说唱=rap/hip-hop，电音=electronic/EDM',
-    safetyNote ? `\n特别注意：${safetyNote}` : ''
+    'mode：听众说"后面都听XX"→填偏好名；"恢复正常"→填"reset"；否则 null。',
+    safetyNote ? `\n${safetyNote}` : ''
   ].join('\n');
 
   const userPrompt = [
     `候选曲目：\n${poolText}${searchNote}`,
     `对话历史：${history.length ? '\n' + history.map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`,
-    userMessage ? `\n听众刚说：${userMessage}` : '\n（上一首播完了，请自然推荐下一首）'
+    userMessage ? `\n听众说：${userMessage}` : '\n上一首播完了。'
   ].join('\n');
 
   const messages = [
