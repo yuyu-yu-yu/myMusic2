@@ -587,6 +587,39 @@ test('light chat returns text without selecting a track', async (t) => {
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE session_id = ?').get('chat-session').count, 2);
 });
 
+test('fallback companion chat is longer and avoids clinical follow-up', async (t) => {
+  const db = testDb(t);
+  const result = await chatTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'warm-fallback-chat',
+    message: '疲惫，但有点开心和期待'
+  });
+
+  assert.equal(result.track, null);
+  assert.equal(result.turnAction.action, TURN_ACTIONS.ASK_FOLLOWUP);
+  assert.equal(result.chatText.length >= 80, true);
+  assert.doesNotMatch(result.chatText, /最明显的感受是什么|为什么/);
+  assert.match(result.chatText, /不急|慢慢|陪/);
+});
+
+test('light greeting stays casual instead of over-supportive', async (t) => {
+  const db = testDb(t);
+  const result = await chatTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'light-greeting-chat',
+    message: '你好'
+  });
+
+  assert.equal(result.track, null);
+  assert.equal(result.chatText.length < 70, true);
+  assert.doesNotMatch(result.chatText, /不用.*完整|接住.*情绪|分析/);
+  assert.match(result.chatText, /你好|我在|灿灿/);
+});
+
 test('conversation mood detects comfort needs from recent chat', () => {
   const mood = analyzeConversationMood({
     history: [{ role: 'user', content: '我心情很不好' }],

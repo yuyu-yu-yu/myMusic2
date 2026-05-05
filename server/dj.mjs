@@ -49,6 +49,48 @@ const NON_RECOMMEND_ACTIONS = new Set([
   TURN_ACTIONS.CONTINUE_CURRENT_SONG,
   TURN_ACTIONS.CLARIFY_INTENT
 ]);
+const KNOWN_ARTIST_ALIASES = [
+  ['陈奕迅', ['Eason', 'Eason Chan']],
+  ['周杰伦', ['Jay Chou', 'Jay']],
+  ['林俊杰', ['JJ Lin', 'JJ']],
+  ['薛之谦', []],
+  ['毛不易', []],
+  ['李荣浩', []],
+  ['邓紫棋', ['G.E.M.', 'GEM']],
+  ['张学友', []],
+  ['王菲', []],
+  ['孙燕姿', []],
+  ['五月天', ['Mayday']],
+  ['许嵩', []],
+  ['汪苏泷', []],
+  ['方大同', []],
+  ['陶喆', []],
+  ['梁静茹', []],
+  ['Taylor Swift', []],
+  ['Adele', []],
+  ['Billie Eilish', []],
+  ['Coldplay', []]
+];
+const GENERIC_ARTIST_PHRASES = new Set([
+  '适合写代码',
+  '写代码',
+  '安静',
+  '伤感',
+  '开心',
+  '国风',
+  '古风',
+  '爵士',
+  '摇滚',
+  '民谣',
+  '电子',
+  '电音',
+  '英文',
+  '中文',
+  '日语',
+  '纯音乐',
+  '慢歌',
+  '快歌'
+].map(normalizeMusicText));
 
 export async function djTurn({ db, config, netease, sessionId, userMessage, conversationMood = null }) {
   ensureSession(db, sessionId);
@@ -306,6 +348,105 @@ export function hasExplicitMusicIntent(text) {
   return /下一首|换一首|换歌|切歌|播放|放一首|来点|想听|推荐|给我.*(歌|音乐)|有没有.*(歌|音乐)|听.*(歌|音乐)|artist|song|music|play|recommend/i.test(value);
 }
 
+export function normalizeMusicText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[\s·・.．,，、\-_/\\（）()《》<>[\]【】"'“”‘’!！?？:：;；~～]/g, '');
+}
+
+function buildArtistConstraint(label, aliases = []) {
+  const cleanLabel = String(label || '').trim();
+  const names = [...new Set([cleanLabel, ...aliases].map(name => String(name || '').trim()).filter(Boolean))];
+  const normalizedAliases = [...new Set(names.map(normalizeMusicText).filter(Boolean))];
+  if (!cleanLabel || !normalizedAliases.length) return null;
+  return { label: cleanLabel, aliases: names, normalizedAliases };
+}
+
+function findKnownArtistConstraint(text) {
+  const normalizedText = normalizeMusicText(text);
+  if (!normalizedText) return null;
+  for (const [label, aliases] of KNOWN_ARTIST_ALIASES) {
+    const constraint = buildArtistConstraint(label, aliases);
+    if (constraint.normalizedAliases.some(alias => alias.length >= 2 && normalizedText.includes(alias))) {
+      return constraint;
+    }
+  }
+  return null;
+}
+
+function findLibraryArtistConstraint(text, tracks = []) {
+  const normalizedText = normalizeMusicText(text);
+  if (!normalizedText) return null;
+  const artists = new Map();
+  for (const track of tracks || []) {
+    for (const artist of track?.artists || []) {
+      const name = String(artist || '').trim();
+      const normalized = normalizeMusicText(name);
+      if (normalized.length < 2) continue;
+      if (!artists.has(normalized)) artists.set(normalized, name);
+    }
+  }
+  const ordered = [...artists.entries()].sort((a, b) => b[0].length - a[0].length);
+  for (const [normalized, name] of ordered) {
+    if (normalizedText.includes(normalized)) return buildArtistConstraint(name, [normalized]);
+  }
+  return null;
+}
+
+function extractArtistPhrase(text) {
+  const value = String(text || '').trim();
+  const patterns = [
+    /(?:想听|听|播放|放|来点|来几首|推荐)(?:几首|一首|一些|一点|点|首)?([^，。？！,.!?]{2,24}?)(?:的)?(?:歌|歌曲|音乐|作品|专辑)/,
+    /(?:后面|接下来|以后|之后)(?:想)?(?:听|放)(?:几首|一首|一些|一点|点|首)?([^，。？！,.!?]{2,24}?)(?:的)?(?:歌|歌曲|音乐|作品|专辑)/
+  ];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (!match?.[1]) continue;
+    const phrase = match[1]
+      .replace(/^(我|给我|帮我|后面|接下来|以后|之后|都|只|全|几首|一首|一些|一点|点|首|想|听|要|来点|放|播放|推荐)+/g, '')
+      .replace(/(的|歌|歌曲|音乐|作品|专辑)+$/g, '')
+      .trim();
+    const normalized = normalizeMusicText(phrase);
+    if (normalized.length >= 2 && normalized.length <= 16 && !GENERIC_ARTIST_PHRASES.has(normalized)) {
+      return phrase;
+    }
+  }
+  return '';
+}
+
+export function extractRequestedArtistConstraint(text, tracks = [], mode = {}) {
+  const direct = findKnownArtistConstraint(text) || findLibraryArtistConstraint(text, tracks);
+  if (direct) return direct;
+
+  const phrase = extractArtistPhrase(text);
+  if (phrase) {
+    const fromPhrase = findKnownArtistConstraint(phrase) || findLibraryArtistConstraint(phrase, tracks);
+    if (fromPhrase) return fromPhrase;
+  }
+
+  const modeText = String(mode?.genre || '').trim();
+  if (!modeText) return null;
+  return findKnownArtistConstraint(modeText) || findLibraryArtistConstraint(modeText, tracks);
+}
+
+export function trackMatchesArtistConstraint(track, constraint) {
+  if (!constraint) return true;
+  const artistNames = (track?.artists || []).map(normalizeMusicText).filter(Boolean);
+  if (!artistNames.length) return false;
+  return artistNames.some(artist =>
+    constraint.normalizedAliases.some(alias => artist === alias || artist.includes(alias) || alias.includes(artist))
+  );
+}
+
+export function filterArtistConstrainedCandidates(candidates, constraint) {
+  if (!constraint) return candidates || [];
+  return (candidates || []).filter(candidate => trackMatchesArtistConstraint(candidate?.track || candidate, constraint));
+}
+
+export function isOngoingArtistRequest(text) {
+  return /后面|接下来|以后|之后|后续|几首|多来几首|一会儿|接着|连续|都听|只听/.test(String(text || ''));
+}
+
 export function decideTurnAction({
   userMessage = '',
   history = [],
@@ -433,9 +574,14 @@ async function generateChatDecision({ config, profile, mode, history, userMessag
       content: [
         '你是私人电台 DJ 灿灿，也像熟悉的朋友。',
         '先自然回应听众，不要每句话都转去推荐音乐。',
+        '你的陪伴方式：先接住用户的原话和情绪，再轻轻复述你听见的重点，然后给一点稳定的陪伴感。',
+        '不要像心理咨询师一样连续追问、分析原因、要求用户解释自己；少说“最明显的感受是什么”“为什么会这样”。',
+        '回复长度要按用户消息强度调节：普通问候/寒暄 20-60 字，日常聊天 60-120 字，明确表达疲惫、难过、矛盾或期待时才用 90-180 字。',
+        '普通问候不要过度共情，不要上来就说“你不用说得完整”“我会接住情绪”；先轻松打招呼，给一个自然入口。',
+        '如果需要提问，每次最多一个问题，而且要像邀请，不要像审问；用户不回答也没关系。',
         '当前歌曲只用于判断是否已有音乐在播放；除非听众主动问当前歌曲、歌词、歌名或艺人，不要提及歌名、艺人、歌词或“正在播放”。',
         turnActionInstruction(turnAction),
-        '输出 JSON：{"chatText":"40-120字自然回复","mood":"comfort|melancholy|calm|healing|focus|energy|romantic|nostalgic|night|random","energy":"low|medium|high","intent":"chat|mood","searchHints":["2-6字关键词"],"reason":"简短理由","mode":null或"reset"或偏好名}'
+        '输出 JSON：{"chatText":"按语境长度生成的自然温柔回复","mood":"comfort|melancholy|calm|healing|focus|energy|romantic|nostalgic|night|random","energy":"low|medium|high","intent":"chat|mood","searchHints":["2-6字关键词"],"reason":"简短理由","mode":null或"reset"或偏好名}'
       ].join('\n')
     },
     {
@@ -500,30 +646,53 @@ function normalizeMoodDecision(input = {}) {
 }
 
 function fallbackFriendChat(userMessage, mood, turnAction = null) {
-  if (turnAction?.action === TURN_ACTIONS.ASK_FOLLOWUP) return '我听见你在说自己的事。先不急着切到音乐，跟我多说一点吧：这件事对你来说，最明显的感受是什么？';
-  if (turnAction?.action === TURN_ACTIONS.SOFT_OFFER_MUSIC) return '我先陪你把话说完。要是你等会儿想让音乐接住这个情绪，我可以再给你找一首合适的。';
-  if (turnAction?.action === TURN_ACTIONS.CLARIFY_INTENT) return '我有点不确定你是想继续聊，还是想让我现在放一首歌。你可以直接跟我说。';
-  if (mood?.mood === 'comfort') return '听起来你现在挺不好受的。先别急着把自己讲清楚，我在这儿陪你缓一缓；要是你愿意，也可以慢慢跟我说发生了什么。';
-  if (mood?.mood === 'night') return '夜里人的情绪会被放大一点。你不用马上睡着，先把呼吸放慢，我陪你把这一会儿安静地过过去。';
-  if (mood?.mood === 'energy') return '我听出来你想把状态拉起来一点。先把肩膀松一下，我们一点点把节奏找回来。';
-  return userMessage ? '我听着呢。你可以继续说，不用急着转到音乐；我会跟着你的状态，觉得合适的时候再接一首歌。' : '我在。想聊什么都可以。';
+  if (isLightGreeting(userMessage)) {
+    return '你好呀，我在。今天想先随便聊几句，还是让灿灿陪你开一会儿电台？';
+  }
+  if (turnAction?.action === TURN_ACTIONS.ASK_FOLLOWUP) {
+    return '我听见你在把自己的状态拿出来给我看了，这件事本身就不轻。先不急着分析，也不急着切到音乐；你可以慢慢说，哪怕只说一点点也可以。我会先陪你把这段情绪放稳，等你愿意的时候，再告诉我现在最想被理解的是哪一小块。';
+  }
+  if (turnAction?.action === TURN_ACTIONS.SOFT_OFFER_MUSIC) {
+    return '我先陪你把话说完，不急着用音乐把它盖过去。你刚刚那种感觉我会放在心上，它可能不是一句“开心”或“难过”就能说完的。等你觉得可以了，我再帮你找一首能轻轻接住这个情绪的歌，不催你。';
+  }
+  if (turnAction?.action === TURN_ACTIONS.CLARIFY_INTENT) {
+    return '我有点不确定你现在更想继续聊，还是想让我用一首歌把气氛接过去。没关系，你不用组织得很清楚，直接按现在的感觉说就好。你想说话，我就在这儿听；你想听歌，我也会慢慢帮你切到合适的方向。';
+  }
+  if (mood?.mood === 'comfort') {
+    return '听起来你现在心里有一块地方挺累的，我先不急着劝你变好，也不急着给答案。你可以先把自己放松一点，像把很重的包暂时放到旁边。我在这儿陪你缓一会儿，等你想说的时候，我们再慢慢拆开看。';
+  }
+  if (mood?.mood === 'night') {
+    return '夜里人的感受会被放大一点，很多白天能忍住的东西，到了这个时候就会轻轻冒出来。你不用马上睡着，也不用马上振作；先让呼吸慢一点，我陪你把这一小段时间安静地走过去。';
+  }
+  if (mood?.mood === 'energy') {
+    return '我听出来你想把状态找回来一点，但也不用一下子把自己推得很猛。先把肩膀松一松，给自己一点启动的余地。我们可以一点点把节奏调亮，不需要马上满格，只要比刚才多一点点就很好。';
+  }
+  return userMessage
+    ? '我在听。你不用把话说得很完整，也不用急着把它变成一个明确的问题；有些感受本来就是边说边清楚的。你可以继续往下讲，我会跟着你的节奏听，等真的适合音乐的时候，再轻轻帮你接一首。'
+    : '我在呢。现在不用急着开始，也不用想好要聊什么；你可以把这里当成一个安静的小电台。想说今天发生了什么、想发呆一会儿，或者只是想有人在旁边，我都会陪着。';
+}
+
+function isLightGreeting(text) {
+  const value = String(text || '').trim().toLowerCase();
+  if (!value) return false;
+  return /^(你好|嗨|hi|hello|哈喽|在吗|灿灿|早|早安|晚上好|下午好|中午好)[呀啊哦～~!！。.\s]*$/.test(value);
 }
 
 function turnActionInstruction(turnAction = {}) {
   const action = turnAction?.action || TURN_ACTIONS.CHAT_ONLY;
   if (action === TURN_ACTIONS.ASK_FOLLOWUP) {
-    return '当前动作是 ASK_FOLLOWUP。禁止推荐歌曲，禁止说“有首歌适合你”。请围绕用户本人回应，并自然追问一个问题。';
+    return '当前动作是 ASK_FOLLOWUP。禁止推荐歌曲，禁止说“有首歌适合你”。如果只是问候，轻松回应即可，不要进入深度陪伴。只有用户表达具体经历或情绪时，才先承接原话，轻轻复述你听见的矛盾、疲惫、期待或在意点；不要分析原因，不要连续追问。最后最多给一个可不回答的轻邀请。';
   }
   if (action === TURN_ACTIONS.SOFT_OFFER_MUSIC) {
-    return '当前动作是 SOFT_OFFER_MUSIC。禁止自动播放或指定具体歌曲。可以温柔地说如果用户愿意，稍后可以放一首。';
+    return '当前动作是 SOFT_OFFER_MUSIC。禁止自动播放或指定具体歌曲。先陪用户把话说完，再很轻地说如果稍后愿意，可以用一首歌接住情绪；音乐只能作为后续选择，不能抢走当下的对话。';
   }
   if (action === TURN_ACTIONS.CLARIFY_INTENT) {
-    return '当前动作是 CLARIFY_INTENT。禁止推荐歌曲。请简短确认用户是想聊天还是想听歌。';
+    return '当前动作是 CLARIFY_INTENT。禁止推荐歌曲。温柔确认用户是想继续聊还是想听歌，不要让用户觉得必须立刻做选择。';
   }
   if (action === TURN_ACTIONS.CONTINUE_CURRENT_SONG) {
-    return '当前动作是 CONTINUE_CURRENT_SONG。禁止推荐新歌。请回应播放控制或继续陪聊。';
+    return '当前动作是 CONTINUE_CURRENT_SONG。禁止推荐新歌。回应播放控制，同时保持陪伴感，可以简短说明你会继续在这里听。';
   }
-  return '当前动作是 CHAT_ONLY。禁止推荐歌曲，禁止说“有首歌适合你”，像朋友一样自然回应。';
+  return '当前动作是 CHAT_ONLY。禁止推荐歌曲，禁止说“有首歌适合你”。像熟悉的朋友一样自然回应；普通问候要轻，不要突然深情或分析；日常聊天先接住，再陪一会儿，少给建议，少下结论。';
 }
 
 function extractActionSearchHints(text, mode = {}) {
