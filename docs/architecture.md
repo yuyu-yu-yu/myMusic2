@@ -107,16 +107,6 @@ public/
 | POST | `/api/auth/netease/qrcode/check` | 轮询扫码状态 |
 | POST | `/api/auth/netease/refresh` | 刷新 token |
 
-### 记忆 & 偏好
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/memories` | 列出所有长期记忆 |
-| DELETE | `/api/memories` | 清除全部记忆 |
-| DELETE | `/api/memories/:id` | 删除单条记忆 |
-| GET | `/api/preferences` | 用户偏好 + 反馈统计摘要 |
-| PUT | `/api/preferences` | 更新用户偏好 |
-
 ### 系统
 
 | 方法 | 路径 | 说明 |
@@ -144,7 +134,6 @@ public/
 | `track_feedback_events` | 反馈事件（like/dislike/skip/complete） |
 | `settings` | 键值配置（token、偏好等） |
 | `tts_cache` | TTS 音频缓存 |
-| `user_memories` | 长期记忆（偏好、边界、口味、聊天风格等） |
 | `diary_entries` | 每日音乐日记 |
 
 ## 认证体系
@@ -186,16 +175,14 @@ canProactivelyRecommend()       ← 是否可以主动推歌
 ### DJ 选歌（djTurn）
 
 ```
-1. 检索长期记忆 + 更新会话摘要
-2. 在线搜索（用户说的话 → DeepSeek 生成搜索词 → 社区 API 搜索）
-3. 构建候选池（分层配额 + 源打分）
-4. 单次 LLM 调用：
-   输入：System Prompt + 候选池 + 对话历史 + 画像 + 天气 + 偏好 + 记忆上下文
+1. 在线搜索（用户说的话 → DeepSeek 生成搜索词 → 社区 API 搜索）
+2. 构建候选池（分层配额 + 源打分）
+3. 单次 LLM 调用：
+   输入：System Prompt + 候选池 + 对话历史 + 画像 + 天气 + 偏好
    输出：<CHAT>对话</CHAT><JSON>{"pick":N,...}</JSON>
-5. pick=null → 纯聊天
+4. pick=null → 纯聊天
    pick=N → 播放第 N 首
-6. 异步提取长期记忆（scheduleMemoryExtraction）
-7. resolvePlayableTrack → 社区 API song_url_v1 → 浏览器 <audio> 播放
+5. resolvePlayableTrack → 社区 API song_url_v1 → 浏览器 <audio> 播放
 ```
 
 ### 播放链路
@@ -224,59 +211,6 @@ canProactivelyRecommend()       ← 是否可以主动推歌
 | 搜索 API | 15+ 次串行 | ~10 次并行 |
 | discover() 耗时 | ~10s | ~0.5s |
 | 总延迟 | 13-19s | 3-6s |
-
-### AI 记忆系统
-
-灿灿具备三层记忆架构，使其能跨会话记住用户偏好、聊天风格和个人信息。
-
-**数据库：** `user_memories` 表
-
-| 字段 | 说明 |
-|---|---|
-| `kind` | 记忆类型（`chat_style` / `music_taste` / `personal_fact` / `boundary` / `mood_pattern` / `music_preference`）|
-| `content` | 自然语言描述（如"用户多次喜欢《晚风里的城市》，后续可把相近气质的歌曲作为安全推荐方向"）|
-| `confidence` | 置信度 0-1 |
-| `importance` | 重要度 0-1 |
-| `evidence_count` | 被证据加强的次数 |
-| `source_session_id` | 产生该记忆的会话 ID |
-| `tags_json` | 标签数组 |
-
-#### 第一层：长期记忆（跨会话持久化）
-
-**写入：** 两个来源
-- **反馈触发** — `maybeRecordFeedbackMemory()`：喜欢 ≥3 次 / 完整听完 ≥4 次 / 跳过 ≥3 次 / 不喜欢 ≥2 次 → 自动生成 `music_preference` 记忆
-- **LLM 异步提取** — `scheduleMemoryExtraction()`：每轮对话结束后，异步调 DeepSeek 分析对话内容，提取结构化记忆（聊天风格、口味、个人信息、边界、情绪模式）。已有相关记忆时走 `recordOrMergeUserMemory()` 去重合并
-
-**读取：** 每次 `djTurn()` 和 `chatTurn()` 调用 `retrieveRelevantMemories()` 做语义检索，上限 8 条 / 800 字，通过 `buildMemoryContext()` 拼入 LLM System Prompt
-
-#### 第二层：会话摘要（实时滚动）
-
-`updateSessionSummary()` — 当前 session 消息数 ≥12 条且上次摘要后新增 ≥6 条时触发。LLM 将最近 60 条对话压缩成 200-500 字中文摘要，存入 session context。每次对话都传给 LLM，灿灿能感知"这轮聊了什么"。
-
-#### 第三层：反馈即时学习
-
-`maybeRecordFeedbackMemory()` 在 `submitFeedback()` 中同步触发。达到阈值即写入 `user_memories`，下次推荐时生效，无需等待 LLM 提取。
-
-#### 内存管理 API
-
-| 方法 | 路径 | 说明 |
-|---|---|---|
-| GET | `/api/memories` | 列出所有长期记忆 |
-| DELETE | `/api/memories` | 清除全部记忆 |
-| DELETE | `/api/memories/:id` | 删除单条记忆 |
-| GET | `/api/preferences` | 用户偏好 + 反馈统计摘要 |
-| PUT | `/api/preferences` | 更新用户偏好 |
-
-#### 用户偏好
-
-```js
-{
-  chatMusicBalance: 'friend' | 'balanced' | 'dj',   // 聊天/音乐平衡
-  recommendationFrequency: 'low' | 'medium' | 'high', // 推荐频率
-  voiceMode: 'off' | 'recommendations' | 'all',       // 语音模式
-  moodMode: 'auto' | 'comfort' | 'focus' | 'calm' | 'night' | 'random' // 情绪模式
-}
-```
 
 ### 前端视觉系统
 
@@ -374,5 +308,3 @@ LLM 分析：7 个维度 + 结构化 JSON
 - [x] **加载动画**：8 条随机文案轮播 + 故障文字效果 + 三点跳动
 - [x] **音频频率可视化**：Web Audio API AnalyserNode + Canvas 柱状图 + CSS 动画回退
 - [x] **SPA 导航音频持久化**：音乐播放中切换页面不中断
-- [x] **三层 AI 记忆系统**：长期记忆（跨会话持久化）+ 会话摘要（滚动压缩）+ 反馈自动提取
-- [x] **用户偏好体系**：聊天/音乐平衡、推荐频率、语音模式、情绪模式可配置
