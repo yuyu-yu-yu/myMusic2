@@ -712,13 +712,13 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
   let selectedTrack = tracks[pick] || tracks[0];
   let finalChatText = chatText;
 
-  const playable = await resolvePlayableTrack(db, netease, selectedTrack, { includeLyric: false });
+  const playable = await resolvePlayableTrack(db, netease, selectedTrack, { includeLyric: true });
   if (!playable?.playable) {
     let found = false;
     for (let offset = 1; offset <= 5; offset++) {
       const nextTrack = tracks[(pick + offset) % tracks.length];
       if (nextTrack === selectedTrack) continue;
-      const nextPlayable = await resolvePlayableTrack(db, netease, nextTrack, { includeLyric: false });
+      const nextPlayable = await resolvePlayableTrack(db, netease, nextTrack, { includeLyric: true });
       if (nextPlayable?.playable) {
         selectedTrack = nextPlayable;
         finalChatText = `来听一首 ${selectedTrack.name} 吧，${(selectedTrack.artists || []).join('、')}的。`;

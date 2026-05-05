@@ -23,6 +23,13 @@
           <a href="/settings" data-link>设置</a>
         </nav>
       </header>
+      <!-- Persistent audio layer — survives SPA navigation -->
+      <div id="audio-layer" style="display:none">
+        <audio id="host-audio"></audio>
+        <audio id="song-audio" crossOrigin="anonymous"></audio>
+        <canvas id="visualizer-canvas" width="600" height="52"></canvas>
+        <div id="equalizer-fallback" class="equalizer-fallback" style="display:none"></div>
+      </div>
       <main id="view" class="view"></main>
     </div>
     <template id="player-template">
@@ -41,10 +48,6 @@
               </div>
             </div>
           </div>
-          <audio id="host-audio"></audio>
-          <audio id="song-audio" controls crossOrigin="anonymous"></audio>
-          <canvas id="visualizer-canvas" width="600" height="52"></canvas>
-          <div id="equalizer-fallback" class="equalizer-fallback" style="display:none"></div>
           <div id="player-status" class="player-status">等待启动</div>
           <button id="start-btn" class="primary start-wide">启动电台</button>
           <div id="lyric" class="lyric"></div>

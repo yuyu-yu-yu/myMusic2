@@ -14,6 +14,7 @@ let statusLocked = false;
 let btnFeedbackReady = false;
 let loadingMsgIndex = 0;
 let loadingMsgTimer = null;
+let savedChatHTML = '';
 
 const view = document.querySelector('#view');
 const template = document.querySelector('#player-template');
@@ -34,6 +35,13 @@ if ('serviceWorker' in navigator) {
 render();
 
 async function render() {
+  // Save chat messages before clearing (they're in #view)
+  const chatEl = document.querySelector('#chat-messages');
+  if (chatEl) savedChatHTML = chatEl.innerHTML;
+
+  // Move persistent audio elements back to hidden layer before clearing view
+  if (view.__audioCleanup) { view.__audioCleanup(); view.__audioCleanup = null; }
+
   document.querySelectorAll('.nav a').forEach((link) => {
     link.classList.toggle('active', new URL(link.href).pathname === location.pathname);
   });
@@ -221,6 +229,33 @@ function initButtonFeedback() {
 function renderPlayer() {
   view.innerHTML = '';
   view.append(template.content.cloneNode(true));
+
+  // Move persistent audio elements into the player layout
+  const leftCol = document.querySelector('.left-col');
+  const audioLayer = document.querySelector('#audio-layer');
+  const audioEls = ['#host-audio', '#song-audio', '#visualizer-canvas', '#equalizer-fallback'];
+  const savedDisplay = [];
+  audioEls.forEach((sel, i) => {
+    const el = audioLayer.querySelector(sel);
+    if (el) {
+      savedDisplay[i] = el.style.display;
+      el.style.display = '';
+      // Insert before #player-status
+      const statusEl = leftCol.querySelector('#player-status');
+      if (statusEl) leftCol.insertBefore(el, statusEl);
+    }
+  });
+  // Store for cleanup on navigation
+  view.__audioCleanup = () => {
+    audioEls.forEach((sel, i) => {
+      const el = leftCol.querySelector(sel);
+      if (el) {
+        el.style.display = savedDisplay[i] || '';
+        audioLayer.appendChild(el);
+      }
+    });
+  };
+
   const startBtn = document.querySelector('#start-btn');
   const nextBtn = document.querySelector('#next-btn');
   const pauseBtn = document.querySelector('#pause-btn');
@@ -248,6 +283,13 @@ function renderPlayer() {
     input.value = '';
     sendChat(msg);
   });
+
+  // Restore saved chat messages
+  if (savedChatHTML) {
+    const chatMessages = document.querySelector('#chat-messages');
+    if (chatMessages) chatMessages.innerHTML = savedChatHTML;
+    savedChatHTML = '';
+  }
 
   if (state.current) updatePlayer(state.current, false);
   startPlayerPolling();
@@ -433,8 +475,11 @@ async function updatePlayer(data, autoplay) {
 
   const songAudio = document.querySelector('#song-audio');
   if (track.playUrl) {
-    songAudio.crossOrigin = 'anonymous';
-    songAudio.src = track.playUrl;
+    // Don't reset src if already playing this URL (e.g. navigating back to player page)
+    if (songAudio.src !== track.playUrl) {
+      songAudio.crossOrigin = 'anonymous';
+      songAudio.src = track.playUrl;
+    }
     songAudio.style.display = '';
   } else {
     songAudio.style.display = 'none';
