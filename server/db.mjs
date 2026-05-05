@@ -554,12 +554,14 @@ function hydrateTrackRow(row) {
   const raw = safeJson(row.rawJson, {});
   const rawOriginalId = raw?.originalId ?? raw?.song?.originalId ?? raw?.track?.originalId ?? null;
   const originalId = row.originalId ?? (rawOriginalId === null || rawOriginalId === undefined || rawOriginalId === '' ? null : String(rawOriginalId));
+  const playUrl = typeof raw?.playUrl === 'string' && raw.playUrl ? raw.playUrl : null;
   const { rawJson, ...track } = row;
   return {
     ...track,
     originalId,
     playbackMode: originalId ? 'ncm-cli' : null,
     playable: Boolean(originalId),
+    playUrl,
     artists: safeJson(row.artists, [])
   };
 }
