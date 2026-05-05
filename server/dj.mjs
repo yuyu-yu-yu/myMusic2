@@ -34,6 +34,7 @@ const SESSION_SUMMARY_STEP = 8;
 const LONG_MEMORY_LIMIT = 8;
 const LONG_MEMORY_MAX_CHARS = 800;
 const CHAT_LLM_TIMEOUT_MS = 9000;
+const PLAYABLE_FALLBACK_SCAN_LIMIT = 12;
 const DEFAULT_PREFS = Object.freeze({
   chatMusicBalance: 'friend',
   recommendationFrequency: 'medium',
@@ -522,6 +523,46 @@ export function normalizeMusicText(value) {
   return String(value || '')
     .toLowerCase()
     .replace(/[\s·・.．,，、\-_/\\（）()《》<>[\]【】"'“”‘’!！?？:：;；~～]/g, '');
+}
+
+function trackDisplayName(track = {}) {
+  const artists = (track.artists || []).filter(Boolean).join('、');
+  return artists ? `《${track.name}》 - ${artists}` : `《${track.name || '这首歌'}》`;
+}
+
+function trackMentionTerms(track = {}) {
+  return [
+    track.name,
+    ...(track.artists || [])
+  ]
+    .map(term => normalizeMusicText(term))
+    .filter(term => term.length >= 2);
+}
+
+export function recommendationTextMentionsDifferentTrack(text, selectedTrack, candidates = []) {
+  const normalizedText = normalizeMusicText(text);
+  if (!normalizedText || !selectedTrack?.id) return false;
+  const selectedTerms = new Set(trackMentionTerms(selectedTrack));
+  for (const candidate of candidates || []) {
+    const track = candidate?.track || candidate;
+    if (!track?.id || String(track.id) === String(selectedTrack.id)) continue;
+    for (const term of trackMentionTerms(track)) {
+      if (!selectedTerms.has(term) && normalizedText.includes(term)) return true;
+    }
+  }
+  return false;
+}
+
+export function ensureRecommendationTextMatchesTrack(text, selectedTrack, candidates = []) {
+  if (!selectedTrack?.name) return String(text || '').trim();
+  const value = String(text || '').trim();
+  const intro = `接下来放 ${trackDisplayName(selectedTrack)}。`;
+  if (!value || recommendationTextMentionsDifferentTrack(value, selectedTrack, candidates)) return intro;
+  const selectedName = normalizeMusicText(selectedTrack.name);
+  if (selectedName && !normalizeMusicText(value).includes(selectedName)) {
+    return `${value} ${intro}`;
+  }
+  return value;
 }
 
 function buildArtistConstraint(label, aliases = []) {
@@ -1538,26 +1579,35 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
   }
 
   let selectedTrack = tracks[pick] || tracks[0];
-  let finalChatText = chatText;
+  let selectedChanged = false;
 
-  const playable = await resolvePlayableTrack(db, netease, selectedTrack, { includeLyric: true });
-  if (!playable?.playable) {
-    let found = false;
-    for (let offset = 1; offset <= 5; offset++) {
-      const nextTrack = tracks[(pick + offset) % tracks.length];
-      if (nextTrack === selectedTrack) continue;
-      const nextPlayable = await resolvePlayableTrack(db, netease, nextTrack, { includeLyric: true });
-      if (nextPlayable?.playable) {
-        selectedTrack = nextPlayable;
-        finalChatText = `来听一首 ${selectedTrack.name} 吧，${(selectedTrack.artists || []).join('、')}的。`;
-        found = true;
-        break;
-      }
+  const checked = new Set();
+  const maxScan = Math.min(tracks.length, PLAYABLE_FALLBACK_SCAN_LIMIT);
+  for (let offset = 0; offset < maxScan; offset++) {
+    const index = (pick + offset) % tracks.length;
+    const candidateTrack = tracks[index];
+    if (!candidateTrack?.id || checked.has(String(candidateTrack.id))) continue;
+    checked.add(String(candidateTrack.id));
+    const playable = await resolvePlayableTrack(db, netease, candidateTrack, { includeLyric: true });
+    if (playable?.playable) {
+      selectedTrack = playable;
+      selectedChanged = offset > 0;
+      break;
     }
-    if (!found) selectedTrack = playable || tracks[0];
-  } else {
-    selectedTrack = playable;
   }
+
+  if (!selectedTrack?.playable) {
+    return {
+      chatText: '这批候选里暂时没有确认可播放的歌，我先不乱播。你点下一首，我重新找一批更稳的。',
+      track: null,
+      reason: '候选歌曲暂时不可播放',
+      newMode
+    };
+  }
+
+  const finalChatText = selectedChanged
+    ? `刚才那首暂时放不了，我换成 ${trackDisplayName(selectedTrack)}。`
+    : ensureRecommendationTextMatchesTrack(chatText, selectedTrack, tracks);
 
   return { chatText: finalChatText, track: selectedTrack, reason: reason || '根据你的口味推荐', newMode };
 }

@@ -35,6 +35,31 @@ const avatarStateAliases = {
   reading_book: 'reading'
 };
 
+const mixerOptions = {
+  chatMusicBalance: [
+    { value: 'friend', label: '更像朋友', detail: '先聊天，少打断，音乐自然接入。' },
+    { value: 'balanced', label: '平衡', detail: '聊天和推歌都保持存在感。' },
+    { value: 'dj', label: '更像 DJ', detail: '更主动接歌，电台感更强。' }
+  ],
+  recommendationFrequency: [
+    { value: 'low', label: '少', detail: '只有明确需求或强情绪时主动推荐。' },
+    { value: 'medium', label: '中', detail: '在合适的聊天节点自然接歌。' },
+    { value: 'high', label: '多', detail: '更频繁捕捉场景并切换氛围。' }
+  ],
+  voiceMode: [
+    { value: 'off', label: '关闭', detail: '只显示文字，不合成语音。' },
+    { value: 'recommendations', label: '只播推荐', detail: '真正接歌时才播报。' },
+    { value: 'all', label: '每句都播', detail: '聊天回复也会语音化。' }
+  ],
+  moodMode: [
+    { value: 'comfort', label: '陪伴', detail: '更柔和，照顾低落或疲惫。' },
+    { value: 'focus', label: '专注', detail: '减少打扰，偏稳定和清晰。' },
+    { value: 'calm', label: '放松', detail: '降低能量，适合慢下来。' },
+    { value: 'night', label: '深夜', detail: '更安静，适合夜晚和睡前。' },
+    { value: 'random', label: '随机', detail: '保留一点不可预测的电台感。' }
+  ]
+};
+
 const view = document.querySelector('#view');
 const template = document.querySelector('#player-template');
 
@@ -61,11 +86,15 @@ async function render() {
   // Move persistent audio elements back to hidden layer before clearing view
   if (view.__audioCleanup) { view.__audioCleanup(); view.__audioCleanup = null; }
 
+  if (location.pathname === '/diary') {
+    history.replaceState({}, '', '/mixer');
+  }
+
   document.querySelectorAll('.nav a').forEach((link) => {
     link.classList.toggle('active', new URL(link.href).pathname === location.pathname);
   });
   if (location.pathname === '/library') return renderLibrary();
-  if (location.pathname === '/diary') return renderDiary();
+  if (location.pathname === '/mixer') return renderMixer();
   if (location.pathname === '/settings') return renderSettings();
   return renderPlayer();
 }
@@ -953,16 +982,14 @@ async function playCurrentTrack() {
   }
   setPlayerStatus(`正在调用 ncm-cli 播放：${track.name || track.id}`, 'playing');
   try {
-    const result = await api('/api/player/play', { method: 'POST', body: { trackId: track.id, maxSkips: 6 } });
+    const result = await api('/api/player/play', { method: 'POST', body: { trackId: track.id, maxSkips: 0 } });
     if (result.track && result.track.id !== track.id) {
-      state.current.track = result.track;
-      updatePlayer(state.current, false);
+      throw new Error(`播放器返回了另一首歌：${result.track.name || result.track.id}`);
     }
-    markPlaybackStarted(result.track || track, 'ncm-cli');
+    markPlaybackStarted(track, 'ncm-cli');
     setAvatarState('listening');
-    const skipped = result.skipped?.length ? `，已跳过 ${result.skipped.length} 首不可播歌曲` : '';
-    setPlayerStatus(`正在播放：${result.track?.name || track.name}${skipped}`, 'playing');
-    api('/api/play/report', { method: 'POST', body: { trackId: result.track?.id || track.id, playType: 'play' } }).catch(() => {});
+    setPlayerStatus(`正在播放：${track.name}`, 'playing');
+    api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
   } catch (error) {
     setPlayerStatus(error.message, 'error');
   }
@@ -1066,24 +1093,77 @@ async function renderLibrary() {
   });
 }
 
-async function renderDiary() {
-  const todayEntry = await api('/api/diary/today');
-  const list = await api('/api/diary');
-  const entries = [todayEntry, ...list.filter((entry) => entry.date !== todayEntry.date)];
+async function renderMixer() {
+  const [prefData, memoryData] = await Promise.all([
+    api('/api/preferences'),
+    api('/api/memories').catch(() => ({ memories: [] }))
+  ]);
+  const preferences = prefData.preferences || {};
+  const feedback = prefData.feedbackSummary || {};
+  const memories = (memoryData.memories || []).slice(0, 8);
+
   view.innerHTML = `
-    <section class="page-panel">
-      <p class="eyebrow">Diary</p>
-      <h1 class="page-title">音乐日记</h1>
-      <button id="diary-btn" class="primary">刷新今天的日记</button>
-      <div class="diary-list">
-        ${entries.map(diaryItem).join('')}
+    <section class="mixer-hero page-panel">
+      <div>
+        <p class="eyebrow">Control Surface</p>
+        <h1 class="page-title">调音台</h1>
+        <p class="mixer-subtitle">调灿灿的聊天、接歌、语音和情绪场景，让电台更像你的私人频率。</p>
+      </div>
+      <div class="mixer-status-card">
+        <span class="mixer-led"></span>
+        <div>
+          <strong id="mixer-mode-summary">${escapeHtml(mixerModeSummary(preferences))}</strong>
+          <p id="mixer-save-status" class="muted">SIGNAL LOCKED</p>
+        </div>
       </div>
     </section>
+    <section class="mixer-console">
+      <div class="mixer-rack">
+        ${mixerControl('chatMusicBalance', '聊天 vs 推歌比例', '控制灿灿先像朋友聊，还是更积极接歌。', preferences)}
+        ${mixerControl('recommendationFrequency', '主动推荐频率', '决定普通聊天中灿灿多久自然接一首歌。', preferences)}
+        ${mixerControl('voiceMode', '语音播报', '控制灿灿什么时候把文字变成主持语音。', preferences)}
+        ${mixerControl('moodMode', '当前情绪模式', '给这段电台会话一个临时氛围方向。', preferences)}
+        <article class="mixer-control mixer-note-control">
+          <div class="mixer-control-head">
+            <div>
+              <h2>灿灿行为补充说明</h2>
+              <p class="muted">最多 500 字，会参与聊天和推荐判断。</p>
+            </div>
+            <button id="mixer-note-save" class="ghost">保存说明</button>
+          </div>
+          <textarea id="mixer-note" maxlength="500" placeholder="例如：多像朋友一样聊天，少一点生硬安慰；晚上偏安静，别太频繁切歌。">${escapeHtml(preferences.note || '')}</textarea>
+        </article>
+      </div>
+      <aside class="mixer-side">
+        <article class="mixer-meter-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Feedback</p>
+              <h2>近期反馈趋势</h2>
+            </div>
+          </div>
+          ${feedbackMeter(feedback)}
+          <div class="feedback-track-list">
+            ${feedbackTracks(feedback)}
+          </div>
+        </article>
+        <article class="mixer-memory-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Memory</p>
+              <h2>长期记忆摘要</h2>
+            </div>
+            <a class="ghost-link" href="/settings" data-link>危险操作</a>
+          </div>
+          <div class="memory-list compact">
+            ${memories.length ? memories.map(memorySummaryItem).join('') : '<p class="muted memory-empty">暂时还没有长期记忆。继续和灿灿聊天后，这里会出现稳定偏好、需求和边界。</p>'}
+          </div>
+        </article>
+      </aside>
+    </section>
   `;
-  document.querySelector('#diary-btn').addEventListener('click', async () => {
-    await api('/api/diary/generate', { method: 'POST', body: {} });
-    renderDiary();
-  });
+
+  bindMixerControls(preferences);
 }
 
 async function renderSettings() {
@@ -1112,18 +1192,15 @@ async function renderSettings() {
         <img id="qr-img" class="qr-img" src="" alt="登录二维码" style="display:none" />
       </div>
     </section>
-    <section class="page-panel memory-panel">
+    <section class="page-panel danger-zone">
       <div class="panel-header">
         <div>
-          <p class="eyebrow">Memory</p>
-          <h2>灿灿的记忆</h2>
+          <p class="eyebrow">Danger Zone</p>
+          <h2>危险操作</h2>
         </div>
         <button id="clear-memories-btn" class="ghost danger" ${memories.length ? '' : 'disabled'}>清空全部</button>
       </div>
-      <p class="muted">这里保存的是灿灿从长期对话和反馈中提炼出的稳定需求、偏好和边界；删除后不会影响聊天历史。</p>
-      <div class="memory-list">
-        ${memories.length ? memories.map(memoryItem).join('') : '<p class="muted memory-empty">暂时还没有长期记忆。继续和灿灿聊天后，这里会出现值得长期记住的内容。</p>'}
-      </div>
+      <p class="muted">长期记忆会影响灿灿后续聊天和推荐。当前共有 ${memories.length} 条；清空后不会删除聊天记录或曲库。</p>
     </section>
   `;
   document.querySelector('#qr-btn').addEventListener('click', () => startQrLogin());
@@ -1132,14 +1209,6 @@ async function renderSettings() {
     statusEl.textContent = '正在续期...';
     const res = await api('/api/auth/netease/refresh', { method: 'POST', body: {} });
     statusEl.textContent = res.ok ? 'token 已续期（7天内有效）' : '续期失败，请重新扫码';
-  });
-  document.querySelectorAll('[data-delete-memory]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      const id = button.getAttribute('data-delete-memory');
-      if (!confirm('删除这条记忆？')) return;
-      await api(`/api/memories/${id}`, { method: 'DELETE' });
-      renderSettings();
-    });
   });
   document.querySelector('#clear-memories-btn')?.addEventListener('click', async () => {
     if (!memories.length) return;
@@ -1215,6 +1284,194 @@ function profileBlock(title, items = []) {
   `;
 }
 
+function mixerControl(key, title, description, preferences = {}) {
+  const options = mixerOptions[key] || [];
+  return `
+    <article class="mixer-control" data-pref-control="${escapeAttr(key)}">
+      <div class="mixer-control-head">
+        <div>
+          <h2>${escapeHtml(title)}</h2>
+          <p class="muted">${escapeHtml(description)}</p>
+        </div>
+        <span class="mixer-value">${escapeHtml(activeMixerLabel(key, preferences[key]))}</span>
+      </div>
+      <div class="segmented-control" role="group" aria-label="${escapeAttr(title)}">
+        ${options.map((option) => `
+          <button
+            type="button"
+            class="${isMixerOptionActive(key, preferences[key], option.value) ? 'active' : ''}"
+            data-pref-key="${escapeAttr(key)}"
+            data-pref-value="${escapeAttr(option.value)}"
+          >
+            <span>${escapeHtml(option.label)}</span>
+            <small>${escapeHtml(option.detail)}</small>
+          </button>
+        `).join('')}
+      </div>
+    </article>
+  `;
+}
+
+function bindMixerControls(initialPreferences = {}) {
+  let preferences = { ...initialPreferences };
+  const controls = [...document.querySelectorAll('[data-pref-key]')];
+  const statusEl = document.querySelector('#mixer-save-status');
+  const summaryEl = document.querySelector('#mixer-mode-summary');
+  const note = document.querySelector('#mixer-note');
+  const noteSave = document.querySelector('#mixer-note-save');
+
+  const refresh = () => {
+    for (const key of Object.keys(mixerOptions)) {
+      const valueEl = document.querySelector(`[data-pref-control="${key}"] .mixer-value`);
+      if (valueEl) valueEl.textContent = activeMixerLabel(key, preferences[key]);
+      document.querySelectorAll(`[data-pref-key="${key}"]`).forEach((button) => {
+        button.classList.toggle('active', isMixerOptionActive(key, preferences[key], button.dataset.prefValue));
+      });
+    }
+    if (summaryEl) summaryEl.textContent = mixerModeSummary(preferences);
+  };
+
+  const save = async (patch) => {
+    const previous = { ...preferences };
+    preferences = { ...preferences, ...patch };
+    refresh();
+    setMixerStatus('正在保存频率...', '');
+    setMixerDisabled(true);
+    try {
+      const result = await api('/api/preferences', { method: 'PUT', body: preferences });
+      preferences = result.preferences || preferences;
+      refresh();
+      setMixerStatus('已保存到灿灿的运行参数', 'ok');
+    } catch (error) {
+      preferences = previous;
+      if (note) note.value = previous.note || '';
+      refresh();
+      setMixerStatus(error.message, 'error');
+    } finally {
+      setMixerDisabled(false);
+    }
+  };
+
+  controls.forEach((button) => {
+    button.addEventListener('click', () => {
+      const key = button.dataset.prefKey;
+      const value = button.dataset.prefValue;
+      if (!key || !value || preferences[key] === value) return;
+      save({ [key]: value });
+    });
+  });
+
+  noteSave?.addEventListener('click', () => save({ note: note?.value || '' }));
+
+  function setMixerStatus(text, kind) {
+    if (!statusEl) return;
+    statusEl.textContent = text;
+    statusEl.classList.toggle('status-ok', kind === 'ok');
+    statusEl.classList.toggle('status-miss', kind === 'error');
+  }
+
+  function setMixerDisabled(disabled) {
+    [...controls, noteSave].filter(Boolean).forEach((el) => { el.disabled = disabled; });
+  }
+}
+
+function activeMixerLabel(key, value) {
+  const normalized = key === 'moodMode' && (!value || value === 'auto') ? 'random' : value;
+  return mixerOptions[key]?.find((option) => option.value === normalized)?.label || '未设置';
+}
+
+function isMixerOptionActive(key, storedValue, optionValue) {
+  const normalized = key === 'moodMode' && (!storedValue || storedValue === 'auto') ? 'random' : storedValue;
+  return normalized === optionValue;
+}
+
+function mixerModeSummary(preferences = {}) {
+  return [
+    activeMixerLabel('chatMusicBalance', preferences.chatMusicBalance),
+    activeMixerLabel('recommendationFrequency', preferences.recommendationFrequency),
+    activeMixerLabel('voiceMode', preferences.voiceMode),
+    activeMixerLabel('moodMode', preferences.moodMode)
+  ].join(' / ');
+}
+
+function feedbackMeter(feedback = {}) {
+  const totals = feedback.totals || {};
+  const like = Number(totals.likes || 0);
+  const complete = Number(totals.completions || 0);
+  const skip = Number(totals.skips || 0);
+  const dislike = Number(totals.dislikes || 0);
+  const total = Math.max(1, like + complete + skip + dislike);
+  return `
+    <div class="feedback-grid">
+      ${feedbackStat('喜欢', like, 'positive')}
+      ${feedbackStat('完整播放', complete, 'positive')}
+      ${feedbackStat('跳过', skip, 'negative')}
+      ${feedbackStat('不喜欢', dislike, 'negative')}
+    </div>
+    <div class="feedback-meter" aria-label="反馈趋势">
+      <span class="like" style="width:${(like / total) * 100}%"></span>
+      <span class="complete" style="width:${(complete / total) * 100}%"></span>
+      <span class="skip" style="width:${(skip / total) * 100}%"></span>
+      <span class="dislike" style="width:${(dislike / total) * 100}%"></span>
+    </div>
+    <p class="muted mixer-impact">${escapeHtml(feedbackImpactText({ like, complete, skip, dislike }))}</p>
+  `;
+}
+
+function feedbackStat(label, value, tone) {
+  return `
+    <div class="feedback-stat ${tone}">
+      <span>${escapeHtml(label)}</span>
+      <strong>${Number(value || 0)}</strong>
+    </div>
+  `;
+}
+
+function feedbackImpactText({ like, complete, skip, dislike }) {
+  if (!like && !complete && !skip && !dislike) return '还没有足够反馈。喜欢、跳过和完整播放会逐步改变后续排序。';
+  if (skip + dislike > like + complete) return '最近负反馈更强，灿灿会降低相似歌曲和重复艺人的权重。';
+  if (like + complete > skip + dislike) return '最近正反馈更强，灿灿会更相信这些歌曲附近的风格和艺人信号。';
+  return '正负反馈接近，灿灿会继续探索但减少短时间重复。';
+}
+
+function feedbackTracks(feedback = {}) {
+  const tracks = (feedback.tracks || []).slice(0, 8);
+  if (!tracks.length) return '<p class="muted memory-empty">还没有反馈曲目。点喜欢、不喜欢、下一首或完整播放后，这里会出现影响排序的歌曲。</p>';
+  return tracks.map((track) => `
+    <article class="feedback-track">
+      <img src="${escapeAttr(track.coverUrl || '/assets/cover-1.svg')}" alt="" />
+      <div>
+        <h3>${escapeHtml(track.name || track.trackId)}</h3>
+        <p>${escapeHtml((track.artists || []).join(' / ') || '未知艺人')}</p>
+      </div>
+      <span>${feedbackScore(track)}</span>
+    </article>
+  `).join('');
+}
+
+function feedbackScore(track = {}) {
+  const score = Number(track.likes || 0) * 3
+    + Number(track.completions || 0)
+    - Number(track.dislikes || 0) * 2
+    - Number(track.skips || 0);
+  return score > 0 ? `+${score}` : String(score);
+}
+
+function memorySummaryItem(memory) {
+  const confidence = Math.round(Number(memory.confidence || 0) * 100);
+  return `
+    <article class="memory-item compact">
+      <div class="memory-main">
+        <div class="memory-meta">
+          <span class="tag">${escapeHtml(memoryKindLabel(memory.kind))}</span>
+          <span class="muted">置信 ${confidence}%</span>
+        </div>
+        <p>${escapeHtml(memory.content || '')}</p>
+      </div>
+    </article>
+  `;
+}
+
 function trackItem(track) {
   return `
     <article class="list-item">
@@ -1223,35 +1480,6 @@ function trackItem(track) {
         <h3>${escapeHtml(track.name)}</h3>
         <p>${escapeHtml((track.artists || []).join(' / ') || track.album || '')}</p>
       </div>
-    </article>
-  `;
-}
-
-function diaryItem(entry) {
-  return `
-    <article class="diary-card">
-      <h2>${escapeHtml(entry.title)}</h2>
-      <div class="tags">${(entry.moodTags || []).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}</div>
-      <p>${escapeHtml(entry.content)}</p>
-    </article>
-  `;
-}
-
-function memoryItem(memory) {
-  const confidence = Math.round(Number(memory.confidence || 0) * 100);
-  const importance = Math.round(Number(memory.importance || 0) * 100);
-  return `
-    <article class="memory-item">
-      <div class="memory-main">
-        <div class="memory-meta">
-          <span class="tag">${escapeHtml(memoryKindLabel(memory.kind))}</span>
-          <span class="muted">置信 ${confidence}% · 重要 ${importance}% · 证据 ${Number(memory.evidenceCount || 0)}</span>
-        </div>
-        <p>${escapeHtml(memory.content || '')}</p>
-        <div class="tags">${(memory.tags || []).map((tag) => `<span class="tag subtle">${escapeHtml(tag)}</span>`).join('')}</div>
-        <p class="muted memory-time">更新于 ${escapeHtml(formatDateTime(memory.updatedAt || memory.lastSeenAt))}</p>
-      </div>
-      <button class="ghost danger" data-delete-memory="${memory.id}">删除</button>
     </article>
   `;
 }
