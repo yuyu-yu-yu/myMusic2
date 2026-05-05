@@ -1,6 +1,6 @@
 // Community API wrapper - uses NeteaseCloudMusicApi module for play URLs
 import { createRequire } from 'node:module';
-import { readFileSync, existsSync, writeFileSync } from 'node:fs';
+import { readFileSync, existsSync } from 'node:fs';
 import path from 'node:path';
 
 const apiPath = process.env.APPDATA + '\\npm\\node_modules\\NeteaseCloudMusicApi\\main.js';
@@ -57,19 +57,41 @@ export async function searchOnline(keyword, limit = 5) {
       cookie: _cookie
     });
     const songs = result.body?.result?.songs || [];
-    return songs.map(s => ({
-      id: String(s.id),
-      originalId: String(s.id),
-      name: s.name,
-      artists: (s.ar || s.artists || []).map(a => a.name || a),
-      album: (s.al || s.album || {}).name || '',
-      coverUrl: (s.al || s.album || {}).picUrl || '',
-      durationMs: s.dt || s.duration || 0
-    }));
+    return normalizeSearchSongs(songs);
   } catch (e) {
-    console.warn('[community] search failed:', e.message);
+    console.warn('[community] search with cookie failed:', e.message || e.body?.message || e.body?.msg || e.status);
+  }
+
+  try {
+    const songs = await searchViaLocalHttp(keyword, limit);
+    return normalizeSearchSongs(songs);
+  } catch (e) {
+    console.warn('[community] search failed:', e.message || e.body?.message || e.body?.msg || e.status);
     return [];
   }
+}
+
+async function searchViaLocalHttp(keyword, limit) {
+  const url = new URL('/search', process.env.COMMUNITY_API_BASE_URL || 'http://localhost:4000');
+  url.searchParams.set('keywords', String(keyword));
+  url.searchParams.set('limit', String(limit));
+  url.searchParams.set('type', '1');
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`community HTTP ${response.status}`);
+  const json = await response.json();
+  return json.result?.songs || [];
+}
+
+function normalizeSearchSongs(songs) {
+  return (songs || []).map(s => ({
+    id: String(s.id),
+    originalId: String(s.id),
+    name: s.name,
+    artists: (s.ar || s.artists || []).map(a => a.name || a),
+    album: (s.al || s.album || {}).name || '',
+    coverUrl: (s.al || s.album || {}).picUrl || '',
+    durationMs: s.dt || s.duration || 0
+  }));
 }
 
 export async function getLyric(songId) {
@@ -83,49 +105,4 @@ export async function getLyric(songId) {
   } catch {
     return null;
   }
-}
-
-export async function generateQrKey() {
-  try {
-    const ts = Date.now();
-    const res = await fetch(`http://127.0.0.1:4000/login/qr/key?timestamp=${ts}`);
-    const json = await res.json();
-    if (json?.data?.unikey) {
-      return {
-        unikey: json.data.unikey,
-        qrUrl: `https://music.163.com/login?codekey=${json.data.unikey}`
-      };
-    }
-  } catch (e) {
-    console.warn('[community] qr key failed:', e.message);
-  }
-  return null;
-}
-
-export async function checkQrStatus(unikey) {
-  try {
-    const ts = Date.now();
-    const res = await fetch(`http://127.0.0.1:4000/login/qr/check?key=${unikey}&timestamp=${ts}`);
-    return await res.json();
-  } catch (e) {
-    console.warn('[community] qr check failed:', e.message);
-    return { code: -1, message: e.message };
-  }
-}
-
-export function saveCookieFromQr(result) {
-  const cookie = result?.cookie;
-  if (!cookie || typeof cookie !== 'string') return false;
-  const match = cookie.match(/MUSIC_U=([^;]+)/);
-  if (!match) return false;
-  const musicU = match[1];
-  const fullCookie = `MUSIC_U=${musicU}`;
-  _cookie = fullCookie;
-  if (_cookiePath) {
-    try {
-      writeFileSync(_cookiePath, fullCookie, 'utf8');
-      console.log('[community] cookie saved from QR login');
-    } catch {}
-  }
-  return true;
 }

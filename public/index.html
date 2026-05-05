@@ -36,7 +36,11 @@
       <section class="player-shell">
         <div class="left-col">
           <div class="now-panel">
-            <img id="cover" class="cover" src="/assets/cover-1.svg" alt="cover" />
+            <div id="ai-dj-avatar" class="ai-dj-avatar" data-state="idle" aria-label="AI DJ CanCan">
+              <video id="avatar-video" class="avatar-video" muted loop playsinline preload="auto"></video>
+              <img id="avatar-image" class="avatar-image" src="/avatar/source/cancan.png" alt="AI DJ CanCan" />
+              <span class="avatar-status">ON AIR</span>
+            </div>
             <div class="track-meta">
               <p class="eyebrow">AI PRIVATE RADIO</p>
               <h1 id="track-title">myMusic</h1>
