@@ -109,7 +109,7 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   const hour = new Date().getHours();
   const timeOfDay = hour < 6 ? '深夜' : hour < 9 ? '清晨' : hour < 12 ? '上午' : hour < 14 ? '中午' : hour < 18 ? '下午' : hour < 21 ? '傍晚' : '夜晚';
   const mode = getSessionMode(db, sessionId);
-  const prefs = getUserPrefs(db);
+  const prefs = normalizeRuntimePrefs(getUserPrefs(db));
   const context = getSessionContext(db, sessionId);
   const conversationState = normalizeConversationState(context.conversationState);
   const recommendationMood = conversationMood || moodFromConversationState(conversationState, prefs, mode);
@@ -158,7 +158,8 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   }
 
   // TTS
-  const ttsUrl = shouldSynthesizeForRecommendation(prefs)
+  const speech = speechDecisionForRecommendation(prefs);
+  const ttsUrl = speech.shouldSpeak
     ? await synthesizeSpeech(config.tts, result.chatText)
     : null;
 
@@ -168,6 +169,7 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
     track: result.track,
     reason: result.reason,
     ttsUrl,
+    speech,
     mode: result.newMode || mode,
     profile,
     weather
@@ -297,7 +299,8 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     ...getSessionContext(db, sessionId),
     conversationState: finalConversationState
   });
-  const ttsUrl = prefs.voiceMode === 'all'
+  const speech = speechDecisionForChat(prefs);
+  const ttsUrl = speech.shouldSpeak
     ? await synthesizeSpeech(config.tts, chatDecision.chatText)
     : null;
 
@@ -307,6 +310,7 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     track: null,
     reason: '',
     ttsUrl,
+    speech,
     mode: chatDecision.newMode || mode,
     profile,
     weather: getSessionContext(db, sessionId).weather || '',
@@ -420,6 +424,22 @@ function normalizeRuntimePrefs(raw = {}) {
 
 function shouldSynthesizeForRecommendation(prefs = {}) {
   return normalizeRuntimePrefs(prefs).voiceMode !== 'off';
+}
+
+function speechDecisionForRecommendation(prefs = {}) {
+  const normalized = normalizeRuntimePrefs(prefs);
+  return {
+    mode: normalized.voiceMode,
+    shouldSpeak: shouldSynthesizeForRecommendation(normalized)
+  };
+}
+
+function speechDecisionForChat(prefs = {}) {
+  const normalized = normalizeRuntimePrefs(prefs);
+  return {
+    mode: normalized.voiceMode,
+    shouldSpeak: normalized.voiceMode === 'all'
+  };
 }
 
 function normalizeConversationState(state = {}) {

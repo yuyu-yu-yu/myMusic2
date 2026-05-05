@@ -244,6 +244,33 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
   assert.equal(sanitized.preferences.note.length, 500);
 });
 
+test('voice mode is returned as an explicit speech decision for chat replies', async (t) => {
+  const db = testDb(t);
+
+  updatePreferences({ db, payload: { voiceMode: 'all' } });
+  const speakAll = await chatTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'voice-all-chat',
+    message: 'hello'
+  });
+  assert.equal(speakAll.track, null);
+  assert.deepEqual(speakAll.speech, { mode: 'all', shouldSpeak: true });
+
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  const speakOff = await chatTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'voice-off-chat',
+    message: 'hello again'
+  });
+  assert.equal(speakOff.track, null);
+  assert.deepEqual(speakOff.speech, { mode: 'off', shouldSpeak: false });
+  assert.equal(speakOff.ttsUrl, null);
+});
+
 test('user memories can be recorded, merged, retrieved, deleted, and cleared', (t) => {
   const db = testDb(t);
 
