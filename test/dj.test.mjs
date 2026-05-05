@@ -182,6 +182,27 @@ test('feedback API handler records valid events and rejects invalid payloads', (
   assert.equal(badType.status, 400);
 });
 
+test('feedback summaries use recent events and are returned after feedback', (t) => {
+  const db = testDb(t);
+
+  recordTrackFeedback(db, { trackId: 'track-1', eventType: 'like' });
+  recordTrackFeedback(db, { trackId: 'track-1', eventType: 'complete' });
+  const summary = getPreferences({ db }).feedbackSummary;
+  assert.equal(summary.totals.likes, 1);
+  assert.equal(summary.totals.completions, 1);
+  assert.equal(summary.totals.events, 2);
+  assert.equal(summary.windowDays, 30);
+  assert.equal(summary.tracks[0].trackId, 'track-1');
+
+  const ok = submitFeedback({
+    db,
+    payload: { trackId: 'track-2', eventType: 'skip', sessionId: 'session-1' }
+  });
+  assert.equal(ok.ok, true);
+  assert.equal(ok.feedbackSummary.totals.skips, 1);
+  assert.equal(Array.isArray(ok.memories), true);
+});
+
 test('preferences API helpers read defaults, persist updates, and sanitize invalid values', (t) => {
   const db = testDb(t);
 
@@ -331,6 +352,28 @@ test('memory API helpers expose list, delete one, and clear all', (t) => {
   recordOrMergeUserMemory(db, { kind: 'preference', content: '用户喜欢温柔的聊天方式。', tags: ['温柔'] });
   assert.equal(removeAllMemories({ db }).ok, true);
   assert.equal(getMemories({ db }).memories.length, 0);
+});
+
+test('memory API surfaces recently updated memories first', (t) => {
+  const db = testDb(t);
+  const oldMemory = recordOrMergeUserMemory(db, {
+    kind: 'preference',
+    content: 'old memory should not stay first forever',
+    importance: 1,
+    confidence: 1
+  });
+  db.prepare('UPDATE user_memories SET updated_at = ? WHERE id = ?')
+    .run('2000-01-01T00:00:00.000Z', oldMemory.id);
+  const recentMemory = recordOrMergeUserMemory(db, {
+    kind: 'need',
+    content: 'recent memory should be visible in the mixer summary',
+    importance: 0.2,
+    confidence: 0.2
+  });
+
+  const memories = getMemories({ db }).memories;
+  assert.equal(memories[0].id, recentMemory.id);
+  assert.equal(listUserMemories(db)[0].id, recentMemory.id);
 });
 
 test('memory prompt formatting has a bounded long-term memory section', () => {
