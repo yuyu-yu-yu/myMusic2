@@ -8,7 +8,8 @@ const state = {
   feedbackSent: new Set(),
   activePlayback: null,
   lyricLines: [],
-  activeLyricIndex: -1
+  activeLyricIndex: -1,
+  avatarState: 'idle'
 };
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
@@ -17,6 +18,22 @@ let btnFeedbackReady = false;
 let loadingMsgIndex = 0;
 let loadingMsgTimer = null;
 let savedChatHTML = '';
+let avatarRestoreTimer = null;
+
+const avatarMotionMap = {
+  idle: '/avatar/webm/idle.webm',
+  listening: '/avatar/webm/listening.webm',
+  talking: '/avatar/webm/talking.webm',
+  searching: '/avatar/webm/searching_music.webm',
+  reading: '/avatar/webm/reading_book.webm',
+  happy: '/avatar/webm/happy.webm',
+  on_air: '/avatar/webm/on_air.webm'
+};
+
+const avatarStateAliases = {
+  searching_music: 'searching',
+  reading_book: 'reading'
+};
 
 const view = document.querySelector('#view');
 const template = document.querySelector('#player-template');
@@ -196,6 +213,85 @@ function stopDrawLoop() {
 function stopVisualizer() {
   switchVisualizerTo('off');
 }
+
+function normalizeAvatarState(nextState) {
+  const normalized = avatarStateAliases[nextState] || nextState || 'idle';
+  return avatarMotionMap[normalized] ? normalized : 'idle';
+}
+
+function setAvatarState(nextState = 'idle', options = {}) {
+  const normalized = normalizeAvatarState(nextState);
+  state.avatarState = normalized;
+
+  if (avatarRestoreTimer) {
+    clearTimeout(avatarRestoreTimer);
+    avatarRestoreTimer = null;
+  }
+
+  const root = document.querySelector('#ai-dj-avatar');
+  if (!root) return;
+
+  root.dataset.state = normalized;
+
+  const video = document.querySelector('#avatar-video');
+  const image = document.querySelector('#avatar-image');
+  const src = avatarMotionMap[normalized];
+
+  if (image) image.src = '/avatar/source/cancan.png';
+  if (video && src) {
+    video.onerror = () => {
+      root.classList.add('is-fallback');
+      video.hidden = true;
+      if (image) image.hidden = false;
+    };
+    video.onloadeddata = () => {
+      root.classList.remove('is-fallback');
+      video.hidden = false;
+      if (image) image.hidden = true;
+      video.play().catch(() => {});
+    };
+
+    if (video.getAttribute('src') !== src) {
+      video.hidden = true;
+      if (image) image.hidden = false;
+      root.classList.add('is-fallback');
+      video.src = src;
+      video.load();
+    } else {
+      if (video.readyState >= 2) {
+        root.classList.remove('is-fallback');
+        video.hidden = false;
+        if (image) image.hidden = true;
+        video.play().catch(() => {});
+      }
+    }
+  }
+
+  if (options.temporaryMs) {
+    const restoreState = options.restoreState || getContextualAvatarState();
+    avatarRestoreTimer = setTimeout(() => {
+      setAvatarState(restoreState);
+    }, options.temporaryMs);
+  }
+}
+
+function getContextualAvatarState() {
+  const hostAudio = document.querySelector('#host-audio');
+  const songAudio = document.querySelector('#song-audio');
+  if (hostAudio?.src && !hostAudio.paused && !hostAudio.ended) return 'talking';
+  if (songAudio?.src && !songAudio.paused && !songAudio.ended) return 'listening';
+  if (state.current?.track) return 'on_air';
+  return 'idle';
+}
+
+function setRadioButtonState(mode = 'idle') {
+  const startBtn = document.querySelector('#start-btn');
+  if (!startBtn) return;
+  startBtn.dataset.radioState = mode;
+  if (mode === 'loading') startBtn.textContent = '电台启动中';
+  else if (mode === 'active') startBtn.textContent = '电台已启动';
+  else startBtn.textContent = '启动电台';
+}
 // --- Button press feedback ---
 
 function initButtonFeedback() {
@@ -274,8 +370,12 @@ function renderPlayer() {
   pauseBtn.addEventListener('click', () => pausePlayback());
   resumeBtn.addEventListener('click', () => resumePlayback());
   modeResetBtn.addEventListener('click', () => resetMode());
-  likeBtn.addEventListener('click', () => reportFeedback('like'));
-  dislikeBtn.addEventListener('click', () => reportFeedback('dislike'));
+  likeBtn.addEventListener('click', () => {
+    setAvatarState('happy', { temporaryMs: 1400 });
+    showLikeBurst();
+    reportFeedback('like');
+  });
+  dislikeBtn.addEventListener('click', () => handleDislike());
 
   chatForm.addEventListener('submit', (event) => {
     event.preventDefault();
@@ -294,6 +394,8 @@ function renderPlayer() {
   }
 
   if (state.current) updatePlayer(state.current, false);
+  setAvatarState(state.avatarState || getContextualAvatarState());
+  setRadioButtonState(state.sessionId || state.current?.track ? 'active' : 'idle');
   startPlayerPolling();
   initButtonFeedback();
   initVisualizer();
@@ -327,6 +429,90 @@ function ensureFeedbackButtons() {
   return { likeBtn, dislikeBtn };
 }
 
+async function handleDislike() {
+  showDislikeBurst();
+  setAvatarState('searching');
+  await reportFeedback('dislike');
+  nextTrack({ skipCurrent: false });
+}
+
+function ensureFxLayer() {
+  let layer = document.querySelector('#screen-fx-layer');
+  if (!layer) {
+    layer = document.createElement('div');
+    layer.id = 'screen-fx-layer';
+    layer.className = 'screen-fx-layer';
+    document.body.appendChild(layer);
+  }
+  return layer;
+}
+
+function showLikeBurst() {
+  const layer = ensureFxLayer();
+  const wrap = document.createElement('div');
+  wrap.className = 'pixel-heart-burst';
+  wrap.setAttribute('aria-hidden', 'true');
+  wrap.innerHTML = `
+    <span class="pixel-heart-core"></span>
+    ${Array.from({ length: 16 }, (_, i) => `<span class="pixel-spark" style="--i:${i}"></span>`).join('')}
+  `;
+  layer.appendChild(wrap);
+
+  animate(wrap, {
+    scale: [0.55, 1.18, 1],
+    opacity: [0, 1, 0],
+    duration: 1050,
+    ease: 'outExpo',
+    onComplete: () => wrap.remove()
+  });
+
+  wrap.querySelectorAll('.pixel-spark').forEach((spark, i) => {
+    const angle = (Math.PI * 2 * i) / 16;
+    const distance = 76 + (i % 4) * 16;
+    animate(spark, {
+      x: Math.cos(angle) * distance,
+      y: Math.sin(angle) * distance,
+      scale: [1, 0],
+      opacity: [1, 0],
+      duration: 720,
+      delay: 80,
+      ease: 'outQuad'
+    });
+  });
+}
+
+function showDislikeBurst() {
+  const layer = ensureFxLayer();
+  const wrap = document.createElement('div');
+  wrap.className = 'pixel-block-burst';
+  wrap.setAttribute('aria-hidden', 'true');
+  wrap.innerHTML = Array.from({ length: 28 }, (_, i) => `<span class="pixel-block" style="--i:${i}"></span>`).join('');
+  layer.appendChild(wrap);
+
+  wrap.querySelectorAll('.pixel-block').forEach((block, i) => {
+    const angle = (Math.PI * 2 * i) / 28;
+    const distance = 54 + (i % 7) * 13;
+    const spin = i % 2 === 0 ? 90 : -90;
+    animate(block, {
+      x: Math.cos(angle) * distance,
+      y: Math.sin(angle) * distance,
+      rotate: spin,
+      scale: [1, 0.25],
+      opacity: [1, 0],
+      duration: 620 + (i % 5) * 40,
+      ease: 'outExpo'
+    });
+  });
+
+  animate(wrap, {
+    scale: [0.85, 1.1],
+    opacity: [1, 0],
+    duration: 820,
+    ease: 'outQuad',
+    onComplete: () => wrap.remove()
+  });
+}
+
 // --- Loading message rotator ---
 const loadingMessages = [
   '灿灿正在帮你挑选歌曲...',
@@ -342,6 +528,7 @@ const loadingMessages = [
 function startLoadingMessages() {
   loadingMsgIndex = 0;
   statusLocked = true;
+  setAvatarState('searching');
   showLoadingMessage();
   loadingMsgTimer = setInterval(() => {
     loadingMsgIndex = (loadingMsgIndex + 1) % loadingMessages.length;
@@ -368,32 +555,37 @@ function stopLoadingMessages() {
 }
 
 async function startRadio() {
+  setAvatarState('on_air');
+  setRadioButtonState('loading');
   appendChat({ role: 'user', text: '启动电台' });
   startLoadingMessages();
   try {
     const data = await api('/api/radio/start', { method: 'POST', body: {} });
     handleRadioResponse(data);
-  } catch (e) { stopLoadingMessages(); setPlayerStatus(e.message, 'error'); }
+  } catch (e) { stopLoadingMessages(); setAvatarState('idle'); setRadioButtonState(state.current?.track ? 'active' : 'idle'); setPlayerStatus(e.message, 'error'); }
 }
 
 async function nextTrack({ skipCurrent = true } = {}) {
+  setAvatarState('searching');
   if (skipCurrent) await reportFeedback('skip');
   appendChat({ role: 'user', text: '下一首' });
   startLoadingMessages();
   try {
     const data = await api('/api/radio/next', { method: 'POST', body: { sessionId: state.sessionId } });
     handleRadioResponse(data);
-  } catch (e) { stopLoadingMessages(); setPlayerStatus(e.message, 'error'); }
+  } catch (e) { stopLoadingMessages(); setAvatarState(getContextualAvatarState()); setPlayerStatus(e.message, 'error'); }
 }
 
 async function sendChat(msg) {
   appendChat({ role: 'user', text: msg });
   startLoadingMessages();
+  setAvatarState('reading', { temporaryMs: 900, restoreState: 'searching' });
   try {
     const data = await api('/api/radio/chat', { method: 'POST', body: { sessionId: state.sessionId, message: msg } });
     handleRadioResponse(data);
   } catch (e) {
     stopLoadingMessages();
+    setAvatarState(getContextualAvatarState());
     appendChat({ role: 'dj', text: '抱歉，出了一点问题：' + e.message });
   }
 }
@@ -407,6 +599,7 @@ async function resetMode() {
 function handleRadioResponse(data) {
   stopLoadingMessages();
   state.sessionId = data.sessionId || state.sessionId;
+  setRadioButtonState(state.sessionId || data.track || state.current?.track ? 'active' : 'idle');
   if (data.track) {
     stopVisualizer();
     state.current = data;
@@ -426,6 +619,7 @@ function handleRadioResponse(data) {
 
   // Only play if there's a track
   if (!data.track) {
+    setAvatarState(getContextualAvatarState());
     setPlayerStatus(state.current?.track ? '继续播放中' : '等待中', '');
     return;
   }
@@ -435,14 +629,17 @@ function handleRadioResponse(data) {
   setPlayerStatus('歌曲就绪', 'playing');
   try {
     if (data.ttsUrl) {
+      setAvatarState('talking');
       hostAudio.onended = () => startSongPlayback();
-      hostAudio.onplay = () => switchVisualizerTo('host');
+      hostAudio.onplay = () => { setAvatarState('talking'); switchVisualizerTo('host'); };
       hostAudio.play();
     } else {
+      setAvatarState('talking');
       switchVisualizerTo('host');  // show fallback for SpeechSynthesis
       speakText(data.chatText || data.hostText, () => startSongPlayback());
     }
   } catch {
+    setAvatarState('talking');
     switchVisualizerTo('host');
     speakText(data.chatText || data.hostText, () => startSongPlayback());
   }
@@ -471,7 +668,6 @@ function appendChat({ role, text, track }) {
 
 async function updatePlayer(data, autoplay) {
   const track = data.track || {};
-  document.querySelector('#cover').src = track.coverUrl || '/assets/cover-1.svg';
   document.querySelector('#track-title').textContent = track.name || 'myMusic';
   document.querySelector('#track-artist').textContent = (track.artists || []).join(' / ') || '等待启动';
   buildLyricDOM(data.track?.lyric || '');
@@ -586,14 +782,17 @@ async function startSongPlayback() {
   if (track?.playUrl) {
     markPlaybackStarted(track, 'browser');
     setPlayerStatus(`正在播放：${track.name || '未知歌曲'}`, 'playing');
+    setAvatarState('listening');
     switchVisualizerTo('song');
     songAudio.play().catch(() => {});
     songAudio.onended = async () => {
       stopVisualizer();
+      setAvatarState('searching');
       await reportFeedback('complete');
       nextTrack({ skipCurrent: false });
     };
     songAudio.onplay = () => {
+      setAvatarState('listening');
       api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
     };
     songAudio.ontimeupdate = () => { syncLyricTime(songAudio.currentTime); updateProgressBar(); };
@@ -601,6 +800,7 @@ async function startSongPlayback() {
   }
 
   // No direct URL, try ncm-cli via server
+  setAvatarState('listening');
   switchVisualizerTo('song');
   playCurrentTrack();
 }
@@ -753,6 +953,7 @@ async function playCurrentTrack() {
       updatePlayer(state.current, false);
     }
     markPlaybackStarted(result.track || track, 'ncm-cli');
+    setAvatarState('listening');
     const skipped = result.skipped?.length ? `，已跳过 ${result.skipped.length} 首不可播歌曲` : '';
     setPlayerStatus(`正在播放：${result.track?.name || track.name}${skipped}`, 'playing');
     api('/api/play/report', { method: 'POST', body: { trackId: result.track?.id || track.id, playType: 'play' } }).catch(() => {});
@@ -763,6 +964,7 @@ async function playCurrentTrack() {
 
 async function pausePlayback() {
   stopVisualizer();
+  setAvatarState('idle');
   document.querySelector('#host-audio')?.pause();
   document.querySelector('#song-audio')?.pause();
   window.speechSynthesis?.cancel?.();
@@ -775,13 +977,15 @@ async function pausePlayback() {
 async function resumePlayback() {
   const songAudio = document.querySelector('#song-audio');
   if (songAudio?.src) {
-    startVisualizer(songAudio);
+    setAvatarState('listening');
+    switchVisualizerTo('song');
     songAudio.play().catch(() => {});
     setPlayerStatus('继续播放', 'playing');
     return;
   }
   try {
     await api('/api/player/resume', { method: 'POST', body: {} });
+    setAvatarState('listening');
     setPlayerStatus('继续播放', 'playing');
   } catch (error) {
     setPlayerStatus(error.message, 'error');
@@ -790,6 +994,7 @@ async function resumePlayback() {
 
 async function stopPlayback() {
   stopVisualizer();
+  setAvatarState('idle');
   document.querySelector('#host-audio')?.pause();
   const songAudio = document.querySelector('#song-audio');
   songAudio?.pause();
