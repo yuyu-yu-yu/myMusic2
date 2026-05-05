@@ -403,9 +403,9 @@ async function resetMode() {
 
 function handleRadioResponse(data) {
   stopLoadingMessages();
-  stopVisualizer();
   state.sessionId = data.sessionId || state.sessionId;
   if (data.track) {
+    stopVisualizer();
     state.current = data;
     updatePlayer(data, false);
   }
@@ -817,7 +817,11 @@ async function renderDiary() {
 }
 
 async function renderSettings() {
-  const status = await api('/api/config/status');
+  const [status, memoryData] = await Promise.all([
+    api('/api/config/status'),
+    api('/api/memories').catch(() => ({ memories: [] }))
+  ]);
+  const memories = memoryData.memories || [];
   view.innerHTML = `
     <section class="page-panel">
       <p class="eyebrow">Settings</p>
@@ -838,6 +842,19 @@ async function renderSettings() {
         <img id="qr-img" class="qr-img" src="" alt="登录二维码" style="display:none" />
       </div>
     </section>
+    <section class="page-panel memory-panel">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Memory</p>
+          <h2>灿灿的记忆</h2>
+        </div>
+        <button id="clear-memories-btn" class="ghost danger" ${memories.length ? '' : 'disabled'}>清空全部</button>
+      </div>
+      <p class="muted">这里保存的是灿灿从长期对话和反馈中提炼出的稳定需求、偏好和边界；删除后不会影响聊天历史。</p>
+      <div class="memory-list">
+        ${memories.length ? memories.map(memoryItem).join('') : '<p class="muted memory-empty">暂时还没有长期记忆。继续和灿灿聊天后，这里会出现值得长期记住的内容。</p>'}
+      </div>
+    </section>
   `;
   document.querySelector('#qr-btn').addEventListener('click', () => startQrLogin());
   document.querySelector('#qr-refresh-btn').addEventListener('click', async () => {
@@ -845,6 +862,20 @@ async function renderSettings() {
     statusEl.textContent = '正在续期...';
     const res = await api('/api/auth/netease/refresh', { method: 'POST', body: {} });
     statusEl.textContent = res.ok ? 'token 已续期（7天内有效）' : '续期失败，请重新扫码';
+  });
+  document.querySelectorAll('[data-delete-memory]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const id = button.getAttribute('data-delete-memory');
+      if (!confirm('删除这条记忆？')) return;
+      await api(`/api/memories/${id}`, { method: 'DELETE' });
+      renderSettings();
+    });
+  });
+  document.querySelector('#clear-memories-btn')?.addEventListener('click', async () => {
+    if (!memories.length) return;
+    if (!confirm('清空灿灿的全部长期记忆？聊天历史不会被删除。')) return;
+    await api('/api/memories', { method: 'DELETE' });
+    renderSettings();
   });
 }
 
@@ -934,6 +965,43 @@ function diaryItem(entry) {
       <p>${escapeHtml(entry.content)}</p>
     </article>
   `;
+}
+
+function memoryItem(memory) {
+  const confidence = Math.round(Number(memory.confidence || 0) * 100);
+  const importance = Math.round(Number(memory.importance || 0) * 100);
+  return `
+    <article class="memory-item">
+      <div class="memory-main">
+        <div class="memory-meta">
+          <span class="tag">${escapeHtml(memoryKindLabel(memory.kind))}</span>
+          <span class="muted">置信 ${confidence}% · 重要 ${importance}% · 证据 ${Number(memory.evidenceCount || 0)}</span>
+        </div>
+        <p>${escapeHtml(memory.content || '')}</p>
+        <div class="tags">${(memory.tags || []).map((tag) => `<span class="tag subtle">${escapeHtml(tag)}</span>`).join('')}</div>
+        <p class="muted memory-time">更新于 ${escapeHtml(formatDateTime(memory.updatedAt || memory.lastSeenAt))}</p>
+      </div>
+      <button class="ghost danger" data-delete-memory="${memory.id}">删除</button>
+    </article>
+  `;
+}
+
+function memoryKindLabel(kind) {
+  return {
+    emotion_pattern: '情绪模式',
+    need: '需求',
+    preference: '偏好',
+    boundary: '边界',
+    life_context: '生活上下文',
+    music_preference: '音乐偏好'
+  }[kind] || kind || '记忆';
+}
+
+function formatDateTime(value) {
+  if (!value) return '未知时间';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return date.toLocaleString('zh-CN', { hour12: false });
 }
 
 function statusRow(label, ok, detail = '') {
