@@ -45,10 +45,22 @@
               <p class="eyebrow">AI PRIVATE RADIO</p>
               <h1 id="track-title">myMusic</h1>
               <p id="track-artist" class="muted">等待启动</p>
-              <div class="transport transport-mini">
-                <button id="pause-btn">暂停</button>
-                <button id="resume-btn">继续</button>
-                <button id="next-btn">下一首</button>
+              <div class="playback-console">
+                <div class="playback-controls" aria-label="播放控制">
+                  <button id="previous-btn" class="transport-icon-btn transport-prev" type="button" title="上一首待接入" aria-label="上一首待接入" disabled>
+                    <span class="transport-icon" aria-hidden="true"></span>
+                  </button>
+                  <button id="play-toggle-btn" class="transport-main-btn is-paused" type="button" title="继续" aria-label="继续">
+                    <span class="transport-symbol" aria-hidden="true"></span>
+                  </button>
+                  <button id="next-btn" class="transport-icon-btn transport-next" type="button" title="下一首" aria-label="下一首">
+                    <span class="transport-icon" aria-hidden="true"></span>
+                  </button>
+                </div>
+                <div class="feedback-controls" aria-label="反馈控制">
+                  <button id="like-btn" type="button" title="喜欢">喜欢</button>
+                  <button id="dislike-btn" type="button" title="不喜欢">不喜欢</button>
+                </div>
               </div>
             </div>
           </div>

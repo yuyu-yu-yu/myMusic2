@@ -385,8 +385,7 @@ function renderPlayer() {
 
   const startBtn = document.querySelector('#start-btn');
   const nextBtn = document.querySelector('#next-btn');
-  const pauseBtn = document.querySelector('#pause-btn');
-  const resumeBtn = document.querySelector('#resume-btn');
+  const playToggleBtn = document.querySelector('#play-toggle-btn');
   const chatForm = document.querySelector('#chat-form');
   const modeResetBtn = document.querySelector('#mode-reset-btn');
   const { likeBtn, dislikeBtn } = ensureFeedbackButtons();
@@ -396,8 +395,10 @@ function renderPlayer() {
     startRadio();
   });
   nextBtn.addEventListener('click', () => nextTrack({ skipCurrent: true }));
-  pauseBtn.addEventListener('click', () => pausePlayback());
-  resumeBtn.addEventListener('click', () => resumePlayback());
+  playToggleBtn?.addEventListener('click', () => {
+    if (playToggleBtn.classList.contains('is-playing')) pausePlayback();
+    else resumePlayback();
+  });
   modeResetBtn.addEventListener('click', () => resetMode());
   likeBtn.addEventListener('click', () => {
     setAvatarState('happy', { temporaryMs: 1400 });
@@ -436,7 +437,7 @@ function renderPlayer() {
 }
 
 function ensureFeedbackButtons() {
-  const transport = document.querySelector('.transport-mini');
+  const controls = document.querySelector('.feedback-controls') || document.querySelector('.transport-mini');
   let likeBtn = document.querySelector('#like-btn');
   let dislikeBtn = document.querySelector('#dislike-btn');
   if (!likeBtn) {
@@ -445,7 +446,7 @@ function ensureFeedbackButtons() {
     likeBtn.type = 'button';
     likeBtn.title = '喜欢';
     likeBtn.textContent = '喜欢';
-    transport?.insertBefore(likeBtn, document.querySelector('#next-btn'));
+    controls?.appendChild(likeBtn);
   }
   if (!dislikeBtn) {
     dislikeBtn = document.createElement('button');
@@ -453,9 +454,19 @@ function ensureFeedbackButtons() {
     dislikeBtn.type = 'button';
     dislikeBtn.title = '不喜欢';
     dislikeBtn.textContent = '不喜欢';
-    transport?.insertBefore(dislikeBtn, document.querySelector('#next-btn'));
+    controls?.appendChild(dislikeBtn);
   }
   return { likeBtn, dislikeBtn };
+}
+
+function setPlaybackToggleState(isPlaying) {
+  const button = document.querySelector('#play-toggle-btn');
+  if (!button) return;
+  button.classList.toggle('is-playing', Boolean(isPlaying));
+  button.classList.toggle('is-paused', !isPlaying);
+  const label = isPlaying ? '暂停' : '继续';
+  button.title = label;
+  button.setAttribute('aria-label', label);
 }
 
 async function handleDislike() {
@@ -603,6 +614,7 @@ async function startRadio() {
 
 async function nextTrack({ skipCurrent = true } = {}) {
   setAvatarState('searching');
+  setPlaybackToggleState(false);
   if (skipCurrent) await reportFeedback('skip');
   appendChat({ role: 'user', text: '下一首' });
   startLoadingMessages();
@@ -665,10 +677,11 @@ function handleRadioResponse(data) {
     if (data.ttsUrl) {
       setAvatarState('talking');
       hostAudio.onended = () => startSongPlayback();
-      hostAudio.onplay = () => { setAvatarState('talking'); switchVisualizerTo('host'); };
+      hostAudio.onplay = () => { setAvatarState('talking'); switchVisualizerTo('host'); setPlaybackToggleState(true); };
       hostAudio.play();
     } else {
       setAvatarState('talking');
+      setPlaybackToggleState(true);
       switchVisualizerTo('host');  // show fallback for SpeechSynthesis
       speakText(data.chatText || data.hostText, () => startSongPlayback());
     }
@@ -817,12 +830,14 @@ async function startSongPlayback() {
     markPlaybackStarted(track, 'browser');
     setPlayerStatus(`正在播放：${track.name || '未知歌曲'}`, 'playing');
     setAvatarState('listening');
+    setPlaybackToggleState(true);
     switchVisualizerTo('song');
     songAudio.play().catch(() => playCurrentTrack());
     songAudio.onerror = () => playCurrentTrack();
     songAudio.onended = async () => {
       stopVisualizer();
       setAvatarState('searching');
+      setPlaybackToggleState(false);
       await reportFeedback('complete');
       nextTrack({ skipCurrent: false });
     };
@@ -836,6 +851,7 @@ async function startSongPlayback() {
 
   // No direct URL, try ncm-cli via server
   setAvatarState('listening');
+  setPlaybackToggleState(true);
   switchVisualizerTo('song');
   playCurrentTrack();
 }
@@ -988,9 +1004,11 @@ async function playCurrentTrack() {
     }
     markPlaybackStarted(track, 'ncm-cli');
     setAvatarState('listening');
+    setPlaybackToggleState(true);
     setPlayerStatus(`正在播放：${track.name}`, 'playing');
     api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
   } catch (error) {
+    setPlaybackToggleState(false);
     setPlayerStatus(error.message, 'error');
   }
 }
@@ -998,6 +1016,7 @@ async function playCurrentTrack() {
 async function pausePlayback() {
   stopVisualizer();
   setAvatarState('idle');
+  setPlaybackToggleState(false);
   document.querySelector('#host-audio')?.pause();
   document.querySelector('#song-audio')?.pause();
   window.speechSynthesis?.cancel?.();
@@ -1011,6 +1030,7 @@ async function resumePlayback() {
   const songAudio = document.querySelector('#song-audio');
   if (songAudio?.src) {
     setAvatarState('listening');
+    setPlaybackToggleState(true);
     switchVisualizerTo('song');
     songAudio.play().catch(() => {});
     setPlayerStatus('继续播放', 'playing');
@@ -1019,6 +1039,7 @@ async function resumePlayback() {
   try {
     await api('/api/player/resume', { method: 'POST', body: {} });
     setAvatarState('listening');
+    setPlaybackToggleState(true);
     setPlayerStatus('继续播放', 'playing');
   } catch (error) {
     setPlayerStatus(error.message, 'error');
@@ -1028,6 +1049,7 @@ async function resumePlayback() {
 async function stopPlayback() {
   stopVisualizer();
   setAvatarState('idle');
+  setPlaybackToggleState(false);
   document.querySelector('#host-audio')?.pause();
   const songAudio = document.querySelector('#song-audio');
   songAudio?.pause();
