@@ -934,7 +934,7 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
     : '';
 
   const systemPrompt = [
-    '你是灿灿，一个私人电台 DJ。',
+    '你是灿灿，一个私人电台 DJ。歌曲播完后推荐下一首。聊天中听众点歌就推，你觉得有首歌特别契合时也可以推。',
     '',
     `此刻：${timeOfDay} ${hour}点，${weather}`,
     `听众画像：${profile.summary}`,
