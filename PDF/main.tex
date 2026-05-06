@@ -1,0 +1,480 @@
+\documentclass[UTF8,a4paper,11pt,fontset=windows]{ctexart}
+
+\usepackage{geometry}
+\geometry{left=2.35cm,right=2.35cm,top=2.35cm,bottom=2.35cm}
+
+\usepackage{xcolor}
+\definecolor{Ink}{HTML}{1F2937}
+\definecolor{Muted}{HTML}{5F6B7A}
+\definecolor{Line}{HTML}{D9E2EF}
+\definecolor{SoftBlue}{HTML}{EAF4FF}
+\definecolor{DeepBlue}{HTML}{2454A6}
+\definecolor{Violet}{HTML}{6D4AFF}
+\definecolor{SoftViolet}{HTML}{F2EDFF}
+\definecolor{SoftGreen}{HTML}{EAF8F0}
+\definecolor{Warm}{HTML}{FFF5E8}
+\definecolor{Night}{HTML}{080B1E}
+\definecolor{Panel}{HTML}{151B3D}
+\definecolor{NeonCyan}{HTML}{28E8FF}
+\definecolor{NeonPurple}{HTML}{8E5CFF}
+\definecolor{CoverCream}{HTML}{FFF8EC}
+
+\usepackage{hyperref}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=DeepBlue,
+  urlcolor=DeepBlue,
+  citecolor=DeepBlue,
+  pdfauthor={臧真宇},
+  pdftitle={CanCan Campus Radio 产品说明文档}
+}
+
+\usepackage{graphicx}
+\graphicspath{{assets/}{PDF/assets/}{../public/avatar/source/}{public/avatar/source/}}
+\usepackage{array}
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{enumitem}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,shapes.geometric,calc}
+\usepackage{caption}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{lastpage}
+\usepackage{needspace}
+
+\setlength{\parindent}{0em}
+\setlength{\parskip}{0.72em}
+\setlist[itemize]{leftmargin=1.5em,itemsep=0.25em,topsep=0.25em}
+\setlist[enumerate]{leftmargin=1.7em,itemsep=0.25em,topsep=0.25em}
+\renewcommand{\arraystretch}{1.35}
+\captionsetup{font=small,labelfont=bf}
+\sloppy
+
+\pagestyle{fancy}
+\fancyhf{}
+\lhead{\small CanCan Campus Radio}
+\rhead{\small 腾讯 PCG 校园 AI 产品创意大赛}
+\cfoot{\small \thepage\ /\ \pageref{LastPage}}
+\renewcommand{\headrulewidth}{0.4pt}
+
+\titleformat{\section}
+  {\Large\bfseries\color{DeepBlue}}
+  {\thesection}{0.8em}{}
+\titleformat{\subsection}
+  {\large\bfseries\color{Ink}}
+  {\thesubsection}{0.75em}{}
+\titleformat{\subsubsection}
+  {\normalsize\bfseries\color{Ink}}
+  {\thesubsubsection}{0.6em}{}
+
+\newcommand{\pill}[1]{%
+  \tikz[baseline=(X.base)] \node[draw=Line,fill=SoftBlue,rounded corners=8pt,inner xsep=8pt,inner ysep=3pt,font=\small\bfseries\color{DeepBlue}] (X) {#1};%
+}
+
+\newcommand{\callout}[2]{%
+  \noindent
+  \begin{tikzpicture}
+    \node[
+      fill=#1,
+      draw=Line,
+      rounded corners=5pt,
+      inner sep=10pt,
+      text width=\dimexpr\linewidth-22pt\relax,
+      align=left
+    ] {#2};
+  \end{tikzpicture}
+}
+
+\newcommand{\placeholder}[3]{%
+  \begin{figure}[htbp]
+    \centering
+    \begin{tikzpicture}
+      \draw[rounded corners=4pt,draw=Line,fill=SoftBlue] (0,0) rectangle (14.2,8.0);
+      \draw[rounded corners=3pt,draw=DeepBlue!35,fill=white] (0.6,0.55) rectangle (13.6,7.45);
+      \draw[draw=Line,fill=SoftViolet] (0.6,6.85) rectangle (13.6,7.45);
+      \foreach \x in {1.0,1.4,1.8} {
+        \fill[DeepBlue!45] (\x,7.15) circle (0.07);
+      }
+      \node[align=center,text width=11.8cm,color=Ink,font=\bfseries] at (7.1,4.45) {#1};
+      \node[align=center,text width=11.8cm,color=Muted,font=\small] at (7.1,3.65) {产品界面截图预留位\\建议图片文件：\texttt{PDF/screenshots/#2}};
+      \node[align=center,text width=11.8cm,color=Muted,font=\small] at (7.1,2.85) {#3};
+    \end{tikzpicture}
+    \caption{#1}
+  \end{figure}
+}
+
+\begin{document}
+
+\begin{titlepage}
+  \thispagestyle{empty}
+  \begin{tikzpicture}[remember picture,overlay]
+    \fill[white] (current page.south west) rectangle (current page.north east);
+    \shade[left color=Night,right color=Panel] (current page.north west) rectangle ($(current page.north east)+(0,-16.8cm)$);
+    \fill[CoverCream] ($(current page.south west)+(0,0)$) rectangle ($(current page.south east)+(0,5.2cm)$);
+    \fill[NeonPurple!16] ($(current page.south west)+(0,0)$) rectangle ($(current page.south east)+(0,1.25cm)$);
+    \draw[NeonCyan,line width=0.9pt] ($(current page.north west)+(1.7cm,-16.8cm)$) -- ($(current page.north east)+(-1.7cm,-16.8cm)$);
+
+    \foreach \x/\h in {1.6/0.35,1.95/0.7,2.3/0.45,2.65/1.05,3.0/0.55,3.35/0.85,3.7/0.42,4.05/0.65} {
+      \fill[NeonCyan!45] ($(current page.north west)+(\x cm,-14.55cm)$) rectangle ++(0.13cm,\h cm);
+    }
+    \foreach \x/\h in {16.8/0.5,17.15/0.9,17.5/0.6,17.85/1.15,18.2/0.78,18.55/0.48,18.9/0.92} {
+      \fill[NeonPurple!55] ($(current page.north west)+(\x cm,-14.55cm)$) rectangle ++(0.13cm,\h cm);
+    }
+    \foreach \x/\y in {5.7/-1.45,9.3/-2.1,16.0/-1.7,18.2/-5.3,3.5/-10.6} {
+      \fill[NeonCyan!60] ($(current page.north west)+(\x cm,\y cm)$) rectangle ++(0.08cm,0.08cm);
+      \fill[NeonPurple!75] ($(current page.north west)+(\x cm+0.12cm,\y cm+0.12cm)$) rectangle ++(0.08cm,0.08cm);
+    }
+
+    \node[anchor=north west,text=NeonCyan,font=\large\bfseries] at ($(current page.north west)+(2.0cm,-1.75cm)$)
+      {腾讯 PCG 校园 AI 产品创意大赛 · 开放赛道};
+    \node[anchor=north west,align=left,text=white,font=\bfseries] at ($(current page.north west)+(2.0cm,-2.85cm)$)
+      {\fontsize{31}{37}\selectfont CanCan\\[-0.05cm]Campus Radio};
+    \node[anchor=north west,text=NeonCyan!92,font=\Large] at ($(current page.north west)+(2.05cm,-5.65cm)$)
+      {大学生的 AI 情绪陪伴电台};
+    \node[anchor=north west,draw=NeonCyan!42,fill=Panel,rounded corners=8pt,inner sep=12pt,text width=8.0cm,align=left,text=white,font=\small] at ($(current page.north west)+(2.0cm,-6.65cm)$)
+      {\textbf{\color{NeonCyan}一句话概述：}CanCan Campus Radio 面向校园生活中需要慢下来、重新整理心情的大学生。它让 AI DJ 灿灿理解用户当下的状态，用合适的歌曲、温柔的口播和可持续记忆，陪学生度过早八、图书馆、考试周、深夜 Deadline 和独处发呆的时刻。};
+
+    \node[anchor=north west,draw=NeonPurple!62,line width=0.9pt,fill=Night,rounded corners=10pt,inner sep=5pt] at ($(current page.north west)+(11.45cm,-1.82cm)$)
+      {\includegraphics[width=7.0cm]{cancan-cover.jpg}};
+    \node[anchor=north west,draw=NeonCyan!55,fill=Night,rounded corners=12pt,inner xsep=12pt,inner ysep=5pt,text=NeonCyan,font=\bfseries] at ($(current page.north west)+(12.45cm,-9.28cm)$)
+      {灿灿 · AI RADIO HOST};
+    \node[anchor=north west,text=NeonPurple!82,font=\small] at ($(current page.north west)+(12.45cm,-10.05cm)$)
+      {会聊天、会推荐、会记住反馈的虚拟电台主持人};
+
+    \node[anchor=north west,fill=white,draw=Line,rounded corners=8pt,inner sep=14pt,text width=15.9cm,align=left] at ($(current page.north west)+(2.5cm,-17.7cm)$)
+      {
+        {\large\bfseries\color{DeepBlue} 作品信息}\par
+        \vspace{0.35cm}
+        \begin{tabularx}{15.3cm}{>{\raggedleft\arraybackslash\bfseries\color{Muted}}p{3.1cm} >{\raggedright\arraybackslash}X}
+          作品名称 & \textbf{CanCan Campus Radio} \\[0.38em]
+          参赛赛道 & 开放赛道 \\[0.38em]
+          选手姓名 & 臧真宇 \\[0.38em]
+          Demo 链接 & GitHub Release URL 待补充 \\[0.38em]
+          提交材料 & 产品说明文档 PDF \\
+        \end{tabularx}
+      };
+    \node[anchor=south,align=center] at ($(current page.south)+(0,1.65cm)$)
+      {\pill{AI 电台}\quad \pill{校园情绪陪伴}\quad \pill{音乐推荐}\quad \pill{调音台控制台}\quad \pill{本地可运行 Demo}};
+  \end{tikzpicture}
+\end{titlepage}
+
+\tableofcontents
+\newpage
+
+\section{写在前面：为什么要做一个“安静”的产品}
+
+做这个产品之前，我经常有一种很具体的感受：一天已经很累了，回到宿舍只是想放松一下，却还是会下意识打开短视频。原本只想看五分钟，结果半小时过去，屏幕一直很热闹，人却没有真的休息下来。
+
+校园生活里有很多这样的时刻。早八路上困得睁不开眼，图书馆坐下之后迟迟进入不了状态，考试周晚上明明焦虑却还要继续写，宿舍熄灯后戴着耳机，想找点声音陪着自己。我们不是没有内容可以看，也不是没有歌可以听，而是经常缺少一个能把人从嘈杂里轻轻拉出来的地方。
+
+我觉得音乐原本就有这种力量。它不要求我一直盯着屏幕，也不要求我立刻说清楚自己怎么了。一首刚好合适的歌，有时候比很多安慰都更有效。问题在于，当音乐产品也越来越像信息流，用户还是要在歌单、榜单、推荐和搜索里继续选择。想听歌的人，最后又变成了一个需要不断做决定的人。
+
+CanCan Campus Radio 想做的，就是把这件事变轻一点。用户可以一边和灿灿聊天，一边听她推荐音乐：说一句“今天有点烦”，她就先理解此刻的状态，再从用户自己的音乐偏好里找一首合适的歌，用几句不打扰的口播把歌曲递过来。它不想让学生打开之后又进入一个新的信息流，而是希望那几分钟像一个可以呼吸的房间。
+
+\section{模块一：用户洞察与问题定义}
+
+\subsection{目标用户}
+
+产品首先面向正在校园里生活的大学生：他们可能正在赶早八，可能在图书馆复习，也可能刚结束社团、实习申请或一段让人消耗的人际关系。CanCan Campus Radio 服务的不是“所有听歌的人”，而是那些在学习、生活和情绪之间频繁切换，又希望用音乐帮自己稳定下来的学生。
+
+\begin{longtable}{>{\bfseries}p{3.2cm}p{11.4cm}}
+\toprule
+用户类型 & 典型特征 \\
+\midrule
+高压学习型学生 & 课程、实验、考试、论文和实习申请叠在一起，经常需要在短时间内切换状态。听歌不是为了热闹，而是为了进入专注、缓和焦虑或撑过疲惫。 \\
+情绪敏感型学生 & 容易被人际关系、成绩反馈、未来不确定性影响心情。有表达欲，但不一定想把每次低落都发到社交平台。 \\
+独处陪伴型学生 & 宿舍、通勤、夜跑或深夜自习时经常一个人听歌，希望有人“在场”，但不希望被过度打扰。 \\
+音乐收藏型学生 & 平时有自己的歌单、收藏和偏好，希望 AI 不是凭空推荐热门歌，而是理解自己的音乐历史。 \\
+\bottomrule
+\end{longtable}
+
+\subsection{用户痛点}
+
+\subsubsection{痛点一：碎片内容让人很难慢下来}
+
+学生的休息时间经常被短视频和社交消息填满。它们确实能迅速转移注意力，但也容易让人越刷越累。很多时候，用户原本只是想放松五分钟，最后却变成了更长时间的被动消费。真正的问题不是学生不想休息，而是缺少一种低刺激、可持续、能把人从信息流里轻轻拉出来的休息方式。
+
+\subsubsection{痛点二：音乐推荐知道“我爱听什么”，但不一定知道“我现在怎么了”}
+
+传统音乐推荐更擅长根据历史播放、收藏、相似歌曲来推测偏好。这对“找好听的歌”很有帮助，但对校园场景里的即时情绪并不够。早八路上的困、考试前的焦虑、论文卡住的烦、失眠时的不安，这些状态不是一个固定歌单能长期解决的。用户需要的是“此刻适合我”的音乐，而不是单纯“我可能喜欢”的音乐。
+
+\subsubsection{痛点三：陪伴产品常常太重，工具产品又常常太冷}
+
+一部分 AI 陪伴产品强调长对话和人格关系，但学生在很多场景下并不想进行沉重表达；一部分音乐工具又只负责播放和推荐，情绪上比较冷。CanCan Campus Radio 选择站在中间：它可以理解用户说的简单一句话，比如“今天有点烦，不想刷手机了”，然后用电台式的方式回应。回应不需要很长，关键是合适、自然、不侵入。
+
+\subsection{使用场景}
+
+\begin{longtable}{>{\bfseries}p{2.8cm}p{5.4cm}p{6.4cm}}
+\toprule
+场景 & 用户状态 & 产品回应 \\
+\midrule
+早八通勤 & 没睡醒，路上需要一点清醒感，但不想被强节奏轰炸。 & AI DJ 选择轻快但不过度兴奋的歌曲，用短口播帮助用户进入一天。 \\
+图书馆专注 & 想进入学习状态，怕歌词和短视频打断注意力。 & 推荐更适合背景陪伴的音乐，减少话语密度，保持低干扰。 \\
+考试周焦虑 & 心里很乱，想找一点稳定感。 & 先承认压力存在，再用舒缓歌曲和温柔口播帮助用户降速。 \\
+熬夜 Deadline & 疲惫但还要继续完成任务。 & 推荐节奏稳定、能支撑行动的歌曲，口播更像陪跑而不是说教。 \\
+宿舍放松 & 一天结束后想从社交和学习里退出来。 & 生成一个更像私人夜间电台的播放体验，让用户慢慢收尾。 \\
+\bottomrule
+\end{longtable}
+
+\placeholder{产品主界面截图}{01-home.png}{建议展示电台启动入口、AI DJ 头像、当前播放状态和整体氛围。}
+
+\section{模块二：产品方案设计}
+
+\subsection{产品概述}
+
+CanCan Campus Radio 是一款面向大学生的 AI 情绪陪伴电台。用户可以用自然语言告诉它现在的场景或心情，例如“我在图书馆，有点焦虑，但想开始复习”，产品会结合用户音乐偏好、曲库画像、近期反馈和当下语境，生成一段电台式回应，并推荐适合当下的歌曲。
+
+它不是一个单纯的播放器，也不是把聊天机器人放进音乐产品里。更准确地说，它由四个部分组成：第一是电台主界面，负责播放歌曲、呈现 AI DJ 头像和口播；第二是私人曲库，负责同步并分析用户自己的音乐偏好；第三是调音台控制台，允许用户调整“聊天 vs 推歌比例”、主动推荐频率、语音播报方式和当前情绪模式；第四是本地配置控制台，呈现网易云、LLM、TTS、天气等能力状态，并提供扫码登录、刷新 token、清空长期记忆等管理入口。
+
+在当前 Demo 中，灿灿的对话和口播由 DeepSeek V4 支撑，语音口播接入火山引擎豆包 TTS。用户可以一边听歌一边和她聊天：如果我说“这首太吵了”，她会把下一首放轻一点；如果我说“现在不想被安慰，只想专注”，她也会降低口播频率，把推荐更偏向稳定的背景陪伴。
+
+从用户体验上看，CanCan 希望完成三个经常被忽略的小动作。它先让用户把模糊的心情说出来，不要求用户学习复杂 prompt；再把歌曲和场景连起来，让 AI DJ 解释为什么这首歌适合现在，而不是只给一个列表；最后把反馈记下来，让喜欢、不喜欢、跳过、聊天内容和调音台设置逐渐影响下一轮推荐。这样一来，用户不是每次从零开始“调教”产品，而是在慢慢拥有一个越来越熟悉自己的私人电台。
+
+\Needspace{16\baselineskip}
+\subsection{核心功能}
+
+\begin{longtable}{>{\bfseries}p{3.35cm}p{11.25cm}}
+\toprule
+功能 & 说明 \\
+\midrule
+\endfirsthead
+\toprule
+功能 & 说明 \\
+\midrule
+\endhead
+AI DJ 电台启动 & 用户进入主界面后可以直接启动电台，系统会创建当前 Session，读取用户偏好与候选歌曲，生成第一段 AI DJ 口播和第一首推荐。 \\
+场景与情绪输入 & 用户可以用一句自然语言描述状态，例如“今天很浮躁，想安静一点”或“还有作业没写完，想要能撑住的歌”。 \\
+个性化歌曲推荐 & 推荐不是只依赖热门或相似歌曲，而是结合曲库画像、聊天语义、近期反馈、当前情绪模式和可播放性，选择更适合这一轮电台的歌曲。 \\
+AI DJ 口播生成 & LLM 会生成短句式、低打扰的电台主持文案，解释歌曲和此刻状态之间的关系，让推荐更像一次陪伴，而不是冷冰冰的结果列表。 \\
+TTS 语音口播 & 当前接入火山引擎豆包 TTS，将 AI DJ 文案转换成语音播放，让用户可以不盯屏幕也能感受到“电台主持人在场”。当外部 TTS 不可用时，仍保留基础语音或文本降级体验。 \\
+播放器控制 & 支持播放、暂停、继续、停止、下一首等基础播放控制，使 AI 推荐真正进入可听、可切换、可反馈的音乐流程。 \\
+自然语言聊天 & DeepSeek V4 支撑用户继续和灿灿对话，例如“换一首轻一点的”“现在想专注”“别太频繁讲话”。用户可以一边聊天一边听推荐，聊天内容会进入当前会话判断。 \\
+调音台控制台 & \texttt{/mixer} 页面提供聊天与推歌比例、主动推荐频率、语音播报、情绪模式和行为补充说明等设置，让用户可以主动调节电台性格。 \\
+曲库与音乐画像 & \texttt{/library} 页面展示私人曲库、歌单数量、常听艺人、Top 流派、Top 情绪、推荐场景和探索方向，帮助评委看到 AI 推荐并不是凭空生成。 \\
+反馈与长期记忆 & 喜欢、不喜欢、跳过、完整播放、聊天偏好和用户补充说明会沉淀为反馈趋势与长期记忆，持续影响后续推荐。 \\
+AI DJ 头像状态 & 头像会随 searching、talking、listening、happy、on air 等状态变化，让产品从“工具界面”变成有主持人存在的电台空间。 \\
+本地配置控制台 & \texttt{/settings} 页面展示网易云、DeepSeek V4、TTS、天气等能力状态，支持网易云扫码登录、刷新 \texttt{token} 和清空长期记忆，便于 Demo 调试和长期使用。 \\
+本地 Release 体验 & 当前 Demo 已打包为 Windows 可运行版本，评委可通过 exe 或 portable zip 在本机体验完整流程。 \\
+\bottomrule
+\end{longtable}
+
+\placeholder{AI DJ 对话与推荐截图}{02-radio-chat.png}{建议展示用户输入场景后，AI DJ 给出推荐、口播文本和歌曲结果。}
+
+\subsection{产品架构与功能图}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=1.0cm,
+  box/.style={draw=Line,fill=white,rounded corners=5pt,align=center,minimum width=3.0cm,minimum height=1.05cm,font=\small},
+  bluebox/.style={box,draw=DeepBlue!55,fill=SoftBlue},
+  violetbox/.style={box,draw=Violet!45,fill=SoftViolet},
+  greenbox/.style={box,draw=green!35!black,fill=SoftGreen},
+  arrow/.style={-Latex,draw=Muted,line width=0.8pt}
+]
+  \node[bluebox] (user) {学生用户\\心情/场景/反馈};
+  \node[violetbox,right=1.1cm of user] (frontend) {静态前端\\电台界面/头像/播放器};
+  \node[bluebox,right=1.1cm of frontend] (server) {Node 服务\\会话/推荐/播放控制};
+
+  \node[greenbox,below=1.0cm of server] (db) {本地数据\\SQLite/缓存/记忆};
+  \node[violetbox,left=1.1cm of db] (llm) {AI 能力\\DeepSeek V4/豆包 TTS};
+  \node[bluebox,left=1.1cm of llm] (music) {音乐来源\\曲库/歌单/网易云能力};
+
+  \draw[arrow] (user) -- (frontend);
+  \draw[arrow] (frontend) -- (server);
+  \draw[arrow] (server) -- (db);
+  \draw[arrow] (server) -- (llm);
+  \draw[arrow] (server) -- (music);
+  \draw[arrow] (llm) -- (frontend);
+  \draw[arrow] (music) -- (frontend);
+\end{tikzpicture}
+\caption{CanCan Campus Radio 产品架构示意}
+\end{figure}
+
+产品采用本地优先的架构。前端负责呈现电台界面、播放器、头像状态和用户输入；后端负责电台会话、推荐逻辑、用户记忆和 AI 能力编排；本地数据库保存曲库、反馈和运行状态。这样的结构有两个好处：一是 Demo 可以被打包成评委可直接运行的版本，二是音乐偏好和使用记忆可以尽量留在本地，减少不必要的数据暴露。
+
+\subsection{关键交互流程}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  flowstep/.style={draw=Line,fill=white,rounded corners=5pt,align=center,text width=2.45cm,minimum height=1.05cm,font=\small},
+  arrow/.style={-Latex,draw=DeepBlue,line width=0.85pt}
+]
+  \node[flowstep,fill=SoftBlue] (a) {打开电台\\进入当前状态};
+  \node[flowstep,right=0.7cm of a] (b) {输入一句话\\描述心情或场景};
+  \node[flowstep,right=0.7cm of b,fill=SoftViolet] (c) {AI 理解\\场景和情绪};
+  \node[flowstep,right=0.7cm of c] (d) {结合曲库\\选择候选歌曲};
+  \node[flowstep,below=0.8cm of d,fill=Warm] (e) {生成 DJ 口播\\并合成语音};
+  \node[flowstep,left=0.7cm of e] (f) {播放歌曲\\展示头像状态};
+  \node[flowstep,left=0.7cm of f,fill=SoftGreen] (g) {用户反馈\\喜欢/跳过/继续聊};
+  \node[flowstep,left=0.7cm of g] (h) {写入记忆\\进入下一轮};
+
+  \draw[arrow] (a) -- (b);
+  \draw[arrow] (b) -- (c);
+  \draw[arrow] (c) -- (d);
+  \draw[arrow] (d) -- (e);
+  \draw[arrow] (e) -- (f);
+  \draw[arrow] (f) -- (g);
+  \draw[arrow] (g) -- (h);
+  \draw[arrow,dashed,draw=Muted] (h.west) -- ++(-0.9,0) coordinate(loopback) |- ([yshift=0.55cm]c.north) -- (c.north);
+\end{tikzpicture}
+\caption{核心使用流程}
+\end{figure}
+
+\subsection{创新与差异化}
+
+CanCan Campus Radio 的差异化不在于把播放器功能堆得更多，而在于把“听歌”重新组织成一个有情绪理解、有声音陪伴、有长期记忆的过程。当前版本接入 DeepSeek V4 作为对话大模型，让灿灿不只是生成一句推荐理由，也可以像电台主持人一样和用户继续聊天：用户可以一边听歌，一边告诉她“这首太吵了”“我现在想专注”“今天想被安静陪着”，模型会把这些话转化为下一轮推荐和口播风格。
+
+\begin{enumerate}
+  \item \textbf{从歌单推荐变成电台陪伴。}传统推荐往往直接给结果，CanCan 会先生成一段贴合场景的 DJ 口播，让用户知道这首歌为什么适合现在。
+  \item \textbf{从平台热门变成个人语境。}产品更重视用户自己的曲库和反馈，而不是只推热门或相似曲目。
+  \item \textbf{从高频刷屏变成低刺激陪伴。}交互不要求用户持续盯屏，适合学习、通勤、夜晚独处等不想被信息流打断的场景。
+  \item \textbf{从一次性 prompt 变成可积累记忆。}用户的喜欢、不喜欢、跳过和聊天内容会影响后续推荐，让电台逐渐形成个人风格。
+  \item \textbf{从单向推荐变成可聊天的陪伴。}DeepSeek V4 支撑自然语言对话，让灿灿可以回应情绪、理解语境，并在聊天中继续推荐音乐。
+  \item \textbf{从文字 AI 变成可听见的 AI。}当前 TTS 接入火山引擎豆包语音能力，让 AI DJ 的存在更自然，电台感比纯文字推荐更强。
+\end{enumerate}
+
+\section{模块三：AI 原生能力说明}
+
+\subsection{AI 核心能力}
+
+这个产品里的 AI 不是一个附加聊天框，而是贯穿推荐、口播、记忆和呈现的核心能力。
+
+\begin{longtable}{>{\bfseries}p{3.1cm}p{5.7cm}p{5.8cm}}
+\toprule
+AI 能力 & 在产品中的作用 & 用户感知 \\
+\midrule
+对话理解 & 由 DeepSeek V4 理解用户输入中的情绪、场景、强度和隐含需求。 & 用户可以自然表达，不需要学习复杂指令，也可以持续和灿灿聊天。 \\
+音乐语境匹配 & 将心情、场景和曲库候选歌曲进行匹配。 & 推荐结果更像“此刻适合”，而不是机械相似。 \\
+DJ 文案生成 & 生成简短、温柔、有电台感的口播。 & 产品有陪伴感，但不会像说教。 \\
+TTS 语音合成 & 接入火山引擎豆包 TTS，把口播文本转成灿灿的主持声音。 & 用户可以闭眼听，不必一直看屏幕。 \\
+反馈记忆 & 记录用户对歌曲和口播的反馈。 & 电台越用越贴近个人偏好。 \\
+状态驱动头像 & 根据 listening、talking、searching、happy 等状态切换 Avatar 表现。 & AI DJ 像一个正在陪伴用户的主持人。 \\
+\bottomrule
+\end{longtable}
+
+\placeholder{曲库与用户音乐画像截图}{03-library-profile.png}{建议展示已同步歌曲、歌单、偏好分析或与用户曲库相关的页面。}
+
+\subsection{AI 如何解决痛点}
+
+\subsubsection{把“我不知道听什么”变成“先说说现在怎么了”}
+
+很多听歌场景里，用户真正卡住的不是缺少歌曲，而是不知道自己现在需要什么。CanCan 允许用户从一句很普通的话开始，例如“今天很浮躁，想安静一点”，AI 会把这句话拆成情绪状态、节奏偏好、干扰程度和场景目标，再决定推荐方向。
+
+\subsubsection{把推荐理由说出来，降低选择成本}
+
+单纯的歌曲列表会让用户继续做选择题。AI DJ 口播的价值在于，它把推荐理由用很短的话说出来：为什么这首歌适合现在，接下来这几分钟可以怎么听。这个过程不是为了制造更多内容，而是为了减少用户的犹豫和切换。
+
+\subsubsection{用声音建立陪伴，而不是用屏幕抢注意力}
+
+如果一个产品声称帮助学生放松，却要求用户一直盯着界面，它就会和短视频争夺同一块注意力。火山引擎豆包 TTS 让 CanCan 更接近广播：用户可以把手机或电脑放在一边，只通过声音获得陪伴。AI 的存在感来自恰当的表达，而不是高频弹窗。
+
+\subsubsection{让反馈真正改变下一次体验}
+
+“不喜欢这首”“换一首轻一点”“今天别太吵”这些反馈如果只停留在当前轮次，就很可惜。CanCan 会把这些反馈沉淀为记忆，用于后续推荐和口播风格调整。对学生来说，这种变化会逐渐形成一种熟悉感：这个电台不是每次从零开始认识我。
+
+\subsection{AI 技术方案}
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[
+  node distance=0.82cm,
+  box/.style={draw=Line,fill=white,rounded corners=5pt,align=center,text width=3.0cm,minimum height=0.95cm,font=\small},
+  arrow/.style={-Latex,draw=Muted,line width=0.8pt}
+]
+  \node[box,fill=SoftBlue] (input) {用户输入\\心情/场景/偏好};
+  \node[box,right=0.75cm of input] (context) {上下文组装\\曲库/天气/记忆/反馈};
+  \node[box,right=0.75cm of context,fill=SoftViolet] (llm) {DeepSeek V4\\对话理解与口播生成};
+  \node[box,right=0.75cm of llm,fill=Warm] (tts) {豆包 TTS\\生成 AI DJ 声音};
+  \node[box,below=0.8cm of llm] (rank) {推荐排序\\选择当前歌曲};
+  \node[box,below=0.8cm of context,fill=SoftGreen] (memory) {反馈写入\\更新用户记忆};
+
+  \draw[arrow] (input) -- (context);
+  \draw[arrow] (context) -- (llm);
+  \draw[arrow] (llm) -- (tts);
+  \draw[arrow] (llm) -- (rank);
+  \draw[arrow] (rank) -- (memory);
+  \draw[arrow,dashed] (memory) -- (context);
+\end{tikzpicture}
+\caption{AI 能力工作流}
+\end{figure}
+
+当前 Demo 的实现路径比较务实：先保证产品体验闭环，再逐步扩大模型能力。系统后端负责把用户输入、当前歌曲、曲库候选、历史反馈和运行状态整理成上下文，再调用 DeepSeek V4 进行对话理解、推荐解释和电台口播生成。口播文本会交给火山引擎豆包 TTS 合成音频，前端播放器负责播放歌曲和口播，头像状态根据电台状态切换。用户在这个过程中不只是“点歌”，还可以持续和灿灿聊天，让聊天内容成为下一首推荐的一部分。
+
+技术上，产品保留了降级策略：当外部模型或 TTS 短暂不可用时，系统仍可以使用基础推荐和本地文本逻辑完成核心流程。这样做的目的不是弱化 AI 能力，而是保证评审和真实使用中的稳定性：用户打开电台后，至少能够完成启动、推荐、播放、聊天和反馈，而不会因为某个外部服务波动就中断整个体验。
+
+\subsection{数据与隐私边界}
+
+音乐偏好和情绪记录本身比较私人，因此产品采用本地优先的设计思路。Demo 中的曲库、会话和反馈主要保存在本地数据库与缓存中；前端不写入任何模型密钥；AI 调用统一由后端读取环境配置。当前版本已经提供长期记忆清空入口，后续还需要补充“导出个人数据”“隐私模式”“只听歌不记忆”等更细的选择，让用户明确知道哪些内容被记录、为什么被记录、如何删除。
+
+在账号接入上，未来版本应该把扫码登录设计成正式的一等流程，而不是让用户手动配置 cookie 或 token。更符合普通用户习惯的路径是：用户在本地或安全的授权页面中选择网易云音乐、QQ 音乐等平台，通过官方授权或二维码扫码完成登录；产品只读取必要的歌单、收藏和播放能力，不把密钥暴露给前端，也不把用户音乐数据默认上传到公共服务。这样既能保留“使用自己真实曲库”的个性化价值，也能降低配置门槛，让产品从比赛 Demo 走向普通学生真正能用的形态。
+
+\placeholder{反馈与调音台截图}{04-mixer-feedback.png}{建议展示喜欢/不喜欢、下一首、调音台或任何会影响后续推荐的交互。}
+
+\section{模块四：落地可行性与商业化思考}
+
+\subsection{落地可行性}
+
+CanCan Campus Radio 不是只停留在概念层的方案。目前项目已经具备可运行的 MVP：有前端电台界面、后端服务、用户曲库读取、AI DJ 文案、TTS 口播、反馈记忆、头像状态和 Windows Release 打包。评委可以通过 exe 或 portable zip 体验完整流程。
+
+\begin{longtable}{>{\bfseries}p{3.3cm}p{11.3cm}}
+\toprule
+落地环节 & 当前状态与后续方向 \\
+\midrule
+产品原型 & 已完成静态前端和本地服务，能够启动电台、和灿灿聊天、播放音乐、提交反馈。后续可补充移动端适配和更明确的校园场景入口。 \\
+AI 能力 & 已接入 DeepSeek V4 对话模型与火山引擎豆包 TTS 工作流，并有 fallback 逻辑。后续可优化音乐语义标签、情绪强度识别和更细的推荐解释。 \\
+音乐能力 & 当前可结合用户曲库和本地数据工作。若接入 PCG 内容生态，可扩展到播客、资讯、视频原声、校园内容等更广场景。 \\
+工程交付 & 已完成 Windows Release 打包，适合比赛评审快速体验。后续可以做云端 Demo、账号隔离和更安全的公开评审环境。 \\
+隐私安全 & 当前思路是本地优先和可删除记忆。后续应完善隐私说明、数据最小化、密钥隔离和账号授权流程。 \\
+\bottomrule
+\end{longtable}
+
+\subsection{为什么要与 PCG 场景结合}
+
+开放赛道的要求不是只做一个孤立的 AI 小工具，而是从校园场景出发，思考它如何与 PCG 现有业务产生连接。CanCan Campus Radio 与 PCG 的关系可以概括为一句话：它把 PCG 擅长的内容、社交和消费级产品体验，整理成一种更低刺激、更适合学生日常节奏的陪伴入口。
+
+这部分不是为了硬套业务，而是为了说明产品未来可以落在哪里。音乐电台本身是一个轻入口：它可以承载歌曲，也可以承载播客、影视 OST、校园资讯、活动提醒和求职复习节点；它不像短视频那样要求用户持续盯屏，也不像纯工具那样冷冰冰。对 PCG 来说，这类低压力、高陪伴感的入口，适合触达那些不想被打扰、但仍然需要内容和社交连接的校园用户。
+
+\begin{itemize}
+  \item \textbf{QQ 场景：}可以和校园群、QQ 状态、音乐分享和轻量社交结合。用户不一定要发一条动态表达心情，也可以分享“我正在听的电台”，让表达更轻、更私人。
+  \item \textbf{腾讯视频场景：}可以把影视 OST、角色歌、剧情情绪和用户心情连接起来，例如“考完试放松电台”“适合今晚独处的剧集歌单”，让长视频内容的情绪资产延伸到日常陪伴。
+  \item \textbf{内容分发场景：}可以把音乐、播客、图文和短内容重新组织成低刺激陪伴流，区别于连续刷新的信息流。用户不是被推着看更多，而是在一个主题电台里慢慢听。
+  \item \textbf{校园招聘与实习场景：}围绕求职、复习、项目 Deadline、面试前夜等节点提供专门电台。它可以成为 PCG 校园产品触达学生的一个温和入口，而不是只在投递和通知时出现。
+\end{itemize}
+
+\subsection{商业化思考}
+
+这个产品不适合一开始就做强付费，因为它解决的是陪伴和情绪缓冲问题，用户信任比变现更重要。它的早期策略应该是先小范围验证，再逐步放大场景，而不是一上线就追求大规模商业化。
+
+\textbf{第一阶段：校园小范围试点。}可以先选择 1-3 所高校、若干班级或社团进行封闭体验，重点观察学生是否愿意在真实生活中反复打开它。早期不急着做付费，而是验证几个关键问题：用户会不会在早八、图书馆、考试周、夜间独处等场景主动使用；他们是否愿意把自己的歌单接入；AI DJ 的口播是增加陪伴感，还是造成打扰；调音台控制台是否真的能帮助用户把电台调成自己的节奏。
+
+\textbf{第二阶段：用数据判断是否值得扩大。}可以关注 D1/D7 留存、单次电台时长、每周启动次数、喜欢/不喜欢反馈量、用户主动聊天次数、扫码接入曲库转化率、清空记忆比例等指标。这里的指标不是为了把用户困在产品里，而是判断产品是否真的减轻了选择成本、提高了陪伴感。如果用户只打开一次觉得新鲜，那说明它只是 AI 玩具；如果用户会在复习、通勤、睡前自然打开，它才有机会成为一个真实产品。
+
+\textbf{第三阶段：轻量商业化。}在信任建立之后，可以探索会员增值能力，例如更长周期的记忆、更丰富的 AI DJ 音色、更细的校园场景模式、更多音乐平台接入、更好的电台回顾与个人报告。也可以做校园主题电台合作，例如考试季、毕业季、社团活动、校园跑、图书馆夜间学习等，但商业合作必须保持低打扰，不能破坏“安静”和“可信任”的产品气质。
+
+\textbf{第四阶段：内容生态联动。}当产品证明自己能稳定承载学生的日常节奏后，可以和音乐、播客、影视 OST、资讯内容联动，让电台成为一种新的内容消费入口。它不是替代传统播放器或视频产品，而是提供一个更温柔的中间层：当用户不知道该听什么、看什么、如何开始时，AI 电台先帮他进入状态。
+
+从商业角度看，CanCan Campus Radio 最重要的资产不是某一次推荐，而是长期形成的场景理解和信任关系。只要这个关系成立，后续无论是会员、内容联动、校园合作还是品牌合作，都有更自然的生长空间。
+
+\subsection{风险与改进计划}
+
+产品也有需要诚实面对的问题。第一，AI 口播如果太满，会打扰听歌；因此默认应保持短、轻、少说。第二，情绪陪伴不能越界成心理诊断，产品需要在文案上避免医疗化承诺。第三，公开 Demo 如果包含真实账号和密钥，需要在正式发布前做隔离版本或严格控制下载范围。第四，音乐版权和播放能力需要遵守平台规则，比赛版本以产品体验验证为主，商业化版本需要重新设计合规链路。
+
+后续迭代会优先做三件事：一是把校园场景入口做得更清晰，比如早八、图书馆、考试周、夜间电台；二是提升推荐解释的自然度，让 AI 口播更像一个克制的电台主持人；三是完善隐私和记忆管理，让用户可以放心地让产品理解自己。
+
+\section{结语}
+
+我最初想做 CanCan Campus Radio，不是因为我觉得市场上缺一个播放器。播放器已经太多了，推荐算法也已经很成熟。真正让我在意的是另一个瞬间：一个学生在晚上回到宿舍，明明已经很累，却还是下意识打开短视频；他只是想休息一下，但越刷越停不下来。屏幕里什么都有，搞笑的、热闹的、刺激的、更新很快的，可是关掉之后，心里反而更空。
+
+音乐本来可以是另一种答案。它不一定要占住眼睛，也不一定要让人马上兴奋起来。一首合适的歌，有时候能让人从混乱里退半步：先把呼吸放慢一点，再把今天没有处理完的情绪放到一边。可是当音乐产品也越来越像信息流，用户仍然要在无数歌单、推荐、榜单里继续选择。很多人不是不想听歌，而是在疲惫的时候连“选一首歌”都觉得累。
+
+所以这个产品想做的事情其实很小：当用户说“今天有点烦”“我想开始复习”“睡不着，但不想再刷了”，CanCan 能听懂这句话背后的状态，从用户自己的音乐偏好里找一首合适的歌，再用几句温柔但不啰嗦的话把它递过来。它不用证明自己多聪明，也不需要把每一次推荐都包装成奇迹。它只需要在用户需要的时候，像一个懂分寸的电台主持人一样出现。
+
+我希望 CanCan Campus Radio 留给人的感觉，不是“这个 AI 好厉害”，而是“刚刚那几分钟，我好像真的慢下来了”。如果一个学生在早八路上不再那么烦，在图书馆坐下前更容易进入状态，在考试周的夜里觉得自己不是完全一个人，这个产品就已经有意义。
+
+AI 产品当然可以追求效率、规模和增长。但在校园生活里，也应该有人认真做一种更安静的 AI：它不抢注意力，不催促表达，不把每个情绪都变成内容；它只是用推荐、口播、记忆和声音，陪用户把一段时间安稳地度过。
+
+\end{document}

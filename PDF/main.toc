@@ -1,0 +1,29 @@
+\contentsline {section}{\numberline {1}写在前面：为什么要做一个“安静”的产品}{3}{section.1}%
+\contentsline {section}{\numberline {2}模块一：用户洞察与问题定义}{3}{section.2}%
+\contentsline {subsection}{\numberline {2.1}目标用户}{3}{subsection.2.1}%
+\contentsline {subsection}{\numberline {2.2}用户痛点}{4}{subsection.2.2}%
+\contentsline {subsubsection}{\numberline {2.2.1}痛点一：碎片内容让人很难慢下来}{4}{subsubsection.2.2.1}%
+\contentsline {subsubsection}{\numberline {2.2.2}痛点二：音乐推荐知道“我爱听什么”，但不一定知道“我现在怎么了”}{4}{subsubsection.2.2.2}%
+\contentsline {subsubsection}{\numberline {2.2.3}痛点三：陪伴产品常常太重，工具产品又常常太冷}{4}{subsubsection.2.2.3}%
+\contentsline {subsection}{\numberline {2.3}使用场景}{4}{subsection.2.3}%
+\contentsline {section}{\numberline {3}模块二：产品方案设计}{5}{section.3}%
+\contentsline {subsection}{\numberline {3.1}产品概述}{5}{subsection.3.1}%
+\contentsline {subsection}{\numberline {3.2}核心功能}{6}{subsection.3.2}%
+\contentsline {subsection}{\numberline {3.3}产品架构与功能图}{7}{subsection.3.3}%
+\contentsline {subsection}{\numberline {3.4}关键交互流程}{7}{subsection.3.4}%
+\contentsline {subsection}{\numberline {3.5}创新与差异化}{7}{subsection.3.5}%
+\contentsline {section}{\numberline {4}模块三：AI 原生能力说明}{8}{section.4}%
+\contentsline {subsection}{\numberline {4.1}AI 核心能力}{8}{subsection.4.1}%
+\contentsline {subsection}{\numberline {4.2}AI 如何解决痛点}{9}{subsection.4.2}%
+\contentsline {subsubsection}{\numberline {4.2.1}把“我不知道听什么”变成“先说说现在怎么了”}{9}{subsubsection.4.2.1}%
+\contentsline {subsubsection}{\numberline {4.2.2}把推荐理由说出来，降低选择成本}{9}{subsubsection.4.2.2}%
+\contentsline {subsubsection}{\numberline {4.2.3}用声音建立陪伴，而不是用屏幕抢注意力}{9}{subsubsection.4.2.3}%
+\contentsline {subsubsection}{\numberline {4.2.4}让反馈真正改变下一次体验}{10}{subsubsection.4.2.4}%
+\contentsline {subsection}{\numberline {4.3}AI 技术方案}{10}{subsection.4.3}%
+\contentsline {subsection}{\numberline {4.4}数据与隐私边界}{10}{subsection.4.4}%
+\contentsline {section}{\numberline {5}模块四：落地可行性与商业化思考}{11}{section.5}%
+\contentsline {subsection}{\numberline {5.1}落地可行性}{11}{subsection.5.1}%
+\contentsline {subsection}{\numberline {5.2}为什么要与 PCG 场景结合}{12}{subsection.5.2}%
+\contentsline {subsection}{\numberline {5.3}商业化思考}{12}{subsection.5.3}%
+\contentsline {subsection}{\numberline {5.4}风险与改进计划}{13}{subsection.5.4}%
+\contentsline {section}{\numberline {6}结语}{13}{section.6}%

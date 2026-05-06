@@ -1,0 +1,41 @@
+CanCan Campus Radio - Windows 备用启动说明
+
+如果 CanCan-Campus-Radio.exe 被安全软件拦截，或双击后无法启动，
+请使用这个便携版 zip：
+
+1. 解压 CanCan-Campus-Radio-Windows-Portable.zip。
+   建议解压到普通本地目录，例如：
+   - C:\CanCanRadio
+   - 桌面\CanCanRadio
+
+2. 打开解压后的文件夹。
+
+3. 双击 start-release.bat。
+
+4. 等待 10-30 秒。程序会自动启动本地服务，并打开 Chrome 或
+   Microsoft Edge 浏览器窗口。
+
+运行要求：
+- Windows 系统
+- 已安装 Chrome 或 Microsoft Edge
+- 本机 3005 和 4005 端口未被其他程序占用
+
+这个启动脚本会做什么：
+- 在 127.0.0.1:4005 启动内置的 NetEaseCloudMusicApi 服务
+- 在 127.0.0.1:3005 启动 CanCan Campus Radio
+- 自动打开本地网页应用
+- 浏览器窗口关闭后，自动停止本地服务
+
+如果浏览器没有自动打开，请在运行 start-release.bat 后手动访问：
+
+http://127.0.0.1:3005
+
+注意：
+- 不要把 app、launcher、runtime、start-release.bat 分开移动。
+- 请保持解压后的文件夹结构完整。
+- 首选方式仍然是直接双击 CanCan-Campus-Radio.exe。
+
+English summary:
+If the exe is blocked, extract the portable zip and double-click
+start-release.bat. Then open http://127.0.0.1:3005 if the browser does not
+open automatically.
