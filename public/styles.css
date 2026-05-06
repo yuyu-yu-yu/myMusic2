@@ -57,6 +57,11 @@
   100%    { opacity: 0; }
 }
 
+@keyframes signal-pulse {
+  0%, 100% { transform: translate(0, 0); opacity: 0.35; }
+  50%      { transform: translate(1px, -1px); opacity: 0.9; }
+}
+
 @keyframes glitch-shake {
   0%, 100% { transform: translate(0); }
   20%      { transform: translate(-2px, 1px); }
@@ -714,6 +719,49 @@ button.danger:hover {
   background: var(--panel-2);
   border: 1px solid rgba(0, 240, 255, 0.15);
   border-bottom-left-radius: 2px;
+}
+
+.dj-msg.loading-msg {
+  min-width: min(360px, 62%);
+  border-color: rgba(0, 240, 255, 0.32);
+  background:
+    linear-gradient(90deg, rgba(0, 240, 255, 0.08), rgba(255, 0, 255, 0.08)),
+    var(--panel-2);
+  box-shadow: inset 0 0 18px rgba(0, 240, 255, 0.06);
+}
+
+.loading-chat-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  color: var(--cyan);
+  min-height: 20px;
+}
+
+.loading-signal {
+  position: relative;
+  flex: 0 0 11px;
+  width: 11px;
+  height: 11px;
+  border: 1px solid var(--cyan);
+  box-shadow: 0 0 8px rgba(0, 240, 255, 0.44);
+}
+
+.loading-signal::before,
+.loading-signal::after {
+  content: '';
+  position: absolute;
+  inset: 2px;
+  background: var(--magenta);
+  opacity: 0.68;
+  animation: signal-pulse 1.2s steps(2, end) infinite;
+}
+
+.loading-signal::after {
+  inset: 4px;
+  background: var(--yellow);
+  animation-delay: 0.28s;
 }
 
 .user-msg {

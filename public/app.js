@@ -21,6 +21,7 @@ let statusLocked = false;
 let btnFeedbackReady = false;
 let loadingMsgIndex = 0;
 let loadingMsgTimer = null;
+let loadingMessageEl = null;
 let savedChatHTML = '';
 let avatarRestoreTimer = null;
 let preferencesLoadPromise = null;
@@ -594,6 +595,8 @@ function startLoadingMessages(kind = 'music') {
   loadingMsgIndex = 0;
   statusLocked = true;
   setAvatarState(kind === 'chat' ? 'reading' : 'searching');
+  if (loadingMessageEl?.isConnected) loadingMessageEl.remove();
+  loadingMessageEl = appendChat({ role: 'dj', loading: true });
   showLoadingMessage(messages);
   loadingMsgTimer = setInterval(() => {
     loadingMsgIndex = (loadingMsgIndex + 1) % messages.length;
@@ -602,11 +605,13 @@ function startLoadingMessages(kind = 'music') {
 }
 
 function showLoadingMessage(messages = loadingMessages) {
-  const el = document.querySelector('#progress-current');
+  const el = loadingMessageEl?.isConnected
+    ? loadingMessageEl.querySelector('[data-loading-text]')
+    : null;
   if (!el) return;
   const msg = messages[loadingMsgIndex] || messages[0] || '';
   el.innerHTML = `
-    <span class="glitch-text" data-text="${escapeHtml(msg)}">${escapeHtml(msg)}</span>
+    <span class="glitch-text" data-text="${escapeAttr(msg)}">${escapeHtml(msg)}</span>
     <span class="loading-dots">
       <span></span><span></span><span></span>
     </span>
@@ -614,9 +619,23 @@ function showLoadingMessage(messages = loadingMessages) {
   el.style.color = 'var(--cyan)';
 }
 
-function stopLoadingMessages() {
+function stopLoadingMessages({ remove = false } = {}) {
   statusLocked = false;
   if (loadingMsgTimer) { clearInterval(loadingMsgTimer); loadingMsgTimer = null; }
+  if (remove && loadingMessageEl?.isConnected) loadingMessageEl.remove();
+  if (remove || !loadingMessageEl?.isConnected) loadingMessageEl = null;
+}
+
+function replaceLoadingMessage({ text, track }) {
+  if (!loadingMessageEl?.isConnected) {
+    return appendChat({ role: 'dj', text, track });
+  }
+  renderChatMessageContent(loadingMessageEl, { text, track });
+  loadingMessageEl.classList.remove('loading-msg');
+  loadingMessageEl.removeAttribute('aria-live');
+  loadingMessageEl = null;
+  scrollChatToBottom();
+  return null;
 }
 
 async function startRadio() {
@@ -629,7 +648,13 @@ async function startRadio() {
     await loadPreferences().catch(() => null);
     const data = await api('/api/radio/start', { method: 'POST', body: {} });
     handleRadioResponse(data);
-  } catch (e) { stopLoadingMessages(); setAvatarState('idle'); setRadioButtonState(state.current?.track ? 'active' : 'idle'); setPlayerStatus(e.message, 'error'); }
+  } catch (e) {
+    stopLoadingMessages();
+    replaceLoadingMessage({ text: '启动电台时出了一点问题：' + e.message });
+    setAvatarState('idle');
+    setRadioButtonState(state.current?.track ? 'active' : 'idle');
+    setPlayerStatus(e.message, 'error');
+  }
 }
 
 async function nextTrack({ skipCurrent = true } = {}) {
@@ -643,7 +668,12 @@ async function nextTrack({ skipCurrent = true } = {}) {
     await loadPreferences().catch(() => null);
     const data = await api('/api/radio/next', { method: 'POST', body: { sessionId: state.sessionId } });
     handleRadioResponse(data);
-  } catch (e) { stopLoadingMessages(); setAvatarState(getContextualAvatarState()); setPlayerStatus(e.message, 'error'); }
+  } catch (e) {
+    stopLoadingMessages();
+    replaceLoadingMessage({ text: '抱歉，刚才找歌时出了一点问题：' + e.message });
+    setAvatarState(getContextualAvatarState());
+    setPlayerStatus(e.message, 'error');
+  }
 }
 
 async function sendChat(msg) {
@@ -657,7 +687,7 @@ async function sendChat(msg) {
   } catch (e) {
     stopLoadingMessages();
     setAvatarState(getContextualAvatarState());
-    appendChat({ role: 'dj', text: '抱歉，出了一点问题：' + e.message });
+    replaceLoadingMessage({ text: '抱歉，出了一点问题：' + e.message });
   }
 }
 
@@ -677,9 +707,7 @@ function handleRadioResponse(data) {
     updatePlayer(data, false);
   }
 
-  // Show DJ chat bubble with optional track card
-  appendChat({
-    role: 'dj',
+  replaceLoadingMessage({
     text: data.chatText || data.hostText || '',
     track: data.track
   });
@@ -805,25 +833,49 @@ function primeSpeechSynthesis() {
   } catch {}
 }
 
-function appendChat({ role, text, track }) {
-  if (!text && !track) return;
+function appendChat({ role, text, track, loading = false }) {
+  if (!text && !track && !loading) return null;
   const container = document.querySelector('#chat-messages');
   const cls = role === 'user' ? 'user-msg' : 'dj-msg';
 
-  let html = `<div class="chat-msg ${cls}">`;
-  if (text) html += `<p>${escapeHtml(text)}</p>`;
-  if (track?.name) {
-    html += `<div class="track-card" onclick="document.querySelector('#song-audio')?.play()">
-      <img src="${escapeAttr(track.coverUrl || '/assets/cover-1.svg')}" alt="" />
-      <div class="track-card-text">
-        <h4>${escapeHtml(track.name)}</h4>
-        <p>${escapeHtml((track.artists || []).join(' / '))}</p>
-      </div>
-    </div>`;
-  }
-  html += '</div>';
+  let html = `<div class="chat-msg ${cls}${loading ? ' loading-msg' : ''}"${loading ? ' aria-live="polite"' : ''}></div>`;
   container.insertAdjacentHTML('beforeend', html);
-  container.scrollTop = container.scrollHeight;
+  const el = container.lastElementChild;
+  if (loading) {
+    el.innerHTML = `
+      <p class="loading-chat-line">
+        <span class="loading-signal" aria-hidden="true"></span>
+        <span data-loading-text></span>
+      </p>
+    `;
+  } else {
+    renderChatMessageContent(el, { text, track });
+  }
+  scrollChatToBottom();
+  return el;
+}
+
+function renderChatMessageContent(el, { text, track }) {
+  if (!el) return;
+  let html = '';
+  if (text) html += `<p>${escapeHtml(text)}</p>`;
+  if (track?.name) html += buildTrackCardHTML(track);
+  el.innerHTML = html;
+}
+
+function buildTrackCardHTML(track) {
+  return `<div class="track-card" onclick="document.querySelector('#song-audio')?.play()">
+    <img src="${escapeAttr(track.coverUrl || '/assets/cover-1.svg')}" alt="" />
+    <div class="track-card-text">
+      <h4>${escapeHtml(track.name)}</h4>
+      <p>${escapeHtml((track.artists || []).join(' / '))}</p>
+    </div>
+  </div>`;
+}
+
+function scrollChatToBottom() {
+  const container = document.querySelector('#chat-messages');
+  if (container) container.scrollTop = container.scrollHeight;
 }
 
 async function updatePlayer(data, autoplay) {
