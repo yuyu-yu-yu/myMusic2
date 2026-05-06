@@ -501,11 +501,12 @@ export async function resolvePlayableTrack(db, netease, track, { includeLyric = 
       lyric: '[00:00.00] 本地演示曲目'
     };
   }
-  // Prefer community API (supports VIP via browser cookie)
+  // Prefer community API direct URL, then keep ncm-cli as a playable fallback
+  // for tracks that still have a NetEase originalId.
   let url = null;
   let lyric = null;
   try {
-    const songUrl = await getSongUrl(normalized.originalId || normalized.id, 'exhigh');
+    const songUrl = await getSongUrl(normalized.originalId || normalized.id, ['exhigh', 'higher', 'standard']);
     if (songUrl?.url) url = songUrl.url;
   } catch { /* fall through */ }
 
@@ -537,9 +538,9 @@ export async function resolvePlayableTrack(db, netease, track, { includeLyric = 
   return {
     ...normalized,
     playUrl: url,
-    playbackMode: 'ncm-cli',
-    playable: Boolean(url),
-    playbackError: url ? null : '该歌曲暂无可用播放资源',
+    playbackMode: url ? 'browser-direct' : 'ncm-cli',
+    playable: Boolean(url || normalized.originalId),
+    playbackError: (url || normalized.originalId) ? null : '该歌曲暂无可用播放资源',
     lyric: lyric || ''
   };
 }

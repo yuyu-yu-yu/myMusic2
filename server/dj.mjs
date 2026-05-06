@@ -34,7 +34,9 @@ const SESSION_SUMMARY_STEP = 8;
 const LONG_MEMORY_LIMIT = 8;
 const LONG_MEMORY_MAX_CHARS = 800;
 const CHAT_LLM_TIMEOUT_MS = 9000;
+const INTENT_LLM_TIMEOUT_MS = 1800;
 const PLAYABLE_FALLBACK_SCAN_LIMIT = 12;
+const INTENT_FALLBACK_SENTINEL = '__INTENT_CLASSIFIER_FALLBACK__';
 const DEFAULT_PREFS = Object.freeze({
   chatMusicBalance: 'friend',
   recommendationFrequency: 'medium',
@@ -214,19 +216,26 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     mood: baseMood,
     prefs
   });
-  const turnAction = decideTurnAction({
-    userMessage,
-    history,
-    baseMood,
-    explicitIntent,
-    canSuggest,
-    currentTrack,
-    mode,
-    prefs,
-    conversationState,
-    userMessageCount: userMessageCountAfterThisTurn,
-    memoryContext
-  });
+  const hardAction = decideHardRuleTurnAction({ userMessage, mode });
+  const intentDecision = hardAction
+    ? { turnAction: hardAction, intentSource: 'rule', skipFriendLlm: hardAction.action !== TURN_ACTIONS.RECOMMEND_AND_PLAY }
+    : await resolveTurnActionWithIntentModel({
+      config,
+      userMessage,
+      history,
+      baseMood,
+      explicitIntent,
+      canSuggest,
+      currentTrack,
+      profile,
+      mode,
+      prefs,
+      conversationState,
+      userMessageCount: userMessageCountAfterThisTurn,
+      memoryContext
+    });
+  const turnAction = intentDecision.turnAction;
+  const intentSource = intentDecision.intentSource;
   const nextConversationState = updateConversationState({
     previous: conversationState,
     analysis: baseMood,
@@ -239,8 +248,13 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     const conversationMood = normalizeMoodDecision({
       ...baseMood,
       shouldRecommend: true,
+      mood: turnAction.mood || baseMood.mood,
+      energy: turnAction.energy || baseMood.energy,
       intent: 'music',
-      searchHints: turnAction.searchHints?.length ? turnAction.searchHints : baseMood.searchHints,
+      musicIntent: turnAction.musicIntent || baseMood.musicIntent || 'music',
+      searchHints: turnAction.searchHints?.length
+        ? uniqueStrings([...(turnAction.searchHints || []), ...(baseMood.searchHints || [])], 6)
+        : baseMood.searchHints,
       reason: turnAction.reason || baseMood.reason
     });
     setSessionContext(db, sessionId, {
@@ -260,7 +274,7 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
       },
       lastSuggestedAtUserCount: countUserMessages(db, sessionId)
     });
-    return { ...result, conversationMood, turnAction, intent: 'explicit' };
+    return { ...result, conversationMood, turnAction, intent: explicitIntent ? 'explicit' : 'mood', intentSource };
   }
 
   const chatDecision = await generateFriendReply({
@@ -275,7 +289,8 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     explicitIntent,
     canSuggest,
     memoryContext,
-    turnAction
+    turnAction,
+    skipLlm: Boolean(intentDecision.skipFriendLlm)
   });
   const conversationMood = normalizeMoodDecision({ ...baseMood, ...chatDecision });
   const finalConversationState = updateConversationState({
@@ -291,8 +306,9 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
   if (userMessage) {
     scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: chatDecision.chatText, conversationMood });
   }
-  if (chatDecision.newMode) {
-    const newMode = { ...chatDecision.newMode, updatedAt: nowIso() };
+  const newModeDecision = chatDecision.newMode ?? turnAction.newMode ?? null;
+  if (newModeDecision) {
+    const newMode = { ...newModeDecision, updatedAt: nowIso() };
     setSessionMode(db, sessionId, newMode);
   }
   setSessionContext(db, sessionId, {
@@ -311,12 +327,13 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     reason: '',
     ttsUrl,
     speech,
-    mode: chatDecision.newMode || mode,
+    mode: newModeDecision || mode,
     profile,
     weather: getSessionContext(db, sessionId).weather || '',
     conversationMood,
     turnAction,
-    intent: 'chat'
+    intent: 'chat',
+    intentSource
   };
 }
 
@@ -535,6 +552,7 @@ function extractRecentTopics(text) {
 export function hasExplicitMusicIntent(text) {
   const value = String(text || '');
   if (/不想听|先别放|不要切|别切|别换/.test(value)) return false;
+  if (/^(?:我想|想|要|我要|给我|帮我)?(?:听|放|播放|播)(?!说|说话|你说|我说|着|起来|过)(?:一下|一首|首)?[\s\S]{2,40}(?:的[\s\S]{1,30})?$/.test(value.trim())) return true;
   if (/下一首|换一首|换歌|切歌|播放|放一首|来一首|来首|想听|给我.*(歌|音乐)|有没有.*(歌|音乐)|听.*(歌|音乐)|artist|song|music|play|recommend/i.test(value)) return true;
   return /(推荐|来点).*(歌|音乐|曲|国风|古风|电子|摇滚|民谣|爵士|说唱|粤语|日语|英语|中文|安静|治愈|伤感|开心|提神|专注|睡前)|推荐(一首|首|点|些)?$/.test(value);
 }
@@ -548,6 +566,24 @@ export function normalizeMusicText(value) {
 function trackDisplayName(track = {}) {
   const artists = (track.artists || []).filter(Boolean).join('、');
   return artists ? `《${track.name}》 - ${artists}` : `《${track.name || '这首歌'}》`;
+}
+
+function recommendationAtmosphereLine(track = {}) {
+  const artists = (track.artists || []).filter(Boolean).join('、');
+  const subject = artists ? `${artists}的声音` : '这首歌';
+  return `${subject}会把气氛稳稳接住，先让它在背景里铺一会儿，我陪你听。`;
+}
+
+function fallbackRecommendationText(track = {}, { playableFallback = false } = {}) {
+  const lead = playableFallback ? '刚才那首暂时放不了，我换一首更稳能播的' : '我给你接一首';
+  return `${lead}：${trackDisplayName(track)}。${recommendationAtmosphereLine(track)}`;
+}
+
+function expandShortRecommendationText(text, track = {}) {
+  const value = String(text || '').trim();
+  if (!value || value.length >= 45) return value;
+  const suffix = /[。.!！?？]$/.test(value) ? '' : '。';
+  return `${value}${suffix}${recommendationAtmosphereLine(track)}`;
 }
 
 function trackMentionTerms(track = {}) {
@@ -573,16 +609,19 @@ export function recommendationTextMentionsDifferentTrack(text, selectedTrack, ca
   return false;
 }
 
-export function ensureRecommendationTextMatchesTrack(text, selectedTrack, candidates = []) {
+export function ensureRecommendationTextMatchesTrack(text, selectedTrack, candidates = [], options = {}) {
   if (!selectedTrack?.name) return String(text || '').trim();
   const value = String(text || '').trim();
   const intro = `接下来放 ${trackDisplayName(selectedTrack)}。`;
-  if (!value || recommendationTextMentionsDifferentTrack(value, selectedTrack, candidates)) return intro;
-  const selectedName = normalizeMusicText(selectedTrack.name);
-  if (selectedName && !normalizeMusicText(value).includes(selectedName)) {
-    return `${value} ${intro}`;
+  if (!value || recommendationTextMentionsDifferentTrack(value, selectedTrack, candidates)) {
+    return fallbackRecommendationText(selectedTrack, { playableFallback: Boolean(options.playableFallback) });
   }
-  return value;
+  const selectedName = normalizeMusicText(selectedTrack.name);
+  let finalText = value;
+  if (selectedName && !normalizeMusicText(value).includes(selectedName)) {
+    finalText = `${value} ${intro}`;
+  }
+  return expandShortRecommendationText(finalText, selectedTrack);
 }
 
 function buildArtistConstraint(label, aliases = []) {
@@ -752,6 +791,235 @@ export function canProactivelyRecommend({ userMessageCount = 0, lastSuggestedAtU
   return Boolean(mood?.shouldRecommend);
 }
 
+export function decideHardRuleTurnAction({ userMessage = '', mode = {} } = {}) {
+  const text = String(userMessage || '').trim();
+  const result = (action, reason, extra = {}) => ({
+    action,
+    reason,
+    confidence: extra.confidence ?? 1,
+    source: 'hard_rule',
+    searchHints: extra.searchHints || [],
+    newMode: extra.newMode ?? null
+  });
+
+  if (!text) return result(TURN_ACTIONS.RECOMMEND_AND_PLAY, 'empty turn means radio continuation');
+  if (rejectsMusic(text)) return result(TURN_ACTIONS.CHAT_ONLY, 'user explicitly rejected playback or switching');
+  if (isModeUpdateRequest(text)) {
+    return result(TURN_ACTIONS.CHAT_ONLY, 'user is updating listening mode rather than asking for an immediate song', {
+      newMode: modeUpdateFromText(text)
+    });
+  }
+  if (isPlaybackControlRequest(text)) {
+    return result(TURN_ACTIONS.CONTINUE_CURRENT_SONG, 'user asked for playback control without a new recommendation');
+  }
+  if (isImmediateNextRequest(text)) {
+    return result(TURN_ACTIONS.RECOMMEND_AND_PLAY, 'user explicitly asked to switch songs', {
+      searchHints: extractActionSearchHints(text, mode)
+    });
+  }
+  return null;
+}
+
+async function resolveTurnActionWithIntentModel({
+  config,
+  userMessage,
+  history,
+  baseMood,
+  explicitIntent,
+  canSuggest,
+  currentTrack,
+  profile,
+  mode,
+  prefs,
+  conversationState,
+  userMessageCount,
+  memoryContext
+}) {
+  const fallbackAction = () => decideTurnAction({
+    userMessage,
+    history,
+    baseMood,
+    explicitIntent,
+    canSuggest,
+    currentTrack,
+    mode,
+    prefs,
+    conversationState,
+    userMessageCount,
+    memoryContext
+  });
+
+  const classified = await classifyTurnIntent({
+    config,
+    userMessage,
+    history,
+    currentTrack,
+    profile,
+    mode,
+    prefs,
+    baseMood,
+    memoryContext,
+    canSuggest,
+    explicitIntent
+  });
+
+  if (classified.accepted) {
+    if (classified.action === TURN_ACTIONS.RECOMMEND_AND_PLAY && !explicitIntent && !canSuggest) {
+      return { turnAction: fallbackAction(), intentSource: 'fallback', skipFriendLlm: false };
+    }
+    return { turnAction: classified, intentSource: 'llm', skipFriendLlm: false };
+  }
+
+  return {
+    turnAction: fallbackAction(),
+    intentSource: 'fallback',
+    skipFriendLlm: Boolean(classified.skipFriendLlm)
+  };
+}
+
+export async function classifyTurnIntent({
+  config,
+  userMessage = '',
+  history = [],
+  currentTrack = null,
+  profile = {},
+  mode = {},
+  prefs = {},
+  baseMood = {},
+  memoryContext = {},
+  canSuggest = false,
+  explicitIntent = false
+} = {}) {
+  if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) {
+    return { accepted: false, source: 'fallback', reason: 'LLM is not configured', skipFriendLlm: false };
+  }
+
+  const messages = [
+    {
+      role: 'system',
+      content: [
+        '你是 AI 电台灿灿的轻量意图路由器，只判断这一轮该聊天还是该切歌，不负责写聊天回复，也不负责选歌。',
+        '必须只输出 JSON，不要 Markdown，不要解释。',
+        'action 只能是：chat_only、ask_followup、recommend_and_play、continue_current_song。',
+        '普通聊天、问观点、问歌手喜好、问知识，不要切歌；明确点歌、换歌、要求某风格/歌手/歌曲，才 recommend_and_play。',
+        '用户情绪表达但没有明确要音乐时，通常 ask_followup；只有上下文显示适合自然接歌且允许主动推荐时，才 recommend_and_play。',
+        '如果只是“你喜欢陈奕迅吗/你觉得这首歌如何”，这是聊天，不是点歌。',
+        '输出字段：{"action":"...","confidence":0-1,"mood":"comfort|melancholy|calm|healing|focus|energy|romantic|nostalgic|night|random","energy":"low|medium|high","musicIntent":"none|explicit_song|artist|genre|mood|skip|playback_control","searchHints":["关键词"],"reason":"简短中文理由"}'
+      ].join('\n')
+    },
+    {
+      role: 'user',
+      content: [
+        `听众刚说：${userMessage}`,
+        `最近对话：${history.slice(-8).map(h => `${h.role}: ${h.content}`).join('\n') || '无'}`,
+        `当前歌曲：${getCurrentTrackPromptContext(userMessage, currentTrack)}`,
+        `听众画像：${profile?.summary || '无'}`,
+        `当前模式：${mode?.genre || '无'}`,
+        `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
+        `长期记忆：${memoryContext.promptText || '无'}`,
+        `会话摘要：${memoryContext.sessionSummary || '无'}`,
+        `启发式情绪：${JSON.stringify(baseMood)}`,
+        `本地显式音乐意图：${explicitIntent}`,
+        `允许主动推荐：${canSuggest}`
+      ].join('\n')
+    }
+  ];
+
+  const raw = await withTimeout(
+    generateChatCompletion(config.llm, messages, () => INTENT_FALLBACK_SENTINEL),
+    INTENT_LLM_TIMEOUT_MS,
+    INTENT_FALLBACK_SENTINEL
+  );
+
+  if (raw === INTENT_FALLBACK_SENTINEL) {
+    return { accepted: false, source: 'fallback', reason: 'intent classifier unavailable or timed out', skipFriendLlm: true };
+  }
+
+  try {
+    const parsed = parseIntentDecision(raw);
+    const action = normalizeIntentAction(parsed.action);
+    const confidence = Number(parsed.confidence);
+    if (!action || !Number.isFinite(confidence) || confidence < 0.55) {
+      return {
+        accepted: false,
+        source: 'fallback',
+        reason: 'intent classifier returned low confidence or invalid action',
+        candidate: parsed,
+        skipFriendLlm: false
+      };
+    }
+    const normalizedMood = normalizeMoodDecision({
+      mood: parsed.mood,
+      energy: parsed.energy,
+      intent: action === TURN_ACTIONS.RECOMMEND_AND_PLAY ? 'music' : 'chat',
+      musicIntent: parsed.musicIntent || 'none',
+      searchHints: Array.isArray(parsed.searchHints) ? parsed.searchHints : [],
+      reason: parsed.reason,
+      confidence
+    });
+    return {
+      ...normalizedMood,
+      accepted: true,
+      action,
+      confidence,
+      source: 'llm',
+      reason: parsed.reason || 'LLM intent classifier',
+      searchHints: normalizedMood.searchHints,
+      musicIntent: parsed.musicIntent || normalizedMood.musicIntent || 'none'
+    };
+  } catch (error) {
+    return {
+      accepted: false,
+      source: 'fallback',
+      reason: `intent classifier JSON parse failed: ${error.message}`,
+      skipFriendLlm: false
+    };
+  }
+}
+
+function parseIntentDecision(raw) {
+  const text = stripCodeFence(String(raw || '')).trim();
+  try {
+    return JSON.parse(text);
+  } catch {}
+  const objectMatch = text.match(/\{[\s\S]*\}/);
+  if (objectMatch) return JSON.parse(objectMatch[0]);
+  throw new Error('intent decision is not JSON');
+}
+
+function normalizeIntentAction(action) {
+  const value = String(action || '').trim().toLowerCase();
+  const map = {
+    chat_only: TURN_ACTIONS.CHAT_ONLY,
+    chat: TURN_ACTIONS.CHAT_ONLY,
+    ask_followup: TURN_ACTIONS.ASK_FOLLOWUP,
+    followup: TURN_ACTIONS.ASK_FOLLOWUP,
+    soft_offer_music: TURN_ACTIONS.SOFT_OFFER_MUSIC,
+    recommend_and_play: TURN_ACTIONS.RECOMMEND_AND_PLAY,
+    recommend_now: TURN_ACTIONS.RECOMMEND_AND_PLAY,
+    play_music: TURN_ACTIONS.RECOMMEND_AND_PLAY,
+    continue_current_song: TURN_ACTIONS.CONTINUE_CURRENT_SONG,
+    playback_control: TURN_ACTIONS.CONTINUE_CURRENT_SONG
+  };
+  return map[value] || null;
+}
+
+function isImmediateNextRequest(text) {
+  return /下一首|换一首|换歌|切歌|跳过|skip/i.test(String(text || ''));
+}
+
+function isPlaybackControlRequest(text) {
+  return /暂停|停一下|继续播放|继续放|接着放|resume|pause/i.test(String(text || ''));
+}
+
+function modeUpdateFromText(text) {
+  const value = String(text || '').trim();
+  if (/恢复正常推荐|取消.*偏好|取消.*模式|恢复正常/.test(value)) return {};
+  const match = value.match(/(?:后面|以后|接下来)(?:都|只)?听([^，。？！,.!?]{1,16})/);
+  const genre = match?.[1]?.trim();
+  return genre ? { genre, note: '用户指定' } : null;
+}
+
 export function analyzeTurnContext({ history = [], userMessage = '', profile = {}, currentTrack = null, mode = {}, prefs = {}, conversationState = {} } = {}) {
   const normalizedPrefs = normalizeRuntimePrefs(prefs);
   const mood = applyMoodPreferenceOverride(
@@ -878,7 +1146,7 @@ function isModeUpdateRequest(text) {
   return /恢复正常推荐|取消.*偏好|取消.*模式|恢复正常|后面都听|以后都听|接下来都听/.test(String(text || ''));
 }
 
-async function generateFriendReply({ config, profile, mode, prefs = {}, history, userMessage, currentTrack, baseMood, explicitIntent, canSuggest, memoryContext = {}, turnAction = null }) {
+async function generateFriendReply({ config, profile, mode, prefs = {}, history, userMessage, currentTrack, baseMood, explicitIntent, canSuggest, memoryContext = {}, turnAction = null, skipLlm = false }) {
   const fallback = () => ({
     chatText: fallbackFriendChat(userMessage, baseMood, turnAction),
     shouldRecommend: false,
@@ -889,7 +1157,7 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
     reason: baseMood.reason,
     newMode: null
   });
-  if (!config?.llm?.baseUrl) return fallback();
+  if (skipLlm || !config?.llm?.baseUrl) return fallback();
   const currentTrackContext = getCurrentTrackPromptContext(userMessage, currentTrack);
 
   const messages = [
@@ -1625,9 +1893,9 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
     };
   }
 
-  const finalChatText = selectedChanged
-    ? `刚才那首暂时放不了，我换成 ${trackDisplayName(selectedTrack)}。`
-    : ensureRecommendationTextMatchesTrack(chatText, selectedTrack, tracks);
+  const finalChatText = ensureRecommendationTextMatchesTrack(chatText, selectedTrack, tracks, {
+    playableFallback: selectedChanged
+  });
 
   return { chatText: finalChatText, track: selectedTrack, reason: reason || '根据你的口味推荐', newMode };
 }

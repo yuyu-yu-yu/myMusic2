@@ -31,18 +31,24 @@ export function hasCookie() {
 
 export async function getSongUrl(songId, level = 'exhigh') {
   if (!_cookie || !songId) return null;
-  try {
-    const result = await api.song_url_v1({
-      id: String(songId),
-      level,
-      cookie: _cookie
-    });
-    const data = result.body?.data?.[0];
-    if (data?.url && data?.code === 200) {
-      return { url: data.url, br: data.br, type: data.type };
+  const levels = Array.isArray(level) ? level : [level, 'higher', 'standard'];
+  const tried = new Set();
+  for (const targetLevel of levels) {
+    if (!targetLevel || tried.has(targetLevel)) continue;
+    tried.add(targetLevel);
+    try {
+      const result = await api.song_url_v1({
+        id: String(songId),
+        level: targetLevel,
+        cookie: _cookie
+      });
+      const data = result.body?.data?.[0];
+      if (data?.url && data?.code === 200) {
+        return { url: data.url, br: data.br, type: data.type, level: targetLevel };
+      }
+    } catch (e) {
+      console.warn('[community] song_url failed:', e.message);
     }
-  } catch (e) {
-    console.warn('[community] song_url failed:', e.message);
   }
   return null;
 }

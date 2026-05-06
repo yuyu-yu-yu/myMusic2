@@ -16,8 +16,10 @@ import {
   analyzeConversationMood,
   analyzeTurnContext,
   buildMemoryContext,
+  classifyTurnIntent,
   canProactivelyRecommend,
   chatTurn,
+  decideHardRuleTurnAction,
   decideTurnAction,
   extractAndStoreMemories,
   ensureRecommendationTextMatchesTrack,
@@ -26,6 +28,7 @@ import {
   rankAndSelectCandidates,
   TURN_ACTIONS
 } from '../server/dj.mjs';
+import { resolvePlayableTrack } from '../server/library.mjs';
 import { getMemories, getPreferences, removeAllMemories, removeMemory, submitFeedback, updatePreferences } from '../server/radio.mjs';
 
 function candidate(id, source, artists = ['Artist']) {
@@ -135,6 +138,44 @@ test('recommendation text is forced to match the final playable track', () => {
   assert.match(text, /安静/);
   assert.match(text, /海洋/);
   assert.doesNotMatch(text, /Angel|陶喆/);
+  assert.equal(text.length > 45, true);
+
+  const shortText = ensureRecommendationTextMatchesTrack('接下来放《安静》。', selected, candidates);
+  assert.match(shortText, /安静/);
+  assert.equal(shortText.length > '接下来放《安静》。'.length, true);
+
+  const fallbackText = ensureRecommendationTextMatchesTrack('', selected, candidates, { playableFallback: true });
+  assert.match(fallbackText, /安静/);
+  assert.match(fallbackText, /暂时放不了/);
+  assert.equal(fallbackText.length > 45, true);
+});
+
+test('playable resolution keeps originalId tracks eligible for ncm-cli fallback', async () => {
+  const netease = {
+    isConfigured: () => true,
+    playUrl: async () => ({ data: {} }),
+    lyric: async () => ({ data: {} })
+  };
+
+  const resolved = await resolvePlayableTrack(null, netease, {
+    id: 'encrypted-vip',
+    originalId: '123456',
+    name: 'VIP Song',
+    artists: ['Artist']
+  }, { includeLyric: false });
+
+  assert.equal(resolved.playable, true);
+  assert.equal(resolved.playUrl, null);
+  assert.equal(resolved.playbackMode, 'ncm-cli');
+  assert.equal(resolved.playbackError, null);
+
+  const missingOriginalId = await resolvePlayableTrack(null, netease, {
+    id: 'no-original-id',
+    name: 'No Resource',
+    artists: ['Artist']
+  }, { includeLyric: false });
+
+  assert.equal(missingOriginalId.playable, false);
 });
 
 test('feedback and artist cooldown change candidate order', () => {
@@ -474,6 +515,12 @@ test('turn action gate separates self-disclosure, fatigue, music requests, and r
   }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
 
   assert.equal(decideTurnAction({
+    userMessage: '听陈奕迅的稳稳的幸福',
+    explicitIntent: hasExplicitMusicIntent('听陈奕迅的稳稳的幸福'),
+    baseMood: {}
+  }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+
+  assert.equal(decideTurnAction({
     userMessage: '别放歌，先聊聊',
     explicitIntent: false,
     baseMood: {}
@@ -490,6 +537,100 @@ test('turn action gate separates self-disclosure, fatigue, music requests, and r
     explicitIntent: true,
     baseMood: {}
   }).action, TURN_ACTIONS.CHAT_ONLY);
+});
+
+test('intent classifier maps DeepSeek JSON into turn actions', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url, options) => {
+    const body = JSON.parse(options.body);
+    const prompt = JSON.stringify(body.messages);
+    const isSongRequest = prompt.includes('稳稳的幸福');
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify(isSongRequest
+            ? {
+              action: 'recommend_and_play',
+              confidence: 0.92,
+              mood: 'calm',
+              energy: 'medium',
+              musicIntent: 'explicit_song',
+              searchHints: ['陈奕迅', '稳稳的幸福'],
+              reason: '用户明确点歌'
+            }
+            : {
+              action: 'chat_only',
+              confidence: 0.88,
+              mood: 'random',
+              energy: 'medium',
+              musicIntent: 'none',
+              searchHints: [],
+              reason: '用户在问观点'
+            })
+        }
+      }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const config = { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-flash' } };
+  const songIntent = await classifyTurnIntent({
+    config,
+    userMessage: '听陈奕迅的稳稳的幸福',
+    baseMood: {},
+    explicitIntent: true
+  });
+  assert.equal(songIntent.accepted, true);
+  assert.equal(songIntent.action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+  assert.equal(songIntent.source, 'llm');
+  assert.equal(songIntent.searchHints.includes('陈奕迅'), true);
+  assert.equal(songIntent.searchHints.includes('稳稳的幸福'), true);
+
+  const chatIntent = await classifyTurnIntent({
+    config,
+    userMessage: '你喜欢陈奕迅吗',
+    baseMood: {},
+    explicitIntent: false
+  });
+  assert.equal(chatIntent.accepted, true);
+  assert.equal(chatIntent.action, TURN_ACTIONS.CHAT_ONLY);
+});
+
+test('intent classifier falls back on bad JSON, low confidence, and hard rules', async (t) => {
+  assert.equal(decideHardRuleTurnAction({ userMessage: '下一首' }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+  assert.equal(decideHardRuleTurnAction({ userMessage: '暂停' }).action, TURN_ACTIONS.CONTINUE_CURRENT_SONG);
+  assert.equal(decideHardRuleTurnAction({ userMessage: '别放歌，先聊聊' }).action, TURN_ACTIONS.CHAT_ONLY);
+
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    choices: [{ message: { content: '{"action":"recommend_and_play","confidence":0.2}' } }]
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  const lowConfidence = await classifyTurnIntent({
+    config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-flash' } },
+    userMessage: '随便聊聊',
+    baseMood: {}
+  });
+  assert.equal(lowConfidence.accepted, false);
+
+  const hardRuleRequests = [];
+  globalThis.fetch = async (url, options) => {
+    hardRuleRequests.push(options?.body || '');
+    return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const db = testDb(t);
+  const result = await chatTurn({
+    db,
+    config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-flash' }, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'hard-rule-no-llm',
+    message: '别放歌，先聊聊'
+  });
+  assert.equal(result.track, null);
+  assert.equal(result.turnAction.action, TURN_ACTIONS.CHAT_ONLY);
+  assert.equal(hardRuleRequests.some(body => String(body).includes('轻量意图路由器')), false);
+  assert.equal(hardRuleRequests.some(body => String(body).includes('这一轮是普通聊天回复')), false);
 });
 
 test('self-disclosure chat does not select a track and stays in chat mode', async (t) => {
@@ -527,7 +668,10 @@ test('self-disclosure chat does not select a track and stays in chat mode', asyn
   assert.equal(result.track, null);
   assert.equal(result.turnAction.action, TURN_ACTIONS.ASK_FOLLOWUP);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM plays').get().count, 0);
-  assert.match(JSON.stringify(requests[0].messages), /这一轮只聊天，不切歌/);
+  const chatPromptText = JSON.stringify(
+    requests.find(req => JSON.stringify(req.messages).includes('这一轮只聊天，不切歌'))?.messages || []
+  );
+  assert.match(chatPromptText, /这一轮只聊天，不切歌/);
 });
 
 test('ordinary chat hides current track details from prompt', async (t) => {
@@ -762,6 +906,9 @@ test('conversation mood detects comfort needs from recent chat', () => {
 
 test('recommendation trigger policy distinguishes chat from music intent', () => {
   assert.equal(hasExplicitMusicIntent('换一首，来点国风'), true);
+  assert.equal(hasExplicitMusicIntent('听陈奕迅的稳稳的幸福'), true);
+  assert.equal(hasExplicitMusicIntent('放周杰伦的晴天'), true);
+  assert.equal(hasExplicitMusicIntent('听过陈奕迅的稳稳的幸福吗'), false);
   assert.equal(hasExplicitMusicIntent('只是想和你说句话'), false);
   assert.equal(hasExplicitMusicIntent('你推荐什么电影'), false);
 
