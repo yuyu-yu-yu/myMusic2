@@ -157,11 +157,16 @@ test('recommendation text is forced to match the final playable track', () => {
     true
   );
 
-  const text = ensureRecommendationTextMatchesTrack('今晚适合听 Angel，陶喆这版很柔和。', selected, candidates);
+  const text = ensureRecommendationTextMatchesTrack('今晚适合听 Angel，陶喆这版很柔和。', selected, candidates, {
+    timeOfDay: '夜晚',
+    weather: '上海有点风',
+    conversationMood: { mood: 'calm' }
+  });
   assert.match(text, /安静/);
   assert.match(text, /海洋/);
   assert.doesNotMatch(text, /Angel|陶喆/);
-  assert.equal(text.length > 45, true);
+  assert.match(text, /今晚适合听/);
+  assert.notEqual(text, '接下来放 《安静》 - 海洋。');
 
   const naturalText = ensureRecommendationTextMatchesTrack(
     '我知道你现在压力很大，我们先把节奏放慢一点，我陪你听一会儿。',
@@ -175,17 +180,21 @@ test('recommendation text is forced to match the final playable track', () => {
   assert.match(naturalText, /压力很大/);
   assert.match(naturalText, /我们先把节奏放慢/);
   assert.match(naturalText, /陪你听/);
-  assert.doesNotMatch(naturalText, /我把现在的气氛接到|这一轮先放/);
+  assert.match(naturalText, /安静/);
+  assert.doesNotMatch(naturalText, /我把现在的气氛接到|这一轮先放|接下来放/);
 
   const shortText = ensureRecommendationTextMatchesTrack('接下来放《安静》。', selected, candidates);
   assert.match(shortText, /安静/);
-  assert.equal(shortText.length > '接下来放《安静》。'.length, true);
+  assert.equal(shortText, '接下来放《安静》。');
 
-  const fallbackText = ensureRecommendationTextMatchesTrack('', selected, candidates, { playableFallback: true });
+  const fallbackText = ensureRecommendationTextMatchesTrack('', selected, candidates, {
+    playableFallback: true,
+    timeOfDay: '上午',
+    conversationMood: { mood: 'comfort' }
+  });
   assert.match(fallbackText, /安静/);
-  assert.match(fallbackText, /暂时放不了|重新确认|不太稳/);
-  assert.equal(fallbackText.length > 45, true);
-  assert.doesNotMatch(fallbackText, /气氛稳稳接住|我陪你听/);
+  assert.equal(fallbackText, '接下来放 《安静》 - 海洋。');
+  assert.doesNotMatch(fallbackText, /上午|情绪|放稳|暂时放不了|重新确认|不太稳/);
 });
 
 test('DJ response parser accepts tagged and plain JSON responses', () => {
