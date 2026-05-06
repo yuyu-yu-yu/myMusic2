@@ -24,6 +24,7 @@ import {
   extractAndStoreMemories,
   ensureRecommendationTextMatchesTrack,
   hasExplicitMusicIntent,
+  parseDjModelResponse,
   recommendationTextMentionsDifferentTrack,
   rankAndSelectCandidates,
   TURN_ACTIONS
@@ -133,6 +134,28 @@ test('recommendation text is forced to match the final playable track', () => {
     recommendationTextMentionsDifferentTrack('今晚适合听 Angel，陶喆这版很柔和。', selected, candidates),
     true
   );
+  assert.equal(
+    recommendationTextMentionsDifferentTrack('我知道你现在压力很大，我们先把节奏放慢一点，我陪你听一会儿。', selected, [
+      { id: 'us', name: '我们', artists: ['陈奕迅'] },
+      { id: 'company', name: '陪伴', artists: ['纳豆nado'] },
+      selected
+    ]),
+    false
+  );
+  assert.equal(
+    recommendationTextMentionsDifferentTrack('我不会催你振作，先让这段音乐在旁边陪着。', selected, [
+      { id: 'company', name: '陪伴', artists: ['纳豆nado'] },
+      selected
+    ]),
+    false
+  );
+  assert.equal(
+    recommendationTextMentionsDifferentTrack('那我给你放《我们》，陈奕迅这首会轻一点。', selected, [
+      { id: 'us', name: '我们', artists: ['陈奕迅'] },
+      selected
+    ]),
+    true
+  );
 
   const text = ensureRecommendationTextMatchesTrack('今晚适合听 Angel，陶喆这版很柔和。', selected, candidates);
   assert.match(text, /安静/);
@@ -140,14 +163,65 @@ test('recommendation text is forced to match the final playable track', () => {
   assert.doesNotMatch(text, /Angel|陶喆/);
   assert.equal(text.length > 45, true);
 
+  const naturalText = ensureRecommendationTextMatchesTrack(
+    '我知道你现在压力很大，我们先把节奏放慢一点，我陪你听一会儿。',
+    selected,
+    [
+      { id: 'us', name: '我们', artists: ['陈奕迅'] },
+      { id: 'company', name: '陪伴', artists: ['纳豆nado'] },
+      selected
+    ]
+  );
+  assert.match(naturalText, /压力很大/);
+  assert.match(naturalText, /我们先把节奏放慢/);
+  assert.match(naturalText, /陪你听/);
+  assert.doesNotMatch(naturalText, /我把现在的气氛接到|这一轮先放/);
+
   const shortText = ensureRecommendationTextMatchesTrack('接下来放《安静》。', selected, candidates);
   assert.match(shortText, /安静/);
   assert.equal(shortText.length > '接下来放《安静》。'.length, true);
 
   const fallbackText = ensureRecommendationTextMatchesTrack('', selected, candidates, { playableFallback: true });
   assert.match(fallbackText, /安静/);
-  assert.match(fallbackText, /暂时放不了/);
+  assert.match(fallbackText, /暂时放不了|重新确认|不太稳/);
   assert.equal(fallbackText.length > 45, true);
+  assert.doesNotMatch(fallbackText, /气氛稳稳接住|我陪你听/);
+});
+
+test('DJ response parser accepts tagged and plain JSON responses', () => {
+  const tagged = parseDjModelResponse(
+    '<CHAT>上午适合轻一点，我给你放《安静》。</CHAT><JSON>{"pick":1,"reason":"calm","mode":null}</JSON>',
+    'fallback'
+  );
+  assert.equal(tagged.chatText, '上午适合轻一点，我给你放《安静》。');
+  assert.equal(tagged.pick, 1);
+  assert.equal(tagged.reason, 'calm');
+
+  const plainJson = parseDjModelResponse(JSON.stringify({
+    chatText: '我先把节奏放轻一点，接这首《Weightless》。',
+    pick: 0,
+    reason: '适合放松',
+    mode: null
+  }), 'fallback');
+  assert.equal(plainJson.chatText, '我先把节奏放轻一点，接这首《Weightless》。');
+  assert.equal(plainJson.pick, 0);
+  assert.equal(plainJson.reason, '适合放松');
+
+  const textThenJson = parseDjModelResponse(
+    '我先把今天的节奏放轻一点，给你接一首没那么吵的。\n{"pick":2,"reason":"适合安静下来","mode":null}',
+    'fallback'
+  );
+  assert.equal(textThenJson.chatText, '我先把今天的节奏放轻一点，给你接一首没那么吵的。');
+  assert.equal(textThenJson.pick, 2);
+  assert.equal(textThenJson.reason, '适合安静下来');
+
+  const alternateKeys = parseDjModelResponse(JSON.stringify({
+    message: '这首会更轻一点，先让它把空间留出来。',
+    pick: 0,
+    reason: '低打扰'
+  }), 'fallback');
+  assert.equal(alternateKeys.chatText, '这首会更轻一点，先让它把空间留出来。');
+  assert.equal(alternateKeys.pick, 0);
 });
 
 test('playable resolution keeps originalId tracks eligible for ncm-cli fallback', async () => {

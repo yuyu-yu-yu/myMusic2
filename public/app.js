@@ -836,6 +836,7 @@ function primeSpeechSynthesis() {
 function appendChat({ role, text, track, loading = false }) {
   if (!text && !track && !loading) return null;
   const container = document.querySelector('#chat-messages');
+  container?.querySelector('[data-initial-chat]')?.remove();
   const cls = role === 'user' ? 'user-msg' : 'dj-msg';
 
   let html = `<div class="chat-msg ${cls}${loading ? ' loading-msg' : ''}"${loading ? ' aria-live="polite"' : ''}></div>`;

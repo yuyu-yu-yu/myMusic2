@@ -568,22 +568,57 @@ function trackDisplayName(track = {}) {
   return artists ? `《${track.name}》 - ${artists}` : `《${track.name || '这首歌'}》`;
 }
 
-function recommendationAtmosphereLine(track = {}) {
+function stableTemplateIndex(track = {}, count = 1) {
+  const text = `${track.id || ''}:${track.name || ''}:${(track.artists || []).join('/')}`;
+  let hash = 0;
+  for (let i = 0; i < text.length; i += 1) hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+  return Math.abs(hash) % Math.max(1, count);
+}
+
+function recommendationAtmosphereLine(track = {}, options = {}) {
   const artists = (track.artists || []).filter(Boolean).join('、');
-  const subject = artists ? `${artists}的声音` : '这首歌';
-  return `${subject}会把气氛稳稳接住，先让它在背景里铺一会儿，我陪你听。`;
+  const subject = artists ? `${artists}这一首` : '这首歌';
+  const mood = options.conversationMood?.mood || 'random';
+  const scene = mood === 'night' || options.timeOfDay === '深夜' || options.timeOfDay === '夜晚'
+    ? '夜里的噪声'
+    : mood === 'focus'
+      ? '注意力'
+      : mood === 'comfort'
+        ? '心里的褶皱'
+        : '房间里的节奏';
+  const lines = [
+    `${subject}不会把情绪推得太满，更像把${scene}慢慢调低一点。`,
+    `${subject}的线条比较干净，适合让现在的空气松下来，不急着往前赶。`,
+    `${subject}适合放在背景里，让旋律先铺开，剩下的情绪慢慢跟上。`,
+    `${subject}有种低亮度的安稳感，先让它把这一小段时间接住。`
+  ];
+  return lines[stableTemplateIndex(track, lines.length)];
 }
 
-function fallbackRecommendationText(track = {}, { playableFallback = false } = {}) {
-  const lead = playableFallback ? '刚才那首暂时放不了，我换一首更稳能播的' : '我给你接一首';
-  return `${lead}：${trackDisplayName(track)}。${recommendationAtmosphereLine(track)}`;
+function fallbackRecommendationText(track = {}, { playableFallback = false, timeOfDay = '', conversationMood = null } = {}) {
+  const displayName = trackDisplayName(track);
+  const atmosphere = recommendationAtmosphereLine(track, { timeOfDay, conversationMood });
+  const fallbackLeads = playableFallback
+    ? [
+        `刚才那首暂时放不了，我先换成${displayName}`,
+        `我重新确认了一下播放源，这里先接${displayName}`,
+        `那首现在不太稳，我换一首能播的：${displayName}`
+      ]
+    : [
+        `这一轮先放${displayName}`,
+        `我把现在的气氛接到${displayName}`,
+        `先让${displayName}进来陪你一会儿`,
+        `我挑了${displayName}`
+      ];
+  const lead = fallbackLeads[stableTemplateIndex(track, fallbackLeads.length)];
+  return `${lead}。${atmosphere}`;
 }
 
-function expandShortRecommendationText(text, track = {}) {
+function expandShortRecommendationText(text, track = {}, options = {}) {
   const value = String(text || '').trim();
   if (!value || value.length >= 45) return value;
   const suffix = /[。.!！?？]$/.test(value) ? '' : '。';
-  return `${value}${suffix}${recommendationAtmosphereLine(track)}`;
+  return `${value}${suffix}${recommendationAtmosphereLine(track, options)}`;
 }
 
 function trackMentionTerms(track = {}) {
@@ -596,15 +631,39 @@ function trackMentionTerms(track = {}) {
 }
 
 export function recommendationTextMentionsDifferentTrack(text, selectedTrack, candidates = []) {
-  const normalizedText = normalizeMusicText(text);
+  const originalText = String(text || '');
+  const normalizedText = normalizeMusicText(originalText);
   if (!normalizedText || !selectedTrack?.id) return false;
   const selectedTerms = new Set(trackMentionTerms(selectedTrack));
   for (const candidate of candidates || []) {
     const track = candidate?.track || candidate;
     if (!track?.id || String(track.id) === String(selectedTrack.id)) continue;
     for (const term of trackMentionTerms(track)) {
-      if (!selectedTerms.has(term) && normalizedText.includes(term)) return true;
+      if (!selectedTerms.has(term) && hasExplicitMusicMention(originalText, normalizedText, term)) return true;
     }
+  }
+  return false;
+}
+
+function hasExplicitMusicMention(originalText, normalizedText, normalizedTerm) {
+  if (!normalizedTerm || !normalizedText.includes(normalizedTerm)) return false;
+
+  const bracketMatches = String(originalText || '').match(/《[^》]{1,80}》/g) || [];
+  if (bracketMatches.some(match => normalizeMusicText(match).includes(normalizedTerm))) {
+    return true;
+  }
+
+  const musicBefore = ['听', '放', '播', '接', '切', '换', '推荐', '点', '唱', '选', '挑', '来首', '来一首'];
+  const musicAfter = ['这首', '这版', '这歌', '歌曲', '歌', '曲', '单曲', '版本', '艺人', '唱的', '唱'];
+  let from = 0;
+  while (from < normalizedText.length) {
+    const index = normalizedText.indexOf(normalizedTerm, from);
+    if (index < 0) break;
+    const before = normalizedText.slice(Math.max(0, index - 10), index);
+    const after = normalizedText.slice(index + normalizedTerm.length, index + normalizedTerm.length + 10);
+    if (musicBefore.some(marker => before.includes(normalizeMusicText(marker)))) return true;
+    if (musicAfter.some(marker => after.includes(normalizeMusicText(marker)))) return true;
+    from = index + Math.max(1, normalizedTerm.length);
   }
   return false;
 }
@@ -614,14 +673,68 @@ export function ensureRecommendationTextMatchesTrack(text, selectedTrack, candid
   const value = String(text || '').trim();
   const intro = `接下来放 ${trackDisplayName(selectedTrack)}。`;
   if (!value || recommendationTextMentionsDifferentTrack(value, selectedTrack, candidates)) {
-    return fallbackRecommendationText(selectedTrack, { playableFallback: Boolean(options.playableFallback) });
+    return fallbackRecommendationText(selectedTrack, {
+      playableFallback: Boolean(options.playableFallback),
+      timeOfDay: options.timeOfDay,
+      conversationMood: options.conversationMood
+    });
   }
   const selectedName = normalizeMusicText(selectedTrack.name);
   let finalText = value;
   if (selectedName && !normalizeMusicText(value).includes(selectedName)) {
     finalText = `${value} ${intro}`;
   }
-  return expandShortRecommendationText(finalText, selectedTrack);
+  return expandShortRecommendationText(finalText, selectedTrack, options);
+}
+
+export function parseDjModelResponse(raw, fallbackText = '') {
+  const text = stripCodeFence(String(raw || '')).trim();
+  const chatMatch = text.match(/<CHAT>([\s\S]*?)<\/CHAT>/i);
+  const jsonMatch = text.match(/<JSON>([\s\S]*?)<\/JSON>/i);
+  let chatText = chatMatch ? chatMatch[1].trim() : '';
+  let parsed = null;
+  let objectMatch = null;
+
+  if (jsonMatch) {
+    try { parsed = JSON.parse(jsonMatch[1].trim()); } catch {}
+  }
+  if (!parsed) {
+    objectMatch = text.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+      try { parsed = JSON.parse(objectMatch[0]); } catch {}
+    }
+  }
+  if (!chatText && parsed) {
+    chatText = String(
+      parsed.chatText ||
+      parsed.chat ||
+      parsed.hostText ||
+      parsed.reply ||
+      parsed.message ||
+      parsed.content ||
+      parsed.text ||
+      ''
+    ).trim();
+  }
+  if (!chatText && parsed && objectMatch && objectMatch.index > 0) {
+    chatText = text
+      .slice(0, objectMatch.index)
+      .replace(/<CHAT>|<\/CHAT>/gi, '')
+      .trim();
+  }
+  if (!chatText && jsonMatch) {
+    chatText = text.slice(0, jsonMatch.index).replace(/<CHAT>|<\/CHAT>/gi, '').trim();
+  }
+  if (!chatText && !parsed) {
+    chatText = text.replace(/<CHAT>|<\/CHAT>/gi, '').trim();
+  }
+
+  return {
+    chatText: chatText || fallbackText,
+    pick: parsed?.pick,
+    reason: parsed?.reason || '',
+    mode: parsed?.mode ?? null
+  };
 }
 
 function buildArtistConstraint(label, aliases = []) {
@@ -1812,9 +1925,10 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
     '- 如果听众没说话，主动根据氛围推荐',
     '- 严格遵守当前模式，不要推荐模式外的歌曲',
     '- 如果听众提到某个艺人或歌曲，我已经在线搜索过并放入了候选列表，不要说"曲库里没有"',
-    '- 如果听众要的风格（如国风、爵士、摇滚）在候选池里没有找到合适的，诚实说"我搜了一下，曲库里这类歌不多"，然后推荐风格相近的替代',,
-    '- 聊天文本 40-120 字，自然、温暖',
-    '- 输出格式：<CHAT>聊天文本</CHAT> 然后 <JSON>{"pick":数字或null,"reason":"理由","mode":null}</JSON>',
+    '- 如果听众要的风格（如国风、爵士、摇滚）在候选池里没有找到合适的，诚实说"我搜了一下，曲库里这类歌不多"，然后推荐风格相近的替代',
+    '- chatText 40-120 字，自然、温暖，必须写出灿灿要说给听众的话',
+    '- 只输出一个 JSON 对象，不要 Markdown，不要代码块，不要额外解释',
+    '- JSON 格式：{"chatText":"灿灿要说的话","pick":数字或null,"reason":"理由","mode":null}',
     '- 音乐常识：国风=中国风/古风（不是日本风），民谣=folk，说唱=rap/hip-hop，电音=electronic/EDM',
     '- 像真正的电台 DJ 朋友一样，自然地聊天',
     '- 这一轮已经由外层决策确认需要接歌，必须从候选曲目里选择一首，不要返回 null',
@@ -1836,24 +1950,26 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
     { role: 'user', content: userPrompt }
   ];
 
-  const raw = await generateChatCompletion(config.llm, messages, () => `<CHAT>${fallbackChat(timeOfDay, weather, profile)}</CHAT><JSON>{"pick":0,"reason":"根据氛围推荐","mode":null}</JSON>`);
+  const raw = await generateChatCompletion(config.llm, messages, () => JSON.stringify({
+    chatText: fallbackChat(timeOfDay, weather, profile),
+    pick: 0,
+    reason: '根据氛围推荐',
+    mode: null
+  }));
 
-  const chatMatch = raw.match(/<CHAT>([\s\S]*?)<\/CHAT>/);
-  const jsonMatch = raw.match(/<JSON>([\s\S]*?)<\/JSON>/);
-  const chatText = chatMatch ? chatMatch[1].trim() : raw.split('<JSON>')[0]?.replace(/<CHAT>|<\/CHAT>/g, '').trim() || fallbackChat(timeOfDay, weather, profile);
+  const parsedResponse = parseDjModelResponse(raw, fallbackChat(timeOfDay, weather, profile));
+  const chatText = parsedResponse.chatText;
 
   let pick = -1, reason = '', newMode = null;
-  if (jsonMatch) {
-    try {
-      const parsed = JSON.parse(jsonMatch[1].trim());
-      pick = parsed.pick === null || parsed.pick === undefined ? -1 : Math.min(Number(parsed.pick), pool.length - 1);
-      reason = parsed.reason || '';
-      if (parsed.mode === 'reset') {
-        newMode = {};
-      } else if (parsed.mode && typeof parsed.mode === 'string') {
-        newMode = { genre: parsed.mode, note: '用户指定' };
-      }
-    } catch { pick = -1; }
+  if (parsedResponse.pick !== null && parsedResponse.pick !== undefined) {
+    const parsedPick = Number(parsedResponse.pick);
+    pick = Number.isFinite(parsedPick) ? Math.min(parsedPick, pool.length - 1) : -1;
+    reason = parsedResponse.reason || '';
+    if (parsedResponse.mode === 'reset') {
+      newMode = {};
+    } else if (parsedResponse.mode && typeof parsedResponse.mode === 'string') {
+      newMode = { genre: parsedResponse.mode, note: '用户指定' };
+    }
   }
 
   // This function is only called from the music-action path. If the model
@@ -1894,7 +2010,9 @@ async function callDJ({ db, config, netease, sessionId, candidates, profile, wea
   }
 
   const finalChatText = ensureRecommendationTextMatchesTrack(chatText, selectedTrack, tracks, {
-    playableFallback: selectedChanged
+    playableFallback: selectedChanged,
+    timeOfDay,
+    conversationMood
   });
 
   return { chatText: finalChatText, track: selectedTrack, reason: reason || '根据你的口味推荐', newMode };

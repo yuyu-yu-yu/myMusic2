@@ -3,6 +3,9 @@
 data/
 cache/
 node_modules/
+release/
+packaging/work/
+packaging/verify/
 .claude/worktrees/
 *.log
 .DS_Store
