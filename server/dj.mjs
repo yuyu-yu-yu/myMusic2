@@ -110,6 +110,7 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   const context = getSessionContext(db, sessionId);
   const conversationState = normalizeConversationState(context.conversationState);
   const recommendationMood = conversationMood || moodFromConversationState(conversationState, prefs, mode);
+  const hostContext = buildRadioHostContext(db, sessionId, context, userMessage);
 
   // Load conversation history
   const history = loadHistory(db, sessionId);
@@ -137,7 +138,8 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
     history,
     userMessage,
     conversationMood: recommendationMood,
-    memoryContext
+    memoryContext,
+    hostContext
   });
 
   // Save to DB
@@ -151,6 +153,13 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
     db.prepare('INSERT INTO plays (track_id, played_at, source, reason, host_text, report_status) VALUES (?,?,?,?,?,?)')
       .run(result.track.id, nowIso(), 'radio', result.reason, result.chatText, 'pending');
     saveTrack(db, result.track);
+    const latestContext = getSessionContext(db, sessionId);
+    setSessionContext(db, sessionId, {
+      ...latestContext,
+      radioIntroDone: true,
+      radioIntroAt: latestContext.radioIntroAt || nowIso(),
+      radioTurnCount: Number(latestContext.radioTurnCount || 0) + 1
+    });
   }
   if (userMessage) {
     scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: result.chatText, conversationMood: recommendationMood });
@@ -1574,6 +1583,70 @@ function getPlayedIdSet(db) {
   return new Set(played.map(p => p.track_id));
 }
 
+function buildRadioHostContext(db, sessionId, context = {}, userMessage = '') {
+  return {
+    isFirstRadioTurn: !context.radioIntroDone,
+    radioTurnCount: Number(context.radioTurnCount || 0),
+    trigger: inferRadioTrigger(userMessage),
+    recentPlays: getRecentHostPlays(db, 4),
+    recentFeedback: getRecentSessionFeedback(db, sessionId, 6)
+  };
+}
+
+function inferRadioTrigger(userMessage = '') {
+  const text = String(userMessage || '').trim();
+  if (!text) return '启动电台或自动续播';
+  if (/下一首|换一首|切歌|跳过|不喜欢/.test(text)) return '用户想换一首';
+  if (/喜欢|好听|可以|不错/.test(text)) return '用户给了正向反馈';
+  return `用户刚说：${text.slice(0, 80)}`;
+}
+
+function getRecentHostPlays(db, limit = 4) {
+  try {
+    return listRecentPlays(db, limit).map(play => ({
+      name: play.name,
+      artists: Array.isArray(play.artists) ? play.artists : [],
+      reason: play.reason || '',
+      hostText: play.host_text || play.hostText || '',
+      playedAt: play.played_at || play.playedAt || ''
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function getRecentSessionFeedback(db, sessionId, limit = 6) {
+  try {
+    return db.prepare(`
+      SELECT e.event_type AS eventType,
+             e.created_at AS createdAt,
+             t.name,
+             t.artists
+      FROM track_feedback_events e
+      LEFT JOIN tracks t ON t.id = e.track_id
+      WHERE e.session_id = ?
+      ORDER BY e.created_at DESC
+      LIMIT ?
+    `).all(String(sessionId || ''), limit).map(row => ({
+      eventType: row.eventType,
+      createdAt: row.createdAt,
+      name: row.name || '',
+      artists: safeJsonArray(row.artists)
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function safeJsonArray(value) {
+  try {
+    const parsed = JSON.parse(value || '[]');
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
 function scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText, conversationMood }) {
   if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return;
   void extractAndStoreMemories({ db, config, sessionId, userMessage, assistantText, conversationMood }).catch(() => {});
@@ -1870,7 +1943,7 @@ function getArtistPenaltyByName(db) {
   return penalties;
 }
 
-async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {} }) {
+async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, hostContext = {} }) {
   const playedIds = getPlayedIdSet(db);
   const request = getMusicRequestConstraints(db, userMessage, mode);
   const failedPicks = [];
@@ -1912,7 +1985,8 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
         weather,
         conversationMood,
         userMessage,
-        memoryContext
+        memoryContext,
+        hostContext
       });
       return {
         chatText,
@@ -2160,7 +2234,8 @@ async function generateFinalHostText({
   weather,
   conversationMood,
   userMessage,
-  memoryContext
+  memoryContext,
+  hostContext = {}
 }) {
   const fallbackText = finalizeSongPlanHostText({
     plan,
@@ -2169,43 +2244,28 @@ async function generateFinalHostText({
     timeOfDay,
     weather,
     conversationMood,
-    userMessage
+    userMessage,
+    hostContext
   });
   if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return fallbackText;
 
   const artistText = (selectedTrack.artists || selectedPick?.artists || []).join('、');
-  const raw = await generateChatCompletion(config.llm, [
-    {
-      role: 'system',
-      content: [
-        '你是灿灿，私人电台 AI DJ。现在最终可播放歌曲已经确认，你只负责写播出前的导播词。',
-        '写 40-120 个中文字，温暖、自然、有电台感，像深夜电台老朋友，不要像搜索说明。',
-        '必须只围绕最终确认的歌曲和艺人展开。不能提到其他候选歌名、候选艺人或“我推荐了三首”。',
-        '要先轻轻接住当前时间、天气、对话状态或听众心情，再自然引到这首歌。',
-        '必须准确包含最终歌曲名，最好用书名号；可以包含艺人名。不要编造歌词、专辑、故事或不可确认的信息。',
-        '不要输出 Markdown，不要解释。只输出严格 JSON：{"chatText":"40-120字导播词"}'
-      ].join('\n')
-    },
-    {
-      role: 'user',
-      content: [
-        `最终歌曲：${selectedTrack.name}`,
-        `最终艺人：${artistText || '未知'}`,
-        selectedTrack.album ? `专辑：${selectedTrack.album}` : '',
-        `此刻：${timeOfDay} ${hour}点，${weather}`,
-        `听众画像：${profile?.summary || '无'}`,
-        `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
-        conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
-        memoryContext?.promptText || '相关长期记忆：无',
-        memoryContext?.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
-        `最近对话：${history.length ? '\n' + history.map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`,
-        userMessage ? `听众刚说：${userMessage}` : '听众刚启动电台或上一首播完。',
-        selectedPick?.reason ? `选这首的理由：${selectedPick.reason}` : '',
-        selectedPick?.hostLine ? `选歌阶段备用导播：${selectedPick.hostLine}` : '',
-        plan?.hostDraft ? `选歌阶段整体导播：${plan.hostDraft}` : ''
-      ].filter(Boolean).join('\n')
-    }
-  ], () => JSON.stringify({ chatText: fallbackText }));
+  const raw = await generateChatCompletion(config.llm, buildFinalHostMessages({
+    selectedTrack,
+    selectedPick,
+    plan,
+    artistText,
+    profile,
+    prefs,
+    history,
+    timeOfDay,
+    hour,
+    weather,
+    conversationMood,
+    userMessage,
+    memoryContext,
+    hostContext
+  }), () => JSON.stringify({ chatText: fallbackText }));
 
   const parsedText = parseFinalHostText(raw, fallbackText);
   return finalizeSongPlanHostText({
@@ -2216,8 +2276,85 @@ async function generateFinalHostText({
     weather,
     conversationMood,
     userMessage,
-    overrideText: parsedText
+    overrideText: parsedText,
+    hostContext
   });
+}
+
+export function buildFinalHostMessages({
+  selectedTrack,
+  selectedPick = {},
+  plan = {},
+  artistText = '',
+  profile = {},
+  prefs = {},
+  history = [],
+  timeOfDay,
+  hour,
+  weather,
+  conversationMood,
+  userMessage,
+  memoryContext = {},
+  hostContext = {}
+} = {}) {
+  const firstTurn = Boolean(hostContext.isFirstRadioTurn);
+  return [
+    {
+      role: 'system',
+      content: [
+        '你是灿灿，私人电台 AI DJ。最终可播放歌曲已经确认，你只负责写播出前导播词。',
+        '写 40-120 个中文字，温暖、自然、有电台感，像朋友在电台里临场说话，不要像搜索说明。',
+        '不要套固定模板，不要每次都用“深夜的上海/有风无雨/愿这首歌陪你/我找到”这类固定开头或结尾。',
+        firstTurn
+          ? '这是本轮电台第一次播歌，可以自然交代一次时间、天气或城市，但最多一句，不要写成天气播报。'
+          : '这不是本轮电台第一次播歌。除非用户主动问天气，否则不要再用时间、天气、城市、温度开头，也不要重复“深夜的上海”。',
+        '后续导播优先接最近对话、上一首歌的余味、用户的喜欢/不喜欢/跳过/下一首操作，以及当前歌曲和上一首之间的情绪转场。',
+        '必须只围绕最终确认的歌曲和艺人展开。不能提到其他候选歌名、候选艺人或“我推荐了三首”。',
+        '必须准确包含最终歌曲名，最好用书名号；可以包含艺人名。不要编造歌词、专辑、故事或不可确认的信息。',
+        '句式自由，可以短句、停顿、比喻或轻声聊天，但每次角度要不同。不要输出 Markdown，不要解释。只输出严格 JSON：{"chatText":"40-120字导播词"}'
+      ].join('\n')
+    },
+    {
+      role: 'user',
+      content: [
+        `本轮是否第一次播歌：${firstTurn ? '是，可以轻描淡写使用一次时间天气' : '否，避免天气时间模板'}`,
+        `触发原因：${hostContext.trigger || inferRadioTrigger(userMessage)}`,
+        `最终歌曲：${selectedTrack?.name || ''}`,
+        `最终艺人：${artistText || (selectedTrack?.artists || selectedPick?.artists || []).join('、') || '未知'}`,
+        selectedTrack?.album ? `专辑：${selectedTrack.album}` : '',
+        firstTurn ? `时间天气参考：${timeOfDay} ${hour}点，${weather}` : `时间天气仅供理解氛围，不要写进导播词：${timeOfDay} ${hour}点，${weather}`,
+        `听众画像：${profile?.summary || '无'}`,
+        `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
+        conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
+        formatRecentHostPlays(hostContext.recentPlays),
+        formatRecentHostFeedback(hostContext.recentFeedback),
+        memoryContext?.promptText || '相关长期记忆：无',
+        memoryContext?.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
+        `最近对话：${history.length ? '\n' + history.map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`,
+        userMessage ? `听众刚说：${userMessage}` : '听众刚启动电台或上一首播完。',
+        selectedPick?.reason ? `选这首的理由：${selectedPick.reason}` : '',
+        selectedPick?.hostLine ? `选歌阶段备用导播：${selectedPick.hostLine}` : '',
+        plan?.hostDraft ? `选歌阶段整体导播：${plan.hostDraft}` : ''
+      ].filter(Boolean).join('\n')
+    }
+  ];
+}
+
+function formatRecentHostPlays(plays = []) {
+  const items = (plays || []).slice(0, 4).filter(play => play?.name);
+  if (!items.length) return '最近播放：无';
+  return `最近播放：\n${items.map((play, index) =>
+    `${index + 1}. ${play.name}${play.artists?.length ? ' - ' + play.artists.join('、') : ''}${play.reason ? `（${play.reason}）` : ''}`
+  ).join('\n')}`;
+}
+
+function formatRecentHostFeedback(events = []) {
+  const items = (events || []).slice(0, 6).filter(event => event?.eventType);
+  if (!items.length) return '最近操作反馈：无';
+  const labels = { like: '喜欢', dislike: '不喜欢', skip: '下一首/跳过', complete: '完整播放' };
+  return `最近操作反馈：\n${items.map((event, index) =>
+    `${index + 1}. ${labels[event.eventType] || event.eventType}${event.name ? `：${event.name}${event.artists?.length ? ' - ' + event.artists.join('、') : ''}` : ''}`
+  ).join('\n')}`;
 }
 
 export function parseFinalHostText(raw, fallbackText = '') {
@@ -2240,13 +2377,13 @@ export function parseFinalHostText(raw, fallbackText = '') {
   return text;
 }
 
-function finalizeSongPlanHostText({ plan, selectedPick, selectedTrack, timeOfDay, weather, conversationMood, userMessage, overrideText = '' }) {
+function finalizeSongPlanHostText({ plan, selectedPick, selectedTrack, timeOfDay, weather, conversationMood, userMessage, overrideText = '', hostContext = {} }) {
   const candidateTracks = plan.picks.map((pick, index) => ({
     id: `plan-${index}`,
     name: pick.name,
     artists: pick.artists
   }));
-  const fallbackText = buildConfirmedTrackHostFallback({ selectedTrack, timeOfDay, weather, conversationMood, userMessage });
+  const fallbackText = buildConfirmedTrackHostFallback({ selectedTrack, timeOfDay, weather, conversationMood, userMessage, hostContext });
   const baseText = overrideText || chooseBestPlanHostText(plan, selectedPick, selectedTrack) || fallbackText;
   const cleanedText = stripUnselectedQuotedSongTitles(baseText, selectedTrack);
   const finalText = ensureRecommendationTextMatchesTrack(cleanedText, selectedTrack, candidateTracks, {
@@ -2285,9 +2422,23 @@ function hostTextLength(text) {
   return String(text || '').replace(/\s+/g, '').length;
 }
 
-function buildConfirmedTrackHostFallback({ selectedTrack, timeOfDay, weather, conversationMood, userMessage }) {
+function buildConfirmedTrackHostFallback({ selectedTrack, timeOfDay, weather, conversationMood, userMessage, hostContext = {} }) {
   const artists = (selectedTrack.artists || []).join('、');
   const trackLabel = `《${selectedTrack.name}》${artists ? ' - ' + artists : ''}`;
+  if (!hostContext.isFirstRadioTurn) {
+    const feedback = (hostContext.recentFeedback || [])[0];
+    const previous = (hostContext.recentPlays || [])[0];
+    if (feedback?.eventType === 'dislike' || feedback?.eventType === 'skip') {
+      return `那首我先收起来，不在同一个情绪里打转了。现在换一个方向，给你放 ${trackLabel}，让声音重新轻一点，看看这一首能不能更贴近你要的感觉。`;
+    }
+    if (feedback?.eventType === 'like') {
+      return `刚才那首你接住了，我就顺着那一点喜欢继续往前走。接下来放 ${trackLabel}，不复制上一首的情绪，只把舒服的余温留住。`;
+    }
+    if (previous?.name) {
+      return `上一首的尾音还在这里，我不急着把它切断。接下来换成 ${trackLabel}，让气氛从刚才那一段慢慢转过去。`;
+    }
+    return `这一首我不从天气说起了，直接把声音递给你。接下来是 ${trackLabel}，让它接住刚才的对话，也给这一刻换一点新的颜色。`;
+  }
   if (userMessage) {
     return `我先接住你刚才说的状态，不急着把气氛切得太用力。现在给你放 ${trackLabel}，让这首歌把接下来的几分钟慢慢托住。`;
   }
