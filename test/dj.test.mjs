@@ -10,13 +10,13 @@ import {
   openDatabase,
   recordOrMergeUserMemory,
   recordTrackFeedback,
-  retrieveRelevantMemories,
-  saveTrack
+  retrieveRelevantMemories
 } from '../server/db.mjs';
 import {
   analyzeConversationMood,
   analyzeTurnContext,
   buildMemoryContext,
+  buildSongSearchQueries,
   classifyTurnIntent,
   canProactivelyRecommend,
   chatTurn,
@@ -26,12 +26,15 @@ import {
   ensureRecommendationTextMatchesTrack,
   hasExplicitMusicIntent,
   parseDjModelResponse,
+  parseFinalHostText,
+  parseSongPlanResponse,
   recommendationTextMentionsDifferentTrack,
   rankAndSelectCandidates,
+  trackMatchesSongPick,
   TURN_ACTIONS
 } from '../server/dj.mjs';
 import { resolvePlayableTrack } from '../server/library.mjs';
-import { getMemories, getPreferences, nextRadioItem, prepareRadio, removeAllMemories, removeMemory, startRadio, submitFeedback, updatePreferences } from '../server/radio.mjs';
+import { getMemories, getPreferences, nextRadioItem, removeAllMemories, removeMemory, startRadio, submitFeedback, updatePreferences } from '../server/radio.mjs';
 
 function candidate(id, source, artists = ['Artist']) {
   return {
@@ -66,29 +69,6 @@ function testDb(t) {
   });
   return db;
 }
-
-function addPlayableTracks(db, count = 12, prefix = 'prepared') {
-  for (let index = 0; index < count; index += 1) {
-    saveTrack(db, {
-      id: `${prefix}-${index}`,
-      originalId: `${prefix}-original-${index}`,
-      name: `Prepared Song ${index}`,
-      artists: [`Artist ${index}`],
-      album: 'Prepared Album',
-      durationMs: 180000 + index
-    });
-  }
-}
-
-function offlineConfig() {
-  return {
-    llm: {},
-    tts: {},
-    weather: { provider: 'openweathermap', city: '测试' }
-  };
-}
-
-const offlineNetease = { isConfigured: () => false };
 
 test('automatic candidate selection preserves discovery quota in final 60', () => {
   const selected = rankAndSelectCandidates([
@@ -145,6 +125,64 @@ test('candidate ranking deduplicates tracks and keeps highest scoring source', (
 
   assert.equal(selected.filter(item => item.track.id === 'same-track').length, 1);
   assert.equal(selected.find(item => item.track.id === 'same-track').source, 'community_search');
+});
+
+test('song plan parser creates concrete song-search queries', () => {
+  const plan = parseSongPlanResponse(JSON.stringify({
+    picks: [
+      {
+        name: '陪你度过漫长岁月',
+        artists: ['陈奕迅'],
+        reason: '贴合陪伴感',
+        queries: ['深夜 安静 陪伴', '陪你度过漫长岁月 陈奕迅']
+      }
+    ],
+    hostDraft: '我给你放《陪你度过漫长岁月》。'
+  }));
+
+  assert.equal(plan.picks.length, 1);
+  assert.equal(plan.picks[0].name, '陪你度过漫长岁月');
+  assert.deepEqual(plan.picks[0].artists, ['陈奕迅']);
+
+  const queries = buildSongSearchQueries(plan.picks[0]);
+  assert.equal(queries[0], '陪你度过漫长岁月 陈奕迅');
+  assert.equal(queries.includes('深夜 安静 陪伴'), false);
+});
+
+test('song search matching rejects unrelated mood-title results', () => {
+  const pick = { name: '陪你度过漫长岁月', artists: ['陈奕迅'] };
+
+  assert.equal(trackMatchesSongPick({
+    id: 'target',
+    name: '陪你度过漫长岁月',
+    artists: ['Eason Chan']
+  }, pick), true);
+
+  assert.equal(trackMatchesSongPick({
+    id: 'mood-hit',
+    name: '安静',
+    artists: ['周杰伦']
+  }, pick), false);
+
+  assert.equal(trackMatchesSongPick({
+    id: 'wrong-artist',
+    name: '陪你度过漫长岁月',
+    artists: ['其他歌手']
+  }, pick), false);
+});
+
+test('final host text parser accepts confirmed-track DJ copy', () => {
+  const text = '我把这会儿的灯光放暗一点，先让情绪慢慢落下来。接下来给你放《陪你度过漫长岁月》 - 陈奕迅，像一只稳稳伸过来的手，陪你把这一段时间走完。';
+
+  assert.equal(
+    parseFinalHostText(JSON.stringify({ chatText: text }), 'fallback'),
+    text
+  );
+  assert.equal(
+    parseFinalHostText(text, 'fallback'),
+    text
+  );
+  assert.equal(parseFinalHostText('', 'fallback'), 'fallback');
 });
 
 test('recommendation text is forced to match the final playable track', () => {
@@ -283,115 +321,6 @@ test('playable resolution keeps originalId tracks eligible for ncm-cli fallback'
   }, { includeLyric: false });
 
   assert.equal(missingOriginalId.playable, false);
-});
-
-test('radio prepare creates session and stores reusable playable queue', async (t) => {
-  const db = testDb(t);
-  addPlayableTracks(db, 12, 'prep');
-
-  const prepared = await prepareRadio({
-    db,
-    config: offlineConfig(),
-    netease: offlineNetease,
-    sessionId: 'prepare-session'
-  });
-
-  assert.equal(prepared.ok, true);
-  assert.equal(prepared.reused, false);
-  assert.equal(prepared.candidateCount, 12);
-  assert.equal(prepared.playableCount, 12);
-
-  const row = db.prepare('SELECT context_json AS contextJson, queue_json AS queueJson FROM radio_sessions WHERE id = ?')
-    .get('prepare-session');
-  const context = JSON.parse(row.contextJson);
-  const queue = JSON.parse(row.queueJson);
-  assert.ok(context.preparedCandidateMeta.preparedAt);
-  assert.equal(queue.candidates.length, 12);
-  assert.equal(queue.candidates.every(candidate => candidate.track.playable), true);
-
-  const reused = await prepareRadio({
-    db,
-    config: offlineConfig(),
-    netease: offlineNetease,
-    sessionId: 'prepare-session'
-  });
-  assert.equal(reused.reused, true);
-});
-
-test('start radio reuses prepared queue without rebuilding base candidates', async (t) => {
-  const db = testDb(t);
-  addPlayableTracks(db, 12, 'start-cache');
-
-  await prepareRadio({
-    db,
-    config: offlineConfig(),
-    netease: offlineNetease,
-    sessionId: 'start-prepared'
-  });
-  db.prepare('DELETE FROM tracks').run();
-
-  const result = await startRadio({
-    db,
-    config: offlineConfig(),
-    netease: offlineNetease,
-    sessionId: 'start-prepared'
-  });
-
-  assert.equal(result.sessionId, 'start-prepared');
-  assert.ok(result.track.id.startsWith('start-cache-'));
-  assert.equal(result.ttsUrl, null);
-  const queue = JSON.parse(db.prepare('SELECT queue_json AS queueJson FROM radio_sessions WHERE id = ?')
-    .get('start-prepared').queueJson);
-  assert.equal(queue.candidates.some(candidate => candidate.track.id === result.track.id), false);
-});
-
-test('next radio item consumes prepared queue and avoids repeating the previous cached track', async (t) => {
-  const db = testDb(t);
-  addPlayableTracks(db, 12, 'next-cache');
-
-  await prepareRadio({
-    db,
-    config: offlineConfig(),
-    netease: offlineNetease,
-    sessionId: 'next-prepared'
-  });
-  const first = await startRadio({
-    db,
-    config: offlineConfig(),
-    netease: offlineNetease,
-    sessionId: 'next-prepared'
-  });
-  const second = await nextRadioItem({
-    db,
-    config: offlineConfig(),
-    netease: offlineNetease,
-    sessionId: 'next-prepared'
-  });
-
-  assert.ok(first.track?.id);
-  assert.ok(second.track?.id);
-  assert.notEqual(second.track.id, first.track.id);
-});
-
-test('radio prepare refreshes when preferences change', async (t) => {
-  const db = testDb(t);
-  addPlayableTracks(db, 12, 'pref-cache');
-
-  await prepareRadio({
-    db,
-    config: offlineConfig(),
-    netease: offlineNetease,
-    sessionId: 'pref-prepared'
-  });
-  updatePreferences({ db, payload: { moodMode: 'focus' } });
-  const refreshed = await prepareRadio({
-    db,
-    config: offlineConfig(),
-    netease: offlineNetease,
-    sessionId: 'pref-prepared'
-  });
-
-  assert.equal(refreshed.reused, false);
 });
 
 test('feedback and artist cooldown change candidate order', () => {

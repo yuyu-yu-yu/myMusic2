@@ -1,5 +1,4 @@
 // Conversational AI DJ — unified chat + track selection
-import crypto from 'node:crypto';
 import { generateChatCompletion, getWeatherSummary, synthesizeSpeech } from './ai.mjs';
 import { getProfile, resolvePlayableTrack } from './library.mjs';
 import {
@@ -9,14 +8,12 @@ import {
   saveTrack,
   getSessionMode,
   setSessionMode,
-  getFeedbackSummaryMap,
   recordOrMergeUserMemory,
   retrieveRelevantMemories,
   memoryKinds
 } from './db.mjs';
 import { searchOnline } from './community.mjs';
 import { getUserPrefs } from './radio.mjs';
-import { getGenreDiscoveryKeywords, searchGenres } from './genre.mjs';
 
 const CANDIDATE_LIMIT = 60;
 const AUTO_QUOTAS = { library_recent: 18, library_deep: 22, ai_discovery: 20 };
@@ -35,11 +32,6 @@ const LONG_MEMORY_LIMIT = 8;
 const LONG_MEMORY_MAX_CHARS = 800;
 const CHAT_LLM_TIMEOUT_MS = 9000;
 const INTENT_LLM_TIMEOUT_MS = 4000;
-const PLAYABLE_PREFLIGHT_BATCH_SIZE = 8;
-const PLAYABLE_PREFLIGHT_TARGET = 18;
-const PLAYABLE_PREFLIGHT_MAX_SCAN = 32;
-const PREPARED_CANDIDATE_TTL_MS = 30 * 60 * 1000;
-const PREPARED_MIN_PLAYABLE = 8;
 const INTENT_FALLBACK_SENTINEL = '__INTENT_CLASSIFIER_FALLBACK__';
 const DEFAULT_PREFS = Object.freeze({
   chatMusicBalance: 'friend',
@@ -131,29 +123,11 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   });
   const memoryContext = buildMemoryContext({ sessionSummary, longTermMemories });
 
-  // Build or reuse candidates.
-  const candidatePlan = await getTurnCandidatePlan({
-    db,
-    config,
-    sessionId,
-    profile,
-    weather,
-    timeOfDay,
-    hour,
-    mode,
-    prefs,
-    userMessage,
-    conversationMood: recommendationMood
-  });
-
-  // Single LLM call: chat + pick
   const result = await callDJ({
     db,
     config,
     netease,
     sessionId,
-    candidates: candidatePlan.candidates,
-    candidatesPrechecked: candidatePlan.prechecked,
     profile,
     weather,
     timeOfDay,
@@ -177,7 +151,6 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
     db.prepare('INSERT INTO plays (track_id, played_at, source, reason, host_text, report_status) VALUES (?,?,?,?,?,?)')
       .run(result.track.id, nowIso(), 'radio', result.reason, result.chatText, 'pending');
     saveTrack(db, result.track);
-    consumePreparedCandidate(db, sessionId, result.track.id);
   }
   if (userMessage) {
     scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: result.chatText, conversationMood: recommendationMood });
@@ -370,52 +343,6 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
   };
 }
 
-export async function prepareRadioSession({ db, config, netease, sessionId, force = false }) {
-  const preparedSessionId = sessionId || crypto.randomUUID();
-  ensureSession(db, preparedSessionId);
-
-  const profile = getProfile(db);
-  const weather = await getCachedWeather(db, preparedSessionId, config.weather);
-  const { hour, timeOfDay } = getTimeContext();
-  const mode = getSessionMode(db, preparedSessionId);
-  const prefs = normalizeRuntimePrefs(getUserPrefs(db));
-  const existing = getPreparedCandidateCache(db, preparedSessionId, { profile, prefs, mode });
-
-  if (!force && existing.fresh) {
-    return {
-      ok: true,
-      sessionId: preparedSessionId,
-      prepared: true,
-      reused: true,
-      candidateCount: existing.candidateCount,
-      playableCount: existing.playableCount,
-      preparedAt: existing.preparedAt
-    };
-  }
-
-  const candidates = await buildBaseCandidates(db, preparedSessionId, profile, weather, timeOfDay, hour, config, mode);
-  const playable = await resolvePlayableCandidatePool(db, netease, candidates);
-  const latestPlayedIds = getPlayedIdSet(db);
-  const playableQueue = playable.filter(candidate => !latestPlayedIds.has(String((candidate.track || candidate)?.id || '')));
-  const preparedAt = nowIso();
-  setPreparedCandidateCache(db, preparedSessionId, {
-    profileUpdatedAt: profile?.updatedAt || null,
-    prefsHash: stableHash(prefs),
-    modeHash: stableHash(mode),
-    preparedAt
-  }, playableQueue, candidates.length);
-
-  return {
-    ok: true,
-    sessionId: preparedSessionId,
-    prepared: true,
-    reused: false,
-    candidateCount: candidates.length,
-    playableCount: playableQueue.length,
-    preparedAt
-  };
-}
-
 export async function updateSessionSummary(db, config, sessionId) {
   const context = getSessionContext(db, sessionId);
   const stats = db.prepare('SELECT COUNT(*) AS count, MAX(id) AS latestId FROM messages WHERE session_id = ?')
@@ -498,55 +425,6 @@ function getTimeContext(date = new Date()) {
   const hour = date.getHours();
   const timeOfDay = hour < 6 ? '深夜' : hour < 9 ? '清晨' : hour < 12 ? '上午' : hour < 14 ? '中午' : hour < 18 ? '下午' : hour < 21 ? '傍晚' : '夜晚';
   return { hour, timeOfDay };
-}
-
-async function getTurnCandidatePlan({
-  db,
-  config,
-  sessionId,
-  profile,
-  weather,
-  timeOfDay,
-  hour,
-  mode,
-  prefs,
-  userMessage = '',
-  conversationMood = null
-}) {
-  const prepared = getPreparedCandidateCache(db, sessionId, { profile, prefs, mode });
-  const needsSearch = Boolean(String(userMessage || '').trim() || conversationMood?.searchHints?.length);
-
-  if (prepared.fresh && !needsSearch) {
-    return { candidates: prepared.candidates, prechecked: true, reusedPrepared: true };
-  }
-
-  if (prepared.fresh && needsSearch) {
-    const playedIds = getPlayedIdSet(db);
-    const searchCandidates = await buildSearchCandidates(db, userMessage, config, playedIds, conversationMood);
-    const rawCandidates = [...searchCandidates, ...prepared.candidates];
-    const feedbackById = getFeedbackSummaryMap(db, rawCandidates.map(c => c.track?.id));
-    return {
-      candidates: rankAndSelectCandidates(rawCandidates, {
-        quotas: SEARCH_QUOTAS,
-        limit: CANDIDATE_LIMIT,
-        feedbackById,
-        artistPenaltyByName: getArtistPenaltyByName(db),
-        profile,
-        mode,
-        userMessage,
-        conversationMood,
-        seed: sessionId
-      }),
-      prechecked: false,
-      reusedPrepared: true
-    };
-  }
-
-  return {
-    candidates: await buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, userMessage, conversationMood),
-    prechecked: false,
-    reusedPrepared: false
-  };
 }
 
 function getCurrentTrack(db) {
@@ -950,6 +828,69 @@ export function extractRequestedArtistConstraint(text, tracks = [], mode = {}) {
   return findKnownArtistConstraint(modeText) || findLibraryArtistConstraint(modeText, tracks);
 }
 
+function getMusicRequestConstraints(db, userMessage = '', mode = {}) {
+  const text = String(userMessage || '').trim();
+  const tracks = safeListTracks(db);
+  const artistConstraint = extractRequestedArtistConstraint(text, tracks, mode);
+  const songTitle = extractRequestedSongTitle(text, artistConstraint);
+  return {
+    text,
+    artistConstraint,
+    songTitle
+  };
+}
+
+function safeListTracks(db) {
+  if (!db) return [];
+  try {
+    return listTracks(db, 5000);
+  } catch {
+    return [];
+  }
+}
+
+function extractRequestedSongTitle(text, artistConstraint = null) {
+  const value = String(text || '').trim();
+  const quoted = value.match(/《([^》]{1,40})》/);
+  if (quoted?.[1]) return cleanRequestedSongTitle(quoted[1], artistConstraint);
+
+  if (artistConstraint?.aliases?.length) {
+    for (const alias of artistConstraint.aliases) {
+      const escaped = escapeRegExp(alias);
+      const match = value.match(new RegExp(`${escaped}(?:的|唱的)?([^，。？！,.!?]{2,28})`));
+      const title = cleanRequestedSongTitle(match?.[1] || '', artistConstraint);
+      if (title) return title;
+    }
+  }
+
+  const patterns = [
+    /(?:想听|听|播放|放|播|来一首|来首|推荐)(?:一下|一首|首)?([^，。？！,.!?]{2,32})/,
+    /(?:有没有)([^，。？！,.!?]{2,32})(?:这首歌|这歌|歌|歌曲)/
+  ];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    const title = cleanRequestedSongTitle(match?.[1] || '', artistConstraint);
+    if (title) return title;
+  }
+  return '';
+}
+
+function cleanRequestedSongTitle(value, artistConstraint = null) {
+  let text = String(value || '')
+    .replace(/^(我想|想|要|我要|给我|帮我|听|放|播放|播|来一首|来首|推荐|一下|一首|首|点|一点|一些|几首)+/g, '')
+    .replace(/(这首歌|这歌|歌|歌曲|音乐|作品|专辑)+$/g, '')
+    .replace(/^的+|的+$/g, '')
+    .trim();
+  for (const alias of artistConstraint?.aliases || []) {
+    text = text.replace(new RegExp(escapeRegExp(alias), 'gi'), '').replace(/^的+|的+$/g, '').trim();
+  }
+  const normalized = normalizeMusicText(text);
+  if (normalized.length < 2 || normalized.length > 24) return '';
+  if (GENERIC_ARTIST_PHRASES.has(normalized)) return '';
+  if (/^(他的|她的|他们的|她们的|它的|那首|一首|几首|一些|一点|歌|歌曲|音乐|作品|专辑)$/.test(text)) return '';
+  return text;
+}
+
 export function trackMatchesArtistConstraint(track, constraint) {
   if (!constraint) return true;
   const artistNames = (track?.artists || []).map(normalizeMusicText).filter(Boolean);
@@ -962,6 +903,17 @@ export function trackMatchesArtistConstraint(track, constraint) {
 export function filterArtistConstrainedCandidates(candidates, constraint) {
   if (!constraint) return candidates || [];
   return (candidates || []).filter(candidate => trackMatchesArtistConstraint(candidate?.track || candidate, constraint));
+}
+
+function trackMatchesSongTitle(track, songTitle) {
+  const wanted = normalizeMusicText(songTitle);
+  const actual = normalizeMusicText(track?.name || '');
+  if (!wanted || !actual) return false;
+  return actual === wanted || actual.includes(wanted) || wanted.includes(actual);
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 export function isOngoingArtistRequest(text) {
@@ -1615,89 +1567,11 @@ function withTimeout(promise, ms, fallbackValue) {
   });
 }
 
-export async function buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, userMessage = '', conversationMood = null) {
-  const playedIds = getPlayedIdSet(db);
-  const [rawBaseCandidates, searchCandidates] = await Promise.all([
-    buildRawBaseCandidates(db, profile, weather, timeOfDay, hour, config, mode, playedIds, conversationMood),
-    buildSearchCandidates(db, userMessage, config, playedIds, conversationMood)
-  ]);
-  const rawCandidates = [...searchCandidates, ...rawBaseCandidates];
-  const feedbackById = getFeedbackSummaryMap(db, rawCandidates.map(c => c.track?.id));
-  return rankAndSelectCandidates(rawCandidates, {
-    quotas: userMessage?.trim() || conversationMood?.searchHints?.length ? SEARCH_QUOTAS : AUTO_QUOTAS,
-    limit: CANDIDATE_LIMIT,
-    feedbackById,
-    artistPenaltyByName: getArtistPenaltyByName(db),
-    profile,
-    mode,
-    userMessage,
-    conversationMood,
-    seed: sessionId
-  });
-}
-
-export async function buildBaseCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode) {
-  const playedIds = getPlayedIdSet(db);
-  const rawCandidates = await buildRawBaseCandidates(db, profile, weather, timeOfDay, hour, config, mode, playedIds, null);
-  const feedbackById = getFeedbackSummaryMap(db, rawCandidates.map(c => c.track?.id));
-  return rankAndSelectCandidates(rawCandidates, {
-    quotas: AUTO_QUOTAS,
-    limit: CANDIDATE_LIMIT,
-    feedbackById,
-    artistPenaltyByName: getArtistPenaltyByName(db),
-    profile,
-    mode,
-    userMessage: '',
-    conversationMood: null,
-    seed: sessionId
-  });
-}
-
 function getPlayedIdSet(db) {
   const played = db.prepare(
     'SELECT track_id FROM plays ORDER BY played_at DESC LIMIT 300'
   ).all();
   return new Set(played.map(p => p.track_id));
-}
-
-async function buildRawBaseCandidates(db, profile, weather, timeOfDay, hour, config, mode, playedIds, conversationMood = null) {
-  const allTracks = listTracks(db, 5000);
-
-  const recentFavIds = db.prepare('SELECT id FROM tracks ORDER BY updated_at DESC LIMIT 100').all().map(t => t.id);
-  const recentFavIdSet = new Set(recentFavIds);
-  const recentFavs = allTracks
-    .filter(t => recentFavIdSet.has(t.id) && !playedIds.has(t.id))
-    .map(track => makeCandidate(track, 'library_recent', 'recent library'));
-
-  const otherFavs = allTracks
-    .filter(t => !recentFavIdSet.has(t.id) && !playedIds.has(t.id))
-    .map(track => makeCandidate(track, 'library_deep', 'deep library'));
-
-  const discovery = await discover(profile, weather, timeOfDay, hour, playedIds, config, mode, conversationMood);
-  const discoveryCandidates = discovery.map(track => makeCandidate(track, 'ai_discovery', 'profile discovery'));
-
-  return [...discoveryCandidates, ...recentFavs, ...otherFavs];
-}
-
-async function buildSearchCandidates(db, userMessage, config, playedIds, conversationMood = null) {
-  const terms = conversationMood?.searchHints?.length
-    ? conversationMood.searchHints
-    : (userMessage?.trim() ? await generateSearchTerms(userMessage, config) : []);
-  if (!terms.length) return [];
-  const candidates = [];
-  const seen = new Set();
-  await Promise.all([...new Set(terms)].map(async (term) => {
-    try {
-      const searchResults = await searchOnline(term, 15);
-      for (const s of searchResults) {
-        if (seen.has(s.id) || playedIds.has(String(s.id))) continue;
-        seen.add(s.id);
-        saveTrack(db, s);
-        candidates.push(makeCandidate(s, 'community_search', term));
-      }
-    } catch {}
-  }));
-  return candidates;
 }
 
 function scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText, conversationMood }) {
@@ -1792,141 +1666,6 @@ function parseJsonArray(text) {
   } catch {
     return [];
   }
-}
-
-function makeCandidate(track, source, sourceReason = '') {
-  return {
-    track,
-    source,
-    sourceReason,
-    score: 0,
-    scoreParts: {},
-    sources: [source]
-  };
-}
-
-function setPreparedCandidateCache(db, sessionId, meta, candidates, candidateCount = 0) {
-  const context = getSessionContext(db, sessionId);
-  setSessionContext(db, sessionId, {
-    ...context,
-    preparedCandidateMeta: meta
-  });
-  db.prepare('UPDATE radio_sessions SET queue_json = ? WHERE id = ?')
-    .run(JSON.stringify({
-      version: 1,
-      preparedAt: meta.preparedAt,
-      candidateCount: Number(candidateCount) || 0,
-      candidates: (candidates || []).map(serializePreparedCandidate)
-    }), sessionId);
-}
-
-function getPreparedCandidateCache(db, sessionId, { profile = {}, prefs = {}, mode = {} } = {}) {
-  const context = getSessionContext(db, sessionId);
-  const meta = context.preparedCandidateMeta || {};
-  const queue = readPreparedQueue(db, sessionId);
-  const candidates = queue.candidates.map(hydratePreparedCandidate).filter(candidate => candidate?.track?.id);
-  const playableCount = candidates.filter(candidate => candidate.track?.playable).length;
-  const candidateCount = Number(queue.candidateCount || candidates.length || 0);
-  const preparedAt = meta.preparedAt || queue.preparedAt || null;
-  const preparedTime = preparedAt ? new Date(preparedAt).getTime() : 0;
-  const expectedPrefsHash = stableHash(normalizeRuntimePrefs(prefs));
-  const expectedModeHash = stableHash(mode || {});
-  const enoughPlayable = playableCount >= PREPARED_MIN_PLAYABLE || (candidateCount > 0 && playableCount >= candidateCount);
-  const fresh = Boolean(
-    candidates.length &&
-    enoughPlayable &&
-    preparedTime &&
-    Date.now() - preparedTime < PREPARED_CANDIDATE_TTL_MS &&
-    meta.profileUpdatedAt === (profile?.updatedAt || null) &&
-    meta.prefsHash === expectedPrefsHash &&
-    meta.modeHash === expectedModeHash
-  );
-
-  return {
-    fresh,
-    candidates,
-    candidateCount,
-    playableCount,
-    preparedAt
-  };
-}
-
-function consumePreparedCandidate(db, sessionId, trackId) {
-  const id = String(trackId || '');
-  if (!id) return;
-  const queue = readPreparedQueue(db, sessionId);
-  if (!queue.candidates.length) return;
-  const nextCandidates = queue.candidates.filter(candidate => String(candidate?.track?.id || '') !== id);
-  if (nextCandidates.length === queue.candidates.length) return;
-  db.prepare('UPDATE radio_sessions SET queue_json = ? WHERE id = ?')
-    .run(JSON.stringify({ ...queue, candidates: nextCandidates }), sessionId);
-}
-
-function readPreparedQueue(db, sessionId) {
-  try {
-    const row = db.prepare('SELECT queue_json AS queueJson FROM radio_sessions WHERE id = ?').get(sessionId);
-    const parsed = JSON.parse(row?.queueJson || '[]');
-    if (Array.isArray(parsed)) {
-      return {
-        version: 0,
-        preparedAt: null,
-        candidateCount: parsed.length,
-        candidates: parsed
-      };
-    }
-    return {
-      version: parsed.version || 1,
-      preparedAt: parsed.preparedAt || null,
-      candidateCount: Number(parsed.candidateCount || parsed.candidates?.length || 0),
-      candidates: Array.isArray(parsed.candidates) ? parsed.candidates : []
-    };
-  } catch {
-    return { version: 1, preparedAt: null, candidateCount: 0, candidates: [] };
-  }
-}
-
-function serializePreparedCandidate(candidate = {}) {
-  const track = candidate.track || candidate;
-  return {
-    track: track ? {
-      id: track.id,
-      originalId: track.originalId || null,
-      name: track.name,
-      artists: Array.isArray(track.artists) ? track.artists : [],
-      album: track.album || '',
-      coverUrl: track.coverUrl || '',
-      durationMs: track.durationMs || null,
-      playUrl: track.playUrl || null,
-      playbackMode: track.playbackMode || null,
-      playable: Boolean(track.playable),
-      playbackError: track.playbackError || null
-    } : null,
-    source: candidate.source || 'library_deep',
-    sourceReason: candidate.sourceReason || '',
-    score: Number(candidate.score || 0),
-    scoreParts: candidate.scoreParts || {},
-    sources: Array.isArray(candidate.sources) ? candidate.sources : [candidate.source || 'library_deep']
-  };
-}
-
-function hydratePreparedCandidate(candidate = {}) {
-  const serialized = serializePreparedCandidate(candidate);
-  return {
-    ...serialized,
-    track: serialized.track
-  };
-}
-
-function stableHash(value) {
-  return crypto.createHash('sha1').update(stableStringify(value)).digest('hex');
-}
-
-function stableStringify(value) {
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
-  if (value && typeof value === 'object') {
-    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
-  }
-  return JSON.stringify(value);
 }
 
 export function rankAndSelectCandidates(candidates, {
@@ -2131,233 +1870,457 @@ function getArtistPenaltyByName(db) {
   return penalties;
 }
 
-function getStructuredDiscoveryKeywords(profile = {}, limit = 6) {
-  const structured = profile?.structured || {};
-  const groups = [
-    structured.discoveryDirections,
-    structured.genres,
-    structured.moods,
-    structured.scenes,
-    structured.languages
-  ];
-  const keywords = [];
-  for (const group of groups) {
-    for (const item of group || []) {
-      const name = String(item?.name || item || '').trim();
-      if (!name) continue;
-      keywords.push(name);
-      if (keywords.length >= limit) return [...new Set(keywords)].slice(0, limit);
+async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {} }) {
+  const playedIds = getPlayedIdSet(db);
+  const request = getMusicRequestConstraints(db, userMessage, mode);
+  const failedPicks = [];
+  let lastPlan = null;
+  let newMode = null;
+
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const plan = await generateSongPlan({
+      config,
+      profile,
+      weather,
+      timeOfDay,
+      hour,
+      mode,
+      prefs,
+      history,
+      userMessage,
+      conversationMood,
+      memoryContext,
+      request,
+      failedPicks
+    });
+    lastPlan = plan;
+    if (!newMode) newMode = modeDecisionFromPlan(plan);
+    if (!plan.picks.length) break;
+
+    const resolved = await resolveSongPlanTrack({ db, netease, plan, playedIds });
+    if (resolved.track) {
+      const chatText = await generateFinalHostText({
+        config,
+        plan,
+        selectedPick: resolved.pick,
+        selectedTrack: resolved.track,
+        profile,
+        prefs,
+        history,
+        timeOfDay,
+        hour,
+        weather,
+        conversationMood,
+        userMessage,
+        memoryContext
+      });
+      return {
+        chatText,
+        track: resolved.track,
+        reason: resolved.pick.reason || '根据当前状态和音乐画像推荐',
+        newMode
+      };
     }
+    failedPicks.push(...resolved.failedPicks);
   }
-  return [...new Set(keywords)].slice(0, limit);
+
+  return {
+    chatText: buildNoPlayableSongText(lastPlan),
+    track: null,
+    reason: 'LLM 推荐歌曲未确认到可播放源',
+    newMode
+  };
 }
 
-async function discover(profile, weather, timeOfDay, hour, playedIds, config, mode, conversationMood = null) {
-  const results = []; const seen = new Set();
+async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood, memoryContext, request, failedPicks = [] }) {
+  const fallbackPlan = {
+    picks: [],
+    hostDraft: fallbackChat(timeOfDay, weather, profile),
+    mode: null
+  };
+  if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return fallbackPlan;
 
-  // Collect all search keywords from 3 sources (no more LLM generation)
-  const keywords = [
-    ...(conversationMood?.searchHints || []),
-    ...getStructuredDiscoveryKeywords(profile, 6),
-    ...getGenreDiscoveryKeywords(profile.summary, 6)
-  ];
+  const modeText = mode?.genre
+    ? `当前模式：${mode.genre}（${mode.note || '用户指定'}）。`
+    : '当前模式：无特殊模式。';
+  const requestText = [
+    request?.artistConstraint?.label ? `指定艺人：${request.artistConstraint.label}` : '',
+    request?.songTitle ? `指定歌名：${request.songTitle}` : ''
+  ].filter(Boolean).join('；') || '无明确歌名/艺人约束';
+  const failedText = failedPicks.length
+    ? `上一批没有确认到可播放源，请避开这些歌：${failedPicks.map(pick => `${pick.name}${pick.artists?.length ? ' - ' + pick.artists.join('、') : ''}`).join('；')}`
+    : '没有失败歌单。';
 
-  // Deduplicate
-  const unique = [...new Set(keywords.map(k => String(k).trim()).filter(Boolean))];
+  const raw = await generateChatCompletion(config.llm, [
+    {
+      role: 'system',
+      content: [
+        '你是灿灿电台的选歌大脑。你的任务不是生成搜索关键词，而是直接推荐真实存在、音乐平台容易搜到的具体歌曲。',
+        '必须结合时间、天气、听众画像、偏好、当前对话和明确请求，给出 3 首备选歌。',
+        '每首都必须有明确歌名和主要艺人。优先推荐知名度较高、网易云音乐更可能搜到并可播放的版本。',
+        '“深夜、安静、陪伴、适合放松、开心、提神”等只能用于理解氛围，不能当作歌曲名或主搜索词，除非它本来就是你明确推荐的真实歌名且给出了艺人。',
+        '搜索 queries 必须像音乐软件里会输入的短词，优先“歌名 艺人”和“艺人 歌名”。不要输出长句。',
+        '如果用户明确指定艺人、歌名或风格，必须优先满足；不确定时选更常见、更好搜的歌曲。',
+        'hostLine 是备用导播词，必须写成 40-90 字的电台导播，不要只写一句“接下来放”。hostDraft 也要保持完整自然。',
+        '只输出严格 JSON，不要 Markdown，不要解释。',
+        'JSON 格式：{"picks":[{"name":"歌名","artists":["艺人"],"reason":"一句话理由","queries":["歌名 艺人","艺人 歌名"],"hostLine":"40-90字电台导播词"}],"hostDraft":"40-90字自然主持词","mode":null}'
+      ].join('\n')
+    },
+    {
+      role: 'user',
+      content: [
+        `此刻：${timeOfDay} ${hour}点，${weather}`,
+        `听众画像：${profile?.summary || '无'}`,
+        `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
+        modeText,
+        `明确请求：${requestText}`,
+        conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
+        memoryContext?.promptText || '相关长期记忆：无',
+        memoryContext?.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
+        `最近对话：${history.length ? '\n' + history.map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`,
+        userMessage ? `听众刚说：${userMessage}` : '听众刚启动电台或上一首播完。',
+        failedText
+      ].join('\n')
+    }
+  ], () => JSON.stringify(fallbackPlan));
 
-  // Parallel search across ALL keywords
-  await Promise.all(unique.map(async (kw) => {
+  return parseSongPlanResponse(raw, fallbackPlan);
+}
+
+export function parseSongPlanResponse(raw, fallbackPlan = { picks: [], hostDraft: '', mode: null }) {
+  const text = stripCodeFence(String(raw || '')).trim();
+  let parsed = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    const objectMatch = text.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+      try { parsed = JSON.parse(objectMatch[0]); } catch {}
+    }
+  }
+  if (!parsed) return fallbackPlan;
+  const rawPicks = Array.isArray(parsed) ? parsed : (parsed.picks || parsed.songs || parsed.recommendations || []);
+  const picks = rawPicks
+    .map(normalizeSongPick)
+    .filter(pick => pick.name && pick.artists.length)
+    .slice(0, 3);
+  return {
+    picks,
+    hostDraft: String(parsed.hostDraft || parsed.hostText || parsed.chatText || '').trim(),
+    mode: parsed.mode ?? null
+  };
+}
+
+function normalizeSongPick(raw = {}) {
+  const name = String(raw.name || raw.song || raw.title || raw.songName || '').trim();
+  const artists = normalizeArtistList(raw.artists || raw.artist || raw.singer || raw.singers);
+  return {
+    name,
+    artists,
+    reason: String(raw.reason || '').trim(),
+    queries: Array.isArray(raw.queries) ? raw.queries.map(q => String(q || '').trim()).filter(Boolean) : [],
+    hostLine: String(raw.hostLine || raw.hostText || '').trim()
+  };
+}
+
+function normalizeArtistList(value) {
+  if (Array.isArray(value)) return uniqueStrings(value, 4);
+  return uniqueStrings(String(value || '').split(/[、,，/&\s]+/), 4);
+}
+
+async function resolveSongPlanTrack({ db, netease, plan, playedIds }) {
+  const failedPicks = [];
+  for (const pick of plan.picks) {
+    const tracks = await searchTracksForSongPick(pick);
+    const ranked = tracks
+      .map(track => ({ track, score: scoreSearchTrackForPick(track, pick) }))
+      .filter(item => item.score >= 100)
+      .sort((a, b) => b.score - a.score)
+      .map(item => item.track);
+
+    for (const track of ranked) {
+      if (playedIds.has(String(track.id))) continue;
+      const playable = await resolvePlayableTrack(db, netease, track, { includeLyric: false });
+      if (!playable?.playable) continue;
+      const withLyric = await resolvePlayableTrack(db, netease, playable, { includeLyric: true });
+      return {
+        track: withLyric?.playable ? withLyric : playable,
+        pick
+      };
+    }
+    failedPicks.push(pick);
+  }
+  return { track: null, pick: null, failedPicks };
+}
+
+async function searchTracksForSongPick(pick) {
+  const seen = new Set();
+  const results = [];
+  const queries = buildSongSearchQueries(pick);
+  for (const query of queries) {
     try {
-      const songs = await searchOnline(kw, 12);
-      for (const s of songs) {
-        if (!seen.has(s.id) && !playedIds.has(s.id)) { seen.add(s.id); results.push(s); }
+      const tracks = await searchOnline(query, 10);
+      for (const track of tracks) {
+        const id = String(track?.id || '');
+        if (!id || seen.has(id)) continue;
+        seen.add(id);
+        results.push(track);
       }
     } catch {}
-  }));
-
+  }
   return results;
 }
 
-async function resolvePlayableCandidatePool(db, netease, candidates = []) {
-  const resolved = [];
-  const seen = new Set();
-  const maxScan = Math.min(candidates.length, PLAYABLE_PREFLIGHT_MAX_SCAN);
-
-  for (let start = 0; start < maxScan && resolved.length < PLAYABLE_PREFLIGHT_TARGET; start += PLAYABLE_PREFLIGHT_BATCH_SIZE) {
-    const batch = [];
-    for (const candidate of candidates.slice(start, start + PLAYABLE_PREFLIGHT_BATCH_SIZE)) {
-      const track = candidate?.track || candidate;
-      const id = String(track?.id || '');
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      batch.push({ candidate, track });
-    }
-    const checked = await Promise.all(batch.map(async ({ candidate, track }) => {
-      try {
-        const playable = await resolvePlayableTrack(db, netease, track, { includeLyric: false });
-        return playable?.playable ? { ...candidate, track: playable } : null;
-      } catch {
-        return null;
-      }
-    }));
-    resolved.push(...checked.filter(Boolean));
-  }
-
-  return resolved.slice(0, CANDIDATE_LIMIT);
+export function buildSongSearchQueries(pick = {}) {
+  const name = String(pick.name || '').trim();
+  const artists = normalizeArtistList(pick.artists || []);
+  if (!name) return [];
+  const primaryArtist = artists[0] || '';
+  const querySeeds = [
+    primaryArtist ? `${name} ${primaryArtist}` : '',
+    primaryArtist ? `${primaryArtist} ${name}` : '',
+    ...(pick.queries || []),
+    name
+  ];
+  const nameToken = normalizeMusicText(name);
+  return uniqueStrings(querySeeds
+    .map(sanitizeSongSearchQuery)
+    .filter(query => query && normalizeMusicText(query).includes(nameToken)), 5);
 }
 
-async function callDJ({ db, config, netease, sessionId, candidates, candidatesPrechecked = false, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {} }) {
-  const pool = candidatesPrechecked
-    ? (candidates || []).filter(candidate => (candidate.track || candidate)?.playable).slice(0, CANDIDATE_LIMIT)
-    : await resolvePlayableCandidatePool(db, netease, (candidates || []).slice(0, CANDIDATE_LIMIT));
-  const tracks = pool.map(candidate => candidate.track || candidate);
-  if (!tracks.length) {
-    return {
-      chatText: '这批候选里我没有确认到可播放的音源，先不硬播。你再点一次下一首，我会重新换一批候选找。',
-      track: null,
-      reason: '候选歌曲暂时不可播放',
-      newMode: null
-    };
-  }
-  const extraCount = pool.filter(candidate => candidate.source === 'community_search').length;
-  const poolText = pool.map((candidate, i) => { const t = candidate.track || candidate; return (
-    `${i}. ${t.name} —— ${(t.artists || []).join('、')}${t.album ? ' / ' + t.album : ''}（来源：${candidate.source || 'library'}，分数：${Math.round(candidate.score || 0)}）`
-  ); }).join('\n');
-  const searchNote = extraCount > 0
-    ? `\n（候选里有 ${extraCount} 首是针对"${userMessage?.slice(0, 20)}"的在线搜索结果，用户明确点歌或提风格时优先从这些结果里选。结合你对每首歌的了解判断流派——例如牵丝戏是古风、Geisha是电子世界融合不是国风、半壶纱是中国风民谣）`
-    : '';
+function sanitizeSongSearchQuery(value) {
+  const clean = String(value || '')
+    .replace(/[“”"']/g, '')
+    .replace(/[。！？!?；;]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (!clean || clean.length > 40 || normalizeMusicText(clean).length < 2) return '';
+  return clean;
+}
 
-  const modeText = mode?.genre
-    ? `当前模式：${mode.genre}（${mode.note || '用户指定'}）。请严格只推荐此类型的歌曲。`
-    : '无特殊模式，自由推荐。';
-  const prefNote = prefs?.note ? `用户偏好：${prefs.note}` : '';
-  const genreHints = getGenreDiscoveryKeywords(profile.summary, 10);
-  const genreNote = genreHints.length ? `听众可能喜欢的音乐风格：${genreHints.join('、')}` : '';
-  const moodNote = conversationMood?.mood && conversationMood.mood !== 'random'
-    ? `最近对话情绪：${conversationMood.mood}，能量：${conversationMood.energy}，搜索提示：${(conversationMood.searchHints || []).join('、')}。推荐要贴合这段对话的情绪。`
-    : '';
+export function trackMatchesSongPick(track, pick = {}) {
+  return scoreSearchTrackForPick(track, pick) >= 100;
+}
 
-  const systemPrompt = [
-    '你是灿灿，私人电台 DJ。你的风格：温暖、真诚，像深夜电台的老朋友。',
-    '你会和听众自然聊天，在对话中自然引出音乐推荐，不生硬转折。',
-    '',
-    `此刻：${timeOfDay} ${hour}点，${weather}`,
-    `听众画像：${profile.summary}`,
-    memoryContext.promptText || '相关长期记忆：无',
-    memoryContext.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
-    modeText,
-    prefNote,
-    genreNote,
-    moodNote,
-    '',
-    '规则：',
-    '- 先回应听众的话题（如果有），再自然引出推荐',
-    '- 如果听众没说话，主动根据氛围推荐',
-    '- 严格遵守当前模式，不要推荐模式外的歌曲',
-    '- 如果听众提到某个艺人或歌曲，我已经在线搜索过并放入了候选列表，不要说"曲库里没有"',
-    '- 如果听众要的风格（如国风、爵士、摇滚）在候选池里没有找到合适的，诚实说"我搜了一下，曲库里这类歌不多"，然后推荐风格相近的替代',
-    '- 只输出一个严格 JSON 对象，不要 Markdown，不要代码块，不要额外解释',
-    '- JSON 格式：{"chatText":"灿灿自然主持词，40-120字","pick":数字,"reason":"选择理由","mode":null}',
-    '- chatText 不是模板句，不能只写“接下来放...”；要先结合当前时间、天气、对话状态或用户偏好，再自然接歌',
-    '- chatText 必须自然提到 pick 指向的歌曲名或艺人，且不能提到其他候选歌名或艺人',
-    '- 音乐常识：国风=中国风/古风（不是日本风），民谣=folk，说唱=rap/hip-hop，电音=electronic/EDM',
-    '- 像真正的电台 DJ 朋友一样，自然地聊天',
-    '- 这一轮已经由外层决策确认需要接歌，必须从候选曲目里选择一首，不要返回 null',
-    '- 如果听众明确点歌或要求换歌，优先满足点歌/风格请求',
-    '- 如果是根据对话情绪接歌，先用一句话回应刚才的聊天，再自然引出歌曲',
-    '- 不要因为候选曲目里恰好有和听众问题同名的歌就推荐——那是巧合',
-    '- pick 必然填数字；只有候选池完全为空时才允许 null',
-    '- mode 字段：如果听众明确指定了新偏好（如「后面都听国风」），设为 "国风"；如果听众要求恢复正常，设为 "reset"；否则 null'
-  ].join('\n');
+function scoreSearchTrackForPick(track, pick = {}) {
+  const wantedName = normalizeMusicText(pick.name);
+  const wantedBaseName = normalizeMusicText(stripSongVersion(pick.name));
+  const actualName = normalizeMusicText(track?.name || '');
+  const actualBaseName = normalizeMusicText(stripSongVersion(track?.name || ''));
+  if (!wantedName || !actualName) return 0;
 
-  const userPrompt = [
-    `已确认可播放候选曲目：\n${poolText}${searchNote}`,
-    `对话历史：${history.length ? '\n' + history.map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`,
-    userMessage ? `\n听众说：${userMessage}\n（外层已经判断现在适合切到一首歌。请自然回应并选择最合适的候选。）` : '\n（上一首播完了，请自然推荐下一首）'
-  ].join('\n');
+  let nameScore = 0;
+  if (actualName === wantedName || actualBaseName === wantedBaseName) nameScore = 100;
+  else if (actualName.includes(wantedName) || wantedName.includes(actualName)) nameScore = 82;
+  else if (wantedBaseName && (actualBaseName.includes(wantedBaseName) || wantedBaseName.includes(actualBaseName))) nameScore = 76;
+  if (nameScore < 70) return 0;
 
-  const messages = [
-    { role: 'system', content: systemPrompt },
-    { role: 'user', content: userPrompt }
-  ];
+  const wantedArtists = expandArtistAliases(normalizeArtistList(pick.artists || []));
+  if (!wantedArtists.length) return nameScore + 20;
+  const actualArtists = expandArtistAliases(track?.artists || []);
+  const artistMatched = actualArtists.some(artist =>
+    wantedArtists.some(wanted => artist === wanted || artist.includes(wanted) || wanted.includes(artist))
+  );
+  return artistMatched ? nameScore + 45 : 0;
+}
 
-  const raw = await generateChatCompletion(config.llm, messages, () => JSON.stringify({
-    chatText: fallbackChat(timeOfDay, weather, profile),
-    pick: 0,
-    reason: '根据氛围推荐',
-    mode: null
-  }));
-
-  const parsedResponse = parseDjModelResponse(raw, fallbackChat(timeOfDay, weather, profile));
-  const chatText = parsedResponse.chatText;
-
-  let pick = -1, reason = '', newMode = null;
-  if (parsedResponse.pick !== null && parsedResponse.pick !== undefined) {
-    const parsedPick = Number(parsedResponse.pick);
-    pick = Number.isFinite(parsedPick) ? Math.min(parsedPick, pool.length - 1) : -1;
-    reason = parsedResponse.reason || '';
-    if (parsedResponse.mode === 'reset') {
-      newMode = {};
-    } else if (parsedResponse.mode && typeof parsedResponse.mode === 'string') {
-      newMode = { genre: parsedResponse.mode, note: '用户指定' };
+function expandArtistAliases(artists = []) {
+  const names = new Set();
+  for (const artist of artists || []) {
+    const raw = String(artist || '').trim();
+    if (!raw) continue;
+    names.add(normalizeMusicText(raw));
+    for (const [label, aliases] of KNOWN_ARTIST_ALIASES) {
+      const normalizedGroup = [label, ...aliases].map(normalizeMusicText);
+      if (normalizedGroup.includes(normalizeMusicText(raw))) {
+        normalizedGroup.forEach(name => names.add(name));
+      }
     }
   }
+  return [...names].filter(Boolean);
+}
 
-  // This function is only called from the music-action path. If the model
-  // forgets to pick, fall back to the top ranked candidate instead of chatting.
-  if ((pick < 0 || pick >= tracks.length) && tracks.length) {
-    pick = 0;
-    reason = reason || '外层决策要求接歌，使用最高分候选';
-  }
-  if (pick < 0 || pick >= tracks.length) {
-    return { chatText, track: null, reason: '', newMode };
-  }
+function stripSongVersion(value) {
+  return String(value || '')
+    .replace(/[（(【[].*?[）)】\]]/g, '')
+    .replace(/\b(live|remix|伴奏|纯音乐|cover|版|现场|录音室版)\b/gi, '')
+    .trim();
+}
 
-  let selectedTrack = tracks[pick] || tracks[0];
-  const playableWithLyric = await resolvePlayableTrack(db, netease, selectedTrack, { includeLyric: true });
-  if (playableWithLyric?.playable) {
-    selectedTrack = playableWithLyric;
-  }
-
-  if (!selectedTrack?.playable) {
-    return {
-      chatText: '这批候选里暂时没有确认可播放的歌，我先不乱播。你点下一首，我重新找一批更稳的。',
-      track: null,
-      reason: '候选歌曲暂时不可播放',
-      newMode
-    };
-  }
-
-  const finalChatText = ensureRecommendationTextMatchesTrack(chatText, selectedTrack, tracks, {
+async function generateFinalHostText({
+  config,
+  plan,
+  selectedPick,
+  selectedTrack,
+  profile,
+  prefs,
+  history,
+  timeOfDay,
+  hour,
+  weather,
+  conversationMood,
+  userMessage,
+  memoryContext
+}) {
+  const fallbackText = finalizeSongPlanHostText({
+    plan,
+    selectedPick,
+    selectedTrack,
     timeOfDay,
     weather,
     conversationMood,
     userMessage
   });
-  if (finalChatText !== chatText) {
-    console.warn('[dj text adjusted]', JSON.stringify({
-      selected: { id: selectedTrack.id, name: selectedTrack.name, artists: selectedTrack.artists || [] },
-      parsedPick: parsedResponse.pick,
-      rawPreview: String(raw || '').slice(0, 240),
-      parsedChatPreview: String(chatText || '').slice(0, 180),
-      finalPreview: String(finalChatText || '').slice(0, 180),
-      differentTrackMention: recommendationTextMentionsDifferentTrack(chatText, selectedTrack, tracks)
-    }));
-  }
+  if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return fallbackText;
 
-  return { chatText: finalChatText, track: selectedTrack, reason: reason || '根据你的口味推荐', newMode };
+  const artistText = (selectedTrack.artists || selectedPick?.artists || []).join('、');
+  const raw = await generateChatCompletion(config.llm, [
+    {
+      role: 'system',
+      content: [
+        '你是灿灿，私人电台 AI DJ。现在最终可播放歌曲已经确认，你只负责写播出前的导播词。',
+        '写 40-120 个中文字，温暖、自然、有电台感，像深夜电台老朋友，不要像搜索说明。',
+        '必须只围绕最终确认的歌曲和艺人展开。不能提到其他候选歌名、候选艺人或“我推荐了三首”。',
+        '要先轻轻接住当前时间、天气、对话状态或听众心情，再自然引到这首歌。',
+        '必须准确包含最终歌曲名，最好用书名号；可以包含艺人名。不要编造歌词、专辑、故事或不可确认的信息。',
+        '不要输出 Markdown，不要解释。只输出严格 JSON：{"chatText":"40-120字导播词"}'
+      ].join('\n')
+    },
+    {
+      role: 'user',
+      content: [
+        `最终歌曲：${selectedTrack.name}`,
+        `最终艺人：${artistText || '未知'}`,
+        selectedTrack.album ? `专辑：${selectedTrack.album}` : '',
+        `此刻：${timeOfDay} ${hour}点，${weather}`,
+        `听众画像：${profile?.summary || '无'}`,
+        `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
+        conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
+        memoryContext?.promptText || '相关长期记忆：无',
+        memoryContext?.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
+        `最近对话：${history.length ? '\n' + history.map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`,
+        userMessage ? `听众刚说：${userMessage}` : '听众刚启动电台或上一首播完。',
+        selectedPick?.reason ? `选这首的理由：${selectedPick.reason}` : '',
+        selectedPick?.hostLine ? `选歌阶段备用导播：${selectedPick.hostLine}` : '',
+        plan?.hostDraft ? `选歌阶段整体导播：${plan.hostDraft}` : ''
+      ].filter(Boolean).join('\n')
+    }
+  ], () => JSON.stringify({ chatText: fallbackText }));
+
+  const parsedText = parseFinalHostText(raw, fallbackText);
+  return finalizeSongPlanHostText({
+    plan,
+    selectedPick,
+    selectedTrack,
+    timeOfDay,
+    weather,
+    conversationMood,
+    userMessage,
+    overrideText: parsedText
+  });
 }
 
+export function parseFinalHostText(raw, fallbackText = '') {
+  const text = stripCodeFence(String(raw || '')).trim();
+  if (!text) return fallbackText;
+  try {
+    const parsed = JSON.parse(text);
+    const chatText = String(parsed.chatText || parsed.text || '').trim();
+    return chatText || fallbackText;
+  } catch {
+    const objectMatch = text.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+      try {
+        const parsed = JSON.parse(objectMatch[0]);
+        const chatText = String(parsed.chatText || parsed.text || '').trim();
+        if (chatText) return chatText;
+      } catch {}
+    }
+  }
+  return text;
+}
 
+function finalizeSongPlanHostText({ plan, selectedPick, selectedTrack, timeOfDay, weather, conversationMood, userMessage, overrideText = '' }) {
+  const candidateTracks = plan.picks.map((pick, index) => ({
+    id: `plan-${index}`,
+    name: pick.name,
+    artists: pick.artists
+  }));
+  const fallbackText = buildConfirmedTrackHostFallback({ selectedTrack, timeOfDay, weather, conversationMood, userMessage });
+  const baseText = overrideText || chooseBestPlanHostText(plan, selectedPick, selectedTrack) || fallbackText;
+  const cleanedText = stripUnselectedQuotedSongTitles(baseText, selectedTrack);
+  const finalText = ensureRecommendationTextMatchesTrack(cleanedText, selectedTrack, candidateTracks, {
+    timeOfDay,
+    weather,
+    conversationMood,
+    userMessage
+  });
+  if (hostTextLength(finalText) < 35) {
+    return ensureRecommendationTextMatchesTrack(fallbackText, selectedTrack, candidateTracks, {
+      timeOfDay,
+      weather,
+      conversationMood,
+      userMessage
+    });
+  }
+  return finalText;
+}
 
-async function generateSearchTerms(userMessage, config) {
-  if (!config?.llm?.baseUrl) return [userMessage.trim()];
-  const text = await generateChatCompletion(config.llm, [
-    { role: 'system', content: '你是音乐搜索专家。把用户的话转化成3-5个搜索关键词。理解用户真实意图：比如"古风DJ"意思是古风风格的电子混音/remix，搜"古风 DJ""古风 remix""古风 电子"。只输出关键词，逗号分隔，不要解释。' },
-    { role: 'user', content: `用户说：${userMessage}\n搜索关键词：` }
-  ], () => userMessage.trim());
-  const terms = (text || '').split(/[,，、\n]/).map(s => s.trim()).filter(Boolean);
-  return [userMessage.trim(), ...terms].slice(0, 6);
+function chooseBestPlanHostText(plan = {}, selectedPick = {}, selectedTrack = {}) {
+  const options = [plan.hostDraft, selectedPick.hostLine]
+    .map(text => String(text || '').trim())
+    .filter(Boolean);
+  if (!options.length) return '';
+  const selectedName = normalizeMusicText(selectedTrack?.name || '');
+  return options
+    .sort((a, b) => hostTextScore(b, selectedName) - hostTextScore(a, selectedName))[0];
+}
+
+function hostTextScore(text, selectedName) {
+  const normalized = normalizeMusicText(text);
+  return hostTextLength(text) + (selectedName && normalized.includes(selectedName) ? 60 : 0);
+}
+
+function hostTextLength(text) {
+  return String(text || '').replace(/\s+/g, '').length;
+}
+
+function buildConfirmedTrackHostFallback({ selectedTrack, timeOfDay, weather, conversationMood, userMessage }) {
+  const artists = (selectedTrack.artists || []).join('、');
+  const trackLabel = `《${selectedTrack.name}》${artists ? ' - ' + artists : ''}`;
+  if (userMessage) {
+    return `我先接住你刚才说的状态，不急着把气氛切得太用力。现在给你放 ${trackLabel}，让这首歌把接下来的几分钟慢慢托住。`;
+  }
+  if (conversationMood?.mood && conversationMood.mood !== 'random') {
+    return `这会儿的情绪适合放得柔和一点，不用急着往前赶。我给你接上 ${trackLabel}，让声音慢慢铺开，陪你把这一段时间放稳。`;
+  }
+  return `${timeOfDay || '现在'}的空气里有一点安静，${weather ? '窗外的天气也刚好适合慢下来。' : '刚好适合慢下来。'}我给你放 ${trackLabel}，让这首歌先把电台的灯点亮。`;
+}
+
+function stripUnselectedQuotedSongTitles(text, selectedTrack) {
+  const selected = normalizeMusicText(selectedTrack?.name || '');
+  if (!selected) return String(text || '').trim();
+  return String(text || '').replace(/《([^》]+)》/g, (match, title) => {
+    const normalized = normalizeMusicText(title);
+    return normalized === selected || selected.includes(normalized) || normalized.includes(selected)
+      ? match
+      : '这首歌';
+  }).trim();
+}
+
+function modeDecisionFromPlan(plan = {}) {
+  if (plan.mode === 'reset') return {};
+  if (plan.mode && typeof plan.mode === 'string') {
+    return { genre: plan.mode, note: '用户指定' };
+  }
+  return null;
+}
+
+function buildNoPlayableSongText(plan = null) {
+  if (plan?.picks?.length) {
+    return '我刚刚按歌名和艺人去确认了几首歌，但这两批都没有拿到稳定可播放源。我先不硬播不相关的歌，你可以换个歌手、歌名或风格我再找。';
+  }
+  return '我现在没能生成一组可靠的具体歌名，所以先不乱播。你可以直接说一个歌手、歌名或想要的风格，我再帮你找。';
 }
 function fallbackChat(timeOfDay, weather, profile) {
   const greetings = {
