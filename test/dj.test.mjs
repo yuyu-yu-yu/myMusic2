@@ -16,6 +16,7 @@ import {
   analyzeConversationMood,
   analyzeTurnContext,
   buildMemoryContext,
+  buildFinalHostMessages,
   buildSongSearchQueries,
   classifyTurnIntent,
   canProactivelyRecommend,
@@ -183,6 +184,45 @@ test('final host text parser accepts confirmed-track DJ copy', () => {
     text
   );
   assert.equal(parseFinalHostText('', 'fallback'), 'fallback');
+});
+
+test('final host prompt uses weather only for first radio turn and then focuses on context', () => {
+  const common = {
+    selectedTrack: { name: '她说', artists: ['林俊杰'], album: '她说 概念自选辑' },
+    selectedPick: { name: '她说', artists: ['林俊杰'], reason: '用户明确想听林俊杰' },
+    plan: { picks: [{ name: '她说', artists: ['林俊杰'] }] },
+    profile: { summary: '偏好华语流行和温柔旋律' },
+    prefs: {},
+    history: [{ role: 'user', content: '再来首陶喆的歌' }],
+    timeOfDay: '深夜',
+    hour: 1,
+    weather: '上海有风，16度',
+    conversationMood: { mood: 'calm' },
+    userMessage: '',
+    memoryContext: {}
+  };
+
+  const firstPrompt = JSON.stringify(buildFinalHostMessages({
+    ...common,
+    hostContext: { isFirstRadioTurn: true, trigger: '启动电台', recentPlays: [], recentFeedback: [] }
+  }));
+  assert.match(firstPrompt, /第一次播歌/);
+  assert.match(firstPrompt, /可以轻描淡写使用一次时间天气/);
+
+  const laterPrompt = JSON.stringify(buildFinalHostMessages({
+    ...common,
+    hostContext: {
+      isFirstRadioTurn: false,
+      trigger: '用户想换一首',
+      recentPlays: [{ name: '普通朋友', artists: ['陶喆'], reason: '上一首' }],
+      recentFeedback: [{ eventType: 'skip', name: '普通朋友', artists: ['陶喆'] }]
+    }
+  }));
+  assert.match(laterPrompt, /避免天气时间模板/);
+  assert.match(laterPrompt, /不要再用时间、天气、城市、温度开头/);
+  assert.match(laterPrompt, /最近播放/);
+  assert.match(laterPrompt, /最近操作反馈/);
+  assert.match(laterPrompt, /下一首\/跳过：普通朋友/);
 });
 
 test('recommendation text is forced to match the final playable track', () => {
