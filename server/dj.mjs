@@ -34,10 +34,12 @@ const SESSION_SUMMARY_STEP = 8;
 const LONG_MEMORY_LIMIT = 8;
 const LONG_MEMORY_MAX_CHARS = 800;
 const CHAT_LLM_TIMEOUT_MS = 9000;
-const INTENT_LLM_TIMEOUT_MS = 1800;
+const INTENT_LLM_TIMEOUT_MS = 4000;
 const PLAYABLE_PREFLIGHT_BATCH_SIZE = 8;
 const PLAYABLE_PREFLIGHT_TARGET = 18;
 const PLAYABLE_PREFLIGHT_MAX_SCAN = 32;
+const PREPARED_CANDIDATE_TTL_MS = 30 * 60 * 1000;
+const PREPARED_MIN_PLAYABLE = 8;
 const INTENT_FALLBACK_SENTINEL = '__INTENT_CLASSIFIER_FALLBACK__';
 const DEFAULT_PREFS = Object.freeze({
   chatMusicBalance: 'friend',
@@ -110,8 +112,7 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   ensureSession(db, sessionId);
   const profile = getProfile(db);
   const weather = await getCachedWeather(db, sessionId, config.weather);
-  const hour = new Date().getHours();
-  const timeOfDay = hour < 6 ? '深夜' : hour < 9 ? '清晨' : hour < 12 ? '上午' : hour < 14 ? '中午' : hour < 18 ? '下午' : hour < 21 ? '傍晚' : '夜晚';
+  const { hour, timeOfDay } = getTimeContext();
   const mode = getSessionMode(db, sessionId);
   const prefs = normalizeRuntimePrefs(getUserPrefs(db));
   const context = getSessionContext(db, sessionId);
@@ -130,11 +131,40 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   });
   const memoryContext = buildMemoryContext({ sessionSummary, longTermMemories });
 
-  // Build candidates
-  const candidates = await buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, userMessage, recommendationMood);
+  // Build or reuse candidates.
+  const candidatePlan = await getTurnCandidatePlan({
+    db,
+    config,
+    sessionId,
+    profile,
+    weather,
+    timeOfDay,
+    hour,
+    mode,
+    prefs,
+    userMessage,
+    conversationMood: recommendationMood
+  });
 
   // Single LLM call: chat + pick
-  const result = await callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood: recommendationMood, memoryContext });
+  const result = await callDJ({
+    db,
+    config,
+    netease,
+    sessionId,
+    candidates: candidatePlan.candidates,
+    candidatesPrechecked: candidatePlan.prechecked,
+    profile,
+    weather,
+    timeOfDay,
+    hour,
+    mode,
+    prefs,
+    history,
+    userMessage,
+    conversationMood: recommendationMood,
+    memoryContext
+  });
 
   // Save to DB
   if (userMessage) {
@@ -147,6 +177,7 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
     db.prepare('INSERT INTO plays (track_id, played_at, source, reason, host_text, report_status) VALUES (?,?,?,?,?,?)')
       .run(result.track.id, nowIso(), 'radio', result.reason, result.chatText, 'pending');
     saveTrack(db, result.track);
+    consumePreparedCandidate(db, sessionId, result.track.id);
   }
   if (userMessage) {
     scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: result.chatText, conversationMood: recommendationMood });
@@ -220,7 +251,7 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
   });
   const hardAction = decideHardRuleTurnAction({ userMessage, mode });
   const intentDecision = hardAction
-    ? { turnAction: hardAction, intentSource: 'rule', skipFriendLlm: hardAction.action !== TURN_ACTIONS.RECOMMEND_AND_PLAY }
+    ? { turnAction: hardAction, intentSource: 'rule', skipFriendLlm: false }
     : await resolveTurnActionWithIntentModel({
       config,
       userMessage,
@@ -339,6 +370,52 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
   };
 }
 
+export async function prepareRadioSession({ db, config, netease, sessionId, force = false }) {
+  const preparedSessionId = sessionId || crypto.randomUUID();
+  ensureSession(db, preparedSessionId);
+
+  const profile = getProfile(db);
+  const weather = await getCachedWeather(db, preparedSessionId, config.weather);
+  const { hour, timeOfDay } = getTimeContext();
+  const mode = getSessionMode(db, preparedSessionId);
+  const prefs = normalizeRuntimePrefs(getUserPrefs(db));
+  const existing = getPreparedCandidateCache(db, preparedSessionId, { profile, prefs, mode });
+
+  if (!force && existing.fresh) {
+    return {
+      ok: true,
+      sessionId: preparedSessionId,
+      prepared: true,
+      reused: true,
+      candidateCount: existing.candidateCount,
+      playableCount: existing.playableCount,
+      preparedAt: existing.preparedAt
+    };
+  }
+
+  const candidates = await buildBaseCandidates(db, preparedSessionId, profile, weather, timeOfDay, hour, config, mode);
+  const playable = await resolvePlayableCandidatePool(db, netease, candidates);
+  const latestPlayedIds = getPlayedIdSet(db);
+  const playableQueue = playable.filter(candidate => !latestPlayedIds.has(String((candidate.track || candidate)?.id || '')));
+  const preparedAt = nowIso();
+  setPreparedCandidateCache(db, preparedSessionId, {
+    profileUpdatedAt: profile?.updatedAt || null,
+    prefsHash: stableHash(prefs),
+    modeHash: stableHash(mode),
+    preparedAt
+  }, playableQueue, candidates.length);
+
+  return {
+    ok: true,
+    sessionId: preparedSessionId,
+    prepared: true,
+    reused: false,
+    candidateCount: candidates.length,
+    playableCount: playableQueue.length,
+    preparedAt
+  };
+}
+
 export async function updateSessionSummary(db, config, sessionId) {
   const context = getSessionContext(db, sessionId);
   const stats = db.prepare('SELECT COUNT(*) AS count, MAX(id) AS latestId FROM messages WHERE session_id = ?')
@@ -415,6 +492,61 @@ async function getCachedWeather(db, sessionId, weatherConfig) {
   const weather = await getWeatherSummary(weatherConfig);
   setSessionContext(db, sessionId, { ...context, weather, weatherUpdatedAt: nowIso() });
   return weather;
+}
+
+function getTimeContext(date = new Date()) {
+  const hour = date.getHours();
+  const timeOfDay = hour < 6 ? '深夜' : hour < 9 ? '清晨' : hour < 12 ? '上午' : hour < 14 ? '中午' : hour < 18 ? '下午' : hour < 21 ? '傍晚' : '夜晚';
+  return { hour, timeOfDay };
+}
+
+async function getTurnCandidatePlan({
+  db,
+  config,
+  sessionId,
+  profile,
+  weather,
+  timeOfDay,
+  hour,
+  mode,
+  prefs,
+  userMessage = '',
+  conversationMood = null
+}) {
+  const prepared = getPreparedCandidateCache(db, sessionId, { profile, prefs, mode });
+  const needsSearch = Boolean(String(userMessage || '').trim() || conversationMood?.searchHints?.length);
+
+  if (prepared.fresh && !needsSearch) {
+    return { candidates: prepared.candidates, prechecked: true, reusedPrepared: true };
+  }
+
+  if (prepared.fresh && needsSearch) {
+    const playedIds = getPlayedIdSet(db);
+    const searchCandidates = await buildSearchCandidates(db, userMessage, config, playedIds, conversationMood);
+    const rawCandidates = [...searchCandidates, ...prepared.candidates];
+    const feedbackById = getFeedbackSummaryMap(db, rawCandidates.map(c => c.track?.id));
+    return {
+      candidates: rankAndSelectCandidates(rawCandidates, {
+        quotas: SEARCH_QUOTAS,
+        limit: CANDIDATE_LIMIT,
+        feedbackById,
+        artistPenaltyByName: getArtistPenaltyByName(db),
+        profile,
+        mode,
+        userMessage,
+        conversationMood,
+        seed: sessionId
+      }),
+      prechecked: false,
+      reusedPrepared: true
+    };
+  }
+
+  return {
+    candidates: await buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, userMessage, conversationMood),
+    prechecked: false,
+    reusedPrepared: false
+  };
 }
 
 function getCurrentTrack(db) {
@@ -1051,7 +1183,7 @@ export async function classifyTurnIntent({
   );
 
   if (raw === INTENT_FALLBACK_SENTINEL) {
-    return { accepted: false, source: 'fallback', reason: 'intent classifier unavailable or timed out', skipFriendLlm: true };
+    return { accepted: false, source: 'fallback', reason: 'intent classifier unavailable or timed out', skipFriendLlm: false };
   }
 
   try {
@@ -1276,7 +1408,7 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
     reason: baseMood.reason,
     newMode: null
   });
-  if (skipLlm || !config?.llm?.baseUrl) return fallback();
+  if (!config?.llm?.baseUrl) return fallback();
   const currentTrackContext = getCurrentTrackPromptContext(userMessage, currentTrack);
 
   const messages = [
@@ -1410,6 +1542,10 @@ function fallbackFriendChat(userMessage, mood, turnAction = null) {
   if (/谢谢|谢啦|感谢/.test(text)) {
     return '不客气呀。你跟我说这些就行，不用太客气。';
   }
+  if (/开心|高兴|爽|激动|兴奋|松一口气|成就感|完成|做完|搞定|解决|通过|成功|结束/.test(text) &&
+      /任务|作业|项目|难做|很难|终于|完成|做完|搞定|解决|通过|成功|结束/.test(text)) {
+    return '这真的值得开心一下。一个很难的任务终于做完，那种松一口气的感觉很爽，先让自己好好享受这几分钟。';
+  }
   if (turnAction?.action === TURN_ACTIONS.ASK_FOLLOWUP) {
     return '听起来这件事确实有点压着你。先不用急着把它整理得很清楚，你可以按想到哪说到哪。';
   }
@@ -1429,7 +1565,7 @@ function fallbackFriendChat(userMessage, mood, turnAction = null) {
     return '那可以把节奏稍微拉起来一点。别一下子冲太猛，先让自己进入状态就行。';
   }
   return text
-    ? `嗯，我懂你的意思。你刚刚说“${text.slice(0, 24)}”，我会先按聊天来接，不会突然切到电台腔。你可以继续说具体一点。`
+    ? '我听到了。你可以按自己的节奏继续说，我会顺着你刚才的话接。'
     : '我在。你想聊什么都可以。';
 }
 
@@ -1480,29 +1616,12 @@ function withTimeout(promise, ms, fallbackValue) {
 }
 
 export async function buildCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode, userMessage = '', conversationMood = null) {
-  const played = db.prepare(
-    'SELECT track_id FROM plays ORDER BY played_at DESC LIMIT 300'
-  ).all();
-  const playedIds = new Set(played.map(p => p.track_id));
-  const allTracks = listTracks(db, 5000);
-
-  const recentFavIds = db.prepare('SELECT id FROM tracks ORDER BY updated_at DESC LIMIT 100').all().map(t => t.id);
-  const recentFavIdSet = new Set(recentFavIds);
-  const recentFavs = allTracks
-    .filter(t => recentFavIdSet.has(t.id) && !playedIds.has(t.id))
-    .map(track => makeCandidate(track, 'library_recent', 'recent library'));
-
-  const otherFavs = allTracks
-    .filter(t => !recentFavIdSet.has(t.id) && !playedIds.has(t.id))
-    .map(track => makeCandidate(track, 'library_deep', 'deep library'));
-
-  const [discovery, searchCandidates] = await Promise.all([
-    discover(profile, weather, timeOfDay, hour, playedIds, config, mode, conversationMood),
+  const playedIds = getPlayedIdSet(db);
+  const [rawBaseCandidates, searchCandidates] = await Promise.all([
+    buildRawBaseCandidates(db, profile, weather, timeOfDay, hour, config, mode, playedIds, conversationMood),
     buildSearchCandidates(db, userMessage, config, playedIds, conversationMood)
   ]);
-  const discoveryCandidates = discovery.map(track => makeCandidate(track, 'ai_discovery', 'profile discovery'));
-
-  const rawCandidates = [...searchCandidates, ...discoveryCandidates, ...recentFavs, ...otherFavs];
+  const rawCandidates = [...searchCandidates, ...rawBaseCandidates];
   const feedbackById = getFeedbackSummaryMap(db, rawCandidates.map(c => c.track?.id));
   return rankAndSelectCandidates(rawCandidates, {
     quotas: userMessage?.trim() || conversationMood?.searchHints?.length ? SEARCH_QUOTAS : AUTO_QUOTAS,
@@ -1515,6 +1634,49 @@ export async function buildCandidates(db, sessionId, profile, weather, timeOfDay
     conversationMood,
     seed: sessionId
   });
+}
+
+export async function buildBaseCandidates(db, sessionId, profile, weather, timeOfDay, hour, config, mode) {
+  const playedIds = getPlayedIdSet(db);
+  const rawCandidates = await buildRawBaseCandidates(db, profile, weather, timeOfDay, hour, config, mode, playedIds, null);
+  const feedbackById = getFeedbackSummaryMap(db, rawCandidates.map(c => c.track?.id));
+  return rankAndSelectCandidates(rawCandidates, {
+    quotas: AUTO_QUOTAS,
+    limit: CANDIDATE_LIMIT,
+    feedbackById,
+    artistPenaltyByName: getArtistPenaltyByName(db),
+    profile,
+    mode,
+    userMessage: '',
+    conversationMood: null,
+    seed: sessionId
+  });
+}
+
+function getPlayedIdSet(db) {
+  const played = db.prepare(
+    'SELECT track_id FROM plays ORDER BY played_at DESC LIMIT 300'
+  ).all();
+  return new Set(played.map(p => p.track_id));
+}
+
+async function buildRawBaseCandidates(db, profile, weather, timeOfDay, hour, config, mode, playedIds, conversationMood = null) {
+  const allTracks = listTracks(db, 5000);
+
+  const recentFavIds = db.prepare('SELECT id FROM tracks ORDER BY updated_at DESC LIMIT 100').all().map(t => t.id);
+  const recentFavIdSet = new Set(recentFavIds);
+  const recentFavs = allTracks
+    .filter(t => recentFavIdSet.has(t.id) && !playedIds.has(t.id))
+    .map(track => makeCandidate(track, 'library_recent', 'recent library'));
+
+  const otherFavs = allTracks
+    .filter(t => !recentFavIdSet.has(t.id) && !playedIds.has(t.id))
+    .map(track => makeCandidate(track, 'library_deep', 'deep library'));
+
+  const discovery = await discover(profile, weather, timeOfDay, hour, playedIds, config, mode, conversationMood);
+  const discoveryCandidates = discovery.map(track => makeCandidate(track, 'ai_discovery', 'profile discovery'));
+
+  return [...discoveryCandidates, ...recentFavs, ...otherFavs];
 }
 
 async function buildSearchCandidates(db, userMessage, config, playedIds, conversationMood = null) {
@@ -1641,6 +1803,130 @@ function makeCandidate(track, source, sourceReason = '') {
     scoreParts: {},
     sources: [source]
   };
+}
+
+function setPreparedCandidateCache(db, sessionId, meta, candidates, candidateCount = 0) {
+  const context = getSessionContext(db, sessionId);
+  setSessionContext(db, sessionId, {
+    ...context,
+    preparedCandidateMeta: meta
+  });
+  db.prepare('UPDATE radio_sessions SET queue_json = ? WHERE id = ?')
+    .run(JSON.stringify({
+      version: 1,
+      preparedAt: meta.preparedAt,
+      candidateCount: Number(candidateCount) || 0,
+      candidates: (candidates || []).map(serializePreparedCandidate)
+    }), sessionId);
+}
+
+function getPreparedCandidateCache(db, sessionId, { profile = {}, prefs = {}, mode = {} } = {}) {
+  const context = getSessionContext(db, sessionId);
+  const meta = context.preparedCandidateMeta || {};
+  const queue = readPreparedQueue(db, sessionId);
+  const candidates = queue.candidates.map(hydratePreparedCandidate).filter(candidate => candidate?.track?.id);
+  const playableCount = candidates.filter(candidate => candidate.track?.playable).length;
+  const candidateCount = Number(queue.candidateCount || candidates.length || 0);
+  const preparedAt = meta.preparedAt || queue.preparedAt || null;
+  const preparedTime = preparedAt ? new Date(preparedAt).getTime() : 0;
+  const expectedPrefsHash = stableHash(normalizeRuntimePrefs(prefs));
+  const expectedModeHash = stableHash(mode || {});
+  const enoughPlayable = playableCount >= PREPARED_MIN_PLAYABLE || (candidateCount > 0 && playableCount >= candidateCount);
+  const fresh = Boolean(
+    candidates.length &&
+    enoughPlayable &&
+    preparedTime &&
+    Date.now() - preparedTime < PREPARED_CANDIDATE_TTL_MS &&
+    meta.profileUpdatedAt === (profile?.updatedAt || null) &&
+    meta.prefsHash === expectedPrefsHash &&
+    meta.modeHash === expectedModeHash
+  );
+
+  return {
+    fresh,
+    candidates,
+    candidateCount,
+    playableCount,
+    preparedAt
+  };
+}
+
+function consumePreparedCandidate(db, sessionId, trackId) {
+  const id = String(trackId || '');
+  if (!id) return;
+  const queue = readPreparedQueue(db, sessionId);
+  if (!queue.candidates.length) return;
+  const nextCandidates = queue.candidates.filter(candidate => String(candidate?.track?.id || '') !== id);
+  if (nextCandidates.length === queue.candidates.length) return;
+  db.prepare('UPDATE radio_sessions SET queue_json = ? WHERE id = ?')
+    .run(JSON.stringify({ ...queue, candidates: nextCandidates }), sessionId);
+}
+
+function readPreparedQueue(db, sessionId) {
+  try {
+    const row = db.prepare('SELECT queue_json AS queueJson FROM radio_sessions WHERE id = ?').get(sessionId);
+    const parsed = JSON.parse(row?.queueJson || '[]');
+    if (Array.isArray(parsed)) {
+      return {
+        version: 0,
+        preparedAt: null,
+        candidateCount: parsed.length,
+        candidates: parsed
+      };
+    }
+    return {
+      version: parsed.version || 1,
+      preparedAt: parsed.preparedAt || null,
+      candidateCount: Number(parsed.candidateCount || parsed.candidates?.length || 0),
+      candidates: Array.isArray(parsed.candidates) ? parsed.candidates : []
+    };
+  } catch {
+    return { version: 1, preparedAt: null, candidateCount: 0, candidates: [] };
+  }
+}
+
+function serializePreparedCandidate(candidate = {}) {
+  const track = candidate.track || candidate;
+  return {
+    track: track ? {
+      id: track.id,
+      originalId: track.originalId || null,
+      name: track.name,
+      artists: Array.isArray(track.artists) ? track.artists : [],
+      album: track.album || '',
+      coverUrl: track.coverUrl || '',
+      durationMs: track.durationMs || null,
+      playUrl: track.playUrl || null,
+      playbackMode: track.playbackMode || null,
+      playable: Boolean(track.playable),
+      playbackError: track.playbackError || null
+    } : null,
+    source: candidate.source || 'library_deep',
+    sourceReason: candidate.sourceReason || '',
+    score: Number(candidate.score || 0),
+    scoreParts: candidate.scoreParts || {},
+    sources: Array.isArray(candidate.sources) ? candidate.sources : [candidate.source || 'library_deep']
+  };
+}
+
+function hydratePreparedCandidate(candidate = {}) {
+  const serialized = serializePreparedCandidate(candidate);
+  return {
+    ...serialized,
+    track: serialized.track
+  };
+}
+
+function stableHash(value) {
+  return crypto.createHash('sha1').update(stableStringify(value)).digest('hex');
+}
+
+function stableStringify(value) {
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  if (value && typeof value === 'object') {
+    return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableStringify(value[key])}`).join(',')}}`;
+  }
+  return JSON.stringify(value);
 }
 
 export function rankAndSelectCandidates(candidates, {
@@ -1920,8 +2206,10 @@ async function resolvePlayableCandidatePool(db, netease, candidates = []) {
   return resolved.slice(0, CANDIDATE_LIMIT);
 }
 
-async function callDJ({ db, config, netease, sessionId, candidates, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {} }) {
-  const pool = await resolvePlayableCandidatePool(db, netease, candidates.slice(0, CANDIDATE_LIMIT));
+async function callDJ({ db, config, netease, sessionId, candidates, candidatesPrechecked = false, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {} }) {
+  const pool = candidatesPrechecked
+    ? (candidates || []).filter(candidate => (candidate.track || candidate)?.playable).slice(0, CANDIDATE_LIMIT)
+    : await resolvePlayableCandidatePool(db, netease, (candidates || []).slice(0, CANDIDATE_LIMIT));
   const tracks = pool.map(candidate => candidate.track || candidate);
   if (!tracks.length) {
     return {

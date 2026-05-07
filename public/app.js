@@ -13,7 +13,8 @@ const state = {
   preferences: null,
   feedbackSummary: null,
   memories: [],
-  mixerRefreshTimer: null
+  mixerRefreshTimer: null,
+  radioPreparePromise: null
 };
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
@@ -449,6 +450,7 @@ function renderPlayer() {
   initButtonFeedback();
   initVisualizer();
   initProgressBar();
+  prepareRadio().catch(() => {});
   // Build audio graph on first user gesture (start button click)
   document.querySelector('#start-btn').addEventListener('click', () => {
     if (!visualizerBuilt) buildAudioGraph();
@@ -638,15 +640,47 @@ function replaceLoadingMessage({ text, track }) {
   return null;
 }
 
+function ensureSessionId() {
+  if (!state.sessionId) {
+    state.sessionId = globalThis.crypto?.randomUUID
+      ? globalThis.crypto.randomUUID()
+      : `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  }
+  return state.sessionId;
+}
+
+async function prepareRadio({ force = false } = {}) {
+  if (state.current?.track && !force) return null;
+  if (state.radioPreparePromise && !force) return state.radioPreparePromise;
+  const sessionId = ensureSessionId();
+  state.radioPreparePromise = api('/api/radio/prepare', {
+    method: 'POST',
+    body: { sessionId, force }
+  })
+    .then((data) => {
+      if (data.sessionId) state.sessionId = data.sessionId;
+      return data;
+    })
+    .catch((error) => {
+      console.warn('[radio prepare]', error?.message || error);
+      return null;
+    })
+    .finally(() => {
+      state.radioPreparePromise = null;
+    });
+  return state.radioPreparePromise;
+}
+
 async function startRadio() {
   primeVoicePlayback();
+  const sessionId = ensureSessionId();
   setAvatarState('on_air');
   setRadioButtonState('loading');
   appendChat({ role: 'user', text: '启动电台' });
   startLoadingMessages();
   try {
     await loadPreferences().catch(() => null);
-    const data = await api('/api/radio/start', { method: 'POST', body: {} });
+    const data = await api('/api/radio/start', { method: 'POST', body: { sessionId } });
     handleRadioResponse(data);
   } catch (e) {
     stopLoadingMessages();
@@ -659,6 +693,7 @@ async function startRadio() {
 
 async function nextTrack({ skipCurrent = true } = {}) {
   primeVoicePlayback();
+  const sessionId = ensureSessionId();
   setAvatarState('searching');
   setPlaybackToggleState(false);
   if (skipCurrent) await reportFeedback('skip');
@@ -666,7 +701,7 @@ async function nextTrack({ skipCurrent = true } = {}) {
   startLoadingMessages();
   try {
     await loadPreferences().catch(() => null);
-    const data = await api('/api/radio/next', { method: 'POST', body: { sessionId: state.sessionId } });
+    const data = await api('/api/radio/next', { method: 'POST', body: { sessionId } });
     handleRadioResponse(data);
   } catch (e) {
     stopLoadingMessages();
@@ -678,11 +713,12 @@ async function nextTrack({ skipCurrent = true } = {}) {
 
 async function sendChat(msg) {
   primeVoicePlayback();
+  const sessionId = ensureSessionId();
   appendChat({ role: 'user', text: msg });
   startLoadingMessages('chat');
   try {
     await loadPreferences().catch(() => null);
-    const data = await api('/api/radio/chat', { method: 'POST', body: { sessionId: state.sessionId, message: msg } });
+    const data = await api('/api/radio/chat', { method: 'POST', body: { sessionId, message: msg } });
     handleRadioResponse(data);
   } catch (e) {
     stopLoadingMessages();

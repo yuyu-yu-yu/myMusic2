@@ -7,7 +7,7 @@ import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
 import { openDatabase, seedDemoLibrary, getSetting, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { getLibrary, getProfile, syncLibrary, updateProfile } from './library.mjs';
-import { chatRadio, getMemories, getPreferences, nextRadioItem, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
+import { chatRadio, getMemories, getPreferences, nextRadioItem, prepareRadio, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
 import { loadCookie } from './community.mjs';
@@ -58,7 +58,14 @@ const routes = {
   'POST /api/library/sync': async () => syncLibrary(db, netease),
   'GET /api/library': async () => getLibrary(db),
   'GET /api/library/profile': async () => getProfile(db),
-  'POST /api/radio/start': async () => startRadio({ db, config, netease }),
+  'POST /api/radio/prepare': async (req) => {
+    const body = await readJson(req);
+    return prepareRadio({ db, config, netease, sessionId: body.sessionId, force: Boolean(body.force) });
+  },
+  'POST /api/radio/start': async (req) => {
+    const body = await readJson(req);
+    return startRadio({ db, config, netease, sessionId: body.sessionId });
+  },
   'POST /api/radio/chat': async (req) => {
     const body = await readJson(req);
     return chatRadio({ db, config, netease, sessionId: body.sessionId, message: body.message || '' });

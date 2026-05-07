@@ -1,6 +1,6 @@
 // Radio routes — thin wrappers over the conversational DJ engine
 import crypto from 'node:crypto';
-import { chatTurn, djTurn } from './dj.mjs';
+import { chatTurn, djTurn, prepareRadioSession } from './dj.mjs';
 import {
   clearUserMemories,
   deleteUserMemory,
@@ -11,12 +11,12 @@ import {
   recordTrackFeedback
 } from './db.mjs';
 
-export async function startRadio({ db, config, netease }) {
-  const sessionId = crypto.randomUUID();
-  const weather = await (await import('./ai.mjs')).getWeatherSummary(config.weather);
-  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
-    .run(sessionId, nowIso(), JSON.stringify({ weather, weatherUpdatedAt: nowIso(), startedAt: nowIso() }), '[]');
-  return djTurn({ db, config, netease, sessionId, userMessage: null });
+export async function prepareRadio({ db, config, netease, sessionId, force = false }) {
+  return prepareRadioSession({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), force });
+}
+
+export async function startRadio({ db, config, netease, sessionId }) {
+  return djTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), userMessage: null });
 }
 
 export async function chatRadio({ db, config, netease, sessionId, message }) {
