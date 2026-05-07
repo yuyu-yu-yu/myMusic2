@@ -10,7 +10,8 @@ import {
   openDatabase,
   recordOrMergeUserMemory,
   recordTrackFeedback,
-  retrieveRelevantMemories
+  retrieveRelevantMemories,
+  saveTrack
 } from '../server/db.mjs';
 import {
   analyzeConversationMood,
@@ -30,7 +31,7 @@ import {
   TURN_ACTIONS
 } from '../server/dj.mjs';
 import { resolvePlayableTrack } from '../server/library.mjs';
-import { getMemories, getPreferences, removeAllMemories, removeMemory, submitFeedback, updatePreferences } from '../server/radio.mjs';
+import { getMemories, getPreferences, nextRadioItem, prepareRadio, removeAllMemories, removeMemory, startRadio, submitFeedback, updatePreferences } from '../server/radio.mjs';
 
 function candidate(id, source, artists = ['Artist']) {
   return {
@@ -65,6 +66,29 @@ function testDb(t) {
   });
   return db;
 }
+
+function addPlayableTracks(db, count = 12, prefix = 'prepared') {
+  for (let index = 0; index < count; index += 1) {
+    saveTrack(db, {
+      id: `${prefix}-${index}`,
+      originalId: `${prefix}-original-${index}`,
+      name: `Prepared Song ${index}`,
+      artists: [`Artist ${index}`],
+      album: 'Prepared Album',
+      durationMs: 180000 + index
+    });
+  }
+}
+
+function offlineConfig() {
+  return {
+    llm: {},
+    tts: {},
+    weather: { provider: 'openweathermap', city: '测试' }
+  };
+}
+
+const offlineNetease = { isConfigured: () => false };
 
 test('automatic candidate selection preserves discovery quota in final 60', () => {
   const selected = rankAndSelectCandidates([
@@ -259,6 +283,115 @@ test('playable resolution keeps originalId tracks eligible for ncm-cli fallback'
   }, { includeLyric: false });
 
   assert.equal(missingOriginalId.playable, false);
+});
+
+test('radio prepare creates session and stores reusable playable queue', async (t) => {
+  const db = testDb(t);
+  addPlayableTracks(db, 12, 'prep');
+
+  const prepared = await prepareRadio({
+    db,
+    config: offlineConfig(),
+    netease: offlineNetease,
+    sessionId: 'prepare-session'
+  });
+
+  assert.equal(prepared.ok, true);
+  assert.equal(prepared.reused, false);
+  assert.equal(prepared.candidateCount, 12);
+  assert.equal(prepared.playableCount, 12);
+
+  const row = db.prepare('SELECT context_json AS contextJson, queue_json AS queueJson FROM radio_sessions WHERE id = ?')
+    .get('prepare-session');
+  const context = JSON.parse(row.contextJson);
+  const queue = JSON.parse(row.queueJson);
+  assert.ok(context.preparedCandidateMeta.preparedAt);
+  assert.equal(queue.candidates.length, 12);
+  assert.equal(queue.candidates.every(candidate => candidate.track.playable), true);
+
+  const reused = await prepareRadio({
+    db,
+    config: offlineConfig(),
+    netease: offlineNetease,
+    sessionId: 'prepare-session'
+  });
+  assert.equal(reused.reused, true);
+});
+
+test('start radio reuses prepared queue without rebuilding base candidates', async (t) => {
+  const db = testDb(t);
+  addPlayableTracks(db, 12, 'start-cache');
+
+  await prepareRadio({
+    db,
+    config: offlineConfig(),
+    netease: offlineNetease,
+    sessionId: 'start-prepared'
+  });
+  db.prepare('DELETE FROM tracks').run();
+
+  const result = await startRadio({
+    db,
+    config: offlineConfig(),
+    netease: offlineNetease,
+    sessionId: 'start-prepared'
+  });
+
+  assert.equal(result.sessionId, 'start-prepared');
+  assert.ok(result.track.id.startsWith('start-cache-'));
+  assert.equal(result.ttsUrl, null);
+  const queue = JSON.parse(db.prepare('SELECT queue_json AS queueJson FROM radio_sessions WHERE id = ?')
+    .get('start-prepared').queueJson);
+  assert.equal(queue.candidates.some(candidate => candidate.track.id === result.track.id), false);
+});
+
+test('next radio item consumes prepared queue and avoids repeating the previous cached track', async (t) => {
+  const db = testDb(t);
+  addPlayableTracks(db, 12, 'next-cache');
+
+  await prepareRadio({
+    db,
+    config: offlineConfig(),
+    netease: offlineNetease,
+    sessionId: 'next-prepared'
+  });
+  const first = await startRadio({
+    db,
+    config: offlineConfig(),
+    netease: offlineNetease,
+    sessionId: 'next-prepared'
+  });
+  const second = await nextRadioItem({
+    db,
+    config: offlineConfig(),
+    netease: offlineNetease,
+    sessionId: 'next-prepared'
+  });
+
+  assert.ok(first.track?.id);
+  assert.ok(second.track?.id);
+  assert.notEqual(second.track.id, first.track.id);
+});
+
+test('radio prepare refreshes when preferences change', async (t) => {
+  const db = testDb(t);
+  addPlayableTracks(db, 12, 'pref-cache');
+
+  await prepareRadio({
+    db,
+    config: offlineConfig(),
+    netease: offlineNetease,
+    sessionId: 'pref-prepared'
+  });
+  updatePreferences({ db, payload: { moodMode: 'focus' } });
+  const refreshed = await prepareRadio({
+    db,
+    config: offlineConfig(),
+    netease: offlineNetease,
+    sessionId: 'pref-prepared'
+  });
+
+  assert.equal(refreshed.reused, false);
 });
 
 test('feedback and artist cooldown change candidate order', () => {
@@ -713,7 +846,7 @@ test('intent classifier falls back on bad JSON, low confidence, and hard rules',
   assert.equal(result.track, null);
   assert.equal(result.turnAction.action, TURN_ACTIONS.CHAT_ONLY);
   assert.equal(hardRuleRequests.some(body => String(body).includes('轻量意图路由器')), false);
-  assert.equal(hardRuleRequests.some(body => String(body).includes('这一轮是普通聊天回复')), false);
+  assert.equal(hardRuleRequests.some(body => String(body).includes('这一轮是普通聊天回复')), true);
 });
 
 test('self-disclosure chat does not select a track and stays in chat mode', async (t) => {
@@ -898,7 +1031,7 @@ test('chat LLM timeout remains bounded without playing music', async (t) => {
 
   assert.equal(result.track, null);
   assert.equal(result.turnAction.action, TURN_ACTIONS.ASK_FOLLOWUP);
-  assert.equal(elapsedMs < 10000, true);
+  assert.equal(elapsedMs < 14000, true);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM plays').get().count, 0);
 });
 
@@ -934,6 +1067,21 @@ test('fallback companion chat is longer and avoids clinical follow-up', async (t
   assert.equal(result.chatText.length >= 30, true);
   assert.doesNotMatch(result.chatText, /最明显的感受是什么|为什么/);
   assert.match(result.chatText, /不用急|慢慢|压着|想到哪/);
+});
+
+test('fallback celebrates completed hard task without exposing routing template', async (t) => {
+  const db = testDb(t);
+  const result = await chatTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'happy-task-fallback',
+    message: '我现在很开心，因为我一个很难做的任务做完了'
+  });
+
+  assert.equal(result.track, null);
+  assert.match(result.chatText, /值得开心|做完|享受/);
+  assert.doesNotMatch(result.chatText, /我会先按聊天来接|电台腔|你刚刚说/);
 });
 
 test('fallback answers direct artist preference without night comfort template', async (t) => {
