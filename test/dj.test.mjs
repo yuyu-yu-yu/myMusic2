@@ -22,14 +22,20 @@ import {
   classifyTurnIntent,
   canProactivelyRecommend,
   chatTurn,
+  consumeReadyRadioQueue,
   decideHardRuleTurnAction,
+  decideQueuePolicy,
   decideTurnAction,
   extractAndStoreMemories,
   ensureRecommendationTextMatchesTrack,
+  getRadioQueueStatus,
   hasExplicitMusicIntent,
+  normalizeMusicContext,
+  normalizeRadioQueue,
   parseDjModelResponse,
   parseFinalHostText,
   parseSongPlanResponse,
+  queueItemMatchesMusicContext,
   recommendationTextMentionsDifferentTrack,
   rankAndSelectCandidates,
   trackMatchesPlayedSongName,
@@ -1183,6 +1189,75 @@ test('recommendation trigger policy distinguishes chat from music intent', () =>
   }), false);
 });
 
+test('radio queue policy handles ordinary chat, explicit music, mood shifts, and clear', () => {
+  const ordinary = decideQueuePolicy({
+    analysis: normalizeMusicContext({ musicIntent: 'chat', mood: 'random' }),
+    turnAction: { action: TURN_ACTIONS.CHAT_ONLY }
+  });
+  assert.equal(ordinary.action, 'refresh_tail');
+
+  const explicit = decideQueuePolicy({
+    analysis: normalizeMusicContext({ musicIntent: 'explicit_music', mood: 'energy', searchHints: ['林俊杰'] }),
+    turnAction: { action: TURN_ACTIONS.RECOMMEND_AND_PLAY }
+  });
+  assert.equal(explicit.action, 'hard_preempt');
+
+  const quietHead = {
+    track: { id: 'q1', name: 'Quiet Song', artists: ['A'] },
+    contextSnapshot: normalizeMusicContext({ mood: 'calm', energy: 'low', searchHints: ['安静'] })
+  };
+  assert.equal(queueItemMatchesMusicContext(quietHead, normalizeMusicContext({
+    mood: 'night',
+    energy: 'low',
+    searchHints: ['安静'],
+    musicIntent: 'mood_signal'
+  })), true);
+  assert.equal(queueItemMatchesMusicContext(quietHead, normalizeMusicContext({
+    mood: 'energy',
+    energy: 'high',
+    searchHints: ['提神'],
+    musicIntent: 'mood_signal'
+  })), false);
+
+  const soft = decideQueuePolicy({
+    analysis: normalizeMusicContext({ musicIntent: 'mood_signal', mood: 'energy', energy: 'high', searchHints: ['提神'], confidence: 0.8 }),
+    currentQueueItem: quietHead
+  });
+  assert.equal(soft.action, 'soft_preempt');
+
+  const clear = decideQueuePolicy({
+    analysis: normalizeMusicContext({ musicIntent: 'suppressed' }),
+    turnAction: { action: TURN_ACTIONS.CHAT_ONLY }
+  });
+  assert.equal(clear.action, 'clear');
+});
+
+test('radio queue consumes ready items and keeps pending items in session order', (t) => {
+  const db = testDb(t);
+  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
+    .run('queue-consume', new Date().toISOString(), '{}', JSON.stringify(normalizeRadioQueue([
+      {
+        id: 'ready-1',
+        status: 'ready',
+        track: { id: 't1', name: 'Same Song', artists: ['A'] },
+        chatText: 'host 1'
+      },
+      {
+        id: 'pending-1',
+        status: 'pending',
+        contextSnapshot: normalizeMusicContext({ mood: 'calm' })
+      }
+    ])));
+
+  const consumed = consumeReadyRadioQueue(db, 'queue-consume');
+  assert.equal(consumed.track.id, 't1');
+
+  const status = getRadioQueueStatus(db, 'queue-consume');
+  assert.equal(status.readyCount, 0);
+  assert.equal(status.pendingCount, 1);
+  assert.equal(status.queue[0].id, 'pending-1');
+});
+
 test('conversation analysis stores short-term preferences without forcing music', async (t) => {
   const db = testDb(t);
   const result = await chatTurn({
@@ -1201,6 +1276,8 @@ test('conversation analysis stores short-term preferences without forcing music'
   assert.equal(context.conversationState.preferenceHints.includes('治愈'), true);
   assert.equal(context.conversationState.preferenceHints.includes('安静'), true);
   assert.equal(context.conversationState.noMusicUntilUserCount >= 4, true);
+  assert.equal(context.musicContext.version >= 1, true);
+  assert.equal(context.musicContext.musicIntent, 'suppressed');
 });
 
 test('preference settings affect proactive recommendation thresholds', () => {

@@ -1,6 +1,6 @@
 // Radio routes — thin wrappers over the conversational DJ engine
 import crypto from 'node:crypto';
-import { chatTurn, djTurn } from './dj.mjs';
+import { chatTurn, djTurn, prefetchRadioQueue } from './dj.mjs';
 import {
   clearUserMemories,
   deleteUserMemory,
@@ -21,6 +21,10 @@ export async function chatRadio({ db, config, netease, sessionId, message }) {
 
 export async function nextRadioItem({ db, config, netease, sessionId, userMessage }) {
   return djTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), userMessage: userMessage || null });
+}
+
+export function prefetchRadio({ db, config, netease, sessionId, force = false }) {
+  return prefetchRadioQueue({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), force });
 }
 
 export async function reportPlay({ db, netease, payload }) {

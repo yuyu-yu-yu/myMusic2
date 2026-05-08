@@ -15,7 +15,8 @@ const state = {
   memories: [],
   mixerRefreshTimer: null,
   profileSelectionDirty: false,
-  librarySyncNotice: ''
+  librarySyncNotice: '',
+  radioPrefetchPromise: null
 };
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
@@ -451,6 +452,7 @@ function renderPlayer() {
   initButtonFeedback();
   initVisualizer();
   initProgressBar();
+  scheduleRadioPrefetch();
   // Build audio graph on first user gesture (start button click)
   document.querySelector('#start-btn').addEventListener('click', () => {
     if (!visualizerBuilt) buildAudioGraph();
@@ -647,6 +649,27 @@ function ensureSessionId() {
       : `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   }
   return state.sessionId;
+}
+
+function scheduleRadioPrefetch({ force = false } = {}) {
+  if (state.radioPrefetchPromise && !force) return state.radioPrefetchPromise;
+  const sessionId = ensureSessionId();
+  state.radioPrefetchPromise = api('/api/radio/prefetch', {
+    method: 'POST',
+    body: { sessionId, force }
+  })
+    .then((result) => {
+      console.debug('[radio queue prefetch]', result);
+      return result;
+    })
+    .catch((error) => {
+      console.warn('[radio queue prefetch failed]', error?.message || error);
+      return null;
+    })
+    .finally(() => {
+      state.radioPrefetchPromise = null;
+    });
+  return state.radioPrefetchPromise;
 }
 
 async function startRadio() {
