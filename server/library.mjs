@@ -1,9 +1,10 @@
-import { getSetting, listRecentPlays, linkPlaylistTrack, normalizeTrack, nowIso, savePlaylist, saveTrack, seedDemoLibrary, setSetting } from './db.mjs';
+import { getSetting, listRecentPlays, normalizeTrack, nowIso, replacePlaylistTracks, savePlaylist, saveTrack, seedDemoLibrary, setSetting } from './db.mjs';
 import { getSongUrl, getLyric as getCommunityLyric } from './community.mjs';
 import { generateChatCompletion } from './ai.mjs';
 
 const PROFILE_EXCLUDED_PLAYLIST_IDS_KEY = 'profile_excluded_playlist_ids';
 const EMPTY_PROFILE_SUMMARY = '尚未选择用于生成音乐画像的网易云歌单。请在曲库页勾选至少一个歌单后，灿灿会只根据这些歌单生成长期音乐画像。';
+const PLAYLIST_SYNC_PAGE_SIZE = 200;
 
 export async function syncLibrary(db, netease) {
   const result = {
@@ -32,8 +33,8 @@ export async function syncLibrary(db, netease) {
   for (const [kind, job] of playlistJobs) {
     try {
       const response = await job();
-      const records = extractRecords(response.data);
-      for (const item of records.length ? records : [response.data].filter(Boolean)) {
+      const records = extractPlaylistRecords(response.data);
+      for (const item of records) {
         const playlist = savePlaylist(db, item, kind);
         playlists.push(playlist);
       }
@@ -42,15 +43,12 @@ export async function syncLibrary(db, netease) {
     }
   }
 
-  for (const playlist of playlists.slice(0, 30)) {
+  for (const playlist of playlists) {
     try {
-      const response = await netease.playlistSongs(playlist.id, 0, 200);
-      const records = extractRecords(response.data);
-      records.forEach((item, index) => {
-        const track = saveTrack(db, item);
-        linkPlaylistTrack(db, playlist.id, track.id, index);
-        result.tracks += 1;
-      });
+      const records = await fetchAllPlaylistSongs(netease, playlist);
+      const trackIds = records.map((item) => saveTrack(db, item).id);
+      replacePlaylistTracks(db, playlist.id, trackIds);
+      result.tracks += trackIds.length;
     } catch (error) {
       result.errors.push(`playlist ${playlist.id}: ${error.message}`);
     }
@@ -213,13 +211,13 @@ export function getLibrary(db) {
     })),
     recent: listRecentPlays(db, 50),
     totalTracks: countLibraryTracks(db),
+    totalPlaylistTracks: countPlaylistTrackLinks(db),
     profileSelection
   };
 }
 
-export async function updateProfilePlaylistSelection(db, selectedPlaylistIds = [], llmConfig = {}) {
+export function updateProfilePlaylistSelection(db, selectedPlaylistIds = []) {
   setProfilePlaylistSelection(db, selectedPlaylistIds);
-  await updateProfile(db, llmConfig);
   return getLibrary(db);
 }
 
@@ -237,6 +235,39 @@ export function extractRecords(data) {
   return [];
 }
 
+function extractPlaylistRecords(data) {
+  const records = extractRecords(data);
+  if (records.length) return records;
+  if (isPlaylistLike(data)) return [data];
+  if (isPlaylistLike(data?.playlist)) return [data.playlist];
+  return [];
+}
+
+function isPlaylistLike(item) {
+  return Boolean(item && typeof item === 'object' && !Array.isArray(item) && (
+    item.id !== undefined ||
+    item.playlistId !== undefined ||
+    item.resourceId !== undefined ||
+    item.coverId !== undefined
+  ));
+}
+
+async function fetchAllPlaylistSongs(netease, playlist, pageSize = PLAYLIST_SYNC_PAGE_SIZE) {
+  const expectedCount = getPlaylistRemoteTrackCount(playlist);
+  const records = [];
+  let offset = 0;
+  while (true) {
+    if (expectedCount !== null && offset >= expectedCount) break;
+    const response = await netease.playlistSongs(playlist.id, offset, pageSize);
+    const pageRecords = extractRecords(response.data);
+    if (!pageRecords.length) break;
+    records.push(...pageRecords);
+    offset += pageRecords.length;
+    if (pageRecords.length < pageSize) break;
+  }
+  return records;
+}
+
 function getProfilePlaylists(db, { selectedOnly = false } = {}) {
   const playlists = getLibraryPlaylists(db);
   const profileSelection = getProfileSelection(db, playlists);
@@ -250,7 +281,6 @@ function getProfilePlaylists(db, { selectedOnly = false } = {}) {
     JOIN tracks t ON t.id = pt.track_id
     WHERE pt.playlist_id = ?
     ORDER BY pt.position ASC
-    LIMIT 120
   `);
   return scopedPlaylists.map((playlist) => ({
     ...playlist,
@@ -268,19 +298,32 @@ function getProfilePlaylists(db, { selectedOnly = false } = {}) {
 
 function getLibraryPlaylists(db) {
   return db.prepare(`
-    SELECT p.id, p.name, p.kind, p.cover_url AS coverUrl, COUNT(pt.track_id) AS trackCount
+    SELECT p.id, p.name, p.kind, p.cover_url AS coverUrl, p.raw_json AS rawJson, COUNT(pt.track_id) AS syncedTrackCount
     FROM playlists p
     LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
-    GROUP BY p.id, p.name, p.kind, p.cover_url, p.updated_at
+    GROUP BY p.id, p.name, p.kind, p.cover_url, p.raw_json, p.updated_at
     ORDER BY p.updated_at DESC
-  `).all().map((playlist) => ({
-    ...playlist,
-    trackCount: Number(playlist.trackCount) || 0
-  }));
+  `).all().map((playlist) => {
+    const { rawJson, ...base } = playlist;
+    const raw = safeJson(rawJson, {});
+    const remoteCount = getPlaylistRemoteTrackCount(raw);
+    const syncedTrackCount = Number(playlist.syncedTrackCount) || 0;
+    const trackCount = remoteCount ?? syncedTrackCount;
+    return {
+      ...base,
+      trackCount,
+      syncedTrackCount,
+      syncComplete: remoteCount === null ? true : syncedTrackCount >= remoteCount
+    };
+  });
 }
 
 function countLibraryTracks(db) {
   return db.prepare('SELECT COUNT(DISTINCT track_id) AS count FROM playlist_tracks').get().count;
+}
+
+function countPlaylistTrackLinks(db) {
+  return db.prepare('SELECT COUNT(*) AS count FROM playlist_tracks').get().count;
 }
 
 function listLibraryTracks(db, limit = 5000) {
@@ -323,6 +366,18 @@ function getProfileSelection(db, playlists = getLibraryPlaylists(db)) {
     selectedCount: selectedIds.length,
     totalCount: playlistIds.length
   };
+}
+
+function getPlaylistRemoteTrackCount(playlist = {}) {
+  const value = playlist.trackCount
+    ?? playlist.songCount
+    ?? playlist.count
+    ?? playlist.resourceCount
+    ?? playlist.musicCount
+    ?? playlist.size
+    ?? playlist.playlist?.trackCount;
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
 }
 
 function setProfilePlaylistSelection(db, selectedPlaylistIds = []) {

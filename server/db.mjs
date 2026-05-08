@@ -475,6 +475,8 @@ export function savePlaylist(db, playlist, kind = 'playlist') {
   const id = String(playlist?.id ?? playlist?.playlistId ?? playlist?.resourceId ?? playlist?.coverId ?? kind);
   const name = String(playlist?.name ?? playlist?.playlistName ?? playlist?.title ?? kind);
   const cover = playlist?.coverImgUrl ?? playlist?.coverUrl ?? playlist?.picUrl ?? playlist?.imageUrl ?? null;
+  const rawTrackCount = playlist?.trackCount ?? playlist?.songCount ?? playlist?.count ?? playlist?.resourceCount ?? playlist?.musicCount ?? playlist?.size ?? null;
+  const trackCount = Number.isFinite(Number(rawTrackCount)) ? Math.max(0, Math.floor(Number(rawTrackCount))) : null;
   db.prepare(`
     INSERT INTO playlists (id, name, kind, cover_url, raw_json, updated_at)
     VALUES (?, ?, ?, ?, ?, ?)
@@ -485,7 +487,7 @@ export function savePlaylist(db, playlist, kind = 'playlist') {
       raw_json = excluded.raw_json,
       updated_at = excluded.updated_at
   `).run(id, name, kind, cover, JSON.stringify(playlist || {}), nowIso());
-  return { id, name, kind, coverUrl: cover };
+  return { id, name, kind, coverUrl: cover, trackCount };
 }
 
 export function linkPlaylistTrack(db, playlistId, trackId, position = 0) {
@@ -494,6 +496,32 @@ export function linkPlaylistTrack(db, playlistId, trackId, position = 0) {
     VALUES (?, ?, ?)
     ON CONFLICT(playlist_id, track_id) DO UPDATE SET position = excluded.position
   `).run(String(playlistId), String(trackId), Number(position) || 0);
+}
+
+export function replacePlaylistTracks(db, playlistId, trackIds = []) {
+  const id = String(playlistId || '').trim();
+  if (!id) throw new Error('playlistId is required');
+  const normalizedIds = [...new Set((trackIds || [])
+    .map((trackId) => String(trackId || '').trim())
+    .filter(Boolean))];
+  const deleteStmt = db.prepare('DELETE FROM playlist_tracks WHERE playlist_id = ?');
+  const insertStmt = db.prepare(`
+    INSERT INTO playlist_tracks (playlist_id, track_id, position)
+    VALUES (?, ?, ?)
+    ON CONFLICT(playlist_id, track_id) DO UPDATE SET position = excluded.position
+  `);
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    deleteStmt.run(id);
+    normalizedIds.forEach((trackId, index) => {
+      insertStmt.run(id, trackId, index);
+    });
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
 }
 
 export function normalizeTrack(input) {

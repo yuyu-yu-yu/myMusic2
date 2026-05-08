@@ -13,7 +13,9 @@ const state = {
   preferences: null,
   feedbackSummary: null,
   memories: [],
-  mixerRefreshTimer: null
+  mixerRefreshTimer: null,
+  profileSelectionDirty: false,
+  librarySyncNotice: ''
 };
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
@@ -1311,6 +1313,7 @@ async function pollPlayerState() {
 async function renderLibrary() {
   const data = await api('/api/library');
   state.library = data;
+  state.profileSelectionDirty = profileSelectionNeedsUpdate(data);
   const structured = data.profile?.structured || {};
   view.innerHTML = `
     <section class="page-panel">
@@ -1333,7 +1336,8 @@ async function renderLibrary() {
       </div>
       <div class="library-actions">
         <button id="sync-btn" class="primary">同步网易云音乐</button>
-        <span id="library-selection-status" class="muted"></span>
+        <button id="profile-update-btn" class="ghost profile-update-btn">更新音乐画像</button>
+        <span id="library-selection-status" class="muted">${escapeHtml(state.librarySyncNotice || '')}</span>
       </div>
       ${profilePlaylistSelector(data)}
     </section>
@@ -1343,9 +1347,22 @@ async function renderLibrary() {
   `;
   document.querySelector('#sync-btn').addEventListener('click', async () => {
     const btn = document.querySelector('#sync-btn');
+    const status = document.querySelector('#library-selection-status');
     btn.textContent = '同步中...';
-    await api('/api/library/sync', { method: 'POST', body: {} });
-    renderLibrary();
+    btn.disabled = true;
+    state.librarySyncNotice = '';
+    if (status) status.textContent = '正在同步网易云歌单...';
+    try {
+      const result = await api('/api/library/sync', { method: 'POST', body: {} });
+      state.profileSelectionDirty = false;
+      state.librarySyncNotice = librarySyncNotice(result);
+      renderLibrary();
+    } catch (error) {
+      btn.disabled = false;
+      btn.textContent = '同步网易云音乐';
+      state.librarySyncNotice = `同步失败：${error.message}`;
+      if (status) status.textContent = state.librarySyncNotice;
+    }
   });
   bindProfilePlaylistSelection();
 }
@@ -1488,12 +1505,22 @@ async function startQrLogin() {
   try {
     const data = await api('/api/auth/netease/qrcode', { method: 'POST', body: {} });
     const info = data.data || data;
-    const qrUrl = info.qrCodeUrl || info.qrCode || '';
-    const key = info.qrCodeKey;
-    if (qrUrl) {
-      // Use Google Chart API to render QR code image
-      img.src = 'https://chart.googleapis.com/chart?chs=200x200&cht=qr&chl=' + encodeURIComponent(qrUrl);
+    const qrUrl = info.qrCodeUrl || info.qrCode || info.qrurl || '';
+    const key = info.qrCodeKey || info.uniKey || info.unikey || info.key;
+    const qrImage = info.qrImage || info.qrimg || '';
+    if (qrImage) {
+      img.src = qrImage;
       img.style.display = 'block';
+    } else if (qrUrl) {
+      img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(qrUrl);
+      img.style.display = 'block';
+    } else {
+      img.removeAttribute('src');
+      img.style.display = 'none';
+    }
+    if (!key) {
+      statusEl.textContent = '二维码 key 缺失，请重试';
+      return;
     }
     statusEl.textContent = '请用网易云音乐 App 扫码';
     pollQrStatus(key, statusEl);
@@ -1550,6 +1577,8 @@ function profileBlock(title, items = []) {
 function profilePlaylistSelector(data = {}) {
   const playlists = data.playlists || [];
   const selection = data.profileSelection || {};
+  const stateText = state.profileSelectionDirty ? '画像待更新' : '已同步选择';
+  const stateClass = state.profileSelectionDirty ? 'dirty' : 'synced';
   if (!playlists.length) {
     return `
       <section class="profile-playlist-selector">
@@ -1558,6 +1587,7 @@ function profilePlaylistSelector(data = {}) {
             <h2>画像歌单</h2>
             <p class="muted">同步网易云后，可以选择哪些歌单参与长期音乐画像。</p>
           </div>
+          <span id="library-profile-state" class="profile-state-chip synced">等待歌单</span>
         </div>
       </section>
     `;
@@ -1569,15 +1599,19 @@ function profilePlaylistSelector(data = {}) {
           <h2>画像歌单</h2>
           <p class="muted">已选择 ${selection.selectedCount ?? playlists.filter(p => p.profileSelected).length} / ${selection.totalCount ?? playlists.length} 个歌单，只用勾选的歌单生成音乐画像。</p>
         </div>
-        <span class="tag subtle">播放历史不参与</span>
+        <div class="profile-playlist-badges">
+          <span id="library-profile-state" class="profile-state-chip ${stateClass}">${stateText}</span>
+          <span class="tag subtle">播放历史不参与</span>
+        </div>
       </div>
       <div class="profile-playlist-list">
         ${playlists.map((playlist) => `
           <label class="profile-playlist-row">
             <span class="profile-playlist-info">
               <strong>${escapeHtml(playlist.name)}</strong>
-              <span>${escapeHtml(playlistKindLabel(playlist.kind))} · ${Number(playlist.trackCount) || 0} 首</span>
+              <span>${escapeHtml(playlistKindLabel(playlist.kind))} · ${escapeHtml(playlistSyncSummary(playlist))}</span>
             </span>
+            ${playlist.syncComplete ? '' : '<span class="playlist-sync-chip">未完整</span>'}
             <input
               type="checkbox"
               data-profile-playlist-id="${escapeAttr(playlist.id)}"
@@ -1593,9 +1627,24 @@ function profilePlaylistSelector(data = {}) {
 
 function bindProfilePlaylistSelection() {
   const inputs = [...document.querySelectorAll('[data-profile-playlist-id]')];
-  if (!inputs.length) return;
   const status = document.querySelector('#library-selection-status');
-  const setDisabled = (disabled) => inputs.forEach((input) => { input.disabled = disabled; });
+  const updateButton = document.querySelector('#profile-update-btn');
+  const stateChip = document.querySelector('#library-profile-state');
+  const setDisabled = (disabled) => {
+    inputs.forEach((input) => { input.disabled = disabled; });
+    if (updateButton) updateButton.disabled = disabled;
+  };
+  const setProfileState = (mode, text) => {
+    if (!stateChip) return;
+    stateChip.className = `profile-state-chip ${mode}`;
+    stateChip.textContent = text;
+  };
+  const setUpdateReady = () => {
+    setProfileState(state.profileSelectionDirty ? 'dirty' : 'synced', state.profileSelectionDirty ? '画像待更新' : '已同步选择');
+    if (updateButton) updateButton.classList.toggle('attention', state.profileSelectionDirty);
+  };
+  setUpdateReady();
+
   inputs.forEach((input) => {
     input.addEventListener('change', async () => {
       const previousChecked = input.checked;
@@ -1603,21 +1652,78 @@ function bindProfilePlaylistSelection() {
         .filter((item) => item.checked)
         .map((item) => item.dataset.profilePlaylistId);
       setDisabled(true);
-      if (status) status.textContent = '正在更新画像...';
+      if (status) status.textContent = '正在保存选择...';
       try {
         const data = await api('/api/library/profile-playlists', {
           method: 'PUT',
           body: { selectedPlaylistIds }
         });
         state.library = data;
-        renderLibrary();
+        state.profileSelectionDirty = profileSelectionNeedsUpdate(data);
+        if (status) status.textContent = state.profileSelectionDirty ? '选择已保存，画像待更新' : '选择已保存，画像已同步';
+        setDisabled(false);
+        setUpdateReady();
       } catch (error) {
         input.checked = !previousChecked;
         setDisabled(false);
-        if (status) status.textContent = `更新失败：${error.message}`;
+        if (status) status.textContent = `保存失败：${error.message}`;
+        setUpdateReady();
       }
     });
   });
+
+  updateButton?.addEventListener('click', async () => {
+    setDisabled(true);
+    setProfileState('busy', '正在更新');
+    if (status) status.textContent = '正在更新音乐画像...';
+    try {
+      const data = await api('/api/library/profile/update', { method: 'POST', body: {} });
+      state.library = data;
+      state.profileSelectionDirty = false;
+      renderLibrary();
+    } catch (error) {
+      setDisabled(false);
+      state.profileSelectionDirty = true;
+      setProfileState('dirty', '画像待更新');
+      if (status) status.textContent = `更新失败：${error.message}`;
+      if (updateButton) updateButton.classList.add('attention');
+    }
+  });
+}
+
+function librarySyncNotice(result = {}) {
+  const errors = Array.isArray(result.errors) ? result.errors.filter(Boolean) : [];
+  if (errors.length) {
+    const firstError = errors[0].replace(/^star: |^subscribed: |^created: |^recent: /, '');
+    const label = Number(result.playlists) > 0 ? '同步部分失败' : '同步失败';
+    return `${label}：${firstError}${errors.length > 1 ? `（另有 ${errors.length - 1} 个错误）` : ''}`;
+  }
+  return `同步完成：${Number(result.playlists) || 0} 个歌单，${Number(result.tracks) || 0} 首歌`;
+}
+
+function profileSelectionNeedsUpdate(data = {}) {
+  const selectedIds = normalizeStringList(data.profileSelection?.selectedIds);
+  const profileIds = normalizeStringList(data.profile?.structured?.selectedPlaylistIds);
+  if (!selectedIds.length && !profileIds.length) return false;
+  return !sameStringList(selectedIds, profileIds);
+}
+
+function normalizeStringList(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => String(value || '').trim())
+    .filter(Boolean))]
+    .sort();
+}
+
+function sameStringList(left = [], right = []) {
+  return left.length === right.length && left.every((value, index) => value === right[index]);
+}
+
+function playlistSyncSummary(playlist = {}) {
+  const synced = Number(playlist.syncedTrackCount ?? playlist.trackCount ?? 0) || 0;
+  const total = Number(playlist.trackCount ?? 0) || 0;
+  if (!total || synced >= total) return `已同步 ${synced || total} 首`;
+  return `已同步 ${synced} / 共 ${total} 首`;
 }
 
 function playlistKindLabel(kind) {
