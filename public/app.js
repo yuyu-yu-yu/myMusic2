@@ -1331,7 +1331,11 @@ async function renderLibrary() {
         <div class="stat"><span class="muted">歌单</span><strong>${data.playlists.length}</strong></div>
         <div class="stat"><span class="muted">最近播放</span><strong>${data.recent.length}</strong></div>
       </div>
-      <button id="sync-btn" class="primary">同步网易云音乐</button>
+      <div class="library-actions">
+        <button id="sync-btn" class="primary">同步网易云音乐</button>
+        <span id="library-selection-status" class="muted"></span>
+      </div>
+      ${profilePlaylistSelector(data)}
     </section>
     <section class="grid" style="margin-top:16px">
       ${data.tracks.slice(0, 50).map(trackItem).join('')}
@@ -1343,6 +1347,7 @@ async function renderLibrary() {
     await api('/api/library/sync', { method: 'POST', body: {} });
     renderLibrary();
   });
+  bindProfilePlaylistSelection();
 }
 
 async function renderMixer() {
@@ -1540,6 +1545,88 @@ function profileBlock(title, items = []) {
       </div>
     </article>
   `;
+}
+
+function profilePlaylistSelector(data = {}) {
+  const playlists = data.playlists || [];
+  const selection = data.profileSelection || {};
+  if (!playlists.length) {
+    return `
+      <section class="profile-playlist-selector">
+        <div class="profile-playlist-head">
+          <div>
+            <h2>画像歌单</h2>
+            <p class="muted">同步网易云后，可以选择哪些歌单参与长期音乐画像。</p>
+          </div>
+        </div>
+      </section>
+    `;
+  }
+  return `
+    <section class="profile-playlist-selector">
+      <div class="profile-playlist-head">
+        <div>
+          <h2>画像歌单</h2>
+          <p class="muted">已选择 ${selection.selectedCount ?? playlists.filter(p => p.profileSelected).length} / ${selection.totalCount ?? playlists.length} 个歌单，只用勾选的歌单生成音乐画像。</p>
+        </div>
+        <span class="tag subtle">播放历史不参与</span>
+      </div>
+      <div class="profile-playlist-list">
+        ${playlists.map((playlist) => `
+          <label class="profile-playlist-row">
+            <span class="profile-playlist-info">
+              <strong>${escapeHtml(playlist.name)}</strong>
+              <span>${escapeHtml(playlistKindLabel(playlist.kind))} · ${Number(playlist.trackCount) || 0} 首</span>
+            </span>
+            <input
+              type="checkbox"
+              data-profile-playlist-id="${escapeAttr(playlist.id)}"
+              ${playlist.profileSelected ? 'checked' : ''}
+              aria-label="是否参与画像：${escapeAttr(playlist.name)}"
+            />
+          </label>
+        `).join('')}
+      </div>
+    </section>
+  `;
+}
+
+function bindProfilePlaylistSelection() {
+  const inputs = [...document.querySelectorAll('[data-profile-playlist-id]')];
+  if (!inputs.length) return;
+  const status = document.querySelector('#library-selection-status');
+  const setDisabled = (disabled) => inputs.forEach((input) => { input.disabled = disabled; });
+  inputs.forEach((input) => {
+    input.addEventListener('change', async () => {
+      const previousChecked = input.checked;
+      const selectedPlaylistIds = inputs
+        .filter((item) => item.checked)
+        .map((item) => item.dataset.profilePlaylistId);
+      setDisabled(true);
+      if (status) status.textContent = '正在更新画像...';
+      try {
+        const data = await api('/api/library/profile-playlists', {
+          method: 'PUT',
+          body: { selectedPlaylistIds }
+        });
+        state.library = data;
+        renderLibrary();
+      } catch (error) {
+        input.checked = !previousChecked;
+        setDisabled(false);
+        if (status) status.textContent = `更新失败：${error.message}`;
+      }
+    });
+  });
+}
+
+function playlistKindLabel(kind) {
+  return {
+    star: '红心歌单',
+    created: '创建歌单',
+    subscribed: '收藏歌单',
+    playlist: '歌单'
+  }[kind] || kind || '歌单';
 }
 
 function mixerControl(key, title, description, preferences = {}) {

@@ -6,7 +6,7 @@ import { fileURLToPath } from 'node:url';
 import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
 import { openDatabase, seedDemoLibrary, getSetting, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
-import { getLibrary, getProfile, syncLibrary, updateProfile } from './library.mjs';
+import { getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
 import { chatRadio, getMemories, getPreferences, nextRadioItem, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
@@ -58,6 +58,11 @@ const routes = {
   'POST /api/library/sync': async () => syncLibrary(db, netease),
   'GET /api/library': async () => getLibrary(db),
   'GET /api/library/profile': async () => getProfile(db),
+  'PUT /api/library/profile-playlists': async (req) => {
+    const body = await readJson(req);
+    if (!Array.isArray(body.selectedPlaylistIds)) return jsonError('selectedPlaylistIds must be an array', 400);
+    return updateProfilePlaylistSelection(db, body.selectedPlaylistIds, config.llm);
+  },
   'POST /api/radio/start': async (req) => {
     const body = await readJson(req);
     return startRadio({ db, config, netease, sessionId: body.sessionId });

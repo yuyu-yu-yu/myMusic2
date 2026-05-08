@@ -158,7 +158,8 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
       ...latestContext,
       radioIntroDone: true,
       radioIntroAt: latestContext.radioIntroAt || nowIso(),
-      radioTurnCount: Number(latestContext.radioTurnCount || 0) + 1
+      radioTurnCount: Number(latestContext.radioTurnCount || 0) + 1,
+      radioPlayedSongs: mergePlayedSongContext(latestContext.radioPlayedSongs, result.track)
     });
   }
   if (userMessage) {
@@ -572,7 +573,8 @@ function extractRecentTopics(text) {
 
 export function hasExplicitMusicIntent(text) {
   const value = String(text || '');
-  if (/不想听|先别放|不要切|别切|别换/.test(value)) return false;
+  if (isImmediateNextRequest(value)) return true;
+  if (/先别放|不要放|别放|不想听歌|不想听音乐|先别切|不要切|别切|别换/.test(value)) return false;
   if (/^(?:我想|想|要|我要|给我|帮我)?(?:听|放|播放|播)(?!说|说话|你说|我说|着|起来|过)(?:一下|一首|首)?[\s\S]{2,40}(?:的[\s\S]{1,30})?$/.test(value.trim())) return true;
   if (/下一首|换一首|换歌|切歌|播放|放一首|来一首|来首|想听|给我.*(歌|音乐)|有没有.*(歌|音乐)|听.*(歌|音乐)|artist|song|music|play|recommend/i.test(value)) return true;
   return /(推荐|来点).*(歌|音乐|曲|国风|古风|电子|摇滚|民谣|爵士|说唱|粤语|日语|英语|中文|安静|治愈|伤感|开心|提神|专注|睡前)|推荐(一首|首|点|些)?$/.test(value);
@@ -1015,7 +1017,6 @@ export function decideHardRuleTurnAction({ userMessage = '', mode = {} } = {}) {
   });
 
   if (!text) return result(TURN_ACTIONS.RECOMMEND_AND_PLAY, 'empty turn means radio continuation');
-  if (rejectsMusic(text)) return result(TURN_ACTIONS.CHAT_ONLY, 'user explicitly rejected playback or switching');
   if (isModeUpdateRequest(text)) {
     return result(TURN_ACTIONS.CHAT_ONLY, 'user is updating listening mode rather than asking for an immediate song', {
       newMode: modeUpdateFromText(text)
@@ -1029,6 +1030,7 @@ export function decideHardRuleTurnAction({ userMessage = '', mode = {} } = {}) {
       searchHints: extractActionSearchHints(text, mode)
     });
   }
+  if (rejectsMusic(text)) return result(TURN_ACTIONS.CHAT_ONLY, 'user explicitly rejected playback or switching');
   return null;
 }
 
@@ -1217,7 +1219,9 @@ function normalizeIntentAction(action) {
 }
 
 function isImmediateNextRequest(text) {
-  return /下一首|换一首|换歌|切歌|跳过|skip/i.test(String(text || ''));
+  const value = String(text || '');
+  if (/(?:先别|不要|别|不用|不必).{0,4}(?:切歌|换歌|换一首|下一首|跳过)/.test(value)) return false;
+  return /下一首|换一首|换歌|切歌|跳过|skip|不想听(?:这首|这歌|这个版本|这版|它|当前|这一个)|这(?:首|歌|个版本|版).{0,8}不想听|换(?:他|她|它|这个歌手|这位歌手)?(?:的)?(?:另一首|别的|其他)/i.test(value);
 }
 
 function isPlaybackControlRequest(text) {
@@ -1351,7 +1355,9 @@ function extractAvoidHints(text) {
 }
 
 function rejectsMusic(text) {
-  return /不想听|先别放|不要放|别放|先别切|不要切|别切|别换|先聊|陪我聊|不放歌|只是聊/.test(String(text || ''));
+  const value = String(text || '');
+  if (isImmediateNextRequest(value)) return false;
+  return /不想听(?:歌|音乐)|先别放|不要放|别放|先别切|不要切|别切|别换|先聊|陪我聊|不放歌|只是聊/.test(value);
 }
 
 function isModeUpdateRequest(text) {
@@ -1576,13 +1582,6 @@ function withTimeout(promise, ms, fallbackValue) {
   });
 }
 
-function getPlayedIdSet(db) {
-  const played = db.prepare(
-    'SELECT track_id FROM plays ORDER BY played_at DESC LIMIT 300'
-  ).all();
-  return new Set(played.map(p => p.track_id));
-}
-
 function buildRadioHostContext(db, sessionId, context = {}, userMessage = '') {
   return {
     isFirstRadioTurn: !context.radioIntroDone,
@@ -1591,6 +1590,100 @@ function buildRadioHostContext(db, sessionId, context = {}, userMessage = '') {
     recentPlays: getRecentHostPlays(db, 4),
     recentFeedback: getRecentSessionFeedback(db, sessionId, 6)
   };
+}
+
+function getPlayedTrackHistory(db, sessionId, limit = 80) {
+  const seen = new Set();
+  const items = [];
+  const add = (play) => {
+    const id = String(play?.track_id || play?.trackId || play?.id || '').trim();
+    const name = String(play?.name || '').trim();
+    if (!id && !name) return;
+    const key = playedSongKey(name) || id;
+    if (seen.has(key)) return;
+    seen.add(key);
+    items.push({
+      id,
+      name,
+      artists: Array.isArray(play.artists) ? play.artists : [],
+      album: play.album || '',
+      playedAt: play.played_at || play.playedAt || ''
+    });
+  };
+
+  try {
+    const context = getSessionContext(db, sessionId);
+    for (const item of context.radioPlayedSongs || []) add(item);
+  } catch {}
+
+  try {
+    if (sessionId) {
+      db.prepare(`
+        SELECT p.track_id AS trackId,
+               p.played_at AS playedAt,
+               t.name,
+               t.artists,
+               t.album
+        FROM plays p
+        JOIN tracks t ON t.id = p.track_id
+        WHERE p.track_id IN (
+          SELECT track_id FROM plays ORDER BY played_at DESC LIMIT 300
+        )
+        ORDER BY p.played_at DESC
+        LIMIT ?
+      `).all(limit).forEach(row => add({
+        ...row,
+        id: row.trackId,
+        artists: safeJsonArray(row.artists)
+      }));
+    }
+  } catch {}
+
+  try {
+    listRecentPlays(db, limit).forEach(add);
+  } catch {}
+
+  return items.slice(0, limit);
+}
+
+function mergePlayedSongContext(existing = [], track = {}) {
+  const key = playedSongKey(track?.name);
+  if (!key) return Array.isArray(existing) ? existing.slice(0, 80) : [];
+  const item = {
+    id: String(track.id || ''),
+    name: String(track.name || ''),
+    artists: Array.isArray(track.artists) ? track.artists.slice(0, 4) : [],
+    album: track.album || '',
+    key,
+    playedAt: nowIso()
+  };
+  const merged = [item, ...(Array.isArray(existing) ? existing : [])]
+    .filter(entry => playedSongKey(entry?.name) || entry?.key);
+  const seen = new Set();
+  const unique = [];
+  for (const entry of merged) {
+    const entryKey = entry.key || playedSongKey(entry.name);
+    if (!entryKey || seen.has(entryKey)) continue;
+    seen.add(entryKey);
+    unique.push({ ...entry, key: entryKey });
+  }
+  return unique.slice(0, 80);
+}
+
+function buildPlayedSignatureSet(playedHistory = []) {
+  return new Set((playedHistory || [])
+    .map(track => track?.key || playedSongKey(track?.name))
+    .filter(Boolean));
+}
+
+function playedSongKey(name) {
+  return normalizeMusicText(stripSongVersion(name));
+}
+
+export function trackMatchesPlayedSongName(track, playedHistory = []) {
+  const signatures = playedHistory instanceof Set ? playedHistory : buildPlayedSignatureSet(playedHistory);
+  const key = playedSongKey(track?.name || track?.song || track?.title || '');
+  return Boolean(key && signatures.has(key));
 }
 
 function inferRadioTrigger(userMessage = '') {
@@ -1944,7 +2037,9 @@ function getArtistPenaltyByName(db) {
 }
 
 async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, hostContext = {} }) {
-  const playedIds = getPlayedIdSet(db);
+  const playedHistory = getPlayedTrackHistory(db, sessionId, 80);
+  const playedIds = new Set(playedHistory.map(track => String(track.id || '')).filter(Boolean));
+  const playedSignatures = buildPlayedSignatureSet(playedHistory);
   const request = getMusicRequestConstraints(db, userMessage, mode);
   const failedPicks = [];
   let lastPlan = null;
@@ -1964,13 +2059,15 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
       conversationMood,
       memoryContext,
       request,
-      failedPicks
+      failedPicks,
+      playedHistory,
+      hostContext
     });
     lastPlan = plan;
     if (!newMode) newMode = modeDecisionFromPlan(plan);
     if (!plan.picks.length) break;
 
-    const resolved = await resolveSongPlanTrack({ db, netease, plan, playedIds });
+    const resolved = await resolveSongPlanTrack({ db, netease, plan, playedIds, playedSignatures });
     if (resolved.track) {
       const chatText = await generateFinalHostText({
         config,
@@ -2006,7 +2103,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
   };
 }
 
-async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood, memoryContext, request, failedPicks = [] }) {
+async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood, memoryContext, request, failedPicks = [], playedHistory = [], hostContext = {} }) {
   const fallbackPlan = {
     picks: [],
     hostDraft: fallbackChat(timeOfDay, weather, profile),
@@ -2024,6 +2121,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
   const failedText = failedPicks.length
     ? `上一批没有确认到可播放源，请避开这些歌：${failedPicks.map(pick => `${pick.name}${pick.artists?.length ? ' - ' + pick.artists.join('、') : ''}`).join('；')}`
     : '没有失败歌单。';
+  const playedText = formatPlayedSongExclusions(playedHistory);
 
   const raw = await generateChatCompletion(config.llm, [
     {
@@ -2035,6 +2133,8 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         '“深夜、安静、陪伴、适合放松、开心、提神”等只能用于理解氛围，不能当作歌曲名或主搜索词，除非它本来就是你明确推荐的真实歌名且给出了艺人。',
         '搜索 queries 必须像音乐软件里会输入的短词，优先“歌名 艺人”和“艺人 歌名”。不要输出长句。',
         '如果用户明确指定艺人、歌名或风格，必须优先满足；不确定时选更常见、更好搜的歌曲。',
+        '如果用户说“他的另一首/她的另一首/这个歌手的另一首/换这位歌手”，优先参考最近播放歌曲的艺人，把它理解成当前或上一首歌的主艺人。',
+        '已播放歌名必须避开：只要歌名相同，就不能再推荐任何版本、翻唱、Live、Remix、Album Version 或不同艺人版本。',
         'hostLine 是备用导播词，必须写成 40-90 字的电台导播，不要只写一句“接下来放”。hostDraft 也要保持完整自然。',
         '只输出严格 JSON，不要 Markdown，不要解释。',
         'JSON 格式：{"picks":[{"name":"歌名","artists":["艺人"],"reason":"一句话理由","queries":["歌名 艺人","艺人 歌名"],"hostLine":"40-90字电台导播词"}],"hostDraft":"40-90字自然主持词","mode":null}'
@@ -2049,6 +2149,8 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         modeText,
         `明确请求：${requestText}`,
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
+        formatRecentHostPlays(hostContext.recentPlays),
+        playedText,
         memoryContext?.promptText || '相关长期记忆：无',
         memoryContext?.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
         `最近对话：${history.length ? '\n' + history.map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`,
@@ -2102,9 +2204,28 @@ function normalizeArtistList(value) {
   return uniqueStrings(String(value || '').split(/[、,，/&\s]+/), 4);
 }
 
-async function resolveSongPlanTrack({ db, netease, plan, playedIds }) {
+function formatPlayedSongExclusions(playedHistory = []) {
+  const songs = [];
+  const seen = new Set();
+  for (const track of playedHistory || []) {
+    const key = playedSongKey(track?.name);
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    songs.push(`${track.name}${track.artists?.length ? ' - ' + track.artists.join('、') : ''}`);
+    if (songs.length >= 30) break;
+  }
+  return songs.length
+    ? `本轮/最近已经播放过的歌名，后续必须避开同名任何版本：${songs.join('；')}`
+    : '本轮/最近已播放歌名：无';
+}
+
+async function resolveSongPlanTrack({ db, netease, plan, playedIds, playedSignatures = new Set() }) {
   const failedPicks = [];
   for (const pick of plan.picks) {
+    if (trackMatchesPlayedSongName(pick, playedSignatures)) {
+      failedPicks.push(pick);
+      continue;
+    }
     const tracks = await searchTracksForSongPick(pick);
     const ranked = tracks
       .map(track => ({ track, score: scoreSearchTrackForPick(track, pick) }))
@@ -2114,6 +2235,7 @@ async function resolveSongPlanTrack({ db, netease, plan, playedIds }) {
 
     for (const track of ranked) {
       if (playedIds.has(String(track.id))) continue;
+      if (trackMatchesPlayedSongName(track, playedSignatures)) continue;
       const playable = await resolvePlayableTrack(db, netease, track, { includeLyric: false });
       if (!playable?.playable) continue;
       const withLyric = await resolvePlayableTrack(db, netease, playable, { includeLyric: true });
@@ -2217,7 +2339,9 @@ function expandArtistAliases(artists = []) {
 function stripSongVersion(value) {
   return String(value || '')
     .replace(/[（(【[].*?[）)】\]]/g, '')
-    .replace(/\b(live|remix|伴奏|纯音乐|cover|版|现场|录音室版)\b/gi, '')
+    .replace(/\s*[-–—]+\s*(album\s*version|single\s*version|live\s*version|studio\s*version|remix|cover|live|伴奏|纯音乐|翻唱|现场版|录音室版|.*版)\s*$/gi, '')
+    .replace(/\b(album\s*version|single\s*version|live\s*version|studio\s*version|live|remix|cover)\b/gi, '')
+    .replace(/(伴奏|纯音乐|翻唱|现场版|录音室版|专辑版|国语版|粤语版|版本|版)$/g, '')
     .trim();
 }
 

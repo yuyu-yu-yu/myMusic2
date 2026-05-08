@@ -31,6 +31,7 @@ import {
   parseSongPlanResponse,
   recommendationTextMentionsDifferentTrack,
   rankAndSelectCandidates,
+  trackMatchesPlayedSongName,
   trackMatchesSongPick,
   TURN_ACTIONS
 } from '../server/dj.mjs';
@@ -170,6 +171,33 @@ test('song search matching rejects unrelated mood-title results', () => {
     name: '陪你度过漫长岁月',
     artists: ['其他歌手']
   }, pick), false);
+});
+
+test('played song matching ignores artist and version names', () => {
+  const played = [
+    { name: '好久不见', artists: ['陈奕迅'] },
+    { name: '她说', artists: ['林俊杰'] }
+  ];
+
+  assert.equal(trackMatchesPlayedSongName({
+    name: '好久不见(国) - Album Version',
+    artists: ['陈奕迅']
+  }, played), true);
+
+  assert.equal(trackMatchesPlayedSongName({
+    name: '好久不见 Live',
+    artists: ['翻唱歌手']
+  }, played), true);
+
+  assert.equal(trackMatchesPlayedSongName({
+    name: '她说 - Cover',
+    artists: ['其他歌手']
+  }, played), true);
+
+  assert.equal(trackMatchesPlayedSongName({
+    name: '好久以后',
+    artists: ['陈奕迅']
+  }, played), false);
 });
 
 test('final host text parser accepts confirmed-track DJ copy', () => {
@@ -783,8 +811,11 @@ test('intent classifier maps DeepSeek JSON into turn actions', async (t) => {
 
 test('intent classifier falls back on bad JSON, low confidence, and hard rules', async (t) => {
   assert.equal(decideHardRuleTurnAction({ userMessage: '下一首' }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+  assert.equal(decideHardRuleTurnAction({ userMessage: '不想听陈奕迅的这首，换他的另一首歌，切歌' }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+  assert.equal(decideHardRuleTurnAction({ userMessage: '不想听这个版本，换一首' }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
   assert.equal(decideHardRuleTurnAction({ userMessage: '暂停' }).action, TURN_ACTIONS.CONTINUE_CURRENT_SONG);
   assert.equal(decideHardRuleTurnAction({ userMessage: '别放歌，先聊聊' }).action, TURN_ACTIONS.CHAT_ONLY);
+  assert.equal(decideHardRuleTurnAction({ userMessage: '不要切歌，先聊聊' }).action, TURN_ACTIONS.CHAT_ONLY);
 
   const originalFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
@@ -1106,10 +1137,13 @@ test('conversation mood detects comfort needs from recent chat', () => {
 
 test('recommendation trigger policy distinguishes chat from music intent', () => {
   assert.equal(hasExplicitMusicIntent('换一首，来点国风'), true);
+  assert.equal(hasExplicitMusicIntent('不想听这首，换他的另一首'), true);
+  assert.equal(hasExplicitMusicIntent('不想听这个版本，切歌'), true);
   assert.equal(hasExplicitMusicIntent('听陈奕迅的稳稳的幸福'), true);
   assert.equal(hasExplicitMusicIntent('放周杰伦的晴天'), true);
   assert.equal(hasExplicitMusicIntent('听过陈奕迅的稳稳的幸福吗'), false);
   assert.equal(hasExplicitMusicIntent('只是想和你说句话'), false);
+  assert.equal(hasExplicitMusicIntent('不想听歌，先聊聊'), false);
   assert.equal(hasExplicitMusicIntent('你推荐什么电影'), false);
 
   assert.equal(canProactivelyRecommend({

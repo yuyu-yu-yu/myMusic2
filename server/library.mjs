@@ -1,6 +1,9 @@
-import { listRecentPlays, listTracks, linkPlaylistTrack, normalizeTrack, nowIso, savePlaylist, saveTrack, seedDemoLibrary } from './db.mjs';
+import { getSetting, listRecentPlays, linkPlaylistTrack, normalizeTrack, nowIso, savePlaylist, saveTrack, seedDemoLibrary, setSetting } from './db.mjs';
 import { getSongUrl, getLyric as getCommunityLyric } from './community.mjs';
 import { generateChatCompletion } from './ai.mjs';
+
+const PROFILE_EXCLUDED_PLAYLIST_IDS_KEY = 'profile_excluded_playlist_ids';
+const EMPTY_PROFILE_SUMMARY = '尚未选择用于生成音乐画像的网易云歌单。请在曲库页勾选至少一个歌单后，灿灿会只根据这些歌单生成长期音乐画像。';
 
 export async function syncLibrary(db, netease) {
   const result = {
@@ -12,9 +15,10 @@ export async function syncLibrary(db, netease) {
 
   if (!netease.isConfigured()) {
     seedDemoLibrary(db);
-    const tracks = listTracks(db, 100);
+    const tracks = listLibraryTracks(db, 100);
     result.tracks = tracks.length;
     result.playlists = 1;
+    await updateProfile(db);
     return result;
   }
 
@@ -61,45 +65,68 @@ export async function syncLibrary(db, netease) {
         INSERT INTO plays (track_id, played_at, source, reason, report_status)
         VALUES (?, ?, ?, ?, ?)
       `).run(track.id, item.playTime ? new Date(Number(item.playTime)).toISOString() : nowIso(), 'netease-recent', '网易云最近播放', 'imported');
-      result.tracks += 1;
     });
   } catch (error) {
     result.errors.push(`recent: ${error.message}`);
   }
 
   result.playlists = playlists.length;
+  result.tracks = countLibraryTracks(db);
   await updateProfile(db);
   return result;
 }
 
 export async function updateProfile(db, llmConfig) {
   // Only analyze tracks the user actually synced from NetEase playlists (not AI recs or test searches)
-  const ownedIds = db.prepare('SELECT DISTINCT track_id FROM playlist_tracks').all().map(r => r.track_id);
-  const ownedIdSet = new Set(ownedIds);
-  const tracks = listTracks(db, 5000).filter(t => ownedIdSet.has(t.id));
-  const playlists = getProfilePlaylists(db);
+  const profileSelection = getProfileSelection(db);
+  const playlists = getProfilePlaylists(db, { selectedOnly: true });
+  const tracks = dedupePlaylistTracks(playlists);
   const stats = buildProfileStats(tracks, playlists);
+  stats.selectedPlaylistIds = profileSelection.selectedIds;
+  stats.excludedPlaylistIds = profileSelection.excludedIds;
   let structured = buildFallbackStructuredProfile(stats);
   let summary = structured.summary;
   const tags = inferTags(tracks);
+
+  if (!stats.trackCount || !stats.playlistCount) {
+    structured = normalizeStructuredProfile({ summary: EMPTY_PROFILE_SUMMARY }, stats);
+    db.prepare(`
+      INSERT INTO music_profile (id, summary, tags_json, profile_json, updated_at)
+      VALUES (1, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        summary = excluded.summary,
+        tags_json = excluded.tags_json,
+        profile_json = excluded.profile_json,
+        updated_at = excluded.updated_at
+    `).run(EMPTY_PROFILE_SUMMARY, JSON.stringify([]), JSON.stringify(structured), nowIso());
+    return {
+      summary: EMPTY_PROFILE_SUMMARY,
+      tags: [],
+      structured,
+      topArtists: [],
+      topAlbums: [],
+      trackCount: 0
+    };
+  }
 
   // LLM enriched profile — only regenerate when needed
   const existing = getProfile(db);
   const lastUpdated = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
   const hoursSinceUpdate = (Date.now() - lastUpdated) / 3600000;
   const previousCount = Number(existing?.structured?.trackCount || existing?.summary?.match(/(\d+)\s*首/)?.[1] || 0);
+  const sourceChanged = !sameStringSet(existing?.structured?.selectedPlaylistIds, stats.selectedPlaylistIds);
   const trackCountChanged = previousCount
     ? Math.abs(stats.trackCount - previousCount) > Math.max(10, stats.trackCount * 0.05)
     : true;
   const missingStructured = !existing?.structured || !Object.keys(existing.structured || {}).length;
 
-  if (llmConfig?.baseUrl && (hoursSinceUpdate > 24 || trackCountChanged || missingStructured || existing.summary.length < 150)) {
+  if (llmConfig?.baseUrl && (hoursSinceUpdate > 24 || trackCountChanged || sourceChanged || missingStructured || existing.summary.length < 150)) {
     const enriched = await generateAIPortrait(stats, llmConfig);
     if (enriched) {
       structured = normalizeStructuredProfile({ ...structured, ...enriched.structured, summary: enriched.summary || structured.summary }, stats);
       summary = enriched.summary || structured.summary;
     }
-  } else if (existing?.summary && existing.summary.length > 50 && existing?.structured) {
+  } else if (!sourceChanged && existing?.summary && existing.summary.length > 50 && existing?.structured) {
     // Reuse existing enriched profile, update only tags/artists stats
     summary = existing.summary;
     structured = normalizeStructuredProfile({ ...structured, ...existing.structured, generatedAt: nowIso() }, stats);
@@ -174,15 +201,26 @@ export function getProfile(db) {
 }
 
 export function getLibrary(db) {
-  const playlists = db.prepare('SELECT id, name, kind, cover_url AS coverUrl FROM playlists ORDER BY updated_at DESC').all();
-  const total = db.prepare('SELECT COUNT(*) AS count FROM tracks').get().count;
+  const playlists = getLibraryPlaylists(db);
+  const profileSelection = getProfileSelection(db, playlists);
+  const selectedIds = new Set(profileSelection.selectedIds);
   return {
     profile: getProfile(db),
-    tracks: listTracks(db, 5000),
-    playlists,
+    tracks: listLibraryTracks(db, 5000),
+    playlists: playlists.map((playlist) => ({
+      ...playlist,
+      profileSelected: selectedIds.has(playlist.id)
+    })),
     recent: listRecentPlays(db, 50),
-    totalTracks: total
+    totalTracks: countLibraryTracks(db),
+    profileSelection
   };
+}
+
+export async function updateProfilePlaylistSelection(db, selectedPlaylistIds = [], llmConfig = {}) {
+  setProfilePlaylistSelection(db, selectedPlaylistIds);
+  await updateProfile(db, llmConfig);
+  return getLibrary(db);
 }
 
 export function extractRecords(data) {
@@ -199,8 +237,13 @@ export function extractRecords(data) {
   return [];
 }
 
-function getProfilePlaylists(db) {
-  const playlists = db.prepare('SELECT id, name, kind FROM playlists ORDER BY updated_at DESC').all();
+function getProfilePlaylists(db, { selectedOnly = false } = {}) {
+  const playlists = getLibraryPlaylists(db);
+  const profileSelection = getProfileSelection(db, playlists);
+  const selectedIds = new Set(profileSelection.selectedIds);
+  const scopedPlaylists = selectedOnly
+    ? playlists.filter((playlist) => selectedIds.has(playlist.id))
+    : playlists;
   const trackStmt = db.prepare(`
     SELECT t.id, t.name, t.artists, t.album, t.cover_url AS coverUrl, t.duration_ms AS durationMs, t.raw_json AS rawJson
     FROM playlist_tracks pt
@@ -209,8 +252,9 @@ function getProfilePlaylists(db) {
     ORDER BY pt.position ASC
     LIMIT 120
   `);
-  return playlists.map((playlist) => ({
+  return scopedPlaylists.map((playlist) => ({
     ...playlist,
+    profileSelected: selectedIds.has(playlist.id),
     tracks: trackStmt.all(playlist.id).map((row) => {
       const { rawJson, ...track } = row;
       return {
@@ -220,6 +264,97 @@ function getProfilePlaylists(db) {
       };
     })
   }));
+}
+
+function getLibraryPlaylists(db) {
+  return db.prepare(`
+    SELECT p.id, p.name, p.kind, p.cover_url AS coverUrl, COUNT(pt.track_id) AS trackCount
+    FROM playlists p
+    LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
+    GROUP BY p.id, p.name, p.kind, p.cover_url, p.updated_at
+    ORDER BY p.updated_at DESC
+  `).all().map((playlist) => ({
+    ...playlist,
+    trackCount: Number(playlist.trackCount) || 0
+  }));
+}
+
+function countLibraryTracks(db) {
+  return db.prepare('SELECT COUNT(DISTINCT track_id) AS count FROM playlist_tracks').get().count;
+}
+
+function listLibraryTracks(db, limit = 5000) {
+  return db.prepare(`
+    SELECT t.id, t.name, t.artists, t.album, t.cover_url AS coverUrl, t.duration_ms AS durationMs,
+           t.raw_json AS rawJson, MIN(pt.position) AS firstPosition, MAX(p.updated_at) AS playlistUpdatedAt
+    FROM playlist_tracks pt
+    JOIN tracks t ON t.id = pt.track_id
+    JOIN playlists p ON p.id = pt.playlist_id
+    GROUP BY t.id, t.name, t.artists, t.album, t.cover_url, t.duration_ms, t.raw_json
+    ORDER BY playlistUpdatedAt DESC, firstPosition ASC, t.name ASC
+    LIMIT ?
+  `).all(limit).map(hydrateLibraryTrackRow);
+}
+
+function hydrateLibraryTrackRow(row) {
+  const raw = safeJson(row.rawJson, {});
+  const rawOriginalId = raw?.originalId ?? raw?.song?.originalId ?? raw?.track?.originalId ?? null;
+  const playUrl = typeof raw?.playUrl === 'string' && raw.playUrl ? raw.playUrl : null;
+  const { rawJson, firstPosition, playlistUpdatedAt, ...track } = row;
+  return {
+    ...track,
+    originalId: rawOriginalId === null || rawOriginalId === undefined || rawOriginalId === '' ? null : String(rawOriginalId),
+    playbackMode: rawOriginalId ? 'ncm-cli' : null,
+    playable: Boolean(rawOriginalId),
+    playUrl,
+    artists: safeJson(row.artists, [])
+  };
+}
+
+function getProfileSelection(db, playlists = getLibraryPlaylists(db)) {
+  const playlistIds = normalizeIdList(playlists.map((playlist) => playlist.id));
+  const excludedIds = normalizeIdList(safeJson(getSetting(db, PROFILE_EXCLUDED_PLAYLIST_IDS_KEY), []))
+    .filter((id) => playlistIds.includes(id));
+  const excludedSet = new Set(excludedIds);
+  const selectedIds = playlistIds.filter((id) => !excludedSet.has(id));
+  return {
+    selectedIds,
+    excludedIds,
+    selectedCount: selectedIds.length,
+    totalCount: playlistIds.length
+  };
+}
+
+function setProfilePlaylistSelection(db, selectedPlaylistIds = []) {
+  const playlistIds = normalizeIdList(getLibraryPlaylists(db).map((playlist) => playlist.id));
+  const selectedSet = new Set(normalizeIdList(selectedPlaylistIds));
+  const excludedIds = playlistIds.filter((id) => !selectedSet.has(id));
+  setSetting(db, PROFILE_EXCLUDED_PLAYLIST_IDS_KEY, JSON.stringify(excludedIds));
+  return getProfileSelection(db);
+}
+
+function dedupePlaylistTracks(playlists = []) {
+  const byId = new Map();
+  for (const playlist of playlists) {
+    for (const track of playlist.tracks || []) {
+      const id = String(track?.id || '').trim();
+      if (id && !byId.has(id)) byId.set(id, track);
+    }
+  }
+  return [...byId.values()];
+}
+
+function normalizeIdList(values = []) {
+  return [...new Set((Array.isArray(values) ? values : [])
+    .map((value) => String(value || '').trim())
+    .filter(Boolean))];
+}
+
+function sameStringSet(left, right) {
+  if (!Array.isArray(left) || !Array.isArray(right)) return false;
+  const leftIds = normalizeIdList(left).sort();
+  const rightIds = normalizeIdList(right).sort();
+  return leftIds.length === rightIds.length && leftIds.every((id, index) => id === rightIds[index]);
 }
 
 function buildProfileStats(tracks, playlists) {
@@ -295,6 +430,8 @@ function normalizeStructuredProfile(profile = {}, stats = {}) {
     version: 1,
     trackCount: stats.trackCount || Number(profile.trackCount) || 0,
     playlistCount: stats.playlistCount || Number(profile.playlistCount) || 0,
+    selectedPlaylistIds: normalizeIdList(stats.selectedPlaylistIds || profile.selectedPlaylistIds),
+    excludedPlaylistIds: normalizeIdList(stats.excludedPlaylistIds || profile.excludedPlaylistIds),
     generatedAt: nowIso(),
     summary: String(profile.summary || '').trim(),
     genres: normalizeWeightedList(profile.genres).slice(0, 12),
