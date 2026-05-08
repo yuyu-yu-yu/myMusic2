@@ -2135,7 +2135,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         '如果用户明确指定艺人、歌名或风格，必须优先满足；不确定时选更常见、更好搜的歌曲。',
         '如果用户说“他的另一首/她的另一首/这个歌手的另一首/换这位歌手”，优先参考最近播放歌曲的艺人，把它理解成当前或上一首歌的主艺人。',
         '已播放歌名必须避开：只要歌名相同，就不能再推荐任何版本、翻唱、Live、Remix、Album Version 或不同艺人版本。',
-        'hostLine 是备用导播词，必须写成 40-90 字的电台导播，不要只写一句“接下来放”。hostDraft 也要保持完整自然。',
+        'hostLine 只是备用素材，不是最终导播词。不要写成“刚才……现在……”“上一首……接下来……”或“接下来放……”。可以只写一个自然的导播方向。',
         '只输出严格 JSON，不要 Markdown，不要解释。',
         'JSON 格式：{"picks":[{"name":"歌名","artists":["艺人"],"reason":"一句话理由","queries":["歌名 艺人","艺人 歌名"],"hostLine":"40-90字电台导播词"}],"hostDraft":"40-90字自然主持词","mode":null}'
       ].join('\n')
@@ -2427,15 +2427,16 @@ export function buildFinalHostMessages({
       role: 'system',
       content: [
         '你是灿灿，私人电台 AI DJ。最终可播放歌曲已经确认，你只负责写播出前导播词。',
-        '写 40-120 个中文字，温暖、自然、有电台感，像朋友在电台里临场说话，不要像搜索说明。',
-        '不要套固定模板，不要每次都用“深夜的上海/有风无雨/愿这首歌陪你/我找到”这类固定开头或结尾。',
+        '写 40-110 个中文字，像真实电台里临场说的一小段话。可以温柔、俏皮、安静、直接、轻轻吐槽，但不要像推荐理由、搜索说明或固定播报。',
+        '不要套固定模板。尤其避免反复使用“刚才……现在……”“上一首……接下来……”“那首……这首……”“我找到……”“愿这首歌……”“陪你……一会儿”“把声音递给你”“让气氛慢慢……”这类结构。',
         firstTurn
           ? '这是本轮电台第一次播歌，可以自然交代一次时间、天气或城市，但最多一句，不要写成天气播报。'
           : '这不是本轮电台第一次播歌。除非用户主动问天气，否则不要再用时间、天气、城市、温度开头，也不要重复“深夜的上海”。',
-        '后续导播优先接最近对话、上一首歌的余味、用户的喜欢/不喜欢/跳过/下一首操作，以及当前歌曲和上一首之间的情绪转场。',
+        '上一首歌、最近操作、喜欢/不喜欢/下一首，只是可选素材，不要强行做上一首到当前歌曲的转场。',
+        '可以只抓一个角度写：回应听众刚才的话、点一下这首歌的声音气质、点一下歌手或歌名带来的感觉、直接带进歌曲、用一个很短的画面或情绪、轻轻开个小玩笑。',
         '必须只围绕最终确认的歌曲和艺人展开。不能提到其他候选歌名、候选艺人或“我推荐了三首”。',
         '必须准确包含最终歌曲名，最好用书名号；可以包含艺人名。不要编造歌词、专辑、故事或不可确认的信息。',
-        '句式自由，可以短句、停顿、比喻或轻声聊天，但每次角度要不同。不要输出 Markdown，不要解释。只输出严格 JSON：{"chatText":"40-120字导播词"}'
+        '句式自由，可以短句、停顿、比喻或轻声聊天，但每次角度要不同。不要输出 Markdown，不要解释。只输出严格 JSON：{"chatText":"40-110字导播词"}'
       ].join('\n')
     },
     {
@@ -2452,13 +2453,14 @@ export function buildFinalHostMessages({
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
         formatRecentHostPlays(hostContext.recentPlays),
         formatRecentHostFeedback(hostContext.recentFeedback),
+        formatRecentHostTexts(hostContext.recentPlays),
         memoryContext?.promptText || '相关长期记忆：无',
         memoryContext?.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
         `最近对话：${history.length ? '\n' + history.map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`,
         userMessage ? `听众刚说：${userMessage}` : '听众刚启动电台或上一首播完。',
         selectedPick?.reason ? `选这首的理由：${selectedPick.reason}` : '',
-        selectedPick?.hostLine ? `选歌阶段备用导播：${selectedPick.hostLine}` : '',
-        plan?.hostDraft ? `选歌阶段整体导播：${plan.hostDraft}` : ''
+        selectedPick?.hostLine ? `选歌阶段备用导播，仅可参考素材，不能照抄句式：${selectedPick.hostLine}` : '',
+        plan?.hostDraft ? `选歌阶段整体导播，仅可参考素材，不能照抄句式：${plan.hostDraft}` : ''
       ].filter(Boolean).join('\n')
     }
   ];
@@ -2479,6 +2481,15 @@ function formatRecentHostFeedback(events = []) {
   return `最近操作反馈：\n${items.map((event, index) =>
     `${index + 1}. ${labels[event.eventType] || event.eventType}${event.name ? `：${event.name}${event.artists?.length ? ' - ' + event.artists.join('、') : ''}` : ''}`
   ).join('\n')}`;
+}
+
+function formatRecentHostTexts(plays = []) {
+  const items = (plays || [])
+    .map(play => String(play?.hostText || '').trim())
+    .filter(Boolean)
+    .slice(0, 3);
+  if (!items.length) return '最近导播词：无';
+  return `最近导播词如下，只用于避免重复句式，不要模仿：\n${items.map((text, index) => `${index + 1}. ${text}`).join('\n')}\n这次请换一个开头、换一个句式，不要复用“刚才/现在/接下来/上一首”的转场结构。`;
 }
 
 export function parseFinalHostText(raw, fallbackText = '') {
@@ -2546,30 +2557,19 @@ function hostTextLength(text) {
   return String(text || '').replace(/\s+/g, '').length;
 }
 
-function buildConfirmedTrackHostFallback({ selectedTrack, timeOfDay, weather, conversationMood, userMessage, hostContext = {} }) {
+export function buildConfirmedTrackHostFallback({ selectedTrack, timeOfDay, weather, conversationMood, userMessage, hostContext = {} }) {
   const artists = (selectedTrack.artists || []).join('、');
   const trackLabel = `《${selectedTrack.name}》${artists ? ' - ' + artists : ''}`;
   if (!hostContext.isFirstRadioTurn) {
-    const feedback = (hostContext.recentFeedback || [])[0];
-    const previous = (hostContext.recentPlays || [])[0];
-    if (feedback?.eventType === 'dislike' || feedback?.eventType === 'skip') {
-      return `那首我先收起来，不在同一个情绪里打转了。现在换一个方向，给你放 ${trackLabel}，让声音重新轻一点，看看这一首能不能更贴近你要的感觉。`;
-    }
-    if (feedback?.eventType === 'like') {
-      return `刚才那首你接住了，我就顺着那一点喜欢继续往前走。接下来放 ${trackLabel}，不复制上一首的情绪，只把舒服的余温留住。`;
-    }
-    if (previous?.name) {
-      return `上一首的尾音还在这里，我不急着把它切断。接下来换成 ${trackLabel}，让气氛从刚才那一段慢慢转过去。`;
-    }
-    return `这一首我不从天气说起了，直接把声音递给你。接下来是 ${trackLabel}，让它接住刚才的对话，也给这一刻换一点新的颜色。`;
+    return `这首是 ${trackLabel}。我们先不多说，听它自己慢慢展开。`;
   }
   if (userMessage) {
-    return `我先接住你刚才说的状态，不急着把气氛切得太用力。现在给你放 ${trackLabel}，让这首歌把接下来的几分钟慢慢托住。`;
+    return `这首是 ${trackLabel}。你刚刚说的那一点心情，先交给音乐接一下。`;
   }
   if (conversationMood?.mood && conversationMood.mood !== 'random') {
-    return `这会儿的情绪适合放得柔和一点，不用急着往前赶。我给你接上 ${trackLabel}，让声音慢慢铺开，陪你把这一段时间放稳。`;
+    return `这首是 ${trackLabel}。不用急着判断合不合适，先听它开口。`;
   }
-  return `${timeOfDay || '现在'}的空气里有一点安静，${weather ? '窗外的天气也刚好适合慢下来。' : '刚好适合慢下来。'}我给你放 ${trackLabel}，让这首歌先把电台的灯点亮。`;
+  return `给你放 ${trackLabel}。先听这首。`;
 }
 
 function stripUnselectedQuotedSongTitles(text, selectedTrack) {

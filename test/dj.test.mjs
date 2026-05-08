@@ -15,6 +15,7 @@ import {
 import {
   analyzeConversationMood,
   analyzeTurnContext,
+  buildConfirmedTrackHostFallback,
   buildMemoryContext,
   buildFinalHostMessages,
   buildSongSearchQueries,
@@ -242,15 +243,33 @@ test('final host prompt uses weather only for first radio turn and then focuses 
     hostContext: {
       isFirstRadioTurn: false,
       trigger: '用户想换一首',
-      recentPlays: [{ name: '普通朋友', artists: ['陶喆'], reason: '上一首' }],
+      recentPlays: [{ name: '普通朋友', artists: ['陶喆'], reason: '上一首', hostText: '刚才那首歌的余温还在，接下来换个方向。' }],
       recentFeedback: [{ eventType: 'skip', name: '普通朋友', artists: ['陶喆'] }]
     }
   }));
   assert.match(laterPrompt, /避免天气时间模板/);
   assert.match(laterPrompt, /不要再用时间、天气、城市、温度开头/);
+  assert.match(laterPrompt, /只是可选素材，不要强行做上一首到当前歌曲的转场/);
+  assert.match(laterPrompt, /不要复用“刚才\/现在\/接下来\/上一首”的转场结构/);
   assert.match(laterPrompt, /最近播放/);
   assert.match(laterPrompt, /最近操作反馈/);
+  assert.match(laterPrompt, /最近导播词/);
   assert.match(laterPrompt, /下一首\/跳过：普通朋友/);
+  assert.doesNotMatch(laterPrompt, /后续导播优先接最近对话、上一首歌的余味/);
+});
+
+test('confirmed track host fallback avoids rigid transition template', () => {
+  const text = buildConfirmedTrackHostFallback({
+    selectedTrack: { name: '晴天', artists: ['周杰伦'] },
+    hostContext: {
+      isFirstRadioTurn: false,
+      recentPlays: [{ name: '普通朋友', artists: ['陶喆'] }],
+      recentFeedback: [{ eventType: 'skip', name: '普通朋友', artists: ['陶喆'] }]
+    }
+  });
+
+  assert.match(text, /《晴天》/);
+  assert.doesNotMatch(text, /刚才|现在换|接下来|上一首/);
 });
 
 test('recommendation text is forced to match the final playable track', () => {
