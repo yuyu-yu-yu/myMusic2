@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { linkPlaylistTrack, openDatabase, savePlaylist, saveTrack } from '../server/db.mjs';
-import { getLibrary, getProfile, updateProfile, updateProfilePlaylistSelection } from '../server/library.mjs';
+import { getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from '../server/library.mjs';
 
 function testDb(t) {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mymusic-library-'));
@@ -86,6 +86,96 @@ test('library only lists real playlist tracks while recent plays stay separate',
   assert.equal(library.playlists[0].profileSelected, true);
 });
 
+test('library sync paginates all playlists and replaces stale playlist links', async (t) => {
+  const db = testDb(t);
+  const stalePlaylist = savePlaylist(db, { id: 'pl-big', name: 'Big Playlist' }, 'created');
+  const staleTrack = addPlaylistTrack(db, stalePlaylist, {
+    id: 'stale-track',
+    name: 'Stale Song',
+    artists: ['Old Artist'],
+    album: 'Old Album'
+  });
+  const playlists = [
+    { id: 'pl-big', name: 'Big Playlist', trackCount: 450 },
+    ...Array.from({ length: 30 }, (_, index) => ({
+      id: `pl-extra-${index}`,
+      name: `Extra Playlist ${index}`,
+      trackCount: 1
+    }))
+  ];
+  const songMap = new Map([
+    ['pl-big', Array.from({ length: 450 }, (_, index) => ({
+      id: `big-${index}`,
+      name: `Big Song ${index}`,
+      artists: ['Paged Artist'],
+      album: 'Paged Album'
+    }))]
+  ]);
+  for (const playlist of playlists.slice(1)) {
+    songMap.set(playlist.id, [{
+      id: `${playlist.id}-song`,
+      name: `${playlist.name} Song`,
+      artists: ['Extra Artist'],
+      album: 'Extra Album'
+    }]);
+  }
+  const calls = [];
+  const netease = {
+    isConfigured: () => true,
+    starPlaylist: async () => ({ data: { records: [playlists[0]] } }),
+    subscribedPlaylists: async () => ({ data: { records: playlists.slice(1) } }),
+    createdPlaylists: async () => ({ data: { records: [] } }),
+    playlistSongs: async (playlistId, offset, limit) => {
+      calls.push({ playlistId, offset, limit });
+      const songs = songMap.get(playlistId) || [];
+      return { data: { songs: songs.slice(offset, offset + limit) } };
+    },
+    recentSongs: async () => ({ data: { records: [] } })
+  };
+
+  const result = await syncLibrary(db, netease);
+  const library = getLibrary(db);
+  const big = library.playlists.find(playlist => playlist.id === 'pl-big');
+
+  assert.equal(result.errors.length, 0);
+  assert.equal(result.playlists, 31);
+  assert.equal(big.trackCount, 450);
+  assert.equal(big.syncedTrackCount, 450);
+  assert.equal(big.syncComplete, true);
+  assert.equal(library.playlists.find(playlist => playlist.id === 'pl-extra-29').syncedTrackCount, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?').get('pl-big', staleTrack.id).count, 0);
+  assert.deepEqual(calls.filter(call => call.playlistId === 'pl-big').map(call => call.offset), [0, 200, 400]);
+});
+
+test('failed playlist sync keeps previous playlist links and reports the error', async (t) => {
+  const db = testDb(t);
+  const playlist = savePlaylist(db, { id: 'pl-fail', name: 'Fail Playlist', trackCount: 2 }, 'created');
+  const existing = addPlaylistTrack(db, playlist, {
+    id: 'existing-track',
+    name: 'Existing Song',
+    artists: ['Existing Artist'],
+    album: 'Existing Album'
+  });
+  const netease = {
+    isConfigured: () => true,
+    starPlaylist: async () => ({ data: { records: [{ id: 'pl-fail', name: 'Fail Playlist', trackCount: 2 }] } }),
+    subscribedPlaylists: async () => ({ data: { records: [] } }),
+    createdPlaylists: async () => ({ data: { records: [] } }),
+    playlistSongs: async () => { throw new Error('page failed'); },
+    recentSongs: async () => ({ data: { records: [] } })
+  };
+
+  const result = await syncLibrary(db, netease);
+  const library = getLibrary(db);
+  const failed = library.playlists.find(item => item.id === 'pl-fail');
+
+  assert.equal(result.errors.some(error => error.includes('page failed')), true);
+  assert.equal(failed.trackCount, 2);
+  assert.equal(failed.syncedTrackCount, 1);
+  assert.equal(failed.syncComplete, false);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?').get('pl-fail', existing.id).count, 1);
+});
+
 test('profile playlist selection filters portrait source and keeps new playlists selected by default', async (t) => {
   const db = testDb(t);
   const selected = savePlaylist(db, { id: 'pl-selected', name: 'Selected Playlist' }, 'created');
@@ -103,15 +193,27 @@ test('profile playlist selection filters portrait source and keeps new playlists
     album: 'Excluded Album'
   });
 
-  let library = await updateProfilePlaylistSelection(db, [selected.id], {});
+  await updateProfile(db, {});
+  const profileUpdatedAt = db.prepare('SELECT updated_at AS updatedAt FROM music_profile WHERE id = 1').get().updatedAt;
+  let library = updateProfilePlaylistSelection(db, [selected.id]);
+  const unchangedUpdatedAt = db.prepare('SELECT updated_at AS updatedAt FROM music_profile WHERE id = 1').get().updatedAt;
   let artistNames = library.profile.structured.artists.map(item => item.name);
+
+  assert.equal(unchangedUpdatedAt, profileUpdatedAt);
+  assert.equal(library.profile.structured.trackCount, 2);
+  assert.equal(artistNames.includes('Selected Artist'), true);
+  assert.equal(artistNames.includes('Excluded Artist'), true);
+  assert.equal(library.profileSelection.selectedCount, 1);
+  assert.equal(library.playlists.find(playlist => playlist.id === selected.id).profileSelected, true);
+  assert.equal(library.playlists.find(playlist => playlist.id === excluded.id).profileSelected, false);
+
+  await updateProfile(db, {});
+  library = getLibrary(db);
+  artistNames = library.profile.structured.artists.map(item => item.name);
 
   assert.equal(library.profile.structured.trackCount, 1);
   assert.equal(artistNames.includes('Selected Artist'), true);
   assert.equal(artistNames.includes('Excluded Artist'), false);
-  assert.equal(library.profileSelection.selectedCount, 1);
-  assert.equal(library.playlists.find(playlist => playlist.id === selected.id).profileSelected, true);
-  assert.equal(library.playlists.find(playlist => playlist.id === excluded.id).profileSelected, false);
 
   const added = savePlaylist(db, { id: 'pl-new', name: 'New Playlist' }, 'created');
   addPlaylistTrack(db, added, {
@@ -124,7 +226,12 @@ test('profile playlist selection filters portrait source and keeps new playlists
   library = getLibrary(db);
   assert.equal(library.playlists.find(playlist => playlist.id === added.id).profileSelected, true);
 
-  library = await updateProfilePlaylistSelection(db, [], {});
+  library = updateProfilePlaylistSelection(db, []);
+  assert.equal(library.profile.structured.trackCount, 1);
+  assert.equal(library.profileSelection.selectedCount, 0);
+
+  await updateProfile(db, {});
+  library = getLibrary(db);
   assert.equal(library.profile.structured.trackCount, 0);
   assert.equal(library.profile.structured.artists.length, 0);
   assert.equal(library.profileSelection.selectedCount, 0);

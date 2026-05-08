@@ -5,6 +5,7 @@ export class NeteaseClient {
     this.config = config;
     this._accessToken = config.accessToken || '';
     this._refreshToken = '';
+    this._anonymousAccessToken = config.anonymousAccessToken || '';
   }
 
   setTokens(accessToken, refreshToken) {
@@ -79,8 +80,9 @@ export class NeteaseClient {
       throw new Error(`NetEase returned non-JSON response: ${text.slice(0, 200)}`);
     }
 
-    // Auto-refresh on token expiration
-    if (!response.ok && isTokenExpired(json) && this._refreshToken && !options._retry) {
+    // Auto-refresh on token expiration. NetEase often returns business errors
+    // with HTTP 200, so check the parsed body instead of response.ok only.
+    if (isTokenExpired(json) && this._refreshToken && !options._retry) {
       try {
         const refreshResult = await this.refreshToken(this._refreshToken);
         const data = refreshResult?.data || refreshResult;
@@ -117,27 +119,48 @@ export class NeteaseClient {
     if (!response.ok) {
       throw new Error(`NetEase HTTP ${response.status}: ${json.message || text.slice(0, 200)}`);
     }
+    if (isTokenExpired(json)) {
+      throw new Error(`NetEase API ${json.code || ''}: ${json.message || json.msg || 'accessToken expired'}`.trim());
+    }
     return json;
   }
 
   anonymousLogin() {
-    return this.request('/openapi/music/basic/oauth2/login/anonymous', { clientId: this.config.appId });
+    return this.request('/openapi/music/basic/oauth2/login/anonymous', { clientId: this.config.appId }, { accessToken: '' });
   }
 
-  qrcode() {
-    return this.request('/openapi/music/basic/user/oauth2/qrcodekey/get/v2', { type: 2, expiredKey: '604800' });
+  async getAnonymousAccessToken() {
+    if (this._anonymousAccessToken) return this._anonymousAccessToken;
+    const result = await this.anonymousLogin();
+    const data = result?.data || result || {};
+    const token = data.accessToken;
+    const accessToken = typeof token === 'string' ? token : token?.accessToken;
+    if (!accessToken || accessToken === 'null') {
+      throw new Error('NetEase anonymous login did not return accessToken');
+    }
+    this._anonymousAccessToken = accessToken;
+    return accessToken;
   }
 
-  qrcodeStatus(qrCodeKey) {
-    return this.request('/openapi/music/basic/oauth2/device/login/qrcode/get', { qrCodeKey });
+  async qrcode() {
+    const accessToken = await this.getAnonymousAccessToken();
+    return this.request('/openapi/music/basic/user/oauth2/qrcodekey/get/v2', { type: 2, expiredKey: '604800' }, { accessToken });
+  }
+
+  async qrcodeStatus(qrCodeKey) {
+    const accessToken = await this.getAnonymousAccessToken();
+    return this.request('/openapi/music/basic/oauth2/device/login/qrcode/get', {
+      key: String(qrCodeKey),
+      clientId: this.config.appId
+    }, { accessToken });
   }
 
   tokenFromCode(code) {
-    return this.request('/openapi/music/basic/user/oauth2/token/get/v2', { code });
+    return this.request('/openapi/music/basic/user/oauth2/token/get/v2', { code }, { accessToken: '' });
   }
 
   refreshToken(refreshToken) {
-    return this.request('/openapi/music/basic/user/oauth2/token/refresh/v2', { refreshToken });
+    return this.request('/openapi/music/basic/user/oauth2/token/refresh/v2', { refreshToken }, { _retry: true, accessToken: '' });
   }
 
   userProfile() {

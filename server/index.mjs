@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
 import { openDatabase, seedDemoLibrary, getSetting, setSetting } from './db.mjs';
@@ -13,6 +14,7 @@ import { createNcmPlayer } from './player.mjs';
 import { loadCookie } from './community.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const require = createRequire(import.meta.url);
 loadEnv(rootDir);
 const config = getConfig();
 const db = openDatabase(rootDir);
@@ -38,7 +40,7 @@ const cacheDir = path.join(rootDir, 'cache', 'tts');
 const routes = {
   'GET /api/health': async () => ({ ok: true, config: tokenStatus(publicConfigStatus(config)) }),
   'GET /api/config/status': async () => tokenStatus(publicConfigStatus(config)),
-  'POST /api/auth/netease/qrcode': async () => netease.qrcode(),
+  'POST /api/auth/netease/qrcode': async () => attachQrImage(await netease.qrcode()),
   'POST /api/auth/netease/qrcode/check': async (req) => {
     const body = await readJson(req);
     const key = body.key || body.qrCodeKey;
@@ -61,7 +63,11 @@ const routes = {
   'PUT /api/library/profile-playlists': async (req) => {
     const body = await readJson(req);
     if (!Array.isArray(body.selectedPlaylistIds)) return jsonError('selectedPlaylistIds must be an array', 400);
-    return updateProfilePlaylistSelection(db, body.selectedPlaylistIds, config.llm);
+    return updateProfilePlaylistSelection(db, body.selectedPlaylistIds);
+  },
+  'POST /api/library/profile/update': async () => {
+    await updateProfile(db, config.llm);
+    return getLibrary(db);
   },
   'POST /api/radio/start': async (req) => {
     const body = await readJson(req);
@@ -110,6 +116,38 @@ const routes = {
 
 function tokenStatus(status) {
   return { ...status, neteaseToken: netease.hasToken() };
+}
+
+let qrcodeModule = null;
+
+async function attachQrImage(result) {
+  const info = result?.data || result;
+  const qrText = info?.qrCodeUrl || info?.qrCode || info?.qrurl || '';
+  if (info?.uniKey && !info.qrCodeKey) info.qrCodeKey = info.uniKey;
+  if (!qrText) return result;
+  const qrImage = await renderQrDataUrl(qrText);
+  if (qrImage) info.qrImage = qrImage;
+  return result;
+}
+
+async function renderQrDataUrl(text) {
+  try {
+    if (!qrcodeModule) {
+      const qrcodePath = path.join(process.env.APPDATA || '', 'npm', 'node_modules', 'NeteaseCloudMusicApi', 'node_modules', 'qrcode');
+      qrcodeModule = require(qrcodePath);
+    }
+    return await qrcodeModule.toDataURL(String(text), {
+      width: 220,
+      margin: 1,
+      color: {
+        dark: '#060816',
+        light: '#f5fbff'
+      }
+    });
+  } catch (error) {
+    console.warn('[netease] QR image render failed:', error.message);
+    return '';
+  }
 }
 
 function tryNeteaseLogin(db, netease, result) {
