@@ -8,7 +8,7 @@ import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
 import { openDatabase, seedDemoLibrary, getSetting, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
-import { chatRadio, getMemories, getPreferences, nextRadioItem, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
+import { chatRadio, getMemories, getPreferences, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
 import { loadCookie } from './community.mjs';
@@ -72,6 +72,10 @@ const routes = {
   'POST /api/radio/start': async (req) => {
     const body = await readJson(req);
     return startRadio({ db, config, netease, sessionId: body.sessionId });
+  },
+  'POST /api/radio/prefetch': async (req) => {
+    const body = await readJson(req);
+    return prefetchRadio({ db, config, netease, sessionId: body.sessionId, force: Boolean(body.force) });
   },
   'POST /api/radio/chat': async (req) => {
     const body = await readJson(req);

@@ -40,6 +40,14 @@ const DEFAULT_PREFS = Object.freeze({
   moodMode: 'auto',
   note: ''
 });
+const RADIO_QUEUE_LIMIT = 2;
+const RADIO_QUEUE_POLICIES = Object.freeze({
+  REFRESH_TAIL: 'refresh_tail',
+  HARD_PREEMPT: 'hard_preempt',
+  SOFT_PREEMPT: 'soft_preempt',
+  CLEAR: 'clear'
+});
+const radioQueueJobs = new Set();
 const BALANCE_MIN_USER_MESSAGES = Object.freeze({ friend: 3, balanced: 2, dj: 1 });
 const FREQUENCY_MIN_GAP = Object.freeze({ low: 5, medium: 3, high: 2 });
 export const TURN_ACTIONS = Object.freeze({
@@ -100,7 +108,57 @@ const GENERIC_ARTIST_PHRASES = new Set([
   '快歌'
 ].map(normalizeMusicText));
 
-export async function djTurn({ db, config, netease, sessionId, userMessage, conversationMood = null }) {
+export async function djTurn({ db, config, netease, sessionId, userMessage, conversationMood = null, useQueue = true }) {
+  ensureSession(db, sessionId);
+  const normalizedUserMessage = String(userMessage || '').trim();
+
+  if (useQueue && !normalizedUserMessage) {
+    const queued = consumeReadyRadioQueue(db, sessionId);
+    if (queued?.track) {
+      const response = await commitRadioRecommendation({
+        db,
+        config,
+        sessionId,
+        payload: queued,
+        userMessage: null,
+        conversationMood: queued.conversationMood || queued.contextSnapshot || conversationMood,
+        source: 'queue'
+      });
+      scheduleRadioQueueFill({ db, config, netease, sessionId, reason: 'after_consume' });
+      return { ...response, queueHit: true };
+    }
+  }
+
+  const payload = await buildRadioRecommendation({
+    db,
+    config,
+    netease,
+    sessionId,
+    userMessage: normalizedUserMessage || null,
+    conversationMood
+  });
+  const response = await commitRadioRecommendation({
+    db,
+    config,
+    sessionId,
+    payload,
+    userMessage: normalizedUserMessage || null,
+    conversationMood: payload.conversationMood || conversationMood,
+    source: 'sync'
+  });
+  scheduleRadioQueueFill({ db, config, netease, sessionId, reason: 'after_sync' });
+  return { ...response, queueHit: false };
+}
+
+async function buildRadioRecommendation({
+  db,
+  config,
+  netease,
+  sessionId,
+  userMessage,
+  conversationMood = null,
+  extraAvoidTracks = []
+}) {
   ensureSession(db, sessionId);
   const profile = getProfile(db);
   const weather = await getCachedWeather(db, sessionId, config.weather);
@@ -109,10 +167,10 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   const prefs = normalizeRuntimePrefs(getUserPrefs(db));
   const context = getSessionContext(db, sessionId);
   const conversationState = normalizeConversationState(context.conversationState);
-  const recommendationMood = conversationMood || moodFromConversationState(conversationState, prefs, mode);
+  const contextMood = context.musicContext ? moodFromMusicContext(context.musicContext) : null;
+  const recommendationMood = conversationMood || contextMood || moodFromConversationState(conversationState, prefs, mode);
   const hostContext = buildRadioHostContext(db, sessionId, context, userMessage);
 
-  // Load conversation history
   const history = loadHistory(db, sessionId);
   const sessionSummary = await updateSessionSummary(db, config, sessionId);
   const longTermMemories = retrieveRelevantMemories(db, {
@@ -139,50 +197,22 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
     userMessage,
     conversationMood: recommendationMood,
     memoryContext,
-    hostContext
+    hostContext,
+    avoidTracks: extraAvoidTracks
   });
 
-  // Save to DB
-  if (userMessage) {
-    db.prepare('INSERT INTO messages (session_id, role, content, created_at) VALUES (?,?,?,?)')
-      .run(sessionId, 'user', userMessage, nowIso());
-  }
-  db.prepare('INSERT INTO messages (session_id, role, content, created_at) VALUES (?,?,?,?)')
-    .run(sessionId, 'assistant', result.chatText, nowIso());
-  if (result.track) {
-    db.prepare('INSERT INTO plays (track_id, played_at, source, reason, host_text, report_status) VALUES (?,?,?,?,?,?)')
-      .run(result.track.id, nowIso(), 'radio', result.reason, result.chatText, 'pending');
-    saveTrack(db, result.track);
-    const latestContext = getSessionContext(db, sessionId);
-    setSessionContext(db, sessionId, {
-      ...latestContext,
-      radioIntroDone: true,
-      radioIntroAt: latestContext.radioIntroAt || nowIso(),
-      radioTurnCount: Number(latestContext.radioTurnCount || 0) + 1,
-      radioPlayedSongs: mergePlayedSongContext(latestContext.radioPlayedSongs, result.track)
-    });
-  }
-  if (userMessage) {
-    scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: result.chatText, conversationMood: recommendationMood });
-  }
-
-  // Persist mode if changed
-  if (result.newMode) {
-    const newMode = result.newMode;
-    newMode.updatedAt = nowIso();
-    setSessionMode(db, sessionId, newMode);
-    mode.genre = newMode.genre;
-    mode.note = newMode.note;
-  }
-
-  // TTS
   const speech = speechDecisionForRecommendation(prefs);
   const ttsUrl = speech.shouldSpeak
     ? await synthesizeSpeech(config.tts, result.chatText)
     : null;
+  const musicContext = normalizeMusicContext(context.musicContext);
 
   return {
-    sessionId,
+    id: `ready-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    status: 'ready',
+    createdAt: nowIso(),
+    contextVersion: musicContext.version,
+    contextSnapshot: musicContext,
     chatText: result.chatText,
     track: result.track,
     reason: result.reason,
@@ -190,7 +220,62 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
     speech,
     mode: result.newMode || mode,
     profile,
-    weather
+    weather,
+    newMode: result.newMode || null,
+    conversationMood: recommendationMood
+  };
+}
+
+async function commitRadioRecommendation({ db, config, sessionId, payload, userMessage = null, conversationMood = null, source = 'sync' }) {
+  const chatText = String(payload?.chatText || '').trim();
+  const track = payload?.track || null;
+  const reason = payload?.reason || '';
+
+  if (userMessage) saveMessage(db, sessionId, 'user', userMessage);
+  saveMessage(db, sessionId, 'assistant', chatText);
+
+  if (track) {
+    db.prepare('INSERT INTO plays (track_id, played_at, source, reason, host_text, report_status) VALUES (?,?,?,?,?,?)')
+      .run(track.id, nowIso(), 'radio', reason, chatText, 'pending');
+    saveTrack(db, track);
+    const latestContext = getSessionContext(db, sessionId);
+    setSessionContext(db, sessionId, {
+      ...latestContext,
+      radioIntroDone: true,
+      radioIntroAt: latestContext.radioIntroAt || nowIso(),
+      radioTurnCount: Number(latestContext.radioTurnCount || 0) + 1,
+      radioPlayedSongs: mergePlayedSongContext(latestContext.radioPlayedSongs, track)
+    });
+  }
+
+  if (userMessage) {
+    scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: chatText, conversationMood });
+  }
+
+  let mode = payload?.mode || getSessionMode(db, sessionId);
+  if (payload?.newMode) {
+    const newMode = { ...payload.newMode, updatedAt: nowIso() };
+    setSessionMode(db, sessionId, newMode);
+    mode = newMode;
+  }
+
+  const prefs = normalizeRuntimePrefs(getUserPrefs(db));
+  const speech = speechDecisionForRecommendation(prefs);
+  let ttsUrl = payload?.ttsUrl || null;
+  if (!speech.shouldSpeak) ttsUrl = null;
+  else if (!ttsUrl && chatText) ttsUrl = await synthesizeSpeech(config.tts, chatText);
+
+  return {
+    sessionId,
+    chatText,
+    track,
+    reason,
+    ttsUrl,
+    speech,
+    mode,
+    profile: payload?.profile || getProfile(db),
+    weather: payload?.weather || getSessionContext(db, sessionId).weather || '',
+    queueSource: source
   };
 }
 
@@ -273,24 +358,77 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
         : baseMood.searchHints,
       reason: turnAction.reason || baseMood.reason
     });
+    const musicContext = nextMusicContext(getSessionContext(db, sessionId).musicContext, conversationMood, userMessage);
+    const queuePolicy = decideQueuePolicy({
+      analysis: musicContext,
+      turnAction,
+      currentQueueItem: firstReadyQueueItem(getSessionQueue(db, sessionId))
+    });
+    const shouldQueueInsteadOfImmediate = Boolean(
+      currentTrack?.id &&
+      userMessage &&
+      queuePolicy.action === RADIO_QUEUE_POLICIES.HARD_PREEMPT &&
+      !isImmediateNextRequest(userMessage)
+    );
+
+    if (shouldQueueInsteadOfImmediate) {
+      const chatText = buildQueuePreemptReply({ userMessage, conversationMood, queuePolicy });
+      if (userMessage) saveMessage(db, sessionId, 'user', userMessage);
+      saveMessage(db, sessionId, 'assistant', chatText);
+      if (userMessage) {
+        scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: chatText, conversationMood });
+      }
+      setSessionContext(db, sessionId, {
+        ...getSessionContext(db, sessionId),
+        conversationState: nextConversationState,
+        musicContext
+      });
+      applyQueuePolicyToSession({ db, config, netease, sessionId, queuePolicy, musicContext, currentTrack });
+      const speech = speechDecisionForChat(prefs);
+      const ttsUrl = speech.shouldSpeak ? await synthesizeSpeech(config.tts, chatText) : null;
+      return {
+        sessionId,
+        chatText,
+        track: null,
+        reason: '',
+        ttsUrl,
+        speech,
+        mode,
+        profile,
+        weather: getSessionContext(db, sessionId).weather || '',
+        conversationMood,
+        turnAction,
+        queuePolicy,
+        intent: explicitIntent ? 'explicit' : 'mood',
+        intentSource
+      };
+    }
+
+    clearRadioQueue(db, sessionId);
     setSessionContext(db, sessionId, {
       ...getSessionContext(db, sessionId),
       conversationState: {
         ...nextConversationState,
         lastSuggestedAtUserCount: userMessageCountAfterThisTurn
       },
-      lastSuggestedAtUserCount: userMessageCountAfterThisTurn
+      lastSuggestedAtUserCount: userMessageCountAfterThisTurn,
+      musicContext
     });
-    const result = await djTurn({ db, config, netease, sessionId, userMessage, conversationMood });
+    const result = await djTurn({ db, config, netease, sessionId, userMessage, conversationMood, useQueue: false });
     setSessionContext(db, sessionId, {
       ...getSessionContext(db, sessionId),
       conversationState: {
         ...normalizeConversationState(getSessionContext(db, sessionId).conversationState),
         lastSuggestedAtUserCount: countUserMessages(db, sessionId)
       },
-      lastSuggestedAtUserCount: countUserMessages(db, sessionId)
+      lastSuggestedAtUserCount: countUserMessages(db, sessionId),
+      musicContext: normalizeMusicContext({
+        ...getSessionContext(db, sessionId).musicContext,
+        version: musicContext.version,
+        updatedAt: nowIso()
+      })
     });
-    return { ...result, conversationMood, turnAction, intent: explicitIntent ? 'explicit' : 'mood', intentSource };
+    return { ...result, conversationMood, turnAction, queuePolicy, intent: explicitIntent ? 'explicit' : 'mood', intentSource };
   }
 
   const chatDecision = await generateFriendReply({
@@ -316,6 +454,12 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     userMessage,
     userMessageCount: userMessageCountAfterThisTurn
   });
+  const musicContext = nextMusicContext(getSessionContext(db, sessionId).musicContext, conversationMood, userMessage);
+  const queuePolicy = decideQueuePolicy({
+    analysis: musicContext,
+    turnAction,
+    currentQueueItem: firstReadyQueueItem(getSessionQueue(db, sessionId))
+  });
 
   if (userMessage) saveMessage(db, sessionId, 'user', userMessage);
   saveMessage(db, sessionId, 'assistant', chatDecision.chatText);
@@ -329,8 +473,10 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
   }
   setSessionContext(db, sessionId, {
     ...getSessionContext(db, sessionId),
-    conversationState: finalConversationState
+    conversationState: finalConversationState,
+    musicContext
   });
+  applyQueuePolicyToSession({ db, config, netease, sessionId, queuePolicy, musicContext, currentTrack });
   const speech = speechDecisionForChat(prefs);
   const ttsUrl = speech.shouldSpeak
     ? await synthesizeSpeech(config.tts, chatDecision.chatText)
@@ -348,6 +494,7 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     weather: getSessionContext(db, sessionId).weather || '',
     conversationMood,
     turnAction,
+    queuePolicy,
     intent: 'chat',
     intentSource
   };
@@ -420,6 +567,224 @@ function getSessionContext(db, sessionId) {
 function setSessionContext(db, sessionId, context) {
   db.prepare('UPDATE radio_sessions SET context_json = ? WHERE id = ?')
     .run(JSON.stringify(context || {}), sessionId);
+}
+
+function getSessionQueue(db, sessionId) {
+  try {
+    const row = db.prepare('SELECT queue_json AS queueJson FROM radio_sessions WHERE id = ?').get(sessionId);
+    return normalizeRadioQueue(JSON.parse(row?.queueJson || '[]'));
+  } catch {
+    return [];
+  }
+}
+
+function setSessionQueue(db, sessionId, queue) {
+  db.prepare('UPDATE radio_sessions SET queue_json = ? WHERE id = ?')
+    .run(JSON.stringify(normalizeRadioQueue(queue).slice(0, RADIO_QUEUE_LIMIT)), sessionId);
+}
+
+export function normalizeRadioQueue(queue = []) {
+  if (!Array.isArray(queue)) return [];
+  const normalized = [];
+  const seenReadySongs = new Set();
+  for (const item of queue) {
+    const status = item?.status === 'pending' ? 'pending' : 'ready';
+    const track = item?.track || null;
+    if (status === 'ready' && !track?.id) continue;
+    const key = status === 'ready' ? playedSongKey(track?.name) : '';
+    if (key && seenReadySongs.has(key)) continue;
+    if (key) seenReadySongs.add(key);
+    normalized.push({
+      id: String(item?.id || `${status}-${Date.now()}-${Math.random().toString(16).slice(2)}`),
+      status,
+      createdAt: item?.createdAt || nowIso(),
+      updatedAt: item?.updatedAt || item?.createdAt || nowIso(),
+      contextVersion: Number(item?.contextVersion || item?.contextSnapshot?.version || 0),
+      contextSnapshot: normalizeMusicContext(item?.contextSnapshot || {}),
+      policy: item?.policy || RADIO_QUEUE_POLICIES.REFRESH_TAIL,
+      reason: item?.reason || '',
+      chatText: String(item?.chatText || '').trim(),
+      track,
+      ttsUrl: item?.ttsUrl || null,
+      speech: item?.speech || null,
+      mode: item?.mode || null,
+      profile: item?.profile || null,
+      weather: item?.weather || '',
+      newMode: item?.newMode || null,
+      conversationMood: item?.conversationMood ? normalizeMoodDecision(item.conversationMood) : null
+    });
+    if (normalized.length >= RADIO_QUEUE_LIMIT) break;
+  }
+  return normalized;
+}
+
+export function consumeReadyRadioQueue(db, sessionId) {
+  const queue = getSessionQueue(db, sessionId);
+  const index = queue.findIndex(item => item.status === 'ready' && item.track?.id);
+  if (index < 0) return null;
+  const [item] = queue.splice(index, 1);
+  setSessionQueue(db, sessionId, queue);
+  return item;
+}
+
+function clearRadioQueue(db, sessionId) {
+  setSessionQueue(db, sessionId, []);
+}
+
+function firstReadyQueueItem(queue = []) {
+  return normalizeRadioQueue(queue).find(item => item.status === 'ready' && item.track?.id) || null;
+}
+
+function queueTracksForAvoidance(queue = []) {
+  return normalizeRadioQueue(queue)
+    .filter(item => item.status === 'ready' && item.track?.id)
+    .map(item => item.track);
+}
+
+export function getRadioQueueStatus(db, sessionId) {
+  const queue = getSessionQueue(db, sessionId);
+  return {
+    queue,
+    queueSize: queue.length,
+    readyCount: queue.filter(item => item.status === 'ready').length,
+    pendingCount: queue.filter(item => item.status === 'pending').length
+  };
+}
+
+export function prefetchRadioQueue({ db, config, netease, sessionId, force = false } = {}) {
+  ensureSession(db, sessionId);
+  const context = getSessionContext(db, sessionId);
+  if (!context.musicContext) {
+    setSessionContext(db, sessionId, {
+      ...context,
+      musicContext: normalizeMusicContext({})
+    });
+  }
+  scheduleRadioQueueFill({ db, config, netease, sessionId, reason: 'warmup', force });
+  const status = getRadioQueueStatus(db, sessionId);
+  return {
+    ok: true,
+    sessionId,
+    queued: status.readyCount,
+    pending: status.pendingCount,
+    queueSize: status.queueSize
+  };
+}
+
+function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill', preempt = false, force = false, contextSnapshot = null } = {}) {
+  if (!sessionId) return false;
+  ensureSession(db, sessionId);
+  const context = getSessionContext(db, sessionId);
+  const musicContext = normalizeMusicContext(contextSnapshot || context.musicContext || {});
+  if (musicContext.musicIntent === 'suppressed') return false;
+
+  let queue = getSessionQueue(db, sessionId);
+  if (!force && queue.length >= RADIO_QUEUE_LIMIT) return false;
+  if (!preempt && queue.some(item => item.status === 'pending')) return false;
+
+  const pendingId = `pending-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  const pending = {
+    id: pendingId,
+    status: 'pending',
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    contextVersion: musicContext.version,
+    contextSnapshot: musicContext,
+    policy: preempt ? RADIO_QUEUE_POLICIES.HARD_PREEMPT : RADIO_QUEUE_POLICIES.REFRESH_TAIL,
+    reason
+  };
+
+  if (preempt) {
+    const compatibleTail = queue
+      .filter(item => item.status !== 'pending')
+      .filter(item => queueItemMatchesMusicContext(item, musicContext));
+    queue = [pending, ...compatibleTail].slice(0, RADIO_QUEUE_LIMIT);
+  } else {
+    queue = [...queue, pending].slice(0, RADIO_QUEUE_LIMIT);
+  }
+  setSessionQueue(db, sessionId, queue);
+
+  radioQueueJobs.add(pendingId);
+  void (async () => {
+    try {
+      const currentContext = normalizeMusicContext(getSessionContext(db, sessionId).musicContext || {});
+      if (!preempt && currentContext.version !== musicContext.version) {
+        removePendingQueueItem(db, sessionId, pendingId);
+        scheduleRadioQueueFill({ db, config, netease, sessionId, reason: 'refresh_after_context_change' });
+        return;
+      }
+      const currentQueue = getSessionQueue(db, sessionId);
+      const avoidTracks = queueTracksForAvoidance(currentQueue.filter(item => item.id !== pendingId));
+      const payload = await buildRadioRecommendation({
+        db,
+        config,
+        netease,
+        sessionId,
+        userMessage: null,
+        conversationMood: moodFromMusicContext(musicContext),
+        extraAvoidTracks: avoidTracks
+      });
+      const readyItem = normalizeRadioQueue([{
+        ...payload,
+        id: pendingId,
+        status: 'ready',
+        updatedAt: nowIso(),
+        contextVersion: musicContext.version,
+        contextSnapshot: musicContext,
+        policy: pending.policy,
+        reason
+      }])[0];
+      replacePendingQueueItem(db, sessionId, pendingId, readyItem);
+    } catch (error) {
+      console.warn('[radio queue prefetch failed]', error?.message || error);
+      removePendingQueueItem(db, sessionId, pendingId);
+    } finally {
+      radioQueueJobs.delete(pendingId);
+    }
+  })();
+  return true;
+}
+
+function removePendingQueueItem(db, sessionId, pendingId) {
+  setSessionQueue(db, sessionId, getSessionQueue(db, sessionId).filter(item => item.id !== pendingId));
+}
+
+function replacePendingQueueItem(db, sessionId, pendingId, readyItem) {
+  if (!readyItem?.track?.id) {
+    removePendingQueueItem(db, sessionId, pendingId);
+    return;
+  }
+  if (trackMatchesPlayedSongName(readyItem.track, getPlayedTrackHistory(db, sessionId, 80))) {
+    removePendingQueueItem(db, sessionId, pendingId);
+    return;
+  }
+  const readyKey = playedSongKey(readyItem.track.name);
+  const queue = getSessionQueue(db, sessionId);
+  const isPreempt = readyItem.policy === RADIO_QUEUE_POLICIES.HARD_PREEMPT ||
+    readyItem.policy === RADIO_QUEUE_POLICIES.SOFT_PREEMPT;
+  const keepNonDuplicate = (item) => {
+    if (item.id === pendingId) return false;
+    if (item.status !== 'ready') return true;
+    return !readyKey || playedSongKey(item.track?.name) !== readyKey;
+  };
+  let next;
+  if (isPreempt) {
+    next = [readyItem, ...queue.filter(keepNonDuplicate)];
+  } else {
+    let inserted = false;
+    next = [];
+    for (const item of queue) {
+      if (item.id === pendingId) {
+        next.push(readyItem);
+        inserted = true;
+        continue;
+      }
+      if (keepNonDuplicate(item)) next.push(item);
+    }
+    if (!inserted) next.push(readyItem);
+  }
+  next = next.slice(0, RADIO_QUEUE_LIMIT);
+  setSessionQueue(db, sessionId, next);
 }
 
 async function getCachedWeather(db, sessionId, weatherConfig) {
@@ -1484,6 +1849,168 @@ function normalizeMoodDecision(input = {}) {
   };
 }
 
+export function normalizeMusicContext(input = {}) {
+  const mood = normalizeMoodDecision(input);
+  return {
+    version: Number.isFinite(Number(input.version)) ? Number(input.version) : 0,
+    mood: mood.mood,
+    energy: mood.energy,
+    searchHints: uniqueStrings(mood.searchHints || [], 8),
+    preferenceHints: uniqueStrings(input.preferenceHints || mood.preferenceHints || [], 8),
+    avoidHints: uniqueStrings(input.avoidHints || mood.avoidHints || [], 8),
+    musicIntent: input.musicIntent || mood.musicIntent || 'chat',
+    confidence: Number.isFinite(Number(input.confidence)) ? Number(input.confidence) : (mood.confidence ?? 0.45),
+    reason: input.reason || mood.reason || '',
+    lastUserMessage: String(input.lastUserMessage || '').slice(0, 180),
+    updatedAt: input.updatedAt || nowIso()
+  };
+}
+
+function nextMusicContext(previous = {}, analysis = {}, userMessage = '') {
+  const normalizedPrevious = normalizeMusicContext(previous);
+  const normalizedAnalysis = normalizeMoodDecision(analysis);
+  return normalizeMusicContext({
+    ...normalizedPrevious,
+    ...normalizedAnalysis,
+    version: normalizedPrevious.version + 1,
+    searchHints: uniqueStrings([
+      ...(normalizedAnalysis.searchHints || []),
+      ...(normalizedPrevious.searchHints || [])
+    ], 8),
+    preferenceHints: uniqueStrings([
+      ...(normalizedAnalysis.preferenceHints || []),
+      ...(normalizedPrevious.preferenceHints || [])
+    ], 8),
+    avoidHints: uniqueStrings([
+      ...(normalizedAnalysis.avoidHints || []),
+      ...(normalizedPrevious.avoidHints || [])
+    ], 8),
+    musicIntent: normalizedAnalysis.musicIntent || normalizedPrevious.musicIntent || 'chat',
+    confidence: normalizedAnalysis.confidence ?? normalizedPrevious.confidence,
+    reason: normalizedAnalysis.reason || normalizedPrevious.reason || '',
+    lastUserMessage: userMessage || normalizedPrevious.lastUserMessage || '',
+    updatedAt: nowIso()
+  });
+}
+
+function moodFromMusicContext(context = {}) {
+  const musicContext = normalizeMusicContext(context);
+  return normalizeMoodDecision({
+    shouldRecommend: musicContext.musicIntent !== 'chat' && musicContext.musicIntent !== 'suppressed',
+    mood: musicContext.mood,
+    energy: musicContext.energy,
+    intent: musicContext.musicIntent === 'explicit_music' ? 'music' : 'mood',
+    searchHints: musicContext.searchHints,
+    preferenceHints: musicContext.preferenceHints,
+    avoidHints: musicContext.avoidHints,
+    musicIntent: musicContext.musicIntent,
+    confidence: musicContext.confidence,
+    reason: musicContext.reason
+  });
+}
+
+export function decideQueuePolicy({ analysis = {}, turnAction = {}, currentQueueItem = null } = {}) {
+  const mood = normalizeMoodDecision(analysis);
+  if (mood.musicIntent === 'suppressed' || turnAction?.reason === 'user explicitly rejected playback or switching') {
+    return { action: RADIO_QUEUE_POLICIES.CLEAR, reason: 'user suppressed music' };
+  }
+  if (mood.musicIntent === 'explicit_music') {
+    return { action: RADIO_QUEUE_POLICIES.HARD_PREEMPT, reason: 'explicit music request' };
+  }
+  if (turnAction?.action === TURN_ACTIONS.RECOMMEND_AND_PLAY && mood.intent === 'music') {
+    return { action: RADIO_QUEUE_POLICIES.HARD_PREEMPT, reason: 'recommend action' };
+  }
+  if (mood.musicIntent === 'mood_signal' && (mood.confidence ?? 0) >= 0.65) {
+    const matches = currentQueueItem ? queueItemMatchesMusicContext(currentQueueItem, mood) : false;
+    return {
+      action: matches ? RADIO_QUEUE_POLICIES.REFRESH_TAIL : RADIO_QUEUE_POLICIES.SOFT_PREEMPT,
+      reason: matches ? 'ready queue still matches mood' : 'strong mood shift'
+    };
+  }
+  return { action: RADIO_QUEUE_POLICIES.REFRESH_TAIL, reason: 'ordinary chat updates future queue' };
+}
+
+export function queueItemMatchesMusicContext(item = {}, musicContext = {}) {
+  if (!item?.track?.id) return false;
+  const itemContext = normalizeMusicContext(item.contextSnapshot || {});
+  const target = normalizeMusicContext(musicContext || {});
+  if (target.musicIntent === 'explicit_music') return false;
+  if (itemContext.energy === 'high' && target.energy === 'low') return false;
+  if (itemContext.energy === 'low' && target.energy === 'high') return false;
+  if (target.mood !== 'random' && itemContext.mood !== 'random' && target.mood !== itemContext.mood) {
+    const compatible = new Set([
+      'comfort:calm',
+      'calm:comfort',
+      'night:calm',
+      'calm:night',
+      'healing:comfort',
+      'comfort:healing'
+    ]);
+    if (!compatible.has(`${itemContext.mood}:${target.mood}`)) return false;
+  }
+  const itemHints = new Set((itemContext.searchHints || []).map(normalizeMusicText).filter(Boolean));
+  const targetHints = (target.searchHints || []).map(normalizeMusicText).filter(Boolean);
+  if (targetHints.length && itemHints.size && !targetHints.some(hint => itemHints.has(hint))) {
+    return false;
+  }
+  return true;
+}
+
+function applyQueuePolicyToSession({ db, config, netease, sessionId, queuePolicy = {}, musicContext = {}, currentTrack = null }) {
+  const action = queuePolicy?.action || RADIO_QUEUE_POLICIES.REFRESH_TAIL;
+  if (action === RADIO_QUEUE_POLICIES.CLEAR) {
+    clearRadioQueue(db, sessionId);
+    return;
+  }
+  const queue = getSessionQueue(db, sessionId);
+  const hasActiveRadioContext = Boolean(currentTrack?.id) || queue.length > 0;
+  if (!hasActiveRadioContext) return;
+  if (action === RADIO_QUEUE_POLICIES.HARD_PREEMPT) {
+    scheduleRadioQueueFill({
+      db,
+      config,
+      netease,
+      sessionId,
+      reason: queuePolicy.reason || 'hard_preempt',
+      preempt: true,
+      force: true,
+      contextSnapshot: musicContext
+    });
+    return;
+  }
+  if (action === RADIO_QUEUE_POLICIES.SOFT_PREEMPT) {
+    const head = firstReadyQueueItem(queue);
+    if (!head || !queueItemMatchesMusicContext(head, musicContext)) {
+      scheduleRadioQueueFill({
+        db,
+        config,
+        netease,
+        sessionId,
+        reason: queuePolicy.reason || 'soft_preempt',
+        preempt: true,
+        force: true,
+        contextSnapshot: musicContext
+      });
+    }
+  }
+}
+
+function buildQueuePreemptReply({ userMessage = '', conversationMood = {}, queuePolicy = {} } = {}) {
+  const hints = uniqueStrings([
+    ...(conversationMood.searchHints || []),
+    ...(conversationMood.preferenceHints || [])
+  ], 2);
+  if (hints.length) {
+    return `好，我把下一首先按「${hints.join('、')}」这个方向换掉。现在这首不用硬切，等它接上时会更贴近你刚刚说的感觉。`;
+  }
+  if (conversationMood.musicIntent === 'explicit_music') {
+    return '好，我把下一首按你刚说的要求重新排到最前面。现在这首先不断掉，等下一首接上。';
+  }
+  return queuePolicy.reason === 'strong mood shift'
+    ? '我听到了，这个状态变化挺明显的。下一首我会先往新的情绪方向调，不让队列继续按旧感觉走。'
+    : '好，我把下一首重新调整到更贴近你刚刚说的方向。';
+}
+
 function fallbackFriendChat(userMessage, mood, turnAction = null) {
   const text = String(userMessage || '').trim();
   if (isLightGreeting(userMessage)) {
@@ -1644,6 +2171,26 @@ function getPlayedTrackHistory(db, sessionId, limit = 80) {
   } catch {}
 
   return items.slice(0, limit);
+}
+
+function mergePlayedTrackHistory(baseHistory = [], extraTracks = [], limit = 80) {
+  const merged = [];
+  const seen = new Set();
+  const add = (track = {}) => {
+    const key = playedSongKey(track.name) || String(track.id || '').trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    merged.push({
+      id: String(track.id || track.trackId || ''),
+      name: String(track.name || ''),
+      artists: Array.isArray(track.artists) ? track.artists : [],
+      album: track.album || '',
+      playedAt: track.playedAt || track.played_at || ''
+    });
+  };
+  for (const track of extraTracks || []) add(track);
+  for (const track of baseHistory || []) add(track);
+  return merged.slice(0, limit);
 }
 
 function mergePlayedSongContext(existing = [], track = {}) {
@@ -2036,8 +2583,8 @@ function getArtistPenaltyByName(db) {
   return penalties;
 }
 
-async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, hostContext = {} }) {
-  const playedHistory = getPlayedTrackHistory(db, sessionId, 80);
+async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, hostContext = {}, avoidTracks = [] }) {
+  const playedHistory = mergePlayedTrackHistory(getPlayedTrackHistory(db, sessionId, 80), avoidTracks);
   const playedIds = new Set(playedHistory.map(track => String(track.id || '')).filter(Boolean));
   const playedSignatures = buildPlayedSignatureSet(playedHistory);
   const request = getMusicRequestConstraints(db, userMessage, mode);
