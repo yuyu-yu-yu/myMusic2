@@ -41,6 +41,9 @@ const DEFAULT_PREFS = Object.freeze({
   note: ''
 });
 const RADIO_QUEUE_LIMIT = 2;
+const RADIO_QUEUE_DIAGNOSTIC_LIMIT = 4;
+const RADIO_QUEUE_DIAGNOSTIC_TTL_MS = 10 * 60 * 1000;
+const QUEUE_ITEM_STATUSES = new Set(['pending', 'ready', 'failed', 'stale']);
 const RADIO_QUEUE_POLICIES = Object.freeze({
   REFRESH_TAIL: 'refresh_tail',
   HARD_PREEMPT: 'hard_preempt',
@@ -127,6 +130,7 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
       scheduleRadioQueueFill({ db, config, netease, sessionId, reason: 'after_consume' });
       return { ...response, queueHit: true };
     }
+    updateQueueMetrics(db, sessionId, { queueMissCount: 1, lastMissReason: 'no_ready_queue_item' });
   }
 
   const payload = await buildRadioRecommendation({
@@ -147,6 +151,9 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
     source: 'sync'
   });
   scheduleRadioQueueFill({ db, config, netease, sessionId, reason: 'after_sync' });
+  if (useQueue && !normalizedUserMessage) {
+    updateQueueMetrics(db, sessionId, { syncFallbackCount: 1 });
+  }
   return { ...response, queueHit: false };
 }
 
@@ -202,9 +209,11 @@ async function buildRadioRecommendation({
   });
 
   const speech = speechDecisionForRecommendation(prefs);
-  const ttsUrl = speech.shouldSpeak
-    ? await synthesizeSpeech(config.tts, result.chatText)
-    : null;
+  const tts = speech.shouldSpeak
+    ? await synthesizeSpeechWithDiagnostics(config.tts, result.chatText)
+    : { url: null, status: 'disabled', ms: 0, error: null };
+  if (tts.status === 'failed') updateQueueMetrics(db, sessionId, { ttsFailedCount: 1 });
+  setRadioDebugInfo(db, sessionId, { lastTtsDiagnostics: sanitizeTtsDiagnostics(tts) });
   const musicContext = normalizeMusicContext(context.musicContext);
 
   return {
@@ -216,7 +225,11 @@ async function buildRadioRecommendation({
     chatText: result.chatText,
     track: result.track,
     reason: result.reason,
-    ttsUrl,
+    explanation: result.explanation,
+    ttsUrl: tts.url,
+    ttsStatus: tts.status,
+    ttsMs: tts.ms,
+    ttsError: tts.error,
     speech,
     mode: result.newMode || mode,
     profile,
@@ -230,6 +243,15 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
   const chatText = String(payload?.chatText || '').trim();
   const track = payload?.track || null;
   const reason = payload?.reason || '';
+  let explanation = normalizeRecommendationExplanation(payload?.explanation);
+  if (source === 'queue' && explanation) {
+    explanation = normalizeRecommendationExplanation({
+      ...explanation,
+      factors: [{ type: 'queue', text: '来自已准备好的预取队列' }, ...(explanation.factors || [])],
+      summary: `预取队列命中 + ${explanation.summary}`,
+      source: explanation.source
+    });
+  }
 
   if (userMessage) saveMessage(db, sessionId, 'user', userMessage);
   saveMessage(db, sessionId, 'assistant', chatText);
@@ -262,15 +284,30 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
   const prefs = normalizeRuntimePrefs(getUserPrefs(db));
   const speech = speechDecisionForRecommendation(prefs);
   let ttsUrl = payload?.ttsUrl || null;
+  let ttsStatus = payload?.ttsStatus || (ttsUrl ? 'ready' : null);
+  let ttsMs = Number(payload?.ttsMs || 0);
+  let ttsError = payload?.ttsError || null;
   if (!speech.shouldSpeak) ttsUrl = null;
-  else if (!ttsUrl && chatText) ttsUrl = await synthesizeSpeech(config.tts, chatText);
+  else if (!ttsUrl && chatText && payload?.ttsStatus !== 'failed') {
+    const tts = await synthesizeSpeechWithDiagnostics(config.tts, chatText);
+    ttsUrl = tts.url;
+    ttsStatus = tts.status;
+    ttsMs = tts.ms;
+    ttsError = tts.error;
+    if (tts.status === 'failed') updateQueueMetrics(db, sessionId, { ttsFailedCount: 1 });
+    setRadioDebugInfo(db, sessionId, { lastTtsDiagnostics: sanitizeTtsDiagnostics(tts) });
+  }
 
   return {
     sessionId,
     chatText,
     track,
     reason,
+    explanation,
     ttsUrl,
+    ttsStatus,
+    ttsMs,
+    ttsError,
     speech,
     mode,
     profile: payload?.profile || getProfile(db),
@@ -569,6 +606,13 @@ function setSessionContext(db, sessionId, context) {
     .run(JSON.stringify(context || {}), sessionId);
 }
 
+function updateSessionContext(db, sessionId, updater) {
+  const current = getSessionContext(db, sessionId);
+  const next = typeof updater === 'function' ? updater(current) : { ...current, ...(updater || {}) };
+  setSessionContext(db, sessionId, next);
+  return next;
+}
+
 function getSessionQueue(db, sessionId) {
   try {
     const row = db.prepare('SELECT queue_json AS queueJson FROM radio_sessions WHERE id = ?').get(sessionId);
@@ -580,7 +624,7 @@ function getSessionQueue(db, sessionId) {
 
 function setSessionQueue(db, sessionId, queue) {
   db.prepare('UPDATE radio_sessions SET queue_json = ? WHERE id = ?')
-    .run(JSON.stringify(normalizeRadioQueue(queue).slice(0, RADIO_QUEUE_LIMIT)), sessionId);
+    .run(JSON.stringify(pruneRadioQueue(normalizeRadioQueue(queue))), sessionId);
 }
 
 export function normalizeRadioQueue(queue = []) {
@@ -588,8 +632,8 @@ export function normalizeRadioQueue(queue = []) {
   const normalized = [];
   const seenReadySongs = new Set();
   for (const item of queue) {
-    const status = item?.status === 'pending' ? 'pending' : 'ready';
-    const track = item?.track || null;
+    const status = QUEUE_ITEM_STATUSES.has(item?.status) ? item.status : 'ready';
+    const track = status === 'pending' ? null : (item?.track || null);
     if (status === 'ready' && !track?.id) continue;
     const key = status === 'ready' ? playedSongKey(track?.name) : '';
     if (key && seenReadySongs.has(key)) continue;
@@ -602,29 +646,116 @@ export function normalizeRadioQueue(queue = []) {
       contextVersion: Number(item?.contextVersion || item?.contextSnapshot?.version || 0),
       contextSnapshot: normalizeMusicContext(item?.contextSnapshot || {}),
       policy: item?.policy || RADIO_QUEUE_POLICIES.REFRESH_TAIL,
+      preemptReason: item?.preemptReason || null,
       reason: item?.reason || '',
       chatText: String(item?.chatText || '').trim(),
       track,
       ttsUrl: item?.ttsUrl || null,
+      ttsStatus: item?.ttsStatus || (item?.ttsUrl ? 'ready' : null),
+      ttsMs: Number(item?.ttsMs || 0),
+      ttsError: item?.ttsError || null,
       speech: item?.speech || null,
       mode: item?.mode || null,
       profile: item?.profile || null,
       weather: item?.weather || '',
       newMode: item?.newMode || null,
-      conversationMood: item?.conversationMood ? normalizeMoodDecision(item.conversationMood) : null
+      conversationMood: item?.conversationMood ? normalizeMoodDecision(item.conversationMood) : null,
+      explanation: normalizeRecommendationExplanation(item?.explanation),
+      failedStage: item?.failedStage || null,
+      error: item?.error ? String(item.error).slice(0, 240) : null,
+      staleReason: item?.staleReason || null
     });
-    if (normalized.length >= RADIO_QUEUE_LIMIT) break;
   }
   return normalized;
 }
 
+function pruneRadioQueue(queue = []) {
+  const now = Date.now();
+  const active = [];
+  const diagnostics = [];
+  for (const item of normalizeRadioQueue(queue)) {
+    if (item.status === 'ready' || item.status === 'pending') {
+      if (active.length < RADIO_QUEUE_LIMIT) active.push(item);
+      continue;
+    }
+    const updatedAt = new Date(item.updatedAt || item.createdAt || 0).getTime();
+    if (!updatedAt || now - updatedAt <= RADIO_QUEUE_DIAGNOSTIC_TTL_MS) diagnostics.push(item);
+  }
+  return [...active, ...diagnostics.slice(0, RADIO_QUEUE_DIAGNOSTIC_LIMIT)];
+}
+
+function normalizeQueueMetrics(metrics = {}) {
+  return {
+    queueHitCount: Number(metrics.queueHitCount || 0),
+    queueMissCount: Number(metrics.queueMissCount || 0),
+    syncFallbackCount: Number(metrics.syncFallbackCount || 0),
+    hardPreemptCount: Number(metrics.hardPreemptCount || 0),
+    softPreemptCount: Number(metrics.softPreemptCount || 0),
+    ttsFailedCount: Number(metrics.ttsFailedCount || 0),
+    lastQueueHitAt: metrics.lastQueueHitAt || null,
+    lastMissReason: metrics.lastMissReason || null
+  };
+}
+
+function updateQueueMetrics(db, sessionId, patch = {}) {
+  if (!sessionId) return normalizeQueueMetrics();
+  let nextMetrics = null;
+  updateSessionContext(db, sessionId, (context) => {
+    const current = normalizeQueueMetrics(context.queueMetrics || {});
+    nextMetrics = normalizeQueueMetrics({
+      ...current,
+      queueHitCount: current.queueHitCount + Number(patch.queueHitCount || 0),
+      queueMissCount: current.queueMissCount + Number(patch.queueMissCount || 0),
+      syncFallbackCount: current.syncFallbackCount + Number(patch.syncFallbackCount || 0),
+      hardPreemptCount: current.hardPreemptCount + Number(patch.hardPreemptCount || 0),
+      softPreemptCount: current.softPreemptCount + Number(patch.softPreemptCount || 0),
+      ttsFailedCount: current.ttsFailedCount + Number(patch.ttsFailedCount || 0),
+      lastQueueHitAt: patch.lastQueueHitAt ?? current.lastQueueHitAt,
+      lastMissReason: patch.lastMissReason ?? current.lastMissReason
+    });
+    return { ...context, queueMetrics: nextMetrics };
+  });
+  return nextMetrics;
+}
+
+function setRadioDebugInfo(db, sessionId, patch = {}) {
+  if (!sessionId) return;
+  updateSessionContext(db, sessionId, (context) => ({
+    ...context,
+    radioDebug: {
+      ...(context.radioDebug || {}),
+      ...patch,
+      updatedAt: nowIso()
+    }
+  }));
+}
+
 export function consumeReadyRadioQueue(db, sessionId) {
   const queue = getSessionQueue(db, sessionId);
-  const index = queue.findIndex(item => item.status === 'ready' && item.track?.id);
-  if (index < 0) return null;
-  const [item] = queue.splice(index, 1);
+  const context = getSessionContext(db, sessionId);
+  const musicContext = normalizeMusicContext(context.musicContext || {});
+  for (let index = 0; index < queue.length; index += 1) {
+    const item = queue[index];
+    if (item.status !== 'ready' || !item.track?.id) continue;
+    const staleByContext = item.contextVersion < musicContext.version &&
+      !queueItemMatchesMusicContext(item, musicContext);
+    if (staleByContext) {
+      queue[index] = {
+        ...item,
+        status: 'stale',
+        updatedAt: nowIso(),
+        staleReason: 'context_mismatch'
+      };
+      updateQueueMetrics(db, sessionId, { queueMissCount: 1, lastMissReason: 'stale_queue_head' });
+      continue;
+    }
+    queue.splice(index, 1);
+    setSessionQueue(db, sessionId, queue);
+    updateQueueMetrics(db, sessionId, { queueHitCount: 1, lastQueueHitAt: nowIso(), lastMissReason: null });
+    return item;
+  }
   setSessionQueue(db, sessionId, queue);
-  return item;
+  return null;
 }
 
 function clearRadioQueue(db, sessionId) {
@@ -647,7 +778,10 @@ export function getRadioQueueStatus(db, sessionId) {
     queue,
     queueSize: queue.length,
     readyCount: queue.filter(item => item.status === 'ready').length,
-    pendingCount: queue.filter(item => item.status === 'pending').length
+    pendingCount: queue.filter(item => item.status === 'pending').length,
+    failedCount: queue.filter(item => item.status === 'failed').length,
+    staleCount: queue.filter(item => item.status === 'stale').length,
+    queueMetrics: normalizeQueueMetrics(getSessionContext(db, sessionId).queueMetrics || {})
   };
 }
 
@@ -671,7 +805,57 @@ export function prefetchRadioQueue({ db, config, netease, sessionId, force = fal
   };
 }
 
-function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill', preempt = false, force = false, contextSnapshot = null } = {}) {
+export function getRadioDebugStatus(db, sessionId) {
+  const id = String(sessionId || '').trim();
+  if (!id) {
+    return { __error: true, ok: false, status: 400, error: 'sessionId is required' };
+  }
+  const row = db.prepare('SELECT context_json AS contextJson, queue_json AS queueJson FROM radio_sessions WHERE id = ?').get(id);
+  if (!row) {
+    return { __error: true, ok: false, status: 404, error: 'radio session not found' };
+  }
+  const context = safeJsonObject(row.contextJson);
+  const queue = normalizeRadioQueue(safeJsonArray(row.queueJson));
+  const debug = context.radioDebug || {};
+  return {
+    ok: true,
+    sessionId: id,
+    musicContext: normalizeMusicContext(context.musicContext || {}),
+    conversationState: normalizeConversationState(context.conversationState || {}),
+    queue: queue.map(sanitizeQueueItemForDebug),
+    queueMetrics: normalizeQueueMetrics(context.queueMetrics || {}),
+    recentPlayedSongs: getPlayedTrackHistory(db, id, 20).map(sanitizeTrackForDebug),
+    recentFeedback: getRecentSessionFeedback(db, id, 10),
+    lastSongPlan: debug.lastSongPlan || null,
+    lastSearchDiagnostics: Array.isArray(debug.lastSearchDiagnostics) ? debug.lastSearchDiagnostics.slice(0, 6) : [],
+    lastTtsDiagnostics: debug.lastTtsDiagnostics || null,
+    updatedAt: debug.updatedAt || null
+  };
+}
+
+function sanitizeQueueItemForDebug(item = {}) {
+  return {
+    id: item.id,
+    status: item.status,
+    createdAt: item.createdAt,
+    updatedAt: item.updatedAt,
+    contextVersion: item.contextVersion,
+    contextSnapshot: item.contextSnapshot,
+    policy: item.policy,
+    preemptReason: item.preemptReason,
+    reason: item.reason,
+    track: item.track ? sanitizeTrackForDebug(item.track) : null,
+    explanation: normalizeRecommendationExplanation(item.explanation),
+    ttsStatus: item.ttsStatus,
+    ttsMs: item.ttsMs,
+    ttsError: item.ttsError,
+    failedStage: item.failedStage,
+    error: item.error,
+    staleReason: item.staleReason
+  };
+}
+
+function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill', preemptReason = null, preempt = false, force = false, contextSnapshot = null } = {}) {
   if (!sessionId) return false;
   ensureSession(db, sessionId);
   const context = getSessionContext(db, sessionId);
@@ -679,7 +863,8 @@ function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill
   if (musicContext.musicIntent === 'suppressed') return false;
 
   let queue = getSessionQueue(db, sessionId);
-  if (!force && queue.length >= RADIO_QUEUE_LIMIT) return false;
+  const activeCount = queue.filter(item => item.status === 'ready' || item.status === 'pending').length;
+  if (!force && activeCount >= RADIO_QUEUE_LIMIT) return false;
   if (!preempt && queue.some(item => item.status === 'pending')) return false;
 
   const pendingId = `pending-${Date.now()}-${Math.random().toString(16).slice(2)}`;
@@ -691,16 +876,19 @@ function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill
     contextVersion: musicContext.version,
     contextSnapshot: musicContext,
     policy: preempt ? RADIO_QUEUE_POLICIES.HARD_PREEMPT : RADIO_QUEUE_POLICIES.REFRESH_TAIL,
+    preemptReason,
     reason
   };
 
   if (preempt) {
     const compatibleTail = queue
-      .filter(item => item.status !== 'pending')
+      .filter(item => item.status === 'ready')
       .filter(item => queueItemMatchesMusicContext(item, musicContext));
-    queue = [pending, ...compatibleTail].slice(0, RADIO_QUEUE_LIMIT);
+    queue = [pending, ...compatibleTail, ...queue.filter(item => item.status === 'failed' || item.status === 'stale')];
   } else {
-    queue = [...queue, pending].slice(0, RADIO_QUEUE_LIMIT);
+    const active = queue.filter(item => item.status === 'ready' || item.status === 'pending');
+    const diagnostics = queue.filter(item => item.status === 'failed' || item.status === 'stale');
+    queue = [...active, pending, ...diagnostics];
   }
   setSessionQueue(db, sessionId, queue);
 
@@ -709,7 +897,7 @@ function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill
     try {
       const currentContext = normalizeMusicContext(getSessionContext(db, sessionId).musicContext || {});
       if (!preempt && currentContext.version !== musicContext.version) {
-        removePendingQueueItem(db, sessionId, pendingId);
+        markQueueItemStale(db, sessionId, pendingId, 'context_changed_while_pending');
         scheduleRadioQueueFill({ db, config, netease, sessionId, reason: 'refresh_after_context_change' });
         return;
       }
@@ -732,12 +920,16 @@ function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill
         contextVersion: musicContext.version,
         contextSnapshot: musicContext,
         policy: pending.policy,
+        preemptReason: pending.preemptReason,
         reason
       }])[0];
       replacePendingQueueItem(db, sessionId, pendingId, readyItem);
     } catch (error) {
       console.warn('[radio queue prefetch failed]', error?.message || error);
-      removePendingQueueItem(db, sessionId, pendingId);
+      markPendingQueueItemFailed(db, sessionId, pendingId, {
+        failedStage: 'prefetch',
+        error: error?.message || String(error)
+      });
     } finally {
       radioQueueJobs.delete(pendingId);
     }
@@ -745,17 +937,50 @@ function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill
   return true;
 }
 
+function markPendingQueueItemFailed(db, sessionId, pendingId, { failedStage = 'prefetch', error = '' } = {}) {
+  const queue = getSessionQueue(db, sessionId).map(item => {
+    if (item.id !== pendingId) return item;
+    return {
+      ...item,
+      status: 'failed',
+      updatedAt: nowIso(),
+      failedStage,
+      error: String(error || '').slice(0, 240)
+    };
+  });
+  setSessionQueue(db, sessionId, queue);
+}
+
 function removePendingQueueItem(db, sessionId, pendingId) {
   setSessionQueue(db, sessionId, getSessionQueue(db, sessionId).filter(item => item.id !== pendingId));
 }
 
+function markQueueItemStale(db, sessionId, itemId, staleReason = 'stale') {
+  const queue = getSessionQueue(db, sessionId).map(item => {
+    if (item.id !== itemId) return item;
+    return {
+      ...item,
+      status: 'stale',
+      updatedAt: nowIso(),
+      staleReason
+    };
+  });
+  setSessionQueue(db, sessionId, queue);
+}
+
 function replacePendingQueueItem(db, sessionId, pendingId, readyItem) {
   if (!readyItem?.track?.id) {
-    removePendingQueueItem(db, sessionId, pendingId);
+    markPendingQueueItemFailed(db, sessionId, pendingId, {
+      failedStage: 'recommendation',
+      error: 'no playable track confirmed'
+    });
     return;
   }
   if (trackMatchesPlayedSongName(readyItem.track, getPlayedTrackHistory(db, sessionId, 80))) {
-    removePendingQueueItem(db, sessionId, pendingId);
+    markPendingQueueItemFailed(db, sessionId, pendingId, {
+      failedStage: 'dedupe',
+      error: 'prefetched track was already played'
+    });
     return;
   }
   const readyKey = playedSongKey(readyItem.track.name);
@@ -783,7 +1008,6 @@ function replacePendingQueueItem(db, sessionId, pendingId, readyItem) {
     }
     if (!inserted) next.push(readyItem);
   }
-  next = next.slice(0, RADIO_QUEUE_LIMIT);
   setSessionQueue(db, sessionId, next);
 }
 
@@ -844,6 +1068,123 @@ function speechDecisionForChat(prefs = {}) {
     mode: normalized.voiceMode,
     shouldSpeak: normalized.voiceMode === 'all'
   };
+}
+
+async function synthesizeSpeechWithDiagnostics(ttsConfig, text) {
+  const started = Date.now();
+  try {
+    const url = await synthesizeSpeech(ttsConfig, text);
+    const ms = Date.now() - started;
+    return {
+      url,
+      status: url ? 'ready' : 'failed',
+      ms,
+      error: url ? null : 'tts returned no audio'
+    };
+  } catch (error) {
+    return {
+      url: null,
+      status: 'failed',
+      ms: Date.now() - started,
+      error: String(error?.message || error).slice(0, 240)
+    };
+  }
+}
+
+function sanitizeTtsDiagnostics(tts = {}) {
+  return {
+    status: tts.status || (tts.url ? 'ready' : 'unknown'),
+    ms: Number(tts.ms || 0),
+    hasUrl: Boolean(tts.url),
+    error: tts.error || null,
+    updatedAt: nowIso()
+  };
+}
+
+function normalizeRecommendationExplanation(explanation = null) {
+  if (!explanation || typeof explanation !== 'object') return null;
+  const factors = Array.isArray(explanation.factors)
+    ? explanation.factors
+      .map((factor) => ({
+        type: String(factor?.type || 'fallback').trim(),
+        text: String(factor?.text || factor?.value || '').trim().slice(0, 80)
+      }))
+      .filter(factor => factor.text)
+      .slice(0, 6)
+    : [];
+  const summary = String(explanation.summary || factors.map(factor => factor.text).join(' + ')).trim().slice(0, 180);
+  if (!summary && !factors.length) return null;
+  return {
+    summary,
+    factors,
+    source: explanation.source === 'llm_pick' ? 'llm_pick' : 'fallback'
+  };
+}
+
+function buildRecommendationExplanation({
+  selectedPick = {},
+  selectedTrack = {},
+  userMessage = '',
+  conversationMood = null,
+  timeOfDay = '',
+  weather = '',
+  profile = {},
+  hostContext = {},
+  source = 'fallback'
+} = {}) {
+  const factors = [];
+  const add = (type, text) => {
+    const value = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!value) return;
+    if (factors.some(factor => factor.type === type && factor.text === value)) return;
+    factors.push({ type, text: value.slice(0, 80) });
+  };
+
+  if (String(userMessage || '').trim()) {
+    add(hasExplicitMusicIntent(userMessage) ? 'explicit_request' : 'chat', `你刚刚说：${String(userMessage).trim().slice(0, 34)}`);
+  }
+  if (selectedPick?.reason) add('chat', selectedPick.reason);
+  if (conversationMood?.searchHints?.length) add('chat', `当前氛围：${conversationMood.searchHints.slice(0, 3).join(' / ')}`);
+  if (timeOfDay) add('time', `现在是${timeOfDay}`);
+  const weatherHint = shortWeatherHint(weather);
+  if (weatherHint) add('weather', weatherHint);
+  const profileHint = shortProfileHint(profile);
+  if (profileHint) add('profile', profileHint);
+  const feedbackHint = shortFeedbackHint(hostContext.recentFeedback);
+  if (feedbackHint) add('feedback', feedbackHint);
+
+  if (!factors.length && selectedTrack?.name) add('fallback', `已确认《${selectedTrack.name}》可播放`);
+  return normalizeRecommendationExplanation({
+    factors,
+    source: source === 'llm_pick' || selectedPick?.reason ? 'llm_pick' : 'fallback'
+  });
+}
+
+function shortWeatherHint(weather = '') {
+  const text = String(weather || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  return text
+    .replace(/。.*$/g, '')
+    .replace(/，.*?天气/g, '，天气')
+    .slice(0, 44);
+}
+
+function shortProfileHint(profile = {}) {
+  const structured = profile?.structured || {};
+  const artists = Array.isArray(structured.artists) ? structured.artists.map(item => item?.name).filter(Boolean).slice(0, 2) : [];
+  const moods = Array.isArray(structured.moods) ? structured.moods.map(item => item?.name).filter(Boolean).slice(0, 2) : [];
+  const genres = Array.isArray(structured.genres) ? structured.genres.map(item => item?.name).filter(Boolean).slice(0, 2) : [];
+  const parts = [...artists, ...genres, ...moods].filter(Boolean).slice(0, 3);
+  if (parts.length) return `你的画像偏好：${parts.join(' / ')}`;
+  const summary = String(profile?.summary || '').trim();
+  return summary ? `参考你的音乐画像：${summary.slice(0, 34)}` : '';
+}
+
+function shortFeedbackHint(events = []) {
+  const items = (events || []).filter(event => event?.eventType).slice(0, 3);
+  if (!items.length) return '';
+  const labels = { like: '喜欢', dislike: '不喜欢', skip: '跳过', complete: '完整播放' };
+  return `最近反馈：${items.map(event => labels[event.eventType] || event.eventType).join(' / ')}`;
 }
 
 function normalizeConversationState(state = {}) {
@@ -1966,12 +2307,14 @@ function applyQueuePolicyToSession({ db, config, netease, sessionId, queuePolicy
   const hasActiveRadioContext = Boolean(currentTrack?.id) || queue.length > 0;
   if (!hasActiveRadioContext) return;
   if (action === RADIO_QUEUE_POLICIES.HARD_PREEMPT) {
+    updateQueueMetrics(db, sessionId, { hardPreemptCount: 1 });
     scheduleRadioQueueFill({
       db,
       config,
       netease,
       sessionId,
       reason: queuePolicy.reason || 'hard_preempt',
+      preemptReason: inferPreemptReason(queuePolicy, musicContext),
       preempt: true,
       force: true,
       contextSnapshot: musicContext
@@ -1981,18 +2324,30 @@ function applyQueuePolicyToSession({ db, config, netease, sessionId, queuePolicy
   if (action === RADIO_QUEUE_POLICIES.SOFT_PREEMPT) {
     const head = firstReadyQueueItem(queue);
     if (!head || !queueItemMatchesMusicContext(head, musicContext)) {
+      updateQueueMetrics(db, sessionId, { softPreemptCount: 1 });
       scheduleRadioQueueFill({
         db,
         config,
         netease,
         sessionId,
         reason: queuePolicy.reason || 'soft_preempt',
+        preemptReason: inferPreemptReason(queuePolicy, musicContext),
         preempt: true,
         force: true,
         contextSnapshot: musicContext
       });
     }
   }
+}
+
+function inferPreemptReason(queuePolicy = {}, musicContext = {}) {
+  if (queuePolicy.reason === 'mode_change') return 'mode_change';
+  if (musicContext.musicIntent === 'explicit_music') return 'explicit_music';
+  if (musicContext.musicIntent === 'feedback') return 'feedback_change';
+  if (musicContext.musicIntent === 'mood_signal') return 'mood_shift';
+  if (queuePolicy.action === RADIO_QUEUE_POLICIES.HARD_PREEMPT) return 'explicit_music';
+  if (queuePolicy.action === RADIO_QUEUE_POLICIES.SOFT_PREEMPT) return 'mood_shift';
+  return queuePolicy.reason || 'context_change';
 }
 
 function buildQueuePreemptReply({ userMessage = '', conversationMood = {}, queuePolicy = {} } = {}) {
@@ -2284,6 +2639,15 @@ function safeJsonArray(value) {
     return Array.isArray(parsed) ? parsed : [];
   } catch {
     return [];
+  }
+}
+
+function safeJsonObject(value) {
+  try {
+    const parsed = JSON.parse(value || '{}');
+    return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
   }
 }
 
@@ -2611,10 +2975,12 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
       hostContext
     });
     lastPlan = plan;
+    setRadioDebugInfo(db, sessionId, { lastSongPlan: sanitizeSongPlan(plan, attempt) });
     if (!newMode) newMode = modeDecisionFromPlan(plan);
     if (!plan.picks.length) break;
 
-    const resolved = await resolveSongPlanTrack({ db, netease, plan, playedIds, playedSignatures });
+    const resolved = await resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, playedSignatures });
+    setRadioDebugInfo(db, sessionId, { lastSearchDiagnostics: resolved.diagnostics || [] });
     if (resolved.track) {
       const chatText = await generateFinalHostText({
         config,
@@ -2636,6 +3002,17 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
         chatText,
         track: resolved.track,
         reason: resolved.pick.reason || '根据当前状态和音乐画像推荐',
+        explanation: buildRecommendationExplanation({
+          selectedPick: resolved.pick,
+          selectedTrack: resolved.track,
+          userMessage,
+          conversationMood,
+          timeOfDay,
+          weather,
+          profile,
+          hostContext,
+          source: resolved.pick?.reason ? 'llm_pick' : 'fallback'
+        }),
         newMode
       };
     }
@@ -2766,52 +3143,137 @@ function formatPlayedSongExclusions(playedHistory = []) {
     : '本轮/最近已播放歌名：无';
 }
 
-async function resolveSongPlanTrack({ db, netease, plan, playedIds, playedSignatures = new Set() }) {
+async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, playedSignatures = new Set() }) {
   const failedPicks = [];
+  const diagnostics = [];
   for (const pick of plan.picks) {
+    const pickDiagnostic = {
+      pick: sanitizeSongPick(pick),
+      queries: buildSongSearchQueries(pick),
+      hits: [],
+      selectedTrackId: null,
+      failedReason: null
+    };
     if (trackMatchesPlayedSongName(pick, playedSignatures)) {
+      pickDiagnostic.failedReason = 'played_song_name';
+      diagnostics.push(pickDiagnostic);
       failedPicks.push(pick);
       continue;
     }
-    const tracks = await searchTracksForSongPick(pick);
-    const ranked = tracks
-      .map(track => ({ track, score: scoreSearchTrackForPick(track, pick) }))
+    const search = await searchTracksForSongPick(pick);
+    pickDiagnostic.queries = search.queries;
+    pickDiagnostic.queryDiagnostics = search.queryDiagnostics;
+    const ranked = search.tracks
+      .map(track => {
+        const score = scoreSearchTrackForPick(track, pick);
+        const diagnostic = {
+          track: sanitizeTrackForDebug(track),
+          score,
+          accepted: score >= 100,
+          filterReason: score >= 100 ? null : 'name_or_artist_mismatch',
+          playable: null
+        };
+        pickDiagnostic.hits.push(diagnostic);
+        return { track, score, diagnostic };
+      })
       .filter(item => item.score >= 100)
       .sort((a, b) => b.score - a.score)
-      .map(item => item.track);
+      .slice(0, 8);
 
-    for (const track of ranked) {
-      if (playedIds.has(String(track.id))) continue;
-      if (trackMatchesPlayedSongName(track, playedSignatures)) continue;
+    for (const item of ranked) {
+      const track = item.track;
+      if (playedIds.has(String(track.id))) {
+        item.diagnostic.accepted = false;
+        item.diagnostic.filterReason = 'played_track_id';
+        continue;
+      }
+      if (trackMatchesPlayedSongName(track, playedSignatures)) {
+        item.diagnostic.accepted = false;
+        item.diagnostic.filterReason = 'played_song_name';
+        continue;
+      }
+      const playableStarted = Date.now();
       const playable = await resolvePlayableTrack(db, netease, track, { includeLyric: false });
-      if (!playable?.playable) continue;
+      item.diagnostic.playable = Boolean(playable?.playable);
+      item.diagnostic.playableMs = Date.now() - playableStarted;
+      if (!playable?.playable) {
+        item.diagnostic.accepted = false;
+        item.diagnostic.filterReason = 'not_playable';
+        continue;
+      }
       const withLyric = await resolvePlayableTrack(db, netease, playable, { includeLyric: true });
+      pickDiagnostic.selectedTrackId = String((withLyric?.playable ? withLyric : playable)?.id || '');
+      diagnostics.push(trimSearchDiagnostic(pickDiagnostic));
       return {
         track: withLyric?.playable ? withLyric : playable,
-        pick
+        pick,
+        diagnostics
       };
     }
+    if (!pickDiagnostic.failedReason) {
+      pickDiagnostic.failedReason = ranked.length ? 'no_playable_match' : 'no_matching_search_hit';
+    }
+    diagnostics.push(trimSearchDiagnostic(pickDiagnostic));
     failedPicks.push(pick);
   }
-  return { track: null, pick: null, failedPicks };
+  return { track: null, pick: null, failedPicks, diagnostics };
 }
 
 async function searchTracksForSongPick(pick) {
   const seen = new Set();
   const results = [];
   const queries = buildSongSearchQueries(pick);
+  const queryDiagnostics = [];
   for (const query of queries) {
     try {
       const tracks = await searchOnline(query, 10);
+      queryDiagnostics.push({ query, count: tracks.length, error: null });
       for (const track of tracks) {
         const id = String(track?.id || '');
         if (!id || seen.has(id)) continue;
         seen.add(id);
         results.push(track);
       }
-    } catch {}
+    } catch (error) {
+      queryDiagnostics.push({ query, count: 0, error: String(error?.message || error).slice(0, 160) });
+    }
   }
-  return results;
+  return { tracks: results, queries, queryDiagnostics };
+}
+
+function sanitizeSongPlan(plan = {}, attempt = 0) {
+  return {
+    attempt,
+    picks: (plan?.picks || []).map(sanitizeSongPick).slice(0, 3),
+    hostDraft: String(plan?.hostDraft || '').slice(0, 160),
+    mode: plan?.mode ?? null,
+    updatedAt: nowIso()
+  };
+}
+
+function sanitizeSongPick(pick = {}) {
+  return {
+    name: String(pick.name || '').slice(0, 80),
+    artists: normalizeArtistList(pick.artists || []).slice(0, 4),
+    reason: String(pick.reason || '').slice(0, 140),
+    queries: Array.isArray(pick.queries) ? pick.queries.map(query => String(query || '').slice(0, 60)).slice(0, 5) : []
+  };
+}
+
+function sanitizeTrackForDebug(track = {}) {
+  return {
+    id: String(track.id || ''),
+    name: String(track.name || '').slice(0, 80),
+    artists: Array.isArray(track.artists) ? track.artists.slice(0, 4) : [],
+    album: String(track.album || '').slice(0, 80)
+  };
+}
+
+function trimSearchDiagnostic(diagnostic = {}) {
+  return {
+    ...diagnostic,
+    hits: (diagnostic.hits || []).slice(0, 8)
+  };
 }
 
 export function buildSongSearchQueries(pick = {}) {

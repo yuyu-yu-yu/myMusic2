@@ -524,6 +524,18 @@ export function replacePlaylistTracks(db, playlistId, trackIds = []) {
   }
 }
 
+export function clearPlaylistLibrary(db) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare('DELETE FROM playlist_tracks').run();
+    db.prepare('DELETE FROM playlists').run();
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 export function normalizeTrack(input) {
   const song = input?.song ?? input?.track ?? input?.resource ?? input ?? {};
   const id = String(song.id ?? song.songId ?? song.trackId ?? song.resourceId ?? input?.songId ?? input?.id ?? `local-${Date.now()}`);

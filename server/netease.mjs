@@ -10,7 +10,7 @@ export class NeteaseClient {
 
   setTokens(accessToken, refreshToken) {
     this._accessToken = accessToken;
-    if (refreshToken) this._refreshToken = refreshToken;
+    this._refreshToken = refreshToken || '';
     this.onTokenChange?.(accessToken, refreshToken);
   }
 

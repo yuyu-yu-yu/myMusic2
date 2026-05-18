@@ -1,7 +1,22 @@
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
+import { getSetting, openDatabase } from '../server/db.mjs';
+import { extractQrAuthorizationCode, resolveQrOpenApiLogin } from '../server/netease-auth.mjs';
 import { getSignContent, NeteaseClient, signParams } from '../server/netease.mjs';
+
+function testDb(t) {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mymusic-netease-'));
+  const db = openDatabase(rootDir);
+  t.after(() => {
+    db.close();
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  });
+  return db;
+}
 
 test('getSignContent sorts params and removes sign/empty values', () => {
   const content = getSignContent({
@@ -200,6 +215,126 @@ test('NeteaseClient throws when accessToken is expired and cannot refresh', asyn
   } finally {
     globalThis.fetch = originalFetch;
   }
+});
+
+test('QR OpenAPI login saves direct accessToken payload', async (t) => {
+  const db = testDb(t);
+  const saved = [];
+  const netease = {
+    setTokens: (accessToken, refreshToken) => saved.push({ accessToken, refreshToken }),
+    hasToken: () => Boolean(saved.at(-1)?.accessToken),
+    userProfile: async () => ({ data: { profile: { userId: 'user-direct', nickname: 'Direct User' } } })
+  };
+
+  const result = await resolveQrOpenApiLogin({
+    db,
+    netease,
+    result: {
+      data: {
+        status: 803,
+        accessToken: {
+          accessToken: 'direct-access',
+          refreshToken: 'direct-refresh'
+        }
+      }
+    }
+  });
+
+  assert.equal(result.loggedIn, true);
+  assert.equal(result.tokenSource, 'direct');
+  assert.deepEqual(saved.at(-1), { accessToken: 'direct-access', refreshToken: 'direct-refresh' });
+  assert.equal(getSetting(db, 'netease_access_token'), 'direct-access');
+  assert.equal(getSetting(db, 'netease_refresh_token'), 'direct-refresh');
+  assert.equal(getSetting(db, 'netease_user_id'), 'user-direct');
+  assert.equal(getSetting(db, 'netease_user_nickname'), 'Direct User');
+});
+
+test('QR OpenAPI login exchanges authorization code before saving token', async (t) => {
+  const db = testDb(t);
+  const calls = [];
+  const saved = [];
+  const netease = {
+    tokenFromCode: async (code) => {
+      calls.push(code);
+      return {
+        data: {
+          accessToken: {
+            accessToken: 'code-access',
+            refreshToken: 'code-refresh'
+          }
+        }
+      };
+    },
+    setTokens: (accessToken, refreshToken) => saved.push({ accessToken, refreshToken }),
+    hasToken: () => Boolean(saved.at(-1)?.accessToken),
+    userProfile: async () => ({ data: { profile: { userId: 'user-code', nickname: 'Code User' } } })
+  };
+
+  const result = await resolveQrOpenApiLogin({
+    db,
+    netease,
+    result: { data: { status: 803, authorizationCode: 'auth-code-1' } }
+  });
+
+  assert.equal(result.loggedIn, true);
+  assert.equal(result.tokenSource, 'authorization_code');
+  assert.deepEqual(calls, ['auth-code-1']);
+  assert.deepEqual(saved.at(-1), { accessToken: 'code-access', refreshToken: 'code-refresh' });
+  assert.equal(getSetting(db, 'netease_access_token'), 'code-access');
+  assert.equal(getSetting(db, 'netease_refresh_token'), 'code-refresh');
+  assert.equal(getSetting(db, 'netease_user_id'), 'user-code');
+});
+
+test('QR OpenAPI login requires readable user profile before reporting logged in', async (t) => {
+  const db = testDb(t);
+  const saved = [];
+  const netease = {
+    setTokens: (accessToken, refreshToken) => saved.push({ accessToken, refreshToken }),
+    hasToken: () => Boolean(saved.at(-1)?.accessToken),
+    userProfile: async () => { throw new Error('profile unreadable'); }
+  };
+
+  const result = await resolveQrOpenApiLogin({
+    db,
+    netease,
+    result: {
+      data: {
+        status: 803,
+        accessToken: {
+          accessToken: 'direct-access',
+          refreshToken: 'direct-refresh'
+        }
+      }
+    }
+  });
+
+  assert.equal(result.loggedIn, false);
+  assert.equal(result.tokenSaved, true);
+  assert.equal(result.hasToken, true);
+  assert.equal(result.profileReadable, false);
+  assert.match(result.loginMessage, /profile unreadable|重新扫码/);
+  assert.equal(getSetting(db, 'netease_access_token'), 'direct-access');
+  assert.equal(getSetting(db, 'netease_user_id'), null);
+});
+
+test('QR OpenAPI login does not treat QR status codes as authorization codes', async (t) => {
+  const db = testDb(t);
+  const netease = {
+    tokenFromCode: async () => { throw new Error('should not exchange status code'); },
+    setTokens: () => { throw new Error('should not save token'); },
+    hasToken: () => false
+  };
+
+  const result = await resolveQrOpenApiLogin({
+    db,
+    netease,
+    result: { data: { status: 803, code: 803 } }
+  });
+
+  assert.equal(result.loggedIn, false);
+  assert.equal(result.tokenSaved, false);
+  assert.equal(result.tokenSource, null);
+  assert.equal(extractQrAuthorizationCode({ data: { status: 802, code: 802 } }), null);
 });
 
 function createPrivatePem() {

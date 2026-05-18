@@ -1,26 +1,79 @@
-import { getSetting, listRecentPlays, normalizeTrack, nowIso, replacePlaylistTracks, savePlaylist, saveTrack, seedDemoLibrary, setSetting } from './db.mjs';
+import { clearPlaylistLibrary, getSetting, listRecentPlays, normalizeTrack, nowIso, replacePlaylistTracks, savePlaylist, saveTrack, seedDemoLibrary, setSetting } from './db.mjs';
 import { getSongUrl, getLyric as getCommunityLyric } from './community.mjs';
 import { generateChatCompletion } from './ai.mjs';
+import { getNeteaseLoginStatus } from './netease-auth.mjs';
 
 const PROFILE_EXCLUDED_PLAYLIST_IDS_KEY = 'profile_excluded_playlist_ids';
 const EMPTY_PROFILE_SUMMARY = '尚未选择用于生成音乐画像的网易云歌单。请在曲库页勾选至少一个歌单后，灿灿会只根据这些歌单生成长期音乐画像。';
 const PLAYLIST_SYNC_PAGE_SIZE = 200;
+const LIBRARY_SYNCED_USER_ID_KEY = 'library_synced_user_id';
 
-export async function syncLibrary(db, netease) {
+export async function syncLibrary(db, netease, options = {}) {
+  const onProgress = typeof options.onProgress === 'function' ? options.onProgress : () => {};
+  const llmConfig = options.llmConfig;
   const result = {
     mode: netease.isConfigured() ? 'netease' : 'demo',
     playlists: 0,
     tracks: 0,
-    errors: []
+    errors: [],
+    diagnostics: [],
+    user: null,
+    syncedPlaylists: 0
   };
+  const progress = (patch = {}) => onProgress({
+    phase: patch.phase || 'syncing_tracks',
+    syncedTracks: result.tracks,
+    syncedPlaylists: result.syncedPlaylists || 0,
+    errors: [...result.errors],
+    diagnostics: [...result.diagnostics],
+    ...patch
+  });
 
   if (!netease.isConfigured()) {
+    progress({ phase: 'syncing_tracks', currentPlaylistIndex: 1, totalPlaylists: 1, currentPlaylistName: 'Demo Library' });
     seedDemoLibrary(db);
     const tracks = listLibraryTracks(db, 100);
     result.tracks = tracks.length;
     result.playlists = 1;
-    await updateProfile(db);
+    result.syncedPlaylists = 1;
+    progress({ phase: 'updating_profile', syncedTracks: result.tracks, syncedPlaylists: result.syncedPlaylists });
+    await updateProfile(db, llmConfig);
+    progress({ phase: 'done', syncedTracks: result.tracks, syncedPlaylists: result.syncedPlaylists });
     return result;
+  }
+
+  if (typeof netease.hasToken === 'function' && !netease.hasToken()) {
+    return {
+      __error: true,
+      ok: false,
+      status: 401,
+      error: '请先在设置页扫码登录网易云',
+      mode: 'netease',
+      playlists: 0,
+      tracks: countLibraryTracks(db),
+      errors: ['请先在设置页扫码登录网易云']
+    };
+  }
+
+  progress({ phase: 'checking_login' });
+  const login = await getNeteaseLoginStatus({ db, netease });
+  result.user = {
+    userId: login.userId || '',
+    nickname: login.nickname || ''
+  };
+  if (!login.profileReadable) {
+    return {
+      __error: true,
+      ok: false,
+      status: 401,
+      error: login.message || '请重新扫码登录网易云',
+      mode: 'netease',
+      playlists: 0,
+      tracks: countLibraryTracks(db),
+      errors: [login.message || '请重新扫码登录网易云'],
+      diagnostics: result.diagnostics,
+      user: result.user
+    };
   }
 
   const playlistJobs = [
@@ -29,28 +82,88 @@ export async function syncLibrary(db, netease) {
     ['created', () => netease.createdPlaylists()]
   ];
 
-  const playlists = [];
+  const playlistRecords = [];
+  progress({ phase: 'fetching_playlists', user: result.user });
   for (const [kind, job] of playlistJobs) {
     try {
       const response = await job();
       const records = extractPlaylistRecords(response.data);
-      for (const item of records) {
-        const playlist = savePlaylist(db, item, kind);
-        playlists.push(playlist);
-      }
+      result.diagnostics.push(buildPlaylistDiagnostic(kind, response, records));
+      playlistRecords.push(...records.map(item => ({ kind, item })));
+      progress({ phase: 'fetching_playlists', totalPlaylists: playlistRecords.length });
     } catch (error) {
       result.errors.push(`${kind}: ${error.message}`);
+      result.diagnostics.push(buildPlaylistDiagnostic(kind, null, [], error));
+      progress({ phase: 'fetching_playlists' });
     }
   }
 
+  if (!playlistRecords.length) {
+    return {
+      __error: true,
+      ok: false,
+      status: 502,
+      error: '登录成功，但没有读取到网易云歌单，请检查账号权限或重新扫码',
+      mode: 'netease',
+      playlists: 0,
+      tracks: countLibraryTracks(db),
+      errors: ['登录成功，但没有读取到网易云歌单，请检查账号权限或重新扫码', ...result.errors],
+      diagnostics: result.diagnostics,
+      user: result.user
+    };
+  }
+
+  const previousSyncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
+  if (result.user.userId && previousSyncedUserId && previousSyncedUserId !== result.user.userId) {
+    clearPlaylistLibrary(db);
+  }
+
+  const playlistById = new Map();
+  for (const { kind, item } of playlistRecords) {
+    const playlist = savePlaylist(db, item, kind);
+    if (!playlistById.has(playlist.id)) playlistById.set(playlist.id, playlist);
+  }
+  const playlists = [...playlistById.values()];
+  result.playlists = playlists.length;
+
   for (const playlist of playlists) {
     try {
-      const records = await fetchAllPlaylistSongs(netease, playlist);
+      const currentPlaylistIndex = playlists.indexOf(playlist) + 1;
+      progress({
+        phase: 'syncing_tracks',
+        currentPlaylistIndex,
+        totalPlaylists: playlists.length,
+        currentPlaylistName: playlist.name,
+        currentPlaylistSynced: 0,
+        currentPlaylistTotal: playlist.trackCount ?? null
+      });
+      const records = await fetchAllPlaylistSongs(netease, playlist, PLAYLIST_SYNC_PAGE_SIZE, ({ synced, total }) => {
+        progress({
+          phase: 'syncing_tracks',
+          currentPlaylistIndex,
+          totalPlaylists: playlists.length,
+          currentPlaylistName: playlist.name,
+          currentPlaylistSynced: synced,
+          currentPlaylistTotal: total
+        });
+      });
       const trackIds = records.map((item) => saveTrack(db, item).id);
       replacePlaylistTracks(db, playlist.id, trackIds);
       result.tracks += trackIds.length;
+      result.syncedPlaylists += 1;
+      progress({
+        phase: 'syncing_tracks',
+        currentPlaylistIndex,
+        totalPlaylists: playlists.length,
+        currentPlaylistName: playlist.name,
+        currentPlaylistSynced: trackIds.length,
+        currentPlaylistTotal: playlist.trackCount ?? trackIds.length,
+        syncedTracks: result.tracks,
+        syncedPlaylists: result.syncedPlaylists
+      });
     } catch (error) {
       result.errors.push(`playlist ${playlist.id}: ${error.message}`);
+      progress({ phase: 'syncing_tracks' });
     }
   }
 
@@ -68,9 +181,11 @@ export async function syncLibrary(db, netease) {
     result.errors.push(`recent: ${error.message}`);
   }
 
-  result.playlists = playlists.length;
   result.tracks = countLibraryTracks(db);
-  await updateProfile(db);
+  progress({ phase: 'updating_profile', syncedTracks: result.tracks, syncedPlaylists: result.syncedPlaylists });
+  await updateProfile(db, llmConfig);
+  if (result.user.userId) setSetting(db, LIBRARY_SYNCED_USER_ID_KEY, result.user.userId);
+  progress({ phase: 'done', syncedTracks: result.tracks, syncedPlaylists: result.syncedPlaylists });
   return result;
 }
 
@@ -202,6 +317,9 @@ export function getLibrary(db) {
   const playlists = getLibraryPlaylists(db);
   const profileSelection = getProfileSelection(db, playlists);
   const selectedIds = new Set(profileSelection.selectedIds);
+  const loginUserId = getSetting(db, 'netease_user_id') || '';
+  const loginNickname = getSetting(db, 'netease_user_nickname') || '';
+  const syncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
   return {
     profile: getProfile(db),
     tracks: listLibraryTracks(db, 5000),
@@ -212,7 +330,13 @@ export function getLibrary(db) {
     recent: listRecentPlays(db, 50),
     totalTracks: countLibraryTracks(db),
     totalPlaylistTracks: countPlaylistTrackLinks(db),
-    profileSelection
+    profileSelection,
+    account: {
+      userId: loginUserId,
+      nickname: loginNickname,
+      syncedUserId,
+      accountMismatch: Boolean(loginUserId && syncedUserId && loginUserId !== syncedUserId)
+    }
   };
 }
 
@@ -243,6 +367,18 @@ function extractPlaylistRecords(data) {
   return [];
 }
 
+function buildPlaylistDiagnostic(kind, response, records = [], error = null) {
+  const data = response?.data ?? response ?? {};
+  const dataObject = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
+  return {
+    kind,
+    ok: !error,
+    recordCount: records.length,
+    message: error?.message || dataObject.message || dataObject.msg || response?.message || response?.msg || '',
+    dataKeys: Object.keys(dataObject).slice(0, 12)
+  };
+}
+
 function isPlaylistLike(item) {
   return Boolean(item && typeof item === 'object' && !Array.isArray(item) && (
     item.id !== undefined ||
@@ -252,7 +388,7 @@ function isPlaylistLike(item) {
   ));
 }
 
-async function fetchAllPlaylistSongs(netease, playlist, pageSize = PLAYLIST_SYNC_PAGE_SIZE) {
+async function fetchAllPlaylistSongs(netease, playlist, pageSize = PLAYLIST_SYNC_PAGE_SIZE, onPage = null) {
   const expectedCount = getPlaylistRemoteTrackCount(playlist);
   const records = [];
   let offset = 0;
@@ -262,6 +398,9 @@ async function fetchAllPlaylistSongs(netease, playlist, pageSize = PLAYLIST_SYNC
     const pageRecords = extractRecords(response.data);
     if (!pageRecords.length) break;
     records.push(...pageRecords);
+    if (typeof onPage === 'function') {
+      onPage({ synced: records.length, total: expectedCount ?? null, offset, pageSize });
+    }
     offset += pageRecords.length;
     if (pageRecords.length < pageSize) break;
   }

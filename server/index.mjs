@@ -7,8 +7,9 @@ import { fileURLToPath } from 'node:url';
 import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
 import { openDatabase, seedDemoLibrary, getSetting, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
+import { extractOpenApiTokenPayload, getNeteaseLoginStatus, resolveQrOpenApiLogin, saveOpenApiToken } from './netease-auth.mjs';
 import { getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
-import { chatRadio, getMemories, getPreferences, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
+import { chatRadio, getMemories, getPreferences, getRadioDebug, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
 import { loadCookie } from './community.mjs';
@@ -22,7 +23,7 @@ const netease = new NeteaseClient(config.netease);
 const player = createNcmPlayer({ db });
 netease.onTokenChange = (accessToken, refreshToken) => {
   setSetting(db, 'netease_access_token', accessToken);
-  if (refreshToken) setSetting(db, 'netease_refresh_token', refreshToken);
+  setSetting(db, 'netease_refresh_token', refreshToken || '');
 };
 const savedAccessToken = getSetting(db, 'netease_access_token');
 const savedRefreshToken = getSetting(db, 'netease_refresh_token');
@@ -37,6 +38,96 @@ await updateProfile(db, config.llm);
 const publicDir = path.join(rootDir, 'public');
 const cacheDir = path.join(rootDir, 'cache', 'tts');
 
+let librarySyncStatus = createIdleLibrarySyncStatus();
+
+function createIdleLibrarySyncStatus() {
+  return {
+    ok: true,
+    jobId: null,
+    status: 'idle',
+    phase: 'idle',
+    currentPlaylistIndex: 0,
+    totalPlaylists: 0,
+    currentPlaylistName: '',
+    currentPlaylistSynced: 0,
+    currentPlaylistTotal: null,
+    syncedTracks: 0,
+    syncedPlaylists: 0,
+    errors: [],
+    diagnostics: [],
+    result: null,
+    startedAt: null,
+    finishedAt: null
+  };
+}
+
+function getLibrarySyncStatus() {
+  return { ...librarySyncStatus, errors: [...librarySyncStatus.errors], diagnostics: [...librarySyncStatus.diagnostics] };
+}
+
+function patchLibrarySyncStatus(patch = {}) {
+  librarySyncStatus = {
+    ...librarySyncStatus,
+    ...patch,
+    errors: patch.errors ? [...patch.errors] : librarySyncStatus.errors,
+    diagnostics: patch.diagnostics ? [...patch.diagnostics] : librarySyncStatus.diagnostics
+  };
+  return getLibrarySyncStatus();
+}
+
+function startLibrarySyncJob() {
+  if (librarySyncStatus.status === 'running') return getLibrarySyncStatus();
+  const jobId = crypto.randomUUID();
+  librarySyncStatus = {
+    ...createIdleLibrarySyncStatus(),
+    jobId,
+    status: 'running',
+    phase: 'checking_login',
+    startedAt: new Date().toISOString()
+  };
+
+  void (async () => {
+    try {
+      const result = await syncLibrary(db, netease, {
+        llmConfig: config.llm,
+        onProgress: (progress) => {
+          if (librarySyncStatus.jobId !== jobId) return;
+          patchLibrarySyncStatus({
+            status: 'running',
+            ...progress
+          });
+        }
+      });
+      if (result?.__error || result?.ok === false) {
+        throw Object.assign(new Error(result.error || '同步失败'), { result });
+      }
+      patchLibrarySyncStatus({
+        status: 'success',
+        phase: 'done',
+        syncedTracks: result.tracks || librarySyncStatus.syncedTracks,
+        syncedPlaylists: result.syncedPlaylists || result.playlists || librarySyncStatus.syncedPlaylists,
+        totalPlaylists: result.playlists || librarySyncStatus.totalPlaylists,
+        errors: result.errors || [],
+        diagnostics: result.diagnostics || librarySyncStatus.diagnostics,
+        result,
+        finishedAt: new Date().toISOString()
+      });
+    } catch (error) {
+      const result = error?.result || null;
+      patchLibrarySyncStatus({
+        status: 'failed',
+        phase: librarySyncStatus.phase === 'idle' ? 'checking_login' : librarySyncStatus.phase,
+        errors: result?.errors?.length ? result.errors : [error.message || '同步失败'],
+        diagnostics: result?.diagnostics || librarySyncStatus.diagnostics,
+        result,
+        finishedAt: new Date().toISOString()
+      });
+    }
+  })();
+
+  return getLibrarySyncStatus();
+}
+
 const routes = {
   'GET /api/health': async () => ({ ok: true, config: tokenStatus(publicConfigStatus(config)) }),
   'GET /api/config/status': async () => tokenStatus(publicConfigStatus(config)),
@@ -46,18 +137,18 @@ const routes = {
     const key = body.key || body.qrCodeKey;
     if (!key) return jsonError('qrCodeKey is required', 400);
     const result = await netease.qrcodeStatus(key);
-    tryNeteaseLogin(db, netease, result);
-    return result;
+    const login = await resolveQrOpenApiLogin({ db, netease, result });
+    return attachLoginMeta(result, { ...login, hasToken: netease.hasToken() });
   },
   'GET /api/auth/netease/token-status': async () => ({
-    configured: netease.isConfigured(),
-    hasToken: netease.hasToken()
+    ...(await getNeteaseLoginStatus({ db, netease }))
   }),
   'POST /api/auth/netease/refresh': async () => {
     const ok = await tryRefreshToken(db, netease);
     return { ok, token: netease.hasToken() };
   },
-  'POST /api/library/sync': async () => syncLibrary(db, netease),
+  'POST /api/library/sync': async () => startLibrarySyncJob(),
+  'GET /api/library/sync/status': async () => getLibrarySyncStatus(),
   'GET /api/library': async () => getLibrary(db),
   'GET /api/library/profile': async () => getProfile(db),
   'PUT /api/library/profile-playlists': async (req) => {
@@ -76,6 +167,11 @@ const routes = {
   'POST /api/radio/prefetch': async (req) => {
     const body = await readJson(req);
     return prefetchRadio({ db, config, netease, sessionId: body.sessionId, force: Boolean(body.force) });
+  },
+  'GET /api/radio/debug': async (req) => {
+    const url = new URL(req.url, 'http://local');
+    const sessionId = url.searchParams.get('sessionId') || '';
+    return getRadioDebug({ db, sessionId });
   },
   'POST /api/radio/chat': async (req) => {
     const body = await readJson(req);
@@ -154,18 +250,12 @@ async function renderQrDataUrl(text) {
   }
 }
 
-function tryNeteaseLogin(db, netease, result) {
-  const data = result?.data || result;
-  const token = data?.accessToken;
-  if (!token || typeof token !== 'object') return false;
-  const accessToken = token.accessToken;
-  const refreshToken = token.refreshToken;
-  if (!accessToken || accessToken === 'null') return false;
-  netease.setTokens(accessToken, refreshToken || '');
-  setSetting(db, 'netease_access_token', accessToken);
-  if (refreshToken) setSetting(db, 'netease_refresh_token', refreshToken);
-  console.log('[netease] token saved from QR login');
-  return true;
+function attachLoginMeta(result, meta) {
+  const payload = result && typeof result === 'object' ? { ...result } : { data: result };
+  if (payload.data && typeof payload.data === 'object' && !Array.isArray(payload.data)) {
+    payload.data = { ...payload.data, ...meta };
+  }
+  return { ...payload, ...meta };
 }
 
 async function tryRefreshToken(db, netease) {
@@ -173,15 +263,12 @@ async function tryRefreshToken(db, netease) {
   if (!refreshToken) return false;
   try {
     const result = await netease.refreshToken(refreshToken);
-    const data = result?.data || result;
-    const token = data?.accessToken;
-    if (!token || typeof token !== 'object') return false;
-    const newAccessToken = token.accessToken;
-    const newRefreshToken = token.refreshToken || refreshToken;
-    if (!newAccessToken || newAccessToken === 'null') return false;
-    netease.setTokens(newAccessToken, newRefreshToken);
-    setSetting(db, 'netease_access_token', newAccessToken);
-    if (newRefreshToken !== refreshToken) setSetting(db, 'netease_refresh_token', newRefreshToken);
+    const token = extractOpenApiTokenPayload(result);
+    if (!token?.accessToken) return false;
+    saveOpenApiToken(db, netease, {
+      accessToken: token.accessToken,
+      refreshToken: token.refreshToken || refreshToken
+    });
     console.log('[netease] token refreshed');
     return true;
   } catch (error) {

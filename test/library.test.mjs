@@ -122,6 +122,8 @@ test('library sync paginates all playlists and replaces stale playlist links', a
   const calls = [];
   const netease = {
     isConfigured: () => true,
+    hasToken: () => true,
+    userProfile: async () => ({ data: { profile: { userId: 'user-1', nickname: 'Tester' } } }),
     starPlaylist: async () => ({ data: { records: [playlists[0]] } }),
     subscribedPlaylists: async () => ({ data: { records: playlists.slice(1) } }),
     createdPlaylists: async () => ({ data: { records: [] } }),
@@ -158,6 +160,8 @@ test('failed playlist sync keeps previous playlist links and reports the error',
   });
   const netease = {
     isConfigured: () => true,
+    hasToken: () => true,
+    userProfile: async () => ({ data: { profile: { userId: 'user-1', nickname: 'Tester' } } }),
     starPlaylist: async () => ({ data: { records: [{ id: 'pl-fail', name: 'Fail Playlist', trackCount: 2 }] } }),
     subscribedPlaylists: async () => ({ data: { records: [] } }),
     createdPlaylists: async () => ({ data: { records: [] } }),
@@ -174,6 +178,54 @@ test('failed playlist sync keeps previous playlist links and reports the error',
   assert.equal(failed.syncedTrackCount, 1);
   assert.equal(failed.syncComplete, false);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?').get('pl-fail', existing.id).count, 1);
+});
+
+test('library sync requires NetEase token when OpenAPI is configured', async (t) => {
+  const db = testDb(t);
+  const result = await syncLibrary(db, {
+    isConfigured: () => true,
+    hasToken: () => false
+  });
+
+  assert.equal(result.__error, true);
+  assert.equal(result.status, 401);
+  assert.match(result.error, /扫码登录网易云/);
+});
+
+test('library sync verifies NetEase profile before reading playlists', async (t) => {
+  const db = testDb(t);
+  const result = await syncLibrary(db, {
+    isConfigured: () => true,
+    hasToken: () => true,
+    userProfile: async () => { throw new Error('profile denied'); }
+  });
+
+  assert.equal(result.__error, true);
+  assert.equal(result.status, 401);
+  assert.match(result.error, /profile denied|重新扫码/);
+  assert.equal(getLibrary(db).playlists.length, 0);
+});
+
+test('library sync fails clearly when logged in account returns zero playlists', async (t) => {
+  const db = testDb(t);
+  const progress = [];
+  const result = await syncLibrary(db, {
+    isConfigured: () => true,
+    hasToken: () => true,
+    userProfile: async () => ({ data: { profile: { userId: 'empty-user', nickname: 'Empty' } } }),
+    starPlaylist: async () => ({ data: { records: [] } }),
+    subscribedPlaylists: async () => ({ data: { list: [] } }),
+    createdPlaylists: async () => ({ data: { playlists: [] } })
+  }, {
+    onProgress: (status) => progress.push(status)
+  });
+
+  assert.equal(result.__error, true);
+  assert.equal(result.status, 502);
+  assert.equal(result.diagnostics.length, 3);
+  assert.deepEqual(result.diagnostics.map(item => item.recordCount), [0, 0, 0]);
+  assert.equal(progress.some(item => item.phase === 'checking_login'), true);
+  assert.equal(progress.some(item => item.phase === 'fetching_playlists'), true);
 });
 
 test('profile playlist selection filters portrait source and keeps new playlists selected by default', async (t) => {

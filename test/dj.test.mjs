@@ -26,8 +26,10 @@ import {
   decideHardRuleTurnAction,
   decideQueuePolicy,
   decideTurnAction,
+  djTurn,
   extractAndStoreMemories,
   ensureRecommendationTextMatchesTrack,
+  getRadioDebugStatus,
   getRadioQueueStatus,
   hasExplicitMusicIntent,
   normalizeMusicContext,
@@ -1256,6 +1258,146 @@ test('radio queue consumes ready items and keeps pending items in session order'
   assert.equal(status.readyCount, 0);
   assert.equal(status.pendingCount, 1);
   assert.equal(status.queue[0].id, 'pending-1');
+});
+
+test('radio queue skips stale head and records miss diagnostics', (t) => {
+  const db = testDb(t);
+  const musicContext = normalizeMusicContext({
+    version: 2,
+    mood: 'energy',
+    energy: 'high',
+    searchHints: ['boost'],
+    musicIntent: 'mood_signal'
+  });
+  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
+    .run('queue-stale', new Date().toISOString(), JSON.stringify({ musicContext }), JSON.stringify(normalizeRadioQueue([
+      {
+        id: 'ready-stale',
+        status: 'ready',
+        contextVersion: 1,
+        contextSnapshot: normalizeMusicContext({
+          version: 1,
+          mood: 'calm',
+          energy: 'low',
+          searchHints: ['quiet'],
+          musicIntent: 'mood_signal'
+        }),
+        track: { id: 'quiet-1', name: 'Quiet Song', artists: ['A'] },
+        chatText: 'host'
+      }
+    ])));
+
+  const consumed = consumeReadyRadioQueue(db, 'queue-stale');
+  assert.equal(consumed, null);
+
+  const status = getRadioQueueStatus(db, 'queue-stale');
+  assert.equal(status.readyCount, 0);
+  assert.equal(status.staleCount, 1);
+  assert.equal(status.queue[0].status, 'stale');
+  assert.equal(status.queue[0].staleReason, 'context_mismatch');
+  assert.equal(status.queueMetrics.queueMissCount, 1);
+  assert.equal(status.queueMetrics.lastMissReason, 'stale_queue_head');
+});
+
+test('radio debug status returns sanitized queue, metrics, and diagnostics', (t) => {
+  const db = testDb(t);
+  const context = {
+    musicContext: normalizeMusicContext({ mood: 'calm', energy: 'low', searchHints: ['quiet'], version: 3 }),
+    queueMetrics: { queueHitCount: 2, queueMissCount: 1, syncFallbackCount: 1, lastMissReason: 'no_ready_queue_item' },
+    radioDebug: {
+      updatedAt: '2026-01-01T00:00:00.000Z',
+      lastSongPlan: {
+        attempt: 0,
+        picks: [{ name: 'Song A', artists: ['Artist A'], reason: 'calm fit', queries: ['Song A Artist A'] }]
+      },
+      lastSearchDiagnostics: [{
+        pick: { name: 'Song A', artists: ['Artist A'] },
+        queries: ['Song A Artist A'],
+        hits: [{ track: { id: 's1', name: 'Song A', artists: ['Artist A'] }, score: 130, accepted: true, playable: true }]
+      }],
+      lastTtsDiagnostics: { status: 'ready', ms: 42, error: null }
+    }
+  };
+  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
+    .run('debug-session', new Date().toISOString(), JSON.stringify(context), JSON.stringify(normalizeRadioQueue([
+      {
+        id: 'ready-debug',
+        status: 'ready',
+        contextVersion: 3,
+        contextSnapshot: context.musicContext,
+        track: { id: 's1', name: 'Song A', artists: ['Artist A'] },
+        chatText: 'host',
+        ttsStatus: 'ready',
+        ttsMs: 42,
+        explanation: { summary: 'calm context', factors: [{ type: 'profile', text: 'prefers soft songs' }], source: 'llm_pick' }
+      }
+    ])));
+
+  const missing = getRadioDebugStatus(db, '');
+  assert.equal(missing.status, 400);
+
+  const debug = getRadioDebugStatus(db, 'debug-session');
+  assert.equal(debug.ok, true);
+  assert.equal(debug.sessionId, 'debug-session');
+  assert.equal(debug.musicContext.version, 3);
+  assert.equal(debug.queueMetrics.queueHitCount, 2);
+  assert.equal(debug.queue[0].status, 'ready');
+  assert.equal(debug.queue[0].track.name, 'Song A');
+  assert.equal(debug.lastSongPlan.picks[0].name, 'Song A');
+  assert.equal(debug.lastSearchDiagnostics[0].hits[0].playable, true);
+  assert.equal(debug.lastTtsDiagnostics.status, 'ready');
+  assert.equal(JSON.stringify(debug).includes('token'), false);
+  assert.equal(JSON.stringify(debug).includes('apiKey'), false);
+});
+
+test('queued recommendation returns queue explanation and does not retry failed tts', async (t) => {
+  const db = testDb(t);
+  db.prepare('INSERT INTO tracks (id, name, artists, album, cover_url, duration_ms, raw_json, updated_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run('queue-song', 'Queue Song', JSON.stringify(['Artist A']), 'Album', null, 180000, '{}', new Date().toISOString());
+  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
+    .run('queue-explanation', new Date().toISOString(), '{}', JSON.stringify(normalizeRadioQueue([
+      {
+        id: 'ready-explain',
+        status: 'ready',
+        track: { id: 'queue-song', name: 'Queue Song', artists: ['Artist A'], album: 'Album' },
+        chatText: 'host',
+        reason: 'prepared',
+        explanation: {
+          summary: 'quiet night + profile',
+          factors: [{ type: 'time', text: 'night' }],
+          source: 'llm_pick'
+        },
+        ttsStatus: 'failed',
+        ttsUrl: null,
+        ttsMs: 12,
+        ttsError: 'timeout'
+      }
+    ])));
+
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => {
+    throw new Error('tts should not be retried for failed queued item');
+  };
+
+  const result = await djTurn({
+    db,
+    config: { llm: {}, tts: { baseUrl: 'http://tts.local', apiKey: 'test' }, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'queue-explanation'
+  });
+
+  assert.equal(result.queueHit, true);
+  assert.equal(result.track.id, 'queue-song');
+  assert.equal(result.ttsStatus, 'failed');
+  assert.equal(result.ttsUrl, null);
+  assert.match(result.explanation.summary, /queue|Queue|棰勫彇|预取/);
+  assert.equal(result.explanation.factors[0].type, 'queue');
+
+  for (let index = 0; index < 20; index += 1) {
+    if (getRadioQueueStatus(db, 'queue-explanation').pendingCount === 0) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
 });
 
 test('conversation analysis stores short-term preferences without forcing music', async (t) => {
