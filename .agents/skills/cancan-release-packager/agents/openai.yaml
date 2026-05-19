@@ -1,0 +1,4 @@
+interface:
+  display_name: "CanCan Release Packager"
+  short_description: "Rebuild slim Windows release packages"
+  default_prompt: "Rebuild the CanCan Campus Radio Windows release using tests, slim cache packaging, and packaged health checks."

@@ -18,7 +18,8 @@ const state = {
   librarySyncStatus: null,
   profileSelectionDirty: false,
   librarySyncNotice: '',
-  radioPrefetchPromise: null
+  radioPrefetchPromise: null,
+  playbackHistory: []
 };
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
@@ -493,6 +494,7 @@ function renderPlayer() {
   };
 
   const startBtn = document.querySelector('#start-btn');
+  const previousBtn = document.querySelector('#previous-btn');
   const nextBtn = document.querySelector('#next-btn');
   const playToggleBtn = document.querySelector('#play-toggle-btn');
   const chatForm = document.querySelector('#chat-form');
@@ -503,6 +505,7 @@ function renderPlayer() {
     api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
     startRadio();
   });
+  previousBtn?.addEventListener('click', () => previousTrack());
   nextBtn.addEventListener('click', () => nextTrack({ skipCurrent: true }));
   playToggleBtn?.addEventListener('click', () => {
     if (playToggleBtn.classList.contains('is-playing')) pausePlayback();
@@ -533,6 +536,7 @@ function renderPlayer() {
   }
 
   if (state.current) updatePlayer(state.current, false);
+  updatePreviousButtonState();
   setAvatarState(state.avatarState || getContextualAvatarState());
   setRadioButtonState(state.sessionId || state.current?.track ? 'active' : 'idle');
   startPlayerPolling();
@@ -827,6 +831,7 @@ function handleRadioResponse(data) {
   setRadioButtonState(state.sessionId || data.track || state.current?.track ? 'active' : 'idle');
   if (data.track) {
     stopVisualizer();
+    rememberCurrentForHistory(data);
     state.current = data;
     updatePlayer(data, false);
   }
@@ -856,6 +861,75 @@ function handleRadioResponse(data) {
   setPlayerStatus('歌曲就绪', 'playing');
   if (responseShouldSpeak(data)) playHostSpeech(data, () => startSongPlayback());
   else startSongPlayback();
+}
+
+function rememberCurrentForHistory(nextData = {}) {
+  const current = state.current;
+  const currentTrackId = current?.track?.id;
+  const nextTrackId = nextData?.track?.id;
+  if (!currentTrackId || !nextTrackId || currentTrackId === nextTrackId) return;
+
+  const last = state.playbackHistory.at(-1);
+  if (last?.track?.id !== currentTrackId) {
+    state.playbackHistory.push(clonePlaybackItem(current));
+    if (state.playbackHistory.length > 20) state.playbackHistory.shift();
+  }
+  updatePreviousButtonState();
+}
+
+function clonePlaybackItem(item) {
+  try {
+    return structuredClone(item);
+  } catch {
+    return JSON.parse(JSON.stringify(item));
+  }
+}
+
+function updatePreviousButtonState() {
+  const button = document.querySelector('#previous-btn');
+  if (!button) return;
+  const hasPrevious = state.playbackHistory.length > 0;
+  button.disabled = !hasPrevious;
+  const label = hasPrevious ? '上一首' : '没有上一首';
+  button.title = label;
+  button.setAttribute('aria-label', label);
+}
+
+async function previousTrack() {
+  const previous = state.playbackHistory.pop();
+  updatePreviousButtonState();
+  if (!previous?.track) {
+    setPlayerStatus('没有上一首', '');
+    return;
+  }
+
+  primeVoicePlayback();
+  stopVisualizer();
+  setAvatarState('searching');
+  setPlaybackToggleState(false);
+  document.querySelector('#host-audio')?.pause();
+  const songAudio = document.querySelector('#song-audio');
+  if (songAudio) {
+    songAudio.pause();
+    songAudio.currentTime = 0;
+  }
+  try {
+    await api('/api/player/stop', { method: 'POST', body: {} });
+  } catch {
+    // Browser playback can still continue even if the external player was not running.
+  }
+
+  state.current = previous;
+  updatePlayer(previous, false);
+  appendChat({ role: 'user', text: '上一首' });
+  appendChat({
+    role: 'dj',
+    text: `回到上一首：《${previous.track.name || '这首歌'}》。`,
+    track: previous.track,
+    explanation: previous.explanation
+  });
+  setPlayerStatus('回到上一首', 'playing');
+  startSongPlayback();
 }
 
 function responseShouldSpeak(data = {}) {
@@ -1027,7 +1101,6 @@ async function updatePlayer(data, autoplay) {
   const track = data.track || {};
   document.querySelector('#track-title').textContent = track.name || 'myMusic';
   document.querySelector('#track-artist').textContent = (track.artists || []).join(' / ') || '等待启动';
-  updateRecommendationReason(data.explanation);
   buildLyricDOM(data.track?.lyric || '');
 
   const songAudio = document.querySelector('#song-audio');
@@ -1048,19 +1121,6 @@ async function updatePlayer(data, autoplay) {
   if (fill) fill.style.width = '0%';
   if (current) current.textContent = '00:00';
   if (duration) duration.textContent = '00:00';
-}
-
-function updateRecommendationReason(explanation = null) {
-  const el = document.querySelector('#recommendation-reason');
-  if (!el) return;
-  const summary = String(explanation?.summary || '').trim();
-  if (!summary) {
-    el.hidden = true;
-    el.textContent = '';
-    return;
-  }
-  el.hidden = false;
-  el.textContent = `依据：${summary}`;
 }
 
 function buildLyricDOM(lrcText) {

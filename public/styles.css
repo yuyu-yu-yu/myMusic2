@@ -808,18 +808,6 @@ button.danger:hover {
   color: var(--muted);
 }
 
-.recommendation-reason {
-  margin-top: 8px;
-  max-width: 420px;
-  padding: 6px 9px;
-  border: 1px solid rgba(255, 215, 0, 0.26);
-  border-radius: 4px;
-  color: var(--yellow);
-  background: rgba(255, 215, 0, 0.07);
-  font-size: 11px;
-  line-height: 1.5;
-}
-
 .track-explanation {
   margin-top: 8px;
   font-size: 11px;

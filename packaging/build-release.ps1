@@ -23,11 +23,18 @@ New-Item -ItemType Directory -Force -Path $payloadRoot, $sfxSource, $releaseDir 
 $appDir = Join-Path $payloadRoot 'app'
 New-Item -ItemType Directory -Force -Path $appDir | Out-Null
 
-foreach ($dir in @('server', 'public', 'scripts', 'data', 'cache')) {
+foreach ($dir in @('server', 'public', 'scripts', 'data')) {
   $source = Join-Path $rootDir $dir
   if (Test-Path -LiteralPath $source) {
     Copy-Item -LiteralPath $source -Destination (Join-Path $appDir $dir) -Recurse
   }
+}
+
+$ttsCacheSource = Join-Path $rootDir 'cache\tts'
+if (Test-Path -LiteralPath $ttsCacheSource) {
+  $cacheDir = Join-Path $appDir 'cache'
+  New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
+  Copy-Item -LiteralPath $ttsCacheSource -Destination (Join-Path $cacheDir 'tts') -Recurse
 }
 
 foreach ($file in @('package.json', 'start.mjs', '.env.local', '.env.example', 'README.md', 'netease_cookie.txt', 'fresh_token.txt')) {

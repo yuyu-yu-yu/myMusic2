@@ -42,6 +42,7 @@ import {
   queueItemMatchesMusicContext,
   recommendationTextMentionsDifferentTrack,
   rankAndSelectCandidates,
+  replayRequestAllowsPlayedSong,
   trackMatchesPlayedSongName,
   trackMatchesSongPick,
   TURN_ACTIONS
@@ -209,6 +210,28 @@ test('played song matching ignores artist and version names', () => {
     name: '好久以后',
     artists: ['陈奕迅']
   }, played), false);
+});
+
+test('explicit replay requests only bypass dedupe for the requested song title', () => {
+  const request = {
+    songTitle: '爱情转移',
+    allowPlayedSongReplay: true
+  };
+
+  assert.equal(replayRequestAllowsPlayedSong({
+    name: '爱情转移 Live',
+    artists: ['陈奕迅']
+  }, request), true);
+
+  assert.equal(replayRequestAllowsPlayedSong({
+    name: '好久不见',
+    artists: ['陈奕迅']
+  }, request), false);
+
+  assert.equal(replayRequestAllowsPlayedSong({
+    name: '爱情转移',
+    artists: ['陈奕迅']
+  }, { songTitle: '爱情转移', allowPlayedSongReplay: false }), false);
 });
 
 test('final host text parser accepts confirmed-track DJ copy', () => {

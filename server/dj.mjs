@@ -1374,9 +1374,16 @@ export function hasExplicitMusicIntent(text) {
   const value = String(text || '');
   if (isImmediateNextRequest(value)) return true;
   if (/先别放|不要放|别放|不想听歌|不想听音乐|先别切|不要切|别切|别换/.test(value)) return false;
+  if (isExplicitReplayRequest(value)) return true;
   if (/^(?:我想|想|要|我要|给我|帮我)?(?:听|放|播放|播)(?!说|说话|你说|我说|着|起来|过)(?:一下|一首|首)?[\s\S]{2,40}(?:的[\s\S]{1,30})?$/.test(value.trim())) return true;
   if (/下一首|换一首|换歌|切歌|播放|放一首|来一首|来首|想听|给我.*(歌|音乐)|有没有.*(歌|音乐)|听.*(歌|音乐)|artist|song|music|play|recommend/i.test(value)) return true;
   return /(推荐|来点).*(歌|音乐|曲|国风|古风|电子|摇滚|民谣|爵士|说唱|粤语|日语|英语|中文|安静|治愈|伤感|开心|提神|专注|睡前)|推荐(一首|首|点|些)?$/.test(value);
+}
+
+export function isExplicitReplayRequest(text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  return /(?:再|重新|还想再|想再).{0,8}(?:听|放|播放|播).{0,6}(?:一遍|一次|一回|一下|这首|这歌)|(?:重听|重播|重复播放|循环播放|再来一遍|再来一次)/.test(value);
 }
 
 export function normalizeMusicText(value) {
@@ -1646,7 +1653,8 @@ function getMusicRequestConstraints(db, userMessage = '', mode = {}) {
   return {
     text,
     artistConstraint,
-    songTitle
+    songTitle,
+    allowPlayedSongReplay: Boolean(songTitle && isExplicitReplayRequest(text))
   };
 }
 
@@ -1687,7 +1695,7 @@ function extractRequestedSongTitle(text, artistConstraint = null) {
 
 function cleanRequestedSongTitle(value, artistConstraint = null) {
   let text = String(value || '')
-    .replace(/^(我想|想|要|我要|给我|帮我|听|放|播放|播|来一首|来首|推荐|一下|一首|首|点|一点|一些|几首)+/g, '')
+    .replace(/^(我想|想|还想|要|我要|给我|帮我|重新|再|重听|再听|再放|再播|听|放|播放|播|来一首|来首|再来|推荐|一下|一遍|一次|一回|一首|首|点|一点|一些|几首)+/g, '')
     .replace(/(这首歌|这歌|歌|歌曲|音乐|作品|专辑)+$/g, '')
     .replace(/^的+|的+$/g, '')
     .trim();
@@ -2026,6 +2034,7 @@ function normalizeIntentAction(action) {
 function isImmediateNextRequest(text) {
   const value = String(text || '');
   if (/(?:先别|不要|别|不用|不必).{0,4}(?:切歌|换歌|换一首|下一首|跳过)/.test(value)) return false;
+  if (isExplicitReplayRequest(value)) return true;
   return /下一首|换一首|换歌|切歌|跳过|skip|不想听(?:这首|这歌|这个版本|这版|它|当前|这一个)|这(?:首|歌|个版本|版).{0,8}不想听|换(?:他|她|它|这个歌手|这位歌手)?(?:的)?(?:另一首|别的|其他)/i.test(value);
 }
 
@@ -2700,6 +2709,13 @@ export function trackMatchesPlayedSongName(track, playedHistory = []) {
   return Boolean(key && signatures.has(key));
 }
 
+export function replayRequestAllowsPlayedSong(track, request = {}) {
+  if (!request?.allowPlayedSongReplay || !request?.songTitle) return false;
+  const allowedKey = playedSongKey(request.songTitle);
+  const trackKey = playedSongKey(track?.name || track?.song || track?.title || '');
+  return Boolean(allowedKey && trackKey && allowedKey === trackKey);
+}
+
 function inferRadioTrigger(userMessage = '') {
   const text = String(userMessage || '').trim();
   if (!text) return '启动电台或自动续播';
@@ -3092,7 +3108,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
     if (!newMode) newMode = modeDecisionFromPlan(plan);
     if (!plan.picks.length) break;
 
-    const resolved = await resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, playedSignatures });
+    const resolved = await resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, playedSignatures, request });
     setRadioDebugInfo(db, sessionId, { lastSearchDiagnostics: resolved.diagnostics || [] });
     if (resolved.track) {
       const chatText = await generateFinalHostText({
@@ -3159,7 +3175,10 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
   const failedText = failedPicks.length
     ? `上一批没有确认到可播放源，请避开这些歌：${failedPicks.map(pick => `${pick.name}${pick.artists?.length ? ' - ' + pick.artists.join('、') : ''}`).join('；')}`
     : '没有失败歌单。';
-  const playedText = formatPlayedSongExclusions(playedHistory);
+  const playedText = formatPlayedSongExclusions(playedHistory, request);
+  const replayRule = request?.allowPlayedSongReplay && request?.songTitle
+    ? `已播放歌名通常必须避开；但本次用户明确要求重听《${request.songTitle}》，这一个歌名允许重复播放，其他已播放歌仍必须避开同名任何版本。`
+    : '已播放歌名必须避开：只要歌名相同，就不能再推荐任何版本、翻唱、Live、Remix、Album Version 或不同艺人版本。';
 
   const raw = await generateChatCompletion(config.llm, [
     {
@@ -3173,7 +3192,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         '搜索 queries 必须像音乐软件里会输入的短词，优先“歌名 艺人”和“艺人 歌名”。不要输出长句。',
         '如果用户明确指定艺人、歌名或风格，必须优先满足；不确定时选更常见、更好搜的歌曲。',
         '如果用户说“他的另一首/她的另一首/这个歌手的另一首/换这位歌手”，优先参考最近播放歌曲的艺人，把它理解成当前或上一首歌的主艺人。',
-        '已播放歌名必须避开：只要歌名相同，就不能再推荐任何版本、翻唱、Live、Remix、Album Version 或不同艺人版本。',
+        replayRule,
         'hostLine 只是备用素材，不是最终导播词。不要写成“刚才……现在……”“上一首……接下来……”或“接下来放……”。可以只写一个自然的导播方向。',
         '只输出严格 JSON，不要 Markdown，不要解释。',
         'JSON 格式：{"picks":[{"name":"歌名","artists":["艺人"],"reason":"一句话理由","queries":["歌名 艺人","艺人 歌名"],"hostLine":"40-90字电台导播词"}],"hostDraft":"40-90字自然主持词","mode":null}'
@@ -3244,22 +3263,27 @@ function normalizeArtistList(value) {
   return uniqueStrings(String(value || '').split(/[、,，/&\s]+/), 4);
 }
 
-function formatPlayedSongExclusions(playedHistory = []) {
+function formatPlayedSongExclusions(playedHistory = [], request = {}) {
   const songs = [];
   const seen = new Set();
+  const allowedReplayKey = request?.allowPlayedSongReplay ? playedSongKey(request.songTitle) : '';
   for (const track of playedHistory || []) {
     const key = playedSongKey(track?.name);
     if (!key || seen.has(key)) continue;
+    if (allowedReplayKey && key === allowedReplayKey) continue;
     seen.add(key);
     songs.push(`${track.name}${track.artists?.length ? ' - ' + track.artists.join('、') : ''}`);
     if (songs.length >= 30) break;
   }
+  const replayText = allowedReplayKey && request?.songTitle
+    ? `用户明确要求重听《${request.songTitle}》，这一个歌名允许重复；`
+    : '';
   return songs.length
-    ? `本轮/最近已经播放过的歌名，后续必须避开同名任何版本：${songs.join('；')}`
-    : '本轮/最近已播放歌名：无';
+    ? `${replayText}本轮/最近其他已经播放过的歌名，后续必须避开同名任何版本：${songs.join('；')}`
+    : `${replayText}本轮/最近已播放歌名：${replayText ? '除本次指定重听歌曲外无其他限制' : '无'}`;
 }
 
-async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, playedSignatures = new Set() }) {
+async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, playedSignatures = new Set(), request = {} }) {
   const failedPicks = [];
   const diagnostics = [];
   for (const pick of plan.picks) {
@@ -3270,7 +3294,7 @@ async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, p
       selectedTrackId: null,
       failedReason: null
     };
-    if (trackMatchesPlayedSongName(pick, playedSignatures)) {
+    if (trackMatchesPlayedSongName(pick, playedSignatures) && !replayRequestAllowsPlayedSong(pick, request)) {
       pickDiagnostic.failedReason = 'played_song_name';
       diagnostics.push(pickDiagnostic);
       failedPicks.push(pick);
@@ -3298,12 +3322,12 @@ async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, p
 
     for (const item of ranked) {
       const track = item.track;
-      if (playedIds.has(String(track.id))) {
+      if (playedIds.has(String(track.id)) && !replayRequestAllowsPlayedSong(track, request)) {
         item.diagnostic.accepted = false;
         item.diagnostic.filterReason = 'played_track_id';
         continue;
       }
-      if (trackMatchesPlayedSongName(track, playedSignatures)) {
+      if (trackMatchesPlayedSongName(track, playedSignatures) && !replayRequestAllowsPlayedSong(track, request)) {
         item.diagnostic.accepted = false;
         item.diagnostic.filterReason = 'played_song_name';
         continue;
