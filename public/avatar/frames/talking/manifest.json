@@ -1,0 +1,55 @@
+{
+  "state": "talking",
+  "loopMs": 2800,
+  "strip": "/avatar/generated/talking-strip.png",
+  "frames": [
+    {
+      "src": "/avatar/frames/talking/00.png",
+      "durationMs": 220
+    },
+    {
+      "src": "/avatar/frames/talking/01.png",
+      "durationMs": 220
+    },
+    {
+      "src": "/avatar/frames/talking/02.png",
+      "durationMs": 220
+    },
+    {
+      "src": "/avatar/frames/talking/03.png",
+      "durationMs": 240
+    },
+    {
+      "src": "/avatar/frames/talking/04.png",
+      "durationMs": 240
+    },
+    {
+      "src": "/avatar/frames/talking/05.png",
+      "durationMs": 240
+    },
+    {
+      "src": "/avatar/frames/talking/06.png",
+      "durationMs": 220
+    },
+    {
+      "src": "/avatar/frames/talking/07.png",
+      "durationMs": 100
+    },
+    {
+      "src": "/avatar/frames/talking/08.png",
+      "durationMs": 220
+    },
+    {
+      "src": "/avatar/frames/talking/09.png",
+      "durationMs": 240
+    },
+    {
+      "src": "/avatar/frames/talking/10.png",
+      "durationMs": 240
+    },
+    {
+      "src": "/avatar/frames/talking/11.png",
+      "durationMs": 400
+    }
+  ]
+}

@@ -26,6 +26,7 @@ const SOURCE_BASE_SCORES = {
 };
 const MOODS = new Set(['comfort', 'melancholy', 'calm', 'healing', 'focus', 'energy', 'romantic', 'nostalgic', 'night', 'random']);
 const WEATHER_CACHE_MS = 10 * 60 * 1000;
+const DEFAULT_APP_TIME_ZONE = 'Asia/Shanghai';
 const SESSION_SUMMARY_MIN_MESSAGES = 12;
 const SESSION_SUMMARY_STEP = 8;
 const LONG_MEMORY_LIMIT = 8;
@@ -168,8 +169,8 @@ async function buildRadioRecommendation({
 }) {
   ensureSession(db, sessionId);
   const profile = getProfile(db);
-  const weather = await getCachedWeather(db, sessionId, config.weather);
-  const { hour, timeOfDay } = getTimeContext();
+  const environmentContext = await getEnvironmentContext({ db, sessionId, config });
+  const { hour, timeOfDay, weather } = environmentContext;
   const mode = getSessionMode(db, sessionId);
   const prefs = normalizeRuntimePrefs(getUserPrefs(db));
   const context = getSessionContext(db, sessionId);
@@ -205,6 +206,7 @@ async function buildRadioRecommendation({
     conversationMood: recommendationMood,
     memoryContext,
     hostContext,
+    environmentContext,
     avoidTracks: extraAvoidTracks
   });
 
@@ -234,6 +236,7 @@ async function buildRadioRecommendation({
     mode: result.newMode || mode,
     profile,
     weather,
+    environmentContext,
     newMode: result.newMode || null,
     conversationMood: recommendationMood
   };
@@ -326,6 +329,7 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
   const currentTrack = getCurrentTrack(db);
   const context = getSessionContext(db, sessionId);
   const conversationState = normalizeConversationState(context.conversationState);
+  const environmentContext = await getEnvironmentContext({ db, sessionId, config });
   const baseMood = analyzeTurnContext({
     history,
     userMessage,
@@ -333,7 +337,8 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     currentTrack,
     mode,
     prefs,
-    conversationState
+    conversationState,
+    environmentContext
   });
   const sessionSummary = await updateSessionSummary(db, config, sessionId);
   const longTermMemories = retrieveRelevantMemories(db, {
@@ -370,7 +375,8 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
       prefs,
       conversationState,
       userMessageCount: userMessageCountAfterThisTurn,
-      memoryContext
+      memoryContext,
+      environmentContext
     });
   const turnAction = intentDecision.turnAction;
   const intentSource = intentDecision.intentSource;
@@ -432,7 +438,8 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
         speech,
         mode,
         profile,
-        weather: getSessionContext(db, sessionId).weather || '',
+        weather: environmentContext.weather || getSessionContext(db, sessionId).weather || '',
+        environmentContext,
         conversationMood,
         turnAction,
         queuePolicy,
@@ -481,7 +488,8 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     canSuggest,
     memoryContext,
     turnAction,
-    skipLlm: Boolean(intentDecision.skipFriendLlm)
+    skipLlm: Boolean(intentDecision.skipFriendLlm),
+    environmentContext
   });
   const conversationMood = normalizeMoodDecision({ ...baseMood, ...chatDecision });
   const finalConversationState = updateConversationState({
@@ -528,7 +536,8 @@ export async function chatTurn({ db, config, netease, sessionId, message }) {
     speech,
     mode: newModeDecision || mode,
     profile,
-    weather: getSessionContext(db, sessionId).weather || '',
+    weather: environmentContext.weather || getSessionContext(db, sessionId).weather || '',
+    environmentContext,
     conversationMood,
     turnAction,
     queuePolicy,
@@ -1020,10 +1029,94 @@ async function getCachedWeather(db, sessionId, weatherConfig) {
   return weather;
 }
 
-function getTimeContext(date = new Date()) {
-  const hour = date.getHours();
+async function getEnvironmentContext({ db, sessionId, config, date = new Date() } = {}) {
+  const timeZone = resolveAppTimeZone(config);
+  const timeContext = getTimeContext(date, timeZone);
+  let weather = '';
+  let weatherUpdatedAt = '';
+  if (db && sessionId && config?.weather?.city) {
+    weather = await getCachedWeather(db, sessionId, {
+      ...(config?.weather || {}),
+      timeZone
+    });
+    weatherUpdatedAt = getSessionContext(db, sessionId).weatherUpdatedAt || '';
+  }
+  return {
+    ...timeContext,
+    timeZone,
+    weather,
+    weatherUpdatedAt
+  };
+}
+
+function resolveAppTimeZone(config = {}) {
+  return config?.app?.timeZone || config?.weather?.timeZone || process.env.APP_TIME_ZONE || DEFAULT_APP_TIME_ZONE;
+}
+
+export function getTimeContext(date = new Date(), timeZone = DEFAULT_APP_TIME_ZONE) {
+  const parts = getZonedDateTimeParts(date, timeZone);
+  const hour = Number(parts.hour);
   const timeOfDay = hour < 6 ? '深夜' : hour < 9 ? '清晨' : hour < 12 ? '上午' : hour < 14 ? '中午' : hour < 18 ? '下午' : hour < 21 ? '傍晚' : '夜晚';
-  return { hour, timeOfDay };
+  return {
+    hour,
+    timeOfDay,
+    localDate: `${parts.year}-${parts.month}-${parts.day}`,
+    localTime: `${parts.hour}:${parts.minute}`,
+    timeZone
+  };
+}
+
+function getZonedDateTimeParts(date, timeZone) {
+  try {
+    const formatter = new Intl.DateTimeFormat('zh-CN', {
+      timeZone,
+      hour12: false,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+    const parts = Object.fromEntries(formatter.formatToParts(date).map(part => [part.type, part.value]));
+    return {
+      year: parts.year,
+      month: parts.month,
+      day: parts.day,
+      hour: parts.hour === '24' ? '00' : parts.hour,
+      minute: parts.minute
+    };
+  } catch {
+    const fallback = new Date(date);
+    const pad = value => String(value).padStart(2, '0');
+    return {
+      year: String(fallback.getFullYear()),
+      month: pad(fallback.getMonth() + 1),
+      day: pad(fallback.getDate()),
+      hour: pad(fallback.getHours()),
+      minute: pad(fallback.getMinutes())
+    };
+  }
+}
+
+export function formatEnvironmentContext(environmentContext = {}) {
+  const parts = [
+    `localDate=${environmentContext.localDate || ''}`,
+    `localTime=${environmentContext.localTime || ''}`,
+    `timeOfDay=${environmentContext.timeOfDay || ''}`,
+    `hour=${environmentContext.hour ?? ''}`,
+    `timeZone=${environmentContext.timeZone || DEFAULT_APP_TIME_ZONE}`
+  ];
+  if (environmentContext.weather) parts.push(`weather=${environmentContext.weather}`);
+  if (environmentContext.weatherUpdatedAt) parts.push(`weatherUpdatedAt=${environmentContext.weatherUpdatedAt}`);
+  return parts.filter(Boolean).join('; ');
+}
+
+function isNightTimeOfDay(timeOfDay = '') {
+  return timeOfDay === '深夜' || timeOfDay === '夜晚';
+}
+
+function hasCurrentNightSignal(text = '') {
+  return /睡不着|失眠|凌晨|夜里|深夜|半夜|好晚|晚了|晚上了|夜深/i.test(String(text || ''));
 }
 
 function getCurrentTrack(db) {
@@ -1753,7 +1846,8 @@ async function resolveTurnActionWithIntentModel({
   prefs,
   conversationState,
   userMessageCount,
-  memoryContext
+  memoryContext,
+  environmentContext
 }) {
   const fallbackAction = () => decideTurnAction({
     userMessage,
@@ -1766,7 +1860,8 @@ async function resolveTurnActionWithIntentModel({
     prefs,
     conversationState,
     userMessageCount,
-    memoryContext
+    memoryContext,
+    environmentContext
   });
 
   const classified = await classifyTurnIntent({
@@ -1780,7 +1875,8 @@ async function resolveTurnActionWithIntentModel({
     baseMood,
     memoryContext,
     canSuggest,
-    explicitIntent
+    explicitIntent,
+    environmentContext
   });
 
   if (classified.accepted) {
@@ -1808,7 +1904,8 @@ export async function classifyTurnIntent({
   baseMood = {},
   memoryContext = {},
   canSuggest = false,
-  explicitIntent = false
+  explicitIntent = false,
+  environmentContext = {}
 } = {}) {
   if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) {
     return { accepted: false, source: 'fallback', reason: 'LLM is not configured', skipFriendLlm: false };
@@ -1838,6 +1935,8 @@ export async function classifyTurnIntent({
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
         `长期记忆：${memoryContext.promptText || '无'}`,
         `会话摘要：${memoryContext.sessionSummary || '无'}`,
+        `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
+        '时间天气只是事实锚点，不要从历史对话把当前时段误判成晚上；如果用户当前没有明确说夜晚/睡不着，就以 APP_TIME_CONTEXT 为准。',
         `启发式情绪：${JSON.stringify(baseMood)}`,
         `本地显式音乐意图：${explicitIntent}`,
         `允许主动推荐：${canSuggest}`
@@ -1942,12 +2041,22 @@ function modeUpdateFromText(text) {
   return genre ? { genre, note: '用户指定' } : null;
 }
 
-export function analyzeTurnContext({ history = [], userMessage = '', profile = {}, currentTrack = null, mode = {}, prefs = {}, conversationState = {} } = {}) {
+export function analyzeTurnContext({ history = [], userMessage = '', profile = {}, currentTrack = null, mode = {}, prefs = {}, conversationState = {}, environmentContext = {} } = {}) {
   const normalizedPrefs = normalizeRuntimePrefs(prefs);
-  const mood = applyMoodPreferenceOverride(
+  let mood = applyMoodPreferenceOverride(
     analyzeConversationMood({ history, userMessage, profile, currentTrack, mode }),
     normalizedPrefs
   );
+  if (mood.mood === 'night' && normalizedPrefs.moodMode !== 'night' && !hasCurrentNightSignal(userMessage) && !isNightTimeOfDay(environmentContext.timeOfDay)) {
+    mood = {
+      shouldRecommend: false,
+      mood: 'random',
+      energy: 'medium',
+      intent: 'chat',
+      searchHints: [],
+      reason: 'ignored stale night signal from history'
+    };
+  }
   const preferenceHints = extractPreferenceHints(userMessage);
   const avoidHints = extractAvoidHints(userMessage);
   const explicitMusic = hasExplicitMusicIntent(userMessage);
@@ -2070,7 +2179,7 @@ function isModeUpdateRequest(text) {
   return /恢复正常推荐|取消.*偏好|取消.*模式|恢复正常|后面都听|以后都听|接下来都听/.test(String(text || ''));
 }
 
-async function generateFriendReply({ config, profile, mode, prefs = {}, history, userMessage, currentTrack, baseMood, explicitIntent, canSuggest, memoryContext = {}, turnAction = null, skipLlm = false }) {
+async function generateFriendReply({ config, profile, mode, prefs = {}, history, userMessage, currentTrack, baseMood, explicitIntent, canSuggest, memoryContext = {}, turnAction = null, skipLlm = false, environmentContext = {} }) {
   const fallback = () => ({
     chatText: fallbackFriendChat(userMessage, baseMood, turnAction),
     shouldRecommend: false,
@@ -2096,6 +2205,8 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
         '回复长度按内容决定：问候 20-50 字，普通聊天 50-140 字，复杂问题或认真倾诉可以 120-260 字。',
         '如果需要提问，每次最多一个自然的问题；更重要的是先回应用户已经说出的内容。',
         '当前歌曲只用于背景判断；除非用户主动问当前歌曲、歌词、歌名或艺人，不要提及歌名、艺人、歌词或“正在播放”。',
+        '时间天气只是事实背景，不是每句都要说。普通聊天不要主动用时间天气开头；只有用户主动问，或和当前话题自然相关时才轻描淡写提一下。',
+        '如果提到当前时间、上午下午或天气，必须严格以 APP_TIME_CONTEXT 为准；不要根据历史对话把当前时段改成晚上，也不要编造未来天气。',
         turnActionInstruction(turnAction),
         '输出 JSON：{"chatText":"按语境长度生成的自然温柔回复","mood":"comfort|melancholy|calm|healing|focus|energy|romantic|nostalgic|night|random","energy":"low|medium|high","intent":"chat|mood","searchHints":["2-6字关键词"],"reason":"简短理由","mode":null或"reset"或偏好名}'
       ].join('\n')
@@ -2110,6 +2221,7 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
         `当前歌曲：${currentTrackContext}`,
         memoryContext.promptText || '相关长期记忆：无',
         memoryContext.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
+        `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
         `当前动作：${turnAction?.action || TURN_ACTIONS.CHAT_ONLY}`,
         `动作理由：${turnAction?.reason || ''}`,
         `启发式情绪：${JSON.stringify(baseMood)}`,
@@ -2947,7 +3059,7 @@ function getArtistPenaltyByName(db) {
   return penalties;
 }
 
-async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, hostContext = {}, avoidTracks = [] }) {
+async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, hostContext = {}, environmentContext = {}, avoidTracks = [] }) {
   const playedHistory = mergePlayedTrackHistory(getPlayedTrackHistory(db, sessionId, 80), avoidTracks);
   const playedIds = new Set(playedHistory.map(track => String(track.id || '')).filter(Boolean));
   const playedSignatures = buildPlayedSignatureSet(playedHistory);
@@ -2972,7 +3084,8 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
       request,
       failedPicks,
       playedHistory,
-      hostContext
+      hostContext,
+      environmentContext
     });
     lastPlan = plan;
     setRadioDebugInfo(db, sessionId, { lastSongPlan: sanitizeSongPlan(plan, attempt) });
@@ -2996,7 +3109,8 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
         conversationMood,
         userMessage,
         memoryContext,
-        hostContext
+        hostContext,
+        environmentContext
       });
       return {
         chatText,
@@ -3027,7 +3141,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
   };
 }
 
-async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood, memoryContext, request, failedPicks = [], playedHistory = [], hostContext = {} }) {
+async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood, memoryContext, request, failedPicks = [], playedHistory = [], hostContext = {}, environmentContext = {} }) {
   const fallbackPlan = {
     picks: [],
     hostDraft: fallbackChat(timeOfDay, weather, profile),
@@ -3053,6 +3167,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
       content: [
         '你是灿灿电台的选歌大脑。你的任务不是生成搜索关键词，而是直接推荐真实存在、音乐平台容易搜到的具体歌曲。',
         '必须结合时间、天气、听众画像、偏好、当前对话和明确请求，给出 3 首备选歌。',
+        '时间天气只是事实背景，不是固定开场模板；不要因为历史对话把当前上午/下午写成晚上，也不要编造未来天气。',
         '每首都必须有明确歌名和主要艺人。优先推荐知名度较高、网易云音乐更可能搜到并可播放的版本。',
         '“深夜、安静、陪伴、适合放松、开心、提神”等只能用于理解氛围，不能当作歌曲名或主搜索词，除非它本来就是你明确推荐的真实歌名且给出了艺人。',
         '搜索 queries 必须像音乐软件里会输入的短词，优先“歌名 艺人”和“艺人 歌名”。不要输出长句。',
@@ -3067,6 +3182,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
     {
       role: 'user',
       content: [
+        `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
         `此刻：${timeOfDay} ${hour}点，${weather}`,
         `听众画像：${profile?.summary || '无'}`,
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
@@ -3368,7 +3484,8 @@ async function generateFinalHostText({
   conversationMood,
   userMessage,
   memoryContext,
-  hostContext = {}
+  hostContext = {},
+  environmentContext = {}
 }) {
   const fallbackText = finalizeSongPlanHostText({
     plan,
@@ -3397,7 +3514,8 @@ async function generateFinalHostText({
     conversationMood,
     userMessage,
     memoryContext,
-    hostContext
+    hostContext,
+    environmentContext
   }), () => JSON.stringify({ chatText: fallbackText }));
 
   const parsedText = parseFinalHostText(raw, fallbackText);
@@ -3428,7 +3546,8 @@ export function buildFinalHostMessages({
   conversationMood,
   userMessage,
   memoryContext = {},
-  hostContext = {}
+  hostContext = {},
+  environmentContext = {}
 } = {}) {
   const firstTurn = Boolean(hostContext.isFirstRadioTurn);
   return [
@@ -3441,6 +3560,7 @@ export function buildFinalHostMessages({
         firstTurn
           ? '这是本轮电台第一次播歌，可以自然交代一次时间、天气或城市，但最多一句，不要写成天气播报。'
           : '这不是本轮电台第一次播歌。除非用户主动问天气，否则不要再用时间、天气、城市、温度开头，也不要重复“深夜的上海”。',
+        '时间天气是事实背景，不是固定模板。后续导播只有用户主动问、或歌曲氛围明显适合时才可以轻描淡写提；如果提到，必须严格按 APP_TIME_CONTEXT，不要编造今晚、明天或稍后的天气。',
         '上一首歌、最近操作、喜欢/不喜欢/下一首，只是可选素材，不要强行做上一首到当前歌曲的转场。',
         '可以只抓一个角度写：回应听众刚才的话、点一下这首歌的声音气质、点一下歌手或歌名带来的感觉、直接带进歌曲、用一个很短的画面或情绪、轻轻开个小玩笑。',
         '必须只围绕最终确认的歌曲和艺人展开。不能提到其他候选歌名、候选艺人或“我推荐了三首”。',
@@ -3456,6 +3576,7 @@ export function buildFinalHostMessages({
         `最终歌曲：${selectedTrack?.name || ''}`,
         `最终艺人：${artistText || (selectedTrack?.artists || selectedPick?.artists || []).join('、') || '未知'}`,
         selectedTrack?.album ? `专辑：${selectedTrack.album}` : '',
+        `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
         firstTurn ? `时间天气参考：${timeOfDay} ${hour}点，${weather}` : `时间天气仅供理解氛围，不要写进导播词：${timeOfDay} ${hour}点，${weather}`,
         `听众画像：${profile?.summary || '无'}`,
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,

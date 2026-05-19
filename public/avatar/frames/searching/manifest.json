@@ -1,0 +1,55 @@
+{
+  "state": "searching",
+  "loopMs": 3600,
+  "strip": "/avatar/generated/searching-strip.png",
+  "frames": [
+    {
+      "src": "/avatar/frames/searching/00.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/searching/01.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/searching/02.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/searching/03.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/searching/04.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/searching/05.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/searching/06.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/searching/07.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/searching/08.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/searching/09.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/searching/10.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/searching/11.png",
+      "durationMs": 300
+    }
+  ]
+}

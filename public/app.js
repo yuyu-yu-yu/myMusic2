@@ -29,10 +29,31 @@ let loadingMsgTimer = null;
 let loadingMessageEl = null;
 let savedChatHTML = '';
 let avatarRestoreTimer = null;
+let avatarFrameTimer = null;
+let avatarFrameSequenceToken = 0;
 let preferencesLoadPromise = null;
 
+function makeAvatarFrameSequence(stateName, durations) {
+  return {
+    loopMs: durations.reduce((total, durationMs) => total + durationMs, 0),
+    frames: durations.map((durationMs, index) => ({
+      src: `/avatar/frames/${stateName}/${String(index).padStart(2, '0')}.png`,
+      durationMs
+    }))
+  };
+}
+
+const avatarFrameSequences = {
+  idle: makeAvatarFrameSequence('idle', [180, 200, 220, 240, 120, 120, 200, 220, 240, 260, 300, 367]),
+  listening: makeAvatarFrameSequence('listening', [240, 260, 280, 320, 360, 320, 280, 260, 240, 260, 300, 280]),
+  talking: makeAvatarFrameSequence('talking', [220, 220, 220, 240, 240, 240, 220, 100, 220, 240, 240, 400]),
+  searching: makeAvatarFrameSequence('searching', [300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300]),
+  reading: makeAvatarFrameSequence('reading', [240, 240, 250, 260, 260, 250, 240, 240, 250, 260, 260, 250]),
+  happy: makeAvatarFrameSequence('happy', [160, 160, 170, 180, 180, 170, 160, 220]),
+  on_air: makeAvatarFrameSequence('on_air', [233, 233, 233, 233, 233, 233, 233, 233, 233, 233, 233, 237])
+};
+
 const avatarMotionMap = {
-  idle: '/avatar/webm/idle.webm',
   listening: '/avatar/webm/listening.webm',
   talking: '/avatar/webm/talking.webm',
   searching: '/avatar/webm/searching_music.webm',
@@ -265,7 +286,89 @@ function stopVisualizer() {
 
 function normalizeAvatarState(nextState) {
   const normalized = avatarStateAliases[nextState] || nextState || 'idle';
-  return avatarMotionMap[normalized] ? normalized : 'idle';
+  return avatarFrameSequences[normalized] || avatarMotionMap[normalized] ? normalized : 'idle';
+}
+
+function stopAvatarFrameSequence() {
+  avatarFrameSequenceToken += 1;
+  if (avatarFrameTimer) {
+    clearTimeout(avatarFrameTimer);
+    avatarFrameTimer = null;
+  }
+}
+
+function playAvatarVideoOrFallback(root, video, image, src) {
+  root.classList.remove('is-frame-sequence');
+  if (image) image.src = '/avatar/source/cancan.png';
+
+  if (!video || !src) {
+    root.classList.add('is-fallback');
+    if (video) video.hidden = true;
+    if (image) image.hidden = false;
+    return;
+  }
+
+  video.onerror = () => {
+    root.classList.add('is-fallback');
+    video.hidden = true;
+    if (image) image.hidden = false;
+  };
+  video.onloadeddata = () => {
+    root.classList.remove('is-fallback');
+    video.hidden = false;
+    if (image) image.hidden = true;
+    video.play().catch(() => {});
+  };
+
+  if (video.getAttribute('src') !== src) {
+    video.hidden = true;
+    if (image) image.hidden = false;
+    root.classList.add('is-fallback');
+    video.src = src;
+    video.load();
+  } else if (video.readyState >= 2) {
+    root.classList.remove('is-fallback');
+    video.hidden = false;
+    if (image) image.hidden = true;
+    video.play().catch(() => {});
+  }
+}
+
+function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
+  if (!image || !sequence?.frames?.length) {
+    playAvatarVideoOrFallback(root, video, image, fallbackSrc);
+    return;
+  }
+
+  stopAvatarFrameSequence();
+  const token = avatarFrameSequenceToken;
+  let index = 0;
+
+  root.classList.remove('is-fallback');
+  root.classList.add('is-frame-sequence');
+  if (video) {
+    video.pause();
+    video.hidden = true;
+    video.onerror = null;
+    video.onloadeddata = null;
+  }
+  image.hidden = false;
+
+  image.onerror = () => {
+    if (token !== avatarFrameSequenceToken) return;
+    stopAvatarFrameSequence();
+    playAvatarVideoOrFallback(root, video, image, fallbackSrc);
+  };
+
+  const showFrame = () => {
+    if (token !== avatarFrameSequenceToken) return;
+    const frame = sequence.frames[index % sequence.frames.length];
+    image.src = frame.src;
+    index = (index + 1) % sequence.frames.length;
+    avatarFrameTimer = setTimeout(showFrame, frame.durationMs || sequence.loopMs / sequence.frames.length);
+  };
+
+  showFrame();
 }
 
 function setAvatarState(nextState = 'idle', options = {}) {
@@ -285,35 +388,13 @@ function setAvatarState(nextState = 'idle', options = {}) {
   const video = document.querySelector('#avatar-video');
   const image = document.querySelector('#avatar-image');
   const src = avatarMotionMap[normalized];
+  const sequence = avatarFrameSequences[normalized];
 
-  if (image) image.src = '/avatar/source/cancan.png';
-  if (video && src) {
-    video.onerror = () => {
-      root.classList.add('is-fallback');
-      video.hidden = true;
-      if (image) image.hidden = false;
-    };
-    video.onloadeddata = () => {
-      root.classList.remove('is-fallback');
-      video.hidden = false;
-      if (image) image.hidden = true;
-      video.play().catch(() => {});
-    };
-
-    if (video.getAttribute('src') !== src) {
-      video.hidden = true;
-      if (image) image.hidden = false;
-      root.classList.add('is-fallback');
-      video.src = src;
-      video.load();
-    } else {
-      if (video.readyState >= 2) {
-        root.classList.remove('is-fallback');
-        video.hidden = false;
-        if (image) image.hidden = true;
-        video.play().catch(() => {});
-      }
-    }
+  if (sequence) {
+    playAvatarFrameSequence(root, video, image, sequence, src);
+  } else {
+    stopAvatarFrameSequence();
+    playAvatarVideoOrFallback(root, video, image, src);
   }
 
   if (options.temporaryMs) {

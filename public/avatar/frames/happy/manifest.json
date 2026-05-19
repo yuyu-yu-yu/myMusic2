@@ -1,0 +1,39 @@
+{
+  "state": "happy",
+  "loopMs": 1400,
+  "strip": "/avatar/generated/happy-strip.png",
+  "frames": [
+    {
+      "src": "/avatar/frames/happy/00.png",
+      "durationMs": 160
+    },
+    {
+      "src": "/avatar/frames/happy/01.png",
+      "durationMs": 160
+    },
+    {
+      "src": "/avatar/frames/happy/02.png",
+      "durationMs": 170
+    },
+    {
+      "src": "/avatar/frames/happy/03.png",
+      "durationMs": 180
+    },
+    {
+      "src": "/avatar/frames/happy/04.png",
+      "durationMs": 180
+    },
+    {
+      "src": "/avatar/frames/happy/05.png",
+      "durationMs": 170
+    },
+    {
+      "src": "/avatar/frames/happy/06.png",
+      "durationMs": 160
+    },
+    {
+      "src": "/avatar/frames/happy/07.png",
+      "durationMs": 220
+    }
+  ]
+}

@@ -193,7 +193,8 @@ test('Open-Meteo weather geocodes city and returns Chinese summary', async (t) =
   const summary = await getWeatherSummary({
     provider: 'openmeteo',
     city: '上海',
-    countryCode: 'CN'
+    countryCode: 'CN',
+    timeZone: 'Asia/Shanghai'
   });
 
   assert.equal(summary, '上海 阴，23°C，体感 24°C，湿度 68%，微风，当前无降水');
@@ -203,6 +204,7 @@ test('Open-Meteo weather geocodes city and returns Chinese summary', async (t) =
   assert.match(calls[0], /countryCode=CN/);
   assert.match(calls[1], /api\.open-meteo\.com\/v1\/forecast/);
   assert.match(calls[1], /current=temperature_2m%2Crelative_humidity_2m%2Capparent_temperature%2Cprecipitation%2Crain%2Cweather_code%2Cwind_speed_10m/);
+  assert.match(calls[1], /timezone=Asia%2FShanghai/);
 });
 
 test('Open-Meteo weather failure returns fallback summary', async (t) => {

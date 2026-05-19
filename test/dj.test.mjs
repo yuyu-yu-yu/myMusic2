@@ -16,6 +16,7 @@ import {
   analyzeConversationMood,
   analyzeTurnContext,
   buildConfirmedTrackHostFallback,
+  formatEnvironmentContext,
   buildMemoryContext,
   buildFinalHostMessages,
   buildSongSearchQueries,
@@ -31,6 +32,7 @@ import {
   ensureRecommendationTextMatchesTrack,
   getRadioDebugStatus,
   getRadioQueueStatus,
+  getTimeContext,
   hasExplicitMusicIntent,
   normalizeMusicContext,
   normalizeRadioQueue,
@@ -264,6 +266,55 @@ test('final host prompt uses weather only for first radio turn and then focuses 
   assert.match(laterPrompt, /最近导播词/);
   assert.match(laterPrompt, /下一首\/跳过：普通朋友/);
   assert.doesNotMatch(laterPrompt, /后续导播优先接最近对话、上一首歌的余味/);
+});
+
+test('time context uses configured Shanghai morning instead of night', () => {
+  const context = getTimeContext(new Date('2026-05-19T01:50:00.000Z'), 'Asia/Shanghai');
+
+  assert.equal(context.localDate, '2026-05-19');
+  assert.equal(context.localTime, '09:50');
+  assert.equal(context.hour, 9);
+  assert.equal(context.timeOfDay, '上午');
+  assert.notEqual(context.timeOfDay, '夜晚');
+});
+
+test('stale night history does not force a morning ordinary chat into night mood', () => {
+  const mood = analyzeTurnContext({
+    history: [
+      { role: 'user', content: '昨天晚上睡不着，聊了很久。' },
+      { role: 'assistant', content: '那就慢慢聊。' }
+    ],
+    userMessage: '你好',
+    environmentContext: getTimeContext(new Date('2026-05-19T01:50:00.000Z'), 'Asia/Shanghai')
+  });
+
+  assert.equal(mood.mood, 'random');
+  assert.equal(mood.shouldRecommend, false);
+  assert.equal(mood.musicIntent, 'chat');
+});
+
+test('final host prompt carries exact time facts without forcing repeated weather copy', () => {
+  const environmentContext = {
+    ...getTimeContext(new Date('2026-05-19T01:50:00.000Z'), 'Asia/Shanghai'),
+    weather: '上海阴天，26°C，当前无降水',
+    weatherUpdatedAt: '2026-05-19T01:48:00.000Z'
+  };
+  const prompt = JSON.stringify(buildFinalHostMessages({
+    selectedTrack: { name: '天使的指纹', artists: ['孙燕姿'] },
+    selectedPick: { name: '天使的指纹', artists: ['孙燕姿'] },
+    plan: { picks: [{ name: '天使的指纹', artists: ['孙燕姿'] }] },
+    timeOfDay: environmentContext.timeOfDay,
+    hour: environmentContext.hour,
+    weather: environmentContext.weather,
+    environmentContext,
+    hostContext: { isFirstRadioTurn: false }
+  }));
+
+  assert.match(formatEnvironmentContext(environmentContext), /localTime=09:50/);
+  assert.match(prompt, /APP_TIME_CONTEXT/);
+  assert.match(prompt, /localTime=09:50/);
+  assert.match(prompt, /不要编造今晚、明天或稍后的天气/);
+  assert.match(prompt, /时间天气仅供理解氛围，不要写进导播词/);
 });
 
 test('confirmed track host fallback avoids rigid transition template', () => {

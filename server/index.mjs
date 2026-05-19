@@ -355,6 +355,11 @@ function serveStatic(req, res) {
     '.css': 'text/css; charset=utf-8',
     '.json': 'application/json; charset=utf-8',
     '.svg': 'image/svg+xml; charset=utf-8',
+    '.png': 'image/png',
+    '.jpg': 'image/jpeg',
+    '.jpeg': 'image/jpeg',
+    '.webm': 'video/webm',
+    '.mp4': 'video/mp4',
     '.mp3': 'audio/mpeg'
   };
   res.writeHead(200, { 'content-type': types[ext] || 'application/octet-stream' });

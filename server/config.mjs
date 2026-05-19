@@ -30,6 +30,9 @@ export function getConfig() {
       port: Number(env.PORT || 3000),
       host: env.HOST || '127.0.0.1'
     },
+    app: {
+      timeZone: env.APP_TIME_ZONE || 'Asia/Shanghai'
+    },
     netease: {
       baseUrl: env.NETEASE_BASE_URL || 'https://openapi.music.163.com',
       appId: env.NETEASE_APP_ID || '',
@@ -82,7 +85,8 @@ export function getConfig() {
       provider: env.WEATHER_PROVIDER || (env.WEATHER_API_KEY ? 'openweathermap' : 'openmeteo'),
       city: env.WEATHER_CITY || '上海',
       countryCode: env.WEATHER_COUNTRY_CODE || 'CN',
-      apiKey: env.WEATHER_API_KEY || ''
+      apiKey: env.WEATHER_API_KEY || '',
+      timeZone: env.WEATHER_TIME_ZONE || env.APP_TIME_ZONE || 'Asia/Shanghai'
     }
   };
 }
@@ -115,7 +119,8 @@ export function publicConfigStatus(config) {
     weather: {
       configured: Boolean(config.weather.city),
       provider: config.weather.provider || null,
-      city: config.weather.city || null
+      city: config.weather.city || null,
+      timeZone: config.weather.timeZone || config.app?.timeZone || null
     }
   };
 }

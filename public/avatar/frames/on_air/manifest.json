@@ -1,0 +1,55 @@
+{
+  "state": "on_air",
+  "loopMs": 2800,
+  "strip": "/avatar/generated/on_air-strip.png",
+  "frames": [
+    {
+      "src": "/avatar/frames/on_air/00.png",
+      "durationMs": 233
+    },
+    {
+      "src": "/avatar/frames/on_air/01.png",
+      "durationMs": 233
+    },
+    {
+      "src": "/avatar/frames/on_air/02.png",
+      "durationMs": 233
+    },
+    {
+      "src": "/avatar/frames/on_air/03.png",
+      "durationMs": 233
+    },
+    {
+      "src": "/avatar/frames/on_air/04.png",
+      "durationMs": 233
+    },
+    {
+      "src": "/avatar/frames/on_air/05.png",
+      "durationMs": 233
+    },
+    {
+      "src": "/avatar/frames/on_air/06.png",
+      "durationMs": 233
+    },
+    {
+      "src": "/avatar/frames/on_air/07.png",
+      "durationMs": 233
+    },
+    {
+      "src": "/avatar/frames/on_air/08.png",
+      "durationMs": 233
+    },
+    {
+      "src": "/avatar/frames/on_air/09.png",
+      "durationMs": 233
+    },
+    {
+      "src": "/avatar/frames/on_air/10.png",
+      "durationMs": 233
+    },
+    {
+      "src": "/avatar/frames/on_air/11.png",
+      "durationMs": 237
+    }
+  ]
+}

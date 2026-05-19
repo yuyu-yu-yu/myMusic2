@@ -1,0 +1,55 @@
+{
+  "state": "idle",
+  "loopMs": 2667,
+  "strip": "/avatar/generated/idle-strip.png",
+  "frames": [
+    {
+      "src": "/avatar/frames/idle/00.png",
+      "durationMs": 180
+    },
+    {
+      "src": "/avatar/frames/idle/01.png",
+      "durationMs": 200
+    },
+    {
+      "src": "/avatar/frames/idle/02.png",
+      "durationMs": 220
+    },
+    {
+      "src": "/avatar/frames/idle/03.png",
+      "durationMs": 240
+    },
+    {
+      "src": "/avatar/frames/idle/04.png",
+      "durationMs": 120
+    },
+    {
+      "src": "/avatar/frames/idle/05.png",
+      "durationMs": 120
+    },
+    {
+      "src": "/avatar/frames/idle/06.png",
+      "durationMs": 200
+    },
+    {
+      "src": "/avatar/frames/idle/07.png",
+      "durationMs": 220
+    },
+    {
+      "src": "/avatar/frames/idle/08.png",
+      "durationMs": 240
+    },
+    {
+      "src": "/avatar/frames/idle/09.png",
+      "durationMs": 260
+    },
+    {
+      "src": "/avatar/frames/idle/10.png",
+      "durationMs": 300
+    },
+    {
+      "src": "/avatar/frames/idle/11.png",
+      "durationMs": 367
+    }
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "state": "reading",
+  "loopMs": 3000,
+  "strip": "/avatar/generated/reading-strip.png",
+  "frames": [
+    {
+      "src": "/avatar/frames/reading/00.png",
+      "durationMs": 240
+    },
+    {
+      "src": "/avatar/frames/reading/01.png",
+      "durationMs": 240
+    },
+    {
+      "src": "/avatar/frames/reading/02.png",
+      "durationMs": 250
+    },
+    {
+      "src": "/avatar/frames/reading/03.png",
+      "durationMs": 260
+    },
+    {
+      "src": "/avatar/frames/reading/04.png",
+      "durationMs": 260
+    },
+    {
+      "src": "/avatar/frames/reading/05.png",
+      "durationMs": 250
+    },
+    {
+      "src": "/avatar/frames/reading/06.png",
+      "durationMs": 240
+    },
+    {
+      "src": "/avatar/frames/reading/07.png",
+      "durationMs": 240
+    },
+    {
+      "src": "/avatar/frames/reading/08.png",
+      "durationMs": 250
+    },
+    {
+      "src": "/avatar/frames/reading/09.png",
+      "durationMs": 260
+    },
+    {
+      "src": "/avatar/frames/reading/10.png",
+      "durationMs": 260
+    },
+    {
+      "src": "/avatar/frames/reading/11.png",
+      "durationMs": 250
+    }
+  ]
+}

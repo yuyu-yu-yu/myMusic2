@@ -971,6 +971,13 @@ button.danger:hover {
   object-fit: cover;
   image-rendering: pixelated;
   transform-origin: 50% 58%;
+}
+
+.avatar-video {
+  animation: none;
+}
+
+.avatar-image {
   animation: avatar-breathe 3.2s ease-in-out infinite;
 }
 
@@ -983,28 +990,27 @@ button.danger:hover {
   display: block;
 }
 
-.ai-dj-avatar[data-state="listening"] .avatar-video,
 .ai-dj-avatar[data-state="listening"] .avatar-image {
   animation: avatar-listen 2.4s ease-in-out infinite;
 }
 
-.ai-dj-avatar[data-state="talking"] .avatar-video,
 .ai-dj-avatar[data-state="talking"] .avatar-image,
-.ai-dj-avatar[data-state="on_air"] .avatar-video,
 .ai-dj-avatar[data-state="on_air"] .avatar-image {
   animation: avatar-talk 1.35s ease-in-out infinite;
 }
 
-.ai-dj-avatar[data-state="searching"] .avatar-video,
 .ai-dj-avatar[data-state="searching"] .avatar-image,
-.ai-dj-avatar[data-state="reading"] .avatar-video,
 .ai-dj-avatar[data-state="reading"] .avatar-image {
   animation: avatar-search 1.8s steps(4, end) infinite;
 }
 
-.ai-dj-avatar[data-state="happy"] .avatar-video,
 .ai-dj-avatar[data-state="happy"] .avatar-image {
   animation: avatar-happy 0.72s ease-in-out infinite;
+}
+
+.ai-dj-avatar.is-frame-sequence .avatar-image {
+  animation: none;
+  object-fit: contain;
 }
 
 .avatar-status {

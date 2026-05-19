@@ -286,7 +286,7 @@ async function getOpenMeteoSummary(config, city) {
       'weather_code',
       'wind_speed_10m'
     ].join(','));
-    url.searchParams.set('timezone', 'auto');
+    url.searchParams.set('timezone', config.timeZone || 'Asia/Shanghai');
     const response = await fetch(url);
     if (!response.ok) throw new Error(`Open-Meteo forecast HTTP ${response.status}`);
     const json = await response.json();
