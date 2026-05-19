@@ -5,10 +5,10 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
-import { openDatabase, seedDemoLibrary, getSetting, setSetting } from './db.mjs';
+import { openDatabase, getSetting, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { extractOpenApiTokenPayload, getNeteaseLoginStatus, resolveQrOpenApiLogin, saveNeteaseUserProfile, saveOpenApiToken } from './netease-auth.mjs';
-import { getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
+import { clearLibraryAccountSnapshot, getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
 import { chatRadio, getMemories, getPreferences, getRadioDebug, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
@@ -32,11 +32,10 @@ if (savedAccessToken) {
   console.log('[netease] loaded saved token');
 }
 loadCookie(rootDir);
-seedDemoLibrary(db);
-await updateProfile(db, config.llm);
 
 const publicDir = path.join(rootDir, 'public');
 const cacheDir = path.join(rootDir, 'cache', 'tts');
+const LIBRARY_SYNCED_USER_ID_KEY = 'library_synced_user_id';
 
 let librarySyncStatus = createIdleLibrarySyncStatus();
 
@@ -160,12 +159,23 @@ const routes = {
     if (!key) return jsonError('qrCodeKey is required', 400);
     const result = await checkCookieQrLogin(key, rootDir);
     if (result.loggedIn && result.userId) {
+      const previousSyncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
       invalidateLibrarySyncStatus('NetEase cookie login changed, please start sync again.');
+      clearLibraryAccountSnapshot(db);
       saveNeteaseUserProfile(db, { userId: result.userId, nickname: result.nickname || '' });
       setSetting(db, 'netease_login_source', 'cookie');
       setSetting(db, 'netease_cookie_user_id', result.userId);
       setSetting(db, 'netease_cookie_user_nickname', result.nickname || '');
       setSetting(db, 'netease_cookie_checked_at', new Date().toISOString());
+      const syncStatus = startLibrarySyncJob();
+      return {
+        ...result,
+        accountChanged: Boolean(previousSyncedUserId && String(previousSyncedUserId) !== String(result.userId)),
+        previousSyncedUserId,
+        libraryCleared: true,
+        autoSyncStarted: syncStatus.status === 'running',
+        syncStatus
+      };
     }
     return result;
   },
@@ -173,6 +183,7 @@ const routes = {
   'POST /api/auth/netease-cookie/logout': async () => {
     invalidateLibrarySyncStatus('NetEase cookie login cleared, please start sync again.');
     clearCookie(rootDir);
+    clearLibraryAccountSnapshot(db);
     setSetting(db, 'netease_cookie_user_id', '');
     setSetting(db, 'netease_cookie_user_nickname', '');
     setSetting(db, 'netease_cookie_checked_at', '');
@@ -191,7 +202,10 @@ const routes = {
     if (!key) return jsonError('qrCodeKey is required', 400);
     const result = await netease.qrcodeStatus(key);
     const login = await resolveQrOpenApiLogin({ db, netease, result });
-    if (login.loggedIn) invalidateLibrarySyncStatus('NetEase OpenAPI login changed, please start sync again.');
+    if (login.loggedIn) {
+      invalidateLibrarySyncStatus('NetEase OpenAPI login changed, please start sync again.');
+      clearLibraryAccountSnapshot(db);
+    }
     return attachLoginMeta(result, { ...login, hasToken: netease.hasToken() });
   },
   'GET /api/auth/netease/token-status': async () => ({
@@ -466,7 +480,10 @@ function serveStatic(req, res) {
     '.mp4': 'video/mp4',
     '.mp3': 'audio/mpeg'
   };
-  res.writeHead(200, { 'content-type': types[ext] || 'application/octet-stream' });
+  const cacheControl = ['.html', '.js', '.css'].includes(ext)
+    ? 'no-store'
+    : 'public, max-age=3600';
+  res.writeHead(200, { 'content-type': types[ext] || 'application/octet-stream', 'cache-control': cacheControl });
   fs.createReadStream(filePath).pipe(res);
 }
 

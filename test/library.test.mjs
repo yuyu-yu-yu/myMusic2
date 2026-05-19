@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { linkPlaylistTrack, openDatabase, savePlaylist, saveTrack } from '../server/db.mjs';
+import { linkPlaylistTrack, openDatabase, savePlaylist, saveTrack, setSetting } from '../server/db.mjs';
 import { getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from '../server/library.mjs';
 
 function testDb(t) {
@@ -86,6 +86,35 @@ test('library only lists real playlist tracks while recent plays stay separate',
   assert.equal(library.playlists[0].profileSelected, true);
 });
 
+test('library only counts playlists from the active synced account snapshot', async (t) => {
+  const db = testDb(t);
+  const active = savePlaylist(db, { id: 'pl-current', name: 'Current Account Playlist' }, 'created');
+  const stale = savePlaylist(db, { id: 'pl-stale', name: 'Old Account Playlist' }, 'created');
+  addPlaylistTrack(db, active, {
+    id: 'current-track',
+    name: 'Current Song',
+    artists: ['Current Artist'],
+    album: 'Current Album'
+  });
+  addPlaylistTrack(db, stale, {
+    id: 'stale-track',
+    name: 'Stale Song',
+    artists: ['Stale Artist'],
+    album: 'Stale Album'
+  });
+  setSetting(db, 'netease_user_id', 'user-current');
+  setSetting(db, 'library_synced_user_id', 'user-current');
+  setSetting(db, 'library_synced_playlist_ids', JSON.stringify([active.id]));
+
+  const library = getLibrary(db);
+
+  assert.deepEqual(library.playlists.map((playlist) => playlist.id), [active.id]);
+  assert.deepEqual(library.tracks.map((track) => track.id), ['current-track']);
+  assert.equal(library.totalTracks, 1);
+  assert.equal(library.totalPlaylistTracks, 1);
+  assert.equal(library.profileSelection.totalCount, 1);
+});
+
 test('library sync paginates all playlists and replaces stale playlist links', async (t) => {
   const db = testDb(t);
   const stalePlaylist = savePlaylist(db, { id: 'pl-big', name: 'Big Playlist' }, 'created');
@@ -149,7 +178,7 @@ test('library sync paginates all playlists and replaces stale playlist links', a
   assert.deepEqual(calls.filter(call => call.playlistId === 'pl-big').map(call => call.offset), [0, 200, 400]);
 });
 
-test('failed playlist sync keeps previous playlist links and reports the error', async (t) => {
+test('sync clears previous playlist links before rebuilding current account snapshot', async (t) => {
   const db = testDb(t);
   const playlist = savePlaylist(db, { id: 'pl-fail', name: 'Fail Playlist', trackCount: 2 }, 'created');
   const existing = addPlaylistTrack(db, playlist, {
@@ -158,6 +187,8 @@ test('failed playlist sync keeps previous playlist links and reports the error',
     artists: ['Existing Artist'],
     album: 'Existing Album'
   });
+  setSetting(db, 'netease_user_id', 'user-1');
+  setSetting(db, 'library_synced_user_id', 'user-1');
   const netease = {
     isConfigured: () => true,
     hasToken: () => true,
@@ -175,9 +206,51 @@ test('failed playlist sync keeps previous playlist links and reports the error',
 
   assert.equal(result.errors.some(error => error.includes('page failed')), true);
   assert.equal(failed.trackCount, 2);
-  assert.equal(failed.syncedTrackCount, 1);
+  assert.equal(failed.syncedTrackCount, 0);
   assert.equal(failed.syncComplete, false);
-  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?').get('pl-fail', existing.id).count, 1);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?').get('pl-fail', existing.id).count, 0);
+});
+
+test('library hides previous account snapshot when current login is not synced', async (t) => {
+  const db = testDb(t);
+  const playlist = savePlaylist(db, { id: 'pl-a', name: 'Account A Playlist', trackCount: 1 }, 'created');
+  addPlaylistTrack(db, playlist, {
+    id: 'track-a',
+    name: 'Account A Song',
+    artists: ['Artist A'],
+    album: 'Album A'
+  });
+  setSetting(db, 'netease_user_id', 'user-b');
+  setSetting(db, 'netease_user_nickname', 'User B');
+  setSetting(db, 'library_synced_user_id', 'user-a');
+
+  const library = getLibrary(db);
+
+  assert.equal(library.account.needsSync, true);
+  assert.equal(library.playlists.length, 0);
+  assert.equal(library.tracks.length, 0);
+  assert.equal(library.totalTracks, 0);
+  assert.equal(library.profile.summary.includes('尚未同步'), true);
+});
+
+test('library hides stale rows when current account has no active synced playlist ids', async (t) => {
+  const db = testDb(t);
+  const playlist = savePlaylist(db, { id: 'pl-stale', name: 'Stale Playlist', trackCount: 1 }, 'created');
+  addPlaylistTrack(db, playlist, {
+    id: 'stale-track',
+    name: 'Stale Song',
+    artists: ['Stale Artist'],
+    album: 'Stale Album'
+  });
+  setSetting(db, 'netease_user_id', 'user-current');
+  setSetting(db, 'library_synced_user_id', 'user-current');
+
+  const library = getLibrary(db);
+
+  assert.equal(library.account.needsSync, true);
+  assert.equal(library.playlists.length, 0);
+  assert.equal(library.tracks.length, 0);
+  assert.equal(library.totalTracks, 0);
 });
 
 test('library sync requires NetEase token when OpenAPI is configured', async (t) => {
@@ -222,8 +295,9 @@ test('library sync fails clearly when logged in account returns zero playlists',
 
   assert.equal(result.__error, true);
   assert.equal(result.status, 502);
-  assert.equal(result.diagnostics.length, 3);
-  assert.deepEqual(result.diagnostics.map(item => item.recordCount), [0, 0, 0]);
+  const playlistDiagnostics = result.diagnostics.filter(item => ['star', 'subscribed', 'created'].includes(item.kind));
+  assert.equal(playlistDiagnostics.length, 3);
+  assert.deepEqual(playlistDiagnostics.map(item => item.recordCount), [0, 0, 0]);
   assert.equal(progress.some(item => item.phase === 'checking_login'), true);
   assert.equal(progress.some(item => item.phase === 'fetching_playlists'), true);
 });

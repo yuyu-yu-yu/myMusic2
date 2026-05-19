@@ -13,8 +13,10 @@ import { getNeteaseLoginStatus } from './netease-auth.mjs';
 
 const PROFILE_EXCLUDED_PLAYLIST_IDS_KEY = 'profile_excluded_playlist_ids';
 const EMPTY_PROFILE_SUMMARY = 'No playlist selected for music profile.';
+const UNSYNCED_ACCOUNT_SUMMARY = '当前网易云账号尚未同步歌单。';
 const PLAYLIST_SYNC_PAGE_SIZE = 200;
 const LIBRARY_SYNCED_USER_ID_KEY = 'library_synced_user_id';
+const LIBRARY_SYNCED_PLAYLIST_IDS_KEY = 'library_synced_playlist_ids';
 
 export async function syncLibrary(db, netease, options = {}) {
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : () => {};
@@ -48,6 +50,17 @@ export async function syncLibrary(db, netease, options = {}) {
 
   progress({ phase: 'checking_login' });
   assertNotCancelled();
+  clearLibraryAccountSnapshot(db);
+  result.tracks = 0;
+  result.syncedPlaylists = 0;
+  result.diagnostics.push({
+    kind: 'account_library_reset',
+    ok: true,
+    recordCount: 0,
+    message: '开始同步当前账号前，已清理旧歌单快照。',
+    dataKeys: []
+  });
+
   const syncSource = await resolveLibrarySyncSource(db, netease, result);
   assertNotCancelled();
   result.mode = syncSource.mode;
@@ -57,6 +70,7 @@ export async function syncLibrary(db, netease, options = {}) {
   if (syncSource.source === 'demo') {
     progress({ phase: 'syncing_tracks', currentPlaylistIndex: 1, totalPlaylists: 1, currentPlaylistName: 'Demo Library' });
     seedDemoLibrary(db);
+    setActiveLibraryPlaylistIds(db, ['demo-liked']);
     const tracks = listLibraryTracks(db, 100);
     result.tracks = tracks.length;
     result.playlists = 1;
@@ -104,7 +118,7 @@ export async function syncLibrary(db, netease, options = {}) {
         playlistRecords.push(...records.map(item => ({ kind, item })));
         progress({ phase: 'fetching_playlists', totalPlaylists: playlistRecords.length });
       } catch (error) {
-        result.errors.push(`${kind}: ${error.message}`);
+        result.errors.push(`${kind}: ${formatErrorMessage(error, '网易云歌单列表接口失败')}`);
         result.diagnostics.push(buildPlaylistDiagnostic(kind, null, [], error));
         progress({ phase: 'fetching_playlists' });
       }
@@ -130,18 +144,15 @@ export async function syncLibrary(db, netease, options = {}) {
     };
   }
 
-  const previousSyncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
-  if (result.user.userId && previousSyncedUserId && previousSyncedUserId !== result.user.userId) {
-    clearPlaylistLibrary(db);
-  }
-
   const playlistById = new Map();
   for (const { kind, item } of playlistRecords) {
     const playlist = savePlaylist(db, item, kind);
     if (!playlistById.has(playlist.id)) playlistById.set(playlist.id, playlist);
   }
+  pruneStalePlaylists(db, playlistById.keys());
   const playlists = [...playlistById.values()];
   result.playlists = playlists.length;
+  setActiveLibraryPlaylistIds(db, playlists.map((playlist) => playlist.id));
 
   for (const playlist of playlists) {
     assertNotCancelled();
@@ -168,7 +179,7 @@ export async function syncLibrary(db, netease, options = {}) {
       });
       const trackIds = records.map((item) => saveTrack(db, item).id);
       replacePlaylistTracks(db, playlist.id, trackIds);
-      result.tracks += trackIds.length;
+      result.tracks = countLibraryTracks(db);
       result.syncedPlaylists += 1;
       progress({
         phase: 'syncing_tracks',
@@ -181,7 +192,7 @@ export async function syncLibrary(db, netease, options = {}) {
         syncedPlaylists: result.syncedPlaylists
       });
     } catch (error) {
-      result.errors.push(`playlist ${playlist.id}: ${error.message}`);
+      result.errors.push(formatPlaylistSyncError(playlist, error));
       progress({ phase: 'syncing_tracks' });
     }
   }
@@ -198,7 +209,7 @@ export async function syncLibrary(db, netease, options = {}) {
       `).run(track.id, item.playTime ? new Date(Number(item.playTime)).toISOString() : nowIso(), 'netease-recent', 'netease recent play', 'imported');
     });
   } catch (error) {
-    result.errors.push(`recent: ${error.message}`);
+    result.errors.push(`最近播放同步失败：${formatErrorMessage(error, '网易云最近播放接口失败')}`);
   }
 
   result.tracks = countLibraryTracks(db);
@@ -440,8 +451,9 @@ async function generateAIPortrait(stats, llmConfig) {
 }
 
 export function getProfile(db) {
+  if (!hasCurrentAccountSnapshot(db)) return emptyProfile(UNSYNCED_ACCOUNT_SUMMARY);
   const row = db.prepare('SELECT summary, tags_json AS tagsJson, profile_json AS profileJson, updated_at AS updatedAt FROM music_profile WHERE id = 1').get();
-  if (!row) return { summary: 'No music profile generated yet.', tags: [], structured: {}, updatedAt: null };
+  if (!row) return { summary: '尚未生成音乐画像，请先同步当前网易云账号歌单。', tags: [], structured: {}, updatedAt: null };
   return {
     summary: row.summary,
     tags: safeJson(row.tagsJson, []),
@@ -451,13 +463,32 @@ export function getProfile(db) {
 }
 
 export function getLibrary(db) {
-  const playlists = getLibraryPlaylists(db);
-  const profileSelection = getProfileSelection(db, playlists);
-  const selectedIds = new Set(profileSelection.selectedIds);
   const loginUserId = getSetting(db, 'netease_user_id') || '';
   const loginNickname = getSetting(db, 'netease_user_nickname') || '';
   const loginSource = getSetting(db, 'netease_login_source') || '';
   const syncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
+  if (!hasCurrentAccountSnapshot(db)) {
+    return {
+      profile: emptyProfile(UNSYNCED_ACCOUNT_SUMMARY),
+      tracks: [],
+      playlists: [],
+      recent: [],
+      totalTracks: 0,
+      totalPlaylistTracks: 0,
+      profileSelection: { selectedIds: [], excludedIds: [], selectedCount: 0, totalCount: 0 },
+      account: {
+        userId: loginUserId,
+        nickname: loginNickname,
+        source: loginSource,
+        syncedUserId,
+        accountMismatch: Boolean(loginUserId && syncedUserId && loginUserId !== syncedUserId),
+        needsSync: Boolean(loginUserId)
+      }
+    };
+  }
+  const playlists = getLibraryPlaylists(db);
+  const profileSelection = getProfileSelection(db, playlists);
+  const selectedIds = new Set(profileSelection.selectedIds);
   return {
     profile: getProfile(db),
     tracks: listLibraryTracks(db, 5000),
@@ -474,8 +505,55 @@ export function getLibrary(db) {
       nickname: loginNickname,
       source: loginSource,
       syncedUserId,
-      accountMismatch: Boolean(loginUserId && syncedUserId && loginUserId !== syncedUserId)
+      accountMismatch: Boolean(loginUserId && syncedUserId && loginUserId !== syncedUserId),
+      needsSync: Boolean(loginUserId && syncedUserId !== loginUserId)
     }
+  };
+}
+
+export function clearLibraryAccountSnapshot(db) {
+  clearPlaylistLibrary(db);
+  db.prepare('DELETE FROM music_profile WHERE id = 1').run();
+  db.prepare('DELETE FROM settings WHERE key IN (?, ?, ?)').run(
+    PROFILE_EXCLUDED_PLAYLIST_IDS_KEY,
+    LIBRARY_SYNCED_USER_ID_KEY,
+    LIBRARY_SYNCED_PLAYLIST_IDS_KEY
+  );
+}
+
+function isCurrentAccountSnapshotUsable(db) {
+  const loginUserId = getSetting(db, 'netease_user_id') || '';
+  if (!loginUserId) return true;
+  const syncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
+  return Boolean(syncedUserId && syncedUserId === loginUserId);
+}
+
+function hasCurrentAccountSnapshot(db) {
+  if (!isCurrentAccountSnapshotUsable(db)) return false;
+  const loginUserId = getSetting(db, 'netease_user_id') || '';
+  if (!loginUserId) return true;
+  return getActiveLibraryPlaylistIds(db).length > 0;
+}
+
+function setActiveLibraryPlaylistIds(db, playlistIds = []) {
+  const ids = normalizeIdList(playlistIds);
+  setSetting(db, LIBRARY_SYNCED_PLAYLIST_IDS_KEY, JSON.stringify(ids));
+}
+
+function getActiveLibraryPlaylistIds(db) {
+  const ids = normalizeIdList(safeJson(getSetting(db, LIBRARY_SYNCED_PLAYLIST_IDS_KEY), []));
+  if (ids.length) return ids;
+  const loginUserId = getSetting(db, 'netease_user_id') || '';
+  if (loginUserId) return [];
+  return null;
+}
+
+function emptyProfile(summary = '尚未生成音乐画像，请先同步当前网易云账号歌单。') {
+  return {
+    summary,
+    tags: [],
+    structured: {},
+    updatedAt: null
   };
 }
 
@@ -513,9 +591,56 @@ function buildPlaylistDiagnostic(kind, response, records = [], error = null) {
     kind,
     ok: !error,
     recordCount: records.length,
-    message: error?.message || dataObject.message || dataObject.msg || response?.message || response?.msg || '',
+    message: error ? formatErrorMessage(error, '') : dataObject.message || dataObject.msg || response?.message || response?.msg || '',
     dataKeys: Object.keys(dataObject).slice(0, 12)
   };
+}
+
+function formatPlaylistSyncError(playlist = {}, error) {
+  const name = String(playlist.name || '').trim();
+  const label = name ? `《${name}》` : `ID ${playlist.id || '未知'}`;
+  return `歌单${label}同步失败：${formatErrorMessage(error, '网易云接口没有返回明确原因，可能是歌单权限限制或接口临时失败')}`;
+}
+
+function formatErrorMessage(error, fallback = '未知错误') {
+  const message = extractErrorMessage(error);
+  if (!message) return fallback;
+  return message === 'undefined' || message === '[object Object]' ? fallback : message;
+}
+
+function extractErrorMessage(error) {
+  if (!error) return '';
+  if (typeof error === 'string') return error.trim();
+  if (typeof error === 'number') return `错误码 ${error}`;
+  const candidates = [
+    error.message,
+    error.msg,
+    error.error,
+    error.reason,
+    error.body?.message,
+    error.body?.msg,
+    error.body?.error,
+    error.data?.message,
+    error.data?.msg,
+    error.data?.error,
+    error.response?.data?.message,
+    error.response?.data?.msg,
+    error.response?.data?.error
+  ];
+  for (const candidate of candidates) {
+    if (candidate !== undefined && candidate !== null && String(candidate).trim()) {
+      return String(candidate).trim();
+    }
+  }
+  const code = error.code ?? error.body?.code ?? error.data?.code ?? error.response?.data?.code;
+  if (code !== undefined && code !== null && String(code).trim()) return `网易云返回 code ${code}`;
+  try {
+    const serialized = JSON.stringify(error);
+    if (serialized && serialized !== '{}') return serialized.slice(0, 180);
+  } catch {
+    // Ignore serialization failures and use the fallback.
+  }
+  return '';
 }
 
 function isPlaylistLike(item) {
@@ -527,6 +652,21 @@ function isPlaylistLike(item) {
   ));
 }
 
+function pruneStalePlaylists(db, activePlaylistIds = []) {
+  const ids = [...activePlaylistIds].map((id) => String(id || '').trim()).filter(Boolean);
+  if (!ids.length) return;
+  const placeholders = ids.map(() => '?').join(',');
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id NOT IN (${placeholders})`).run(...ids);
+    db.prepare(`DELETE FROM playlists WHERE id NOT IN (${placeholders})`).run(...ids);
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
 async function fetchAllPlaylistSongs(netease, playlist, pageSize = PLAYLIST_SYNC_PAGE_SIZE, onPage = null) {
   const expectedCount = getPlaylistRemoteTrackCount(playlist);
   const records = [];
@@ -534,8 +674,17 @@ async function fetchAllPlaylistSongs(netease, playlist, pageSize = PLAYLIST_SYNC
   while (true) {
     if (expectedCount !== null && offset >= expectedCount) break;
     const response = await netease.playlistSongs(playlist.id, offset, pageSize);
-    const pageRecords = extractRecords(response.data);
-    if (!pageRecords.length) break;
+    const data = response?.data ?? response ?? {};
+    const pageRecords = extractRecords(data);
+    if (!pageRecords.length) {
+      if (isFailedApiPayload(data)) {
+        throw new Error(formatErrorMessage(data, '网易云接口返回失败'));
+      }
+      if ((expectedCount ?? 0) > offset) {
+        throw new Error('网易云接口未返回歌曲列表，可能是歌单权限限制、歌单不可访问或接口临时失败');
+      }
+      break;
+    }
     records.push(...pageRecords);
     if (typeof onPage === 'function') {
       onPage({ synced: records.length, total: expectedCount ?? null, offset, pageSize });
@@ -544,6 +693,15 @@ async function fetchAllPlaylistSongs(netease, playlist, pageSize = PLAYLIST_SYNC
     if (pageRecords.length < pageSize) break;
   }
   return records;
+}
+
+function isFailedApiPayload(data) {
+  if (!data || typeof data !== 'object') return false;
+  const code = data.code ?? data.status ?? data.data?.code;
+  if (code === undefined || code === null || code === '') return false;
+  const normalized = Number(code);
+  if (Number.isNaN(normalized)) return false;
+  return normalized !== 200;
 }
 
 function getProfilePlaylists(db, { selectedOnly = false } = {}) {
@@ -575,13 +733,17 @@ function getProfilePlaylists(db, { selectedOnly = false } = {}) {
 }
 
 function getLibraryPlaylists(db) {
+  const scope = getActiveLibraryPlaylistIds(db);
+  if (scope && !scope.length) return [];
+  const where = scope ? `WHERE p.id IN (${scope.map(() => '?').join(',')})` : '';
   return db.prepare(`
     SELECT p.id, p.name, p.kind, p.cover_url AS coverUrl, p.raw_json AS rawJson, COUNT(pt.track_id) AS syncedTrackCount
     FROM playlists p
     LEFT JOIN playlist_tracks pt ON pt.playlist_id = p.id
+    ${where}
     GROUP BY p.id, p.name, p.kind, p.cover_url, p.raw_json, p.updated_at
     ORDER BY p.updated_at DESC
-  `).all().map((playlist) => {
+  `).all(...(scope || [])).map((playlist) => {
     const { rawJson, ...base } = playlist;
     const raw = safeJson(rawJson, {});
     const remoteCount = getPlaylistRemoteTrackCount(raw);
@@ -597,24 +759,34 @@ function getLibraryPlaylists(db) {
 }
 
 function countLibraryTracks(db) {
-  return db.prepare('SELECT COUNT(DISTINCT track_id) AS count FROM playlist_tracks').get().count;
+  const scope = getActiveLibraryPlaylistIds(db);
+  if (scope && !scope.length) return 0;
+  const where = scope ? `WHERE playlist_id IN (${scope.map(() => '?').join(',')})` : '';
+  return db.prepare(`SELECT COUNT(DISTINCT track_id) AS count FROM playlist_tracks ${where}`).get(...(scope || [])).count;
 }
 
 function countPlaylistTrackLinks(db) {
-  return db.prepare('SELECT COUNT(*) AS count FROM playlist_tracks').get().count;
+  const scope = getActiveLibraryPlaylistIds(db);
+  if (scope && !scope.length) return 0;
+  const where = scope ? `WHERE playlist_id IN (${scope.map(() => '?').join(',')})` : '';
+  return db.prepare(`SELECT COUNT(*) AS count FROM playlist_tracks ${where}`).get(...(scope || [])).count;
 }
 
 function listLibraryTracks(db, limit = 5000) {
+  const scope = getActiveLibraryPlaylistIds(db);
+  if (scope && !scope.length) return [];
+  const where = scope ? `WHERE pt.playlist_id IN (${scope.map(() => '?').join(',')})` : '';
   return db.prepare(`
     SELECT t.id, t.name, t.artists, t.album, t.cover_url AS coverUrl, t.duration_ms AS durationMs,
            t.raw_json AS rawJson, MIN(pt.position) AS firstPosition, MAX(p.updated_at) AS playlistUpdatedAt
     FROM playlist_tracks pt
     JOIN tracks t ON t.id = pt.track_id
     JOIN playlists p ON p.id = pt.playlist_id
+    ${where}
     GROUP BY t.id, t.name, t.artists, t.album, t.cover_url, t.duration_ms, t.raw_json
     ORDER BY playlistUpdatedAt DESC, firstPosition ASC, t.name ASC
     LIMIT ?
-  `).all(limit).map(hydrateLibraryTrackRow);
+  `).all(...(scope || []), limit).map(hydrateLibraryTrackRow);
 }
 
 function hydrateLibraryTrackRow(row) {
@@ -925,7 +1097,7 @@ function inferTags(tracks) {
   if (/lofi|jazz|chill|安静|治愈/.test(names)) tags.push('放松');
   if (/rock|punk|摇滚/.test(names)) tags.push('能量');
   if (/classic|piano|古典|钢琴/.test(names)) tags.push('古典/器乐');
-  if (!tags.length) tags.push('私人曲库');
+  if (!tags.length) tags.push('网易云歌单');
   return tags.slice(0, 5);
 }
 

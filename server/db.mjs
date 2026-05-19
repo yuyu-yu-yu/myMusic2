@@ -615,7 +615,7 @@ function safeJson(value, fallback) {
 }
 
 export function seedDemoLibrary(db) {
-  const count = db.prepare('SELECT COUNT(*) AS count FROM tracks').get().count;
+  const count = db.prepare("SELECT COUNT(*) AS count FROM playlist_tracks WHERE playlist_id = 'demo-liked'").get().count;
   if (count > 0) return;
   const tracks = [
     { id: 'demo-1', name: '晚风里的城市', artists: ['myMusic Demo'], album: 'Local Radio', coverUrl: '/assets/cover-1.svg', durationMs: 210000 },
