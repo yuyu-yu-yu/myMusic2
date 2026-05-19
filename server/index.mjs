@@ -225,7 +225,7 @@ const routes = {
     return updateProfilePlaylistSelection(db, body.selectedPlaylistIds);
   },
   'POST /api/library/profile/update': async () => {
-    await updateProfile(db, config.llm);
+    await updateProfile(db, config.llm, { force: true });
     return getLibrary(db);
   },
   'POST /api/radio/start': async (req) => {

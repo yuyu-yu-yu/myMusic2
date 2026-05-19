@@ -12,7 +12,7 @@ import { generateChatCompletion } from './ai.mjs';
 import { getNeteaseLoginStatus } from './netease-auth.mjs';
 
 const PROFILE_EXCLUDED_PLAYLIST_IDS_KEY = 'profile_excluded_playlist_ids';
-const EMPTY_PROFILE_SUMMARY = 'No playlist selected for music profile.';
+const EMPTY_PROFILE_SUMMARY = '尚未选择用于生成音乐画像的歌单。';
 const UNSYNCED_ACCOUNT_SUMMARY = '当前网易云账号尚未同步歌单。';
 const PLAYLIST_SYNC_PAGE_SIZE = 200;
 const LIBRARY_SYNCED_USER_ID_KEY = 'library_synced_user_id';
@@ -339,7 +339,8 @@ function classifyCookiePlaylist(playlist = {}, userId = '') {
   return 'playlist';
 }
 
-export async function updateProfile(db, llmConfig) {
+export async function updateProfile(db, llmConfig, options = {}) {
+  const force = Boolean(options.force);
   // Only analyze tracks the user actually synced from NetEase playlists (not AI recs or test searches)
   const profileSelection = getProfileSelection(db);
   const playlists = getProfilePlaylists(db, { selectedOnly: true });
@@ -383,7 +384,7 @@ export async function updateProfile(db, llmConfig) {
     : true;
   const missingStructured = !existing?.structured || !Object.keys(existing.structured || {}).length;
 
-  if (llmConfig?.baseUrl && (hoursSinceUpdate > 24 || trackCountChanged || sourceChanged || missingStructured || existing.summary.length < 150)) {
+  if (llmConfig?.baseUrl && (force || hoursSinceUpdate > 24 || trackCountChanged || sourceChanged || missingStructured || existing.summary.length < 150)) {
     const enriched = await generateAIPortrait(stats, llmConfig);
     if (enriched) {
       structured = normalizeStructuredProfile({ ...structured, ...enriched.structured, summary: enriched.summary || structured.summary }, stats);
@@ -424,9 +425,14 @@ async function generateAIPortrait(stats, llmConfig) {
     {
       role: 'system',
       content: [
-        'You are a music profile analyst. Return strict JSON only, no markdown.',
-        'Summarize the user music taste from playlist statistics and sampled tracks.',
-        'JSON schema: {"summary":"20-400 Chinese chars","genres":[{"name":"...","weight":0-1,"evidence":["..."]}],"moods":[...],"artists":[...],"albums":[...],"languages":[...],"scenes":[...],"eras":[...],"energy":[...],"discoveryDirections":[{"name":"...","weight":0-1,"evidence":["..."]}],"avoidSignals":[{"name":"...","weight":0-1,"evidence":["..."]}]}'
+        '你是 AI 私人电台的音乐画像撰写者。只返回严格 JSON，不要 markdown。',
+        '根据歌单名称、艺人、专辑、曲风、场景和抽样歌曲，写一份有审美、有画面感的中文音乐人格画像。',
+        'summary 必须是 180-320 个中文字符，写成一段完整自然的画像文案，像私人电台在描述这个人的音乐世界。',
+        'summary 必须包含：核心曲风/审美、代表艺人或作品线索、常见听歌场景、情绪气质、后续探索方向。',
+        '不要写成冷冰冰的数据报告；禁止用“用户以”“该用户”“数据显示”“从数据看”“偏好为”开头。',
+        '可以有一点文学感，但所有判断都必须来自输入证据，不要编造不存在的艺人或歌单。',
+        '所有 name 字段用于前端标签展示，要短、清楚、有质感；优先中文或“中文/英文”组合，例如“华语流行/独立”“影视/游戏原声”“夜晚/宁静”。',
+        'JSON schema: {"summary":"180-320 Chinese chars","genres":[{"name":"...","weight":0-1,"evidence":["..."]}],"moods":[...],"artists":[...],"albums":[...],"languages":[...],"scenes":[...],"eras":[...],"energy":[...],"discoveryDirections":[{"name":"...","weight":0-1,"evidence":["..."]}],"avoidSignals":[{"name":"...","weight":0-1,"evidence":["..."]}]}'
       ].join('\n')
     },
     {
@@ -463,9 +469,10 @@ export function getProfile(db) {
 }
 
 export function getLibrary(db) {
-  const loginUserId = getSetting(db, 'netease_user_id') || '';
-  const loginNickname = getSetting(db, 'netease_user_nickname') || '';
-  const loginSource = getSetting(db, 'netease_login_source') || '';
+  const account = getCurrentLibraryAccount(db);
+  const loginUserId = account.userId;
+  const loginNickname = account.nickname;
+  const loginSource = account.source;
   const syncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
   if (!hasCurrentAccountSnapshot(db)) {
     return {
@@ -522,7 +529,7 @@ export function clearLibraryAccountSnapshot(db) {
 }
 
 function isCurrentAccountSnapshotUsable(db) {
-  const loginUserId = getSetting(db, 'netease_user_id') || '';
+  const loginUserId = getCurrentLibraryAccount(db).userId;
   if (!loginUserId) return true;
   const syncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
   return Boolean(syncedUserId && syncedUserId === loginUserId);
@@ -530,9 +537,23 @@ function isCurrentAccountSnapshotUsable(db) {
 
 function hasCurrentAccountSnapshot(db) {
   if (!isCurrentAccountSnapshotUsable(db)) return false;
-  const loginUserId = getSetting(db, 'netease_user_id') || '';
+  const loginUserId = getCurrentLibraryAccount(db).userId;
   if (!loginUserId) return true;
   return getActiveLibraryPlaylistIds(db).length > 0;
+}
+
+function getCurrentLibraryAccount(db) {
+  const loginSource = getSetting(db, 'netease_login_source') || '';
+  const cookieUserId = getSetting(db, 'netease_cookie_user_id') || '';
+  const cookieNickname = getSetting(db, 'netease_cookie_user_nickname') || '';
+  if (cookieUserId && (loginSource === 'cookie' || getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) === cookieUserId)) {
+    return { userId: cookieUserId, nickname: cookieNickname, source: 'cookie' };
+  }
+  return {
+    userId: getSetting(db, 'netease_user_id') || '',
+    nickname: getSetting(db, 'netease_user_nickname') || '',
+    source: loginSource
+  };
 }
 
 function setActiveLibraryPlaylistIds(db, playlistIds = []) {
@@ -543,7 +564,7 @@ function setActiveLibraryPlaylistIds(db, playlistIds = []) {
 function getActiveLibraryPlaylistIds(db) {
   const ids = normalizeIdList(safeJson(getSetting(db, LIBRARY_SYNCED_PLAYLIST_IDS_KEY), []));
   if (ids.length) return ids;
-  const loginUserId = getSetting(db, 'netease_user_id') || '';
+  const loginUserId = getCurrentLibraryAccount(db).userId;
   if (loginUserId) return [];
   return null;
 }
@@ -879,6 +900,7 @@ function buildProfileStats(tracks, playlists) {
   const profilePlaylists = playlists.filter(p => p.tracks.length);
   const topArtists = countTop(tracks.flatMap(t => t.artists || []), 20);
   const topAlbums = countTop(tracks.map(t => t.album).filter(Boolean), 20);
+  const sampleTracks = selectRepresentativeTracks(profilePlaylists, 120, 6);
   const playlistProfiles = profilePlaylists.slice(0, 30).map((playlist) => ({
     id: playlist.id,
     name: playlist.name,
@@ -893,10 +915,38 @@ function buildProfileStats(tracks, playlists) {
     topArtists,
     topAlbums,
     playlistNames: profilePlaylists.map(p => p.name),
-    sampleTracks: tracks.slice(0, 120).map(t => ({ name: t.name, artists: t.artists || [], album: t.album || '' })),
+    sampleTracks,
     playlistProfiles,
     ruleSignals: inferRuleSignals(tracks, profilePlaylists)
   };
+}
+
+function selectRepresentativeTracks(playlists, limit = 120, perPlaylist = 6) {
+  const selected = [];
+  const seen = new Set();
+  const addTrack = (track) => {
+    if (!track || selected.length >= limit) return;
+    const key = normalizeProfileSampleKey(track.name || '');
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    selected.push({ name: track.name, artists: track.artists || [], album: track.album || '' });
+  };
+  for (let index = 0; index < perPlaylist; index += 1) {
+    for (const playlist of playlists) addTrack(playlist.tracks[index]);
+  }
+  for (const playlist of playlists) {
+    for (const track of playlist.tracks) addTrack(track);
+    if (selected.length >= limit) break;
+  }
+  return selected;
+}
+
+function normalizeProfileSampleKey(value) {
+  return String(value || '')
+    .toLowerCase()
+    .replace(/[（(].*?[）)]/g, '')
+    .replace(/\s+/g, '')
+    .trim();
 }
 
 function buildFallbackStructuredProfile(stats) {
@@ -909,22 +959,24 @@ function buildFallbackStructuredProfile(stats) {
   const artists = stats.topArtists.slice(0, 12).map((item) => ({
     name: item.name,
     weight: weightedByCount(item.count, stats.trackCount),
-    evidence: [`Appears in ${item.count} synced playlist tracks`]
+    evidence: [`在已同步歌单中出现 ${item.count} 次`]
   }));
   const albums = stats.topAlbums.slice(0, 10).map((item) => ({
     name: item.name,
     weight: weightedByCount(item.count, stats.trackCount),
-    evidence: [`Appears in ${item.count} synced playlist tracks`]
+    evidence: [`在已同步歌单中出现 ${item.count} 次`]
   }));
   const discoveryDirections = normalizeWeightedList([
     ...genres.slice(0, 4).map(item => ({ ...item, evidence: [...(item.evidence || []), 'Derived from playlist genre signals'] })),
     ...moods.slice(0, 3).map(item => ({ ...item, evidence: [...(item.evidence || []), 'Derived from playlist mood signals'] })),
     ...scenes.slice(0, 3).map(item => ({ ...item, evidence: [...(item.evidence || []), 'Derived from listening scene signals'] }))
   ]).slice(0, 8);
-  const topArtistText = artists.slice(0, 4).map(item => item.name).join(', ') || 'mixed artists';
-  const topMoodText = moods.slice(0, 3).map(item => item.name).join(', ') || 'mixed moods';
+  const topArtistText = artists.slice(0, 4).map(item => item.name).join('、') || '多元艺人';
+  const topGenreText = genres.slice(0, 4).map(item => item.name).join('、') || '多元曲风';
+  const topMoodText = moods.slice(0, 3).map(item => item.name).join('、') || '复合情绪';
+  const sceneText = scenes.slice(0, 3).map(item => item.name).join('、') || '日常陪伴';
   const summary = stats.trackCount
-    ? `Based on ${stats.trackCount} synced playlist tracks, this profile leans toward ${topArtistText}, with mood signals around ${topMoodText}.`
+    ? `你的音乐世界像一间按心情调光的私人电台：${topGenreText}构成主要底色，${topArtistText}等声音常常出现，把熟悉旋律、情绪回声和一点探索欲连接起来。歌单里的线索更偏向${topMoodText}，适合${sceneText}这样的时刻，也保留着继续向原声、独立或小众方向延伸的空间。`
     : EMPTY_PROFILE_SUMMARY;
 
   return normalizeStructuredProfile({
@@ -966,20 +1018,21 @@ function normalizeStructuredProfile(profile = {}, stats = {}) {
     normalized.artists = stats.topArtists.slice(0, 12).map(item => ({
       name: item.name,
       weight: weightedByCount(item.count, stats.trackCount),
-      evidence: [`Appears in ${item.count} synced playlist tracks`]
+      evidence: [`在已同步歌单中出现 ${item.count} 次`]
     }));
   }
   if (!normalized.albums.length && stats.topAlbums?.length) {
     normalized.albums = stats.topAlbums.slice(0, 10).map(item => ({
       name: item.name,
       weight: weightedByCount(item.count, stats.trackCount),
-      evidence: [`Appears in ${item.count} synced playlist tracks`]
+      evidence: [`在已同步歌单中出现 ${item.count} 次`]
     }));
   }
   if (!normalized.summary) {
-    const artistText = normalized.artists.slice(0, 4).map(item => item.name).join(', ') || 'mixed artists';
+    const artistText = normalized.artists.slice(0, 4).map(item => item.name).join('、') || '多元艺人';
+    const genreText = normalized.genres.slice(0, 4).map(item => item.name).join('、') || '多元曲风';
     normalized.summary = normalized.trackCount
-      ? `Based on ${normalized.trackCount} synced playlist tracks, the profile leans toward ${artistText}.`
+      ? `你的音乐世界围绕${genreText}展开，${artistText}等声音构成了最常出现的坐标。它既保留熟悉旋律带来的安全感，也留着继续探索新场景、新原声和小众表达的余地。`
       : EMPTY_PROFILE_SUMMARY;
   }
   return normalized;

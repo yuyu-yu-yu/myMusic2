@@ -1462,7 +1462,7 @@ async function renderLibrary() {
   view.innerHTML = `
     <section class="page-panel">
       <p class="eyebrow">Library</p>
-      <h1 class="page-title">网易云歌单画像</h1>
+      <h1 class="page-title">私人曲库</h1>
       <div class="grid" style="margin: 0 0 16px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));">
         ${profileBlock('Top 流派', structured.genres)}
         ${profileBlock('Top 情绪', structured.moods)}

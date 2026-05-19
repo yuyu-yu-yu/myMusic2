@@ -253,6 +253,33 @@ test('library hides stale rows when current account has no active synced playlis
   assert.equal(library.totalTracks, 0);
 });
 
+test('cookie account remains the library account when OpenAPI status stores another user id', async (t) => {
+  const db = testDb(t);
+  const playlist = savePlaylist(db, { id: 'pl-cookie', name: 'Cookie Playlist', trackCount: 1 }, 'created');
+  addPlaylistTrack(db, playlist, {
+    id: 'cookie-track',
+    name: 'Cookie Song',
+    artists: ['Cookie Artist'],
+    album: 'Cookie Album'
+  });
+  setSetting(db, 'netease_login_source', 'cookie');
+  setSetting(db, 'netease_cookie_user_id', 'cookie-user');
+  setSetting(db, 'netease_cookie_user_nickname', 'Cookie User');
+  setSetting(db, 'netease_user_id', 'openapi-user');
+  setSetting(db, 'netease_user_nickname', 'OpenAPI User');
+  setSetting(db, 'library_synced_user_id', 'cookie-user');
+  setSetting(db, 'library_synced_playlist_ids', JSON.stringify([playlist.id]));
+
+  const library = getLibrary(db);
+
+  assert.equal(library.account.userId, 'cookie-user');
+  assert.equal(library.account.nickname, 'Cookie User');
+  assert.equal(library.account.source, 'cookie');
+  assert.equal(library.account.needsSync, false);
+  assert.equal(library.playlists.length, 1);
+  assert.equal(library.totalTracks, 1);
+});
+
 test('library sync requires NetEase token when OpenAPI is configured', async (t) => {
   const db = testDb(t);
   const result = await syncLibrary(db, {
