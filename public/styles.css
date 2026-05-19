@@ -1964,6 +1964,74 @@ audio {
   align-items: center;
 }
 
+.netease-login-console {
+  display: grid;
+  grid-template-columns: minmax(0, 1.2fr) minmax(260px, 0.8fr);
+  gap: 18px;
+  margin-top: 20px;
+  padding: 16px;
+  border: 1px solid rgba(0, 240, 255, 0.18);
+  border-radius: 6px;
+  background:
+    linear-gradient(135deg, rgba(0, 240, 255, 0.06), rgba(255, 0, 255, 0.035)),
+    rgba(8, 10, 24, 0.58);
+}
+
+.netease-login-copy h2 {
+  margin: 4px 0 8px;
+  color: var(--text);
+  font-size: 18px;
+}
+
+.netease-login-actions {
+  display: grid;
+  align-content: start;
+  justify-items: stretch;
+  gap: 10px;
+}
+
+.netease-login-actions .qr-img {
+  justify-self: center;
+  margin-top: 4px;
+}
+
+.openapi-login-advanced {
+  margin-top: 14px;
+  border: 1px solid rgba(124, 132, 180, 0.18);
+  border-radius: 6px;
+  background: rgba(8, 10, 24, 0.35);
+}
+
+.openapi-login-advanced summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 13px 15px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.openapi-login-advanced summary::-webkit-details-marker {
+  display: none;
+}
+
+.openapi-login-advanced summary strong {
+  display: block;
+  margin-top: 2px;
+  color: var(--text);
+}
+
+.openapi-login-advanced small {
+  color: var(--muted);
+  font-family: var(--font-mono);
+}
+
+.openapi-login-advanced .netease-account-card,
+.openapi-login-advanced .netease-login.compact {
+  margin: 0 15px 14px;
+}
+
 .radio-debug-panel {
   margin-top: 14px;
 }
@@ -2291,6 +2359,10 @@ audio {
 
   .mixer-status-card {
     min-width: 0;
+  }
+
+  .netease-login-console {
+    grid-template-columns: 1fr;
   }
 
   .feedback-grid {

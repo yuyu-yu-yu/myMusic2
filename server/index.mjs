@@ -7,12 +7,12 @@ import { fileURLToPath } from 'node:url';
 import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
 import { openDatabase, seedDemoLibrary, getSetting, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
-import { extractOpenApiTokenPayload, getNeteaseLoginStatus, resolveQrOpenApiLogin, saveOpenApiToken } from './netease-auth.mjs';
+import { extractOpenApiTokenPayload, getNeteaseLoginStatus, resolveQrOpenApiLogin, saveNeteaseUserProfile, saveOpenApiToken } from './netease-auth.mjs';
 import { getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
 import { chatRadio, getMemories, getPreferences, getRadioDebug, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
-import { loadCookie } from './community.mjs';
+import { checkCookieQrLogin, clearCookie, createCookieQrLogin, getCookieStatus, getCookieUserProfile, loadCookie, resolveCommunityApiFile } from './community.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -46,6 +46,7 @@ function createIdleLibrarySyncStatus() {
     jobId: null,
     status: 'idle',
     phase: 'idle',
+    source: null,
     currentPlaylistIndex: 0,
     totalPlaylists: 0,
     currentPlaylistName: '',
@@ -75,8 +76,24 @@ function patchLibrarySyncStatus(patch = {}) {
   return getLibrarySyncStatus();
 }
 
+function invalidateLibrarySyncStatus(message = 'Login state changed, please start sync again.') {
+  if (librarySyncStatus.status !== 'running') return getLibrarySyncStatus();
+  librarySyncStatus = {
+    ...createIdleLibrarySyncStatus(),
+    errors: message ? [message] : [],
+    finishedAt: new Date().toISOString()
+  };
+  return getLibrarySyncStatus();
+}
+
 function startLibrarySyncJob() {
-  if (librarySyncStatus.status === 'running') return getLibrarySyncStatus();
+  if (librarySyncStatus.status === 'running') {
+    const preferredSource = getCookieStatus().hasCookie ? 'cookie' : (netease.hasToken() ? 'openapi' : null);
+    if (!preferredSource || !librarySyncStatus.source || librarySyncStatus.source === preferredSource) {
+      return getLibrarySyncStatus();
+    }
+    invalidateLibrarySyncStatus('Login source changed, please start sync again.');
+  }
   const jobId = crypto.randomUUID();
   librarySyncStatus = {
     ...createIdleLibrarySyncStatus(),
@@ -90,6 +107,7 @@ function startLibrarySyncJob() {
     try {
       const result = await syncLibrary(db, netease, {
         llmConfig: config.llm,
+        isCancelled: () => librarySyncStatus.jobId !== jobId,
         onProgress: (progress) => {
           if (librarySyncStatus.jobId !== jobId) return;
           patchLibrarySyncStatus({
@@ -98,12 +116,14 @@ function startLibrarySyncJob() {
           });
         }
       });
+      if (librarySyncStatus.jobId !== jobId) return;
       if (result?.__error || result?.ok === false) {
         throw Object.assign(new Error(result.error || '同步失败'), { result });
       }
       patchLibrarySyncStatus({
         status: 'success',
         phase: 'done',
+        source: result.source || librarySyncStatus.source,
         syncedTracks: result.tracks || librarySyncStatus.syncedTracks,
         syncedPlaylists: result.syncedPlaylists || result.playlists || librarySyncStatus.syncedPlaylists,
         totalPlaylists: result.playlists || librarySyncStatus.totalPlaylists,
@@ -113,10 +133,12 @@ function startLibrarySyncJob() {
         finishedAt: new Date().toISOString()
       });
     } catch (error) {
+      if (librarySyncStatus.jobId !== jobId) return;
       const result = error?.result || null;
       patchLibrarySyncStatus({
         status: 'failed',
         phase: librarySyncStatus.phase === 'idle' ? 'checking_login' : librarySyncStatus.phase,
+        source: result?.source || librarySyncStatus.source,
         errors: result?.errors?.length ? result.errors : [error.message || '同步失败'],
         diagnostics: result?.diagnostics || librarySyncStatus.diagnostics,
         result,
@@ -131,6 +153,37 @@ function startLibrarySyncJob() {
 const routes = {
   'GET /api/health': async () => ({ ok: true, config: tokenStatus(publicConfigStatus(config)) }),
   'GET /api/config/status': async () => tokenStatus(publicConfigStatus(config)),
+  'POST /api/auth/netease-cookie/qrcode': async () => attachQrImage(await createCookieQrLogin()),
+  'POST /api/auth/netease-cookie/qrcode/check': async (req) => {
+    const body = await readJson(req);
+    const key = body.key || body.qrCodeKey || body.uniKey || body.unikey;
+    if (!key) return jsonError('qrCodeKey is required', 400);
+    const result = await checkCookieQrLogin(key, rootDir);
+    if (result.loggedIn && result.userId) {
+      invalidateLibrarySyncStatus('NetEase cookie login changed, please start sync again.');
+      saveNeteaseUserProfile(db, { userId: result.userId, nickname: result.nickname || '' });
+      setSetting(db, 'netease_login_source', 'cookie');
+      setSetting(db, 'netease_cookie_user_id', result.userId);
+      setSetting(db, 'netease_cookie_user_nickname', result.nickname || '');
+      setSetting(db, 'netease_cookie_checked_at', new Date().toISOString());
+    }
+    return result;
+  },
+  'GET /api/auth/netease-cookie/status': async () => getCookieLoginStatus(),
+  'POST /api/auth/netease-cookie/logout': async () => {
+    invalidateLibrarySyncStatus('NetEase cookie login cleared, please start sync again.');
+    clearCookie(rootDir);
+    setSetting(db, 'netease_cookie_user_id', '');
+    setSetting(db, 'netease_cookie_user_nickname', '');
+    setSetting(db, 'netease_cookie_checked_at', '');
+    if (getSetting(db, 'netease_login_source') === 'cookie') {
+      setSetting(db, 'netease_login_source', '');
+      setSetting(db, 'netease_user_id', '');
+      setSetting(db, 'netease_user_nickname', '');
+      setSetting(db, 'netease_login_checked_at', '');
+    }
+    return { ok: true, loggedOut: true, ...(await getCookieLoginStatus()) };
+  },
   'POST /api/auth/netease/qrcode': async () => attachQrImage(await netease.qrcode()),
   'POST /api/auth/netease/qrcode/check': async (req) => {
     const body = await readJson(req);
@@ -138,6 +191,7 @@ const routes = {
     if (!key) return jsonError('qrCodeKey is required', 400);
     const result = await netease.qrcodeStatus(key);
     const login = await resolveQrOpenApiLogin({ db, netease, result });
+    if (login.loggedIn) invalidateLibrarySyncStatus('NetEase OpenAPI login changed, please start sync again.');
     return attachLoginMeta(result, { ...login, hasToken: netease.hasToken() });
   },
   'GET /api/auth/netease/token-status': async () => ({
@@ -215,7 +269,7 @@ const routes = {
 };
 
 function tokenStatus(status) {
-  return { ...status, neteaseToken: netease.hasToken() };
+  return { ...status, neteaseToken: netease.hasToken(), neteaseCookie: getCookieStatus().hasCookie };
 }
 
 let qrcodeModule = null;
@@ -233,7 +287,7 @@ async function attachQrImage(result) {
 async function renderQrDataUrl(text) {
   try {
     if (!qrcodeModule) {
-      const qrcodePath = path.join(process.env.APPDATA || '', 'npm', 'node_modules', 'NeteaseCloudMusicApi', 'node_modules', 'qrcode');
+      const qrcodePath = path.join(path.dirname(resolveCommunityApiFile('main.js')), 'node_modules', 'qrcode');
       qrcodeModule = require(qrcodePath);
     }
     return await qrcodeModule.toDataURL(String(text), {
@@ -277,6 +331,53 @@ async function tryRefreshToken(db, netease) {
   }
 }
 
+async function getCookieLoginStatus() {
+  const base = getCookieStatus();
+  const savedUserId = getSetting(db, 'netease_cookie_user_id') || '';
+  const savedNickname = getSetting(db, 'netease_cookie_user_nickname') || '';
+  if (!base.hasCookie) {
+    return {
+      ok: true,
+      configured: true,
+      hasCookie: false,
+      profileReadable: false,
+      userId: savedUserId,
+      nickname: savedNickname,
+      source: 'cookie',
+      message: '尚未扫码登录网易云'
+    };
+  }
+  try {
+    const profile = await getCookieUserProfile();
+    saveNeteaseUserProfile(db, profile);
+    setSetting(db, 'netease_login_source', 'cookie');
+    setSetting(db, 'netease_cookie_user_id', profile.userId);
+    setSetting(db, 'netease_cookie_user_nickname', profile.nickname || '');
+    setSetting(db, 'netease_cookie_checked_at', new Date().toISOString());
+    return {
+      ok: true,
+      configured: true,
+      hasCookie: true,
+      profileReadable: true,
+      userId: profile.userId,
+      nickname: profile.nickname,
+      source: 'cookie',
+      message: '已登录'
+    };
+  } catch (error) {
+    return {
+      ok: true,
+      configured: true,
+      hasCookie: true,
+      profileReadable: false,
+      userId: savedUserId,
+      nickname: savedNickname,
+      source: 'cookie',
+      message: `登录状态异常，请重新扫码：${error.message}`
+    };
+  }
+}
+
 const server = http.createServer(async (req, res) => {
   try {
     if (req.url.startsWith('/api/tts/')) return serveTts(req, res);
@@ -293,6 +394,9 @@ const server = http.createServer(async (req, res) => {
     if (req.url.startsWith('/api/diary/') && req.method === 'GET') {
       const date = decodeURIComponent(req.url.split('/').pop());
       return sendJson(res, getDiary(db, date) || await generateDiary(db, config, date));
+    }
+    if (pathname.startsWith('/api/')) {
+      return sendJson(res, { ok: false, error: `API route not found: ${req.method} ${pathname}` }, 404);
     }
     return serveStatic(req, res);
   } catch (error) {

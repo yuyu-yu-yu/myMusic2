@@ -1595,8 +1595,9 @@ function librarySyncStatusText(syncStatus = {}) {
 }
 
 function librarySyncRunningText(syncStatus = {}) {
+  const source = librarySyncSourceLabel(syncStatus.source);
   if (syncStatus.phase === 'checking_login') return '正在校验网易云登录状态...';
-  if (syncStatus.phase === 'fetching_playlists') return '正在读取网易云歌单列表...';
+  if (syncStatus.phase === 'fetching_playlists') return `正在通过${source}读取歌单列表...`;
   if (syncStatus.phase === 'updating_profile') return '正在更新音乐画像...';
   const index = Number(syncStatus.currentPlaylistIndex || 0);
   const total = Number(syncStatus.totalPlaylists || 0);
@@ -1605,8 +1606,15 @@ function librarySyncRunningText(syncStatus = {}) {
   const count = syncStatus.currentPlaylistTotal === null || syncStatus.currentPlaylistTotal === undefined
     ? `${synced} 首`
     : `${synced} / ${Number(syncStatus.currentPlaylistTotal) || 0} 首`;
-  if (index && total) return `正在同步第 ${index} / ${total} 个歌单：${name}，${count}`;
-  return '正在同步网易云音乐...';
+  if (index && total) return `正在通过${source}同步第 ${index} / ${total} 个歌单：${name}，${count}`;
+  return `正在通过${source}同步网易云音乐...`;
+}
+
+function librarySyncSourceLabel(source) {
+  if (source === 'cookie') return '网易云扫码登录';
+  if (source === 'openapi') return 'OpenAPI';
+  if (source === 'demo') return 'Demo';
+  return '网易云';
 }
 
 function librarySyncProgressHTML(syncStatus = {}) {
@@ -1619,7 +1627,7 @@ function librarySyncProgressHTML(syncStatus = {}) {
     <div class="library-sync-meter"><span style="width:${percent}%"></span></div>
     <div class="library-sync-line">
       <strong>${escapeHtml(librarySyncStatusText(syncStatus))}</strong>
-      <span>${escapeHtml(`${Number(syncStatus.syncedPlaylists || 0)} 个歌单 · ${Number(syncStatus.syncedTracks || 0)} 首歌`)}</span>
+      <span>${escapeHtml(`${librarySyncSourceLabel(syncStatus.source)} · ${Number(syncStatus.syncedPlaylists || 0)} 个歌单 · ${Number(syncStatus.syncedTracks || 0)} 首歌`)}</span>
     </div>
     ${diagnostics.length ? `<div class="library-sync-diagnostics">${diagnostics.map(item => `
       <span class="${item.ok ? 'ok' : 'fail'}">${escapeHtml(item.kind)}: ${escapeHtml(String(item.recordCount ?? 0))}</span>
@@ -1638,11 +1646,11 @@ function libraryAccountNotice(data = {}) {
   `;
 }
 
-function neteaseAccountCard(status = {}) {
+function neteaseAccountCard(status = {}, label = '网易云') {
   const readable = Boolean(status.profileReadable);
   const title = readable
-    ? `已登录：${status.nickname || '网易云用户'}`
-    : (status.hasToken ? '登录状态异常' : '尚未登录网易云');
+    ? `${label}已登录：${status.nickname || '网易云用户'}`
+    : ((status.hasCookie || status.hasToken) ? `${label}登录状态异常` : `${label}尚未登录`);
   const detail = readable
     ? `userId: ${status.userId}`
     : (status.message || '请使用网易云音乐 App 扫码登录');
@@ -1734,8 +1742,9 @@ async function renderMixer() {
 }
 
 async function renderSettings() {
-  const [status, neteaseLogin, memoryData] = await Promise.all([
+  const [status, cookieLogin, neteaseLogin, memoryData] = await Promise.all([
     api('/api/config/status'),
+    api('/api/auth/netease-cookie/status').catch(() => ({ configured: true, hasCookie: false, profileReadable: false, source: 'cookie', message: '试用版登录状态读取失败' })),
     api('/api/auth/netease/token-status').catch(() => ({ configured: false, hasToken: false, profileReadable: false, message: '登录状态读取失败' })),
     api('/api/memories').catch(() => ({ memories: [] }))
   ]);
@@ -1745,22 +1754,47 @@ async function renderSettings() {
       <p class="eyebrow">Settings</p>
       <h1 class="page-title">本地配置</h1>
       <table class="settings-table">
-        ${statusRow('网易云 当前账号', neteaseLogin.profileReadable, neteaseLogin.profileReadable ? `${neteaseLogin.nickname || '网易云用户'} (${neteaseLogin.userId})` : neteaseLogin.message)}
+        ${statusRow('网易云 试用登录', cookieLogin.profileReadable, cookieLogin.profileReadable ? `${cookieLogin.nickname || '网易云用户'} (${cookieLogin.userId})` : cookieLogin.message)}
+        ${statusRow('网易云 OpenAPI', neteaseLogin.profileReadable, neteaseLogin.profileReadable ? `${neteaseLogin.nickname || '网易云用户'} (${neteaseLogin.userId})` : neteaseLogin.message)}
         ${statusRow('网易云 appId', status.netease.appId)}
         ${statusRow('网易云 RSA 私钥', status.netease.privateKey)}
-        ${statusRow('网易云 登录状态', status.neteaseToken)}
+        ${statusRow('网易云 cookie', status.neteaseCookie)}
+        ${statusRow('网易云 OpenAPI token', status.neteaseToken)}
         ${statusRow('LLM', status.llm.configured, status.llm.model)}
         ${statusRow('TTS', status.tts.configured, status.tts.provider)}
         ${statusRow('天气城市', status.weather.configured, status.weather.city)}
       </table>
       <p class="muted">真实密钥只读取本地 .env.local，前端不会接收密钥内容。</p>
-      ${neteaseAccountCard(neteaseLogin)}
-      <div class="netease-login">
-        <button id="qr-btn">扫码登录网易云</button>
-        <button id="qr-refresh-btn" class="ghost">刷新 token</button>
-        <p id="qr-status"></p>
-        <img id="qr-img" class="qr-img" src="" alt="登录二维码" style="display:none" />
+      <div class="netease-login-console">
+        <div class="netease-login-copy">
+          <p class="eyebrow">Trial Login</p>
+          <h2>扫码登录网易云</h2>
+          <p class="muted">给朋友试用时走这条链路：只需要网易云音乐 App 扫码，不需要配置开发者 API。登录 cookie 只保存在本地。</p>
+          ${neteaseAccountCard(cookieLogin, '试用版')}
+        </div>
+        <div class="netease-login-actions">
+          <button id="cookie-qr-btn">扫码登录网易云（试用版）</button>
+          <button id="cookie-logout-btn" class="ghost" ${cookieLogin.hasCookie ? '' : 'disabled'}>退出网易云登录</button>
+          <p id="cookie-qr-status" class="muted"></p>
+          <img id="cookie-qr-img" class="qr-img" src="" alt="试用版登录二维码" style="display:none" />
+        </div>
       </div>
+      <details class="openapi-login-advanced">
+        <summary>
+          <span>
+            <span class="eyebrow">Advanced</span>
+            <strong>OpenAPI 开发者登录备用</strong>
+          </span>
+          <small>比赛开发调试用</small>
+        </summary>
+        ${neteaseAccountCard(neteaseLogin, 'OpenAPI')}
+        <div class="netease-login compact">
+          <button id="qr-btn" class="ghost">OpenAPI 扫码登录</button>
+          <button id="qr-refresh-btn" class="ghost">刷新 OpenAPI token</button>
+          <p id="qr-status"></p>
+          <img id="qr-img" class="qr-img" src="" alt="OpenAPI 登录二维码" style="display:none" />
+        </div>
+      </details>
     </section>
     <section class="page-panel radio-debug-panel">
       <details>
@@ -1791,9 +1825,16 @@ async function renderSettings() {
       <p class="muted">长期记忆会影响灿灿后续聊天和推荐。当前共有 ${memories.length} 条；清空后不会删除聊天记录或曲库。</p>
     </section>
   `;
-  document.querySelector('#qr-btn').addEventListener('click', () => startQrLogin());
+  document.querySelector('#cookie-qr-btn')?.addEventListener('click', () => startCookieQrLogin());
+  document.querySelector('#cookie-logout-btn')?.addEventListener('click', async () => {
+    const statusEl = document.querySelector('#cookie-qr-status');
+    if (statusEl) statusEl.textContent = '正在退出网易云登录...';
+    await api('/api/auth/netease-cookie/logout', { method: 'POST', body: {} });
+    renderSettings();
+  });
+  document.querySelector('#qr-btn')?.addEventListener('click', () => startQrLogin());
   document.querySelector('#radio-debug-refresh')?.addEventListener('click', () => refreshRadioDebugPanel());
-  document.querySelector('#qr-refresh-btn').addEventListener('click', async () => {
+  document.querySelector('#qr-refresh-btn')?.addEventListener('click', async () => {
     const statusEl = document.querySelector('#qr-status');
     statusEl.textContent = '正在续期...';
     const res = await api('/api/auth/netease/refresh', { method: 'POST', body: {} });
@@ -1926,6 +1967,69 @@ async function startQrLogin() {
   } catch (error) {
     statusEl.textContent = '获取失败: ' + error.message;
   }
+}
+
+async function startCookieQrLogin() {
+  const statusEl = document.querySelector('#cookie-qr-status');
+  const img = document.querySelector('#cookie-qr-img');
+  if (!statusEl || !img) return;
+  statusEl.textContent = '正在获取试用版登录二维码...';
+  try {
+    const data = await api('/api/auth/netease-cookie/qrcode', { method: 'POST', body: {} });
+    const info = data.data || data;
+    const qrUrl = info.qrCodeUrl || info.qrCode || info.qrurl || '';
+    const key = info.qrCodeKey || info.uniKey || info.unikey || info.key;
+    const qrImage = info.qrImage || info.qrimg || '';
+    if (qrImage) {
+      img.src = qrImage;
+      img.style.display = 'block';
+    } else if (qrUrl) {
+      img.src = 'https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=' + encodeURIComponent(qrUrl);
+      img.style.display = 'block';
+    } else {
+      img.removeAttribute('src');
+      img.style.display = 'none';
+    }
+    if (!key) {
+      statusEl.textContent = '二维码 key 缺失，请重试';
+      return;
+    }
+    statusEl.textContent = '请用网易云音乐 App 扫码';
+    pollCookieQrStatus(key, statusEl);
+  } catch (error) {
+    statusEl.textContent = '获取失败: ' + error.message;
+  }
+}
+
+async function pollCookieQrStatus(key, statusEl) {
+  for (let i = 0; i < 60; i++) {
+    await sleep(2000);
+    try {
+      const res = await api('/api/auth/netease-cookie/qrcode/check', { method: 'POST', body: { key } });
+      const data = res.data || res;
+      const code = Number(data.code || res.code || 0);
+      if (code === 803) {
+        if (res.loggedIn === true || data.loggedIn === true) {
+          const nickname = res.nickname || data.nickname || '网易云用户';
+          const userId = res.userId || data.userId || '';
+          statusEl.textContent = `扫码成功，已保存登录信息：${nickname}${userId ? ` (${userId})` : ''}`;
+          const img = document.querySelector('#cookie-qr-img');
+          if (img) img.style.display = 'none';
+          setTimeout(() => renderSettings(), 600);
+          return;
+        }
+        statusEl.textContent = res.loginMessage || data.loginMessage || '授权已确认，但没有拿到网易云登录 cookie，请重新扫码';
+        return;
+      }
+      if (code === 802) { statusEl.textContent = '已扫码，请在手机上确认授权...'; continue; }
+      if (code === 801) { statusEl.textContent = '等待扫码...'; continue; }
+      if (code === 800) { statusEl.textContent = '二维码已过期，请重新获取'; return; }
+      statusEl.textContent = '状态：' + (data.msg || data.message || code);
+    } catch {
+      // Keep polling while the login endpoint is transiently unavailable.
+    }
+  }
+  statusEl.textContent = '超时，请重新获取二维码';
 }
 
 async function pollQrStatus(key, statusEl) {

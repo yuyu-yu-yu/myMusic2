@@ -1,18 +1,28 @@
 import { clearPlaylistLibrary, getSetting, listRecentPlays, normalizeTrack, nowIso, replacePlaylistTracks, savePlaylist, saveTrack, seedDemoLibrary, setSetting } from './db.mjs';
-import { getSongUrl, getLyric as getCommunityLyric } from './community.mjs';
+import {
+  getSongUrl,
+  getLyric as getCommunityLyric,
+  getCookieUserProfile,
+  hasCookie as hasCommunityCookie,
+  playlistTrackAll as communityPlaylistTrackAll,
+  recentSongs as communityRecentSongs,
+  userPlaylists as communityUserPlaylists
+} from './community.mjs';
 import { generateChatCompletion } from './ai.mjs';
 import { getNeteaseLoginStatus } from './netease-auth.mjs';
 
 const PROFILE_EXCLUDED_PLAYLIST_IDS_KEY = 'profile_excluded_playlist_ids';
-const EMPTY_PROFILE_SUMMARY = '尚未选择用于生成音乐画像的网易云歌单。请在曲库页勾选至少一个歌单后，灿灿会只根据这些歌单生成长期音乐画像。';
+const EMPTY_PROFILE_SUMMARY = 'No playlist selected for music profile.';
 const PLAYLIST_SYNC_PAGE_SIZE = 200;
 const LIBRARY_SYNCED_USER_ID_KEY = 'library_synced_user_id';
 
 export async function syncLibrary(db, netease, options = {}) {
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : () => {};
+  const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : () => false;
   const llmConfig = options.llmConfig;
   const result = {
-    mode: netease.isConfigured() ? 'netease' : 'demo',
+    mode: 'demo',
+    source: 'demo',
     playlists: 0,
     tracks: 0,
     errors: [],
@@ -22,14 +32,29 @@ export async function syncLibrary(db, netease, options = {}) {
   };
   const progress = (patch = {}) => onProgress({
     phase: patch.phase || 'syncing_tracks',
+    source: patch.source || result.source,
     syncedTracks: result.tracks,
     syncedPlaylists: result.syncedPlaylists || 0,
     errors: [...result.errors],
     diagnostics: [...result.diagnostics],
     ...patch
   });
+  const assertNotCancelled = () => {
+    if (!isCancelled()) return;
+    const error = new Error('Sync cancelled by newer login state');
+    error.code = 'SYNC_CANCELLED';
+    throw error;
+  };
 
-  if (!netease.isConfigured()) {
+  progress({ phase: 'checking_login' });
+  assertNotCancelled();
+  const syncSource = await resolveLibrarySyncSource(db, netease, result);
+  assertNotCancelled();
+  result.mode = syncSource.mode;
+  result.source = syncSource.source;
+  result.user = syncSource.user;
+
+  if (syncSource.source === 'demo') {
     progress({ phase: 'syncing_tracks', currentPlaylistIndex: 1, totalPlaylists: 1, currentPlaylistName: 'Demo Library' });
     seedDemoLibrary(db);
     const tracks = listLibraryTracks(db, 100);
@@ -42,35 +67,17 @@ export async function syncLibrary(db, netease, options = {}) {
     return result;
   }
 
-  if (typeof netease.hasToken === 'function' && !netease.hasToken()) {
+  if (syncSource.error) {
     return {
       __error: true,
       ok: false,
       status: 401,
-      error: '请先在设置页扫码登录网易云',
-      mode: 'netease',
+      error: syncSource.error,
+      mode: result.mode,
+      source: result.source,
       playlists: 0,
       tracks: countLibraryTracks(db),
-      errors: ['请先在设置页扫码登录网易云']
-    };
-  }
-
-  progress({ phase: 'checking_login' });
-  const login = await getNeteaseLoginStatus({ db, netease });
-  result.user = {
-    userId: login.userId || '',
-    nickname: login.nickname || ''
-  };
-  if (!login.profileReadable) {
-    return {
-      __error: true,
-      ok: false,
-      status: 401,
-      error: login.message || '请重新扫码登录网易云',
-      mode: 'netease',
-      playlists: 0,
-      tracks: countLibraryTracks(db),
-      errors: [login.message || '请重新扫码登录网易云'],
+      errors: [syncSource.error, ...result.errors],
       diagnostics: result.diagnostics,
       user: result.user
     };
@@ -84,30 +91,40 @@ export async function syncLibrary(db, netease, options = {}) {
 
   const playlistRecords = [];
   progress({ phase: 'fetching_playlists', user: result.user });
-  for (const [kind, job] of playlistJobs) {
-    try {
-      const response = await job();
-      const records = extractPlaylistRecords(response.data);
-      result.diagnostics.push(buildPlaylistDiagnostic(kind, response, records));
-      playlistRecords.push(...records.map(item => ({ kind, item })));
-      progress({ phase: 'fetching_playlists', totalPlaylists: playlistRecords.length });
-    } catch (error) {
-      result.errors.push(`${kind}: ${error.message}`);
-      result.diagnostics.push(buildPlaylistDiagnostic(kind, null, [], error));
-      progress({ phase: 'fetching_playlists' });
+  assertNotCancelled();
+  if (syncSource.source === 'cookie') {
+    playlistRecords.push(...await fetchCookiePlaylistRecords(syncSource.client, result.user.userId, result, progress));
+  } else {
+    for (const [kind, job] of playlistJobs) {
+      assertNotCancelled();
+      try {
+        const response = await job();
+        const records = extractPlaylistRecords(response.data);
+        result.diagnostics.push(buildPlaylistDiagnostic(kind, response, records));
+        playlistRecords.push(...records.map(item => ({ kind, item })));
+        progress({ phase: 'fetching_playlists', totalPlaylists: playlistRecords.length });
+      } catch (error) {
+        result.errors.push(`${kind}: ${error.message}`);
+        result.diagnostics.push(buildPlaylistDiagnostic(kind, null, [], error));
+        progress({ phase: 'fetching_playlists' });
+      }
     }
   }
 
   if (!playlistRecords.length) {
+    const noPlaylistMessage = result.source === 'cookie'
+      ? 'Cookie login succeeded but no NetEase playlists were read. Please rescan or check account permissions.'
+      : 'Login succeeded but no NetEase playlists were read. Please check account permissions or rescan.';
     return {
       __error: true,
       ok: false,
       status: 502,
-      error: '登录成功，但没有读取到网易云歌单，请检查账号权限或重新扫码',
-      mode: 'netease',
+      error: noPlaylistMessage,
+      mode: result.mode,
+      source: result.source,
       playlists: 0,
       tracks: countLibraryTracks(db),
-      errors: ['登录成功，但没有读取到网易云歌单，请检查账号权限或重新扫码', ...result.errors],
+      errors: [noPlaylistMessage, ...result.errors],
       diagnostics: result.diagnostics,
       user: result.user
     };
@@ -127,6 +144,7 @@ export async function syncLibrary(db, netease, options = {}) {
   result.playlists = playlists.length;
 
   for (const playlist of playlists) {
+    assertNotCancelled();
     try {
       const currentPlaylistIndex = playlists.indexOf(playlist) + 1;
       progress({
@@ -137,7 +155,8 @@ export async function syncLibrary(db, netease, options = {}) {
         currentPlaylistSynced: 0,
         currentPlaylistTotal: playlist.trackCount ?? null
       });
-      const records = await fetchAllPlaylistSongs(netease, playlist, PLAYLIST_SYNC_PAGE_SIZE, ({ synced, total }) => {
+      const records = await fetchAllPlaylistSongs(syncSource.client || netease, playlist, PLAYLIST_SYNC_PAGE_SIZE, ({ synced, total }) => {
+        assertNotCancelled();
         progress({
           phase: 'syncing_tracks',
           currentPlaylistIndex,
@@ -168,14 +187,15 @@ export async function syncLibrary(db, netease, options = {}) {
   }
 
   try {
-    const response = await netease.recentSongs(0, 50);
+    assertNotCancelled();
+    const response = await (syncSource.client || netease).recentSongs(0, 50);
     const records = extractRecords(response.data);
     records.forEach((item) => {
       const track = saveTrack(db, item);
       db.prepare(`
         INSERT INTO plays (track_id, played_at, source, reason, report_status)
         VALUES (?, ?, ?, ?, ?)
-      `).run(track.id, item.playTime ? new Date(Number(item.playTime)).toISOString() : nowIso(), 'netease-recent', '网易云最近播放', 'imported');
+      `).run(track.id, item.playTime ? new Date(Number(item.playTime)).toISOString() : nowIso(), 'netease-recent', 'netease recent play', 'imported');
     });
   } catch (error) {
     result.errors.push(`recent: ${error.message}`);
@@ -187,6 +207,125 @@ export async function syncLibrary(db, netease, options = {}) {
   if (result.user.userId) setSetting(db, LIBRARY_SYNCED_USER_ID_KEY, result.user.userId);
   progress({ phase: 'done', syncedTracks: result.tracks, syncedPlaylists: result.syncedPlaylists });
   return result;
+}
+
+async function resolveLibrarySyncSource(db, netease, result) {
+  const hasCookie = hasCommunityCookie();
+  if (hasCookie) {
+    try {
+      const profile = await getCookieUserProfile();
+      setSetting(db, 'netease_user_id', profile.userId);
+      setSetting(db, 'netease_user_nickname', profile.nickname || '');
+      setSetting(db, 'netease_login_checked_at', nowIso());
+      setSetting(db, 'netease_login_source', 'cookie');
+      result.diagnostics.push({
+        kind: 'cookie_login',
+        ok: true,
+        recordCount: 1,
+        message: profile.nickname || profile.userId,
+        dataKeys: ['profile', 'account']
+      });
+      return {
+        source: 'cookie',
+        mode: 'cookie',
+        user: profile,
+        client: createCookieLibraryClient()
+      };
+    } catch (error) {
+      result.diagnostics.push({
+        kind: 'cookie_login',
+        ok: false,
+        recordCount: 0,
+        message: error.message,
+        dataKeys: []
+      });
+      return {
+        source: 'cookie',
+        mode: 'cookie',
+        user: null,
+        error: `网易云试用版扫码登录状态异常，请在设置页重新扫码：${error.message}`
+      };
+    }
+  }
+
+  if (!netease.isConfigured()) {
+    return {
+      source: 'demo',
+      mode: 'demo',
+      user: null
+    };
+  }
+
+  if (typeof netease.hasToken === 'function' && !netease.hasToken()) {
+    return {
+      source: 'openapi',
+      mode: 'netease',
+      user: null,
+      error: '请先在设置页扫码登录网易云'
+    };
+  }
+
+  const login = await getNeteaseLoginStatus({ db, netease });
+  const user = {
+    userId: login.userId || '',
+    nickname: login.nickname || ''
+  };
+  if (!login.profileReadable) {
+    return {
+      source: 'openapi',
+      mode: 'netease',
+      user,
+      error: login.message || 'Please rescan NetEase login.'
+    };
+  }
+  setSetting(db, 'netease_login_source', 'openapi');
+  return {
+    source: 'openapi',
+    mode: 'netease',
+    user,
+    client: netease
+  };
+}
+
+function createCookieLibraryClient() {
+  return {
+    userPlaylists: communityUserPlaylists,
+    playlistSongs: communityPlaylistTrackAll,
+    recentSongs: communityRecentSongs
+  };
+}
+
+async function fetchCookiePlaylistRecords(client, userId, result, progress) {
+  const records = [];
+  const limit = 1000;
+  let offset = 0;
+  let pageCount = 0;
+  while (true) {
+    const response = await client.userPlaylists(userId, offset, limit);
+    const pageRecords = extractPlaylistRecords(response.data);
+    records.push(...pageRecords.map(item => ({ kind: classifyCookiePlaylist(item, userId), item })));
+    pageCount += 1;
+    progress({ phase: 'fetching_playlists', totalPlaylists: records.length });
+    const more = Boolean(response.data?.more);
+    if (!pageRecords.length || pageRecords.length < limit || !more) break;
+    offset += pageRecords.length;
+  }
+  result.diagnostics.push({
+    kind: 'cookie_user_playlist',
+    ok: true,
+    recordCount: records.length,
+    message: `${pageCount} page(s)`,
+    dataKeys: ['playlist', 'more']
+  });
+  return records;
+}
+
+function classifyCookiePlaylist(playlist = {}, userId = '') {
+  if (Number(playlist.specialType) === 5) return 'star';
+  const ownerId = playlist.userId ?? playlist.creator?.userId ?? playlist.creatorId;
+  if (String(ownerId || '') === String(userId || '')) return 'created';
+  if (playlist.subscribed === true || playlist.ordered === true) return 'subscribed';
+  return 'playlist';
 }
 
 export async function updateProfile(db, llmConfig) {
@@ -222,11 +361,11 @@ export async function updateProfile(db, llmConfig) {
     };
   }
 
-  // LLM enriched profile — only regenerate when needed
+  // LLM enriched profile 闂?only regenerate when needed
   const existing = getProfile(db);
   const lastUpdated = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
   const hoursSinceUpdate = (Date.now() - lastUpdated) / 3600000;
-  const previousCount = Number(existing?.structured?.trackCount || existing?.summary?.match(/(\d+)\s*首/)?.[1] || 0);
+  const previousCount = Number(existing?.structured?.trackCount || 0);
   const sourceChanged = !sameStringSet(existing?.structured?.selectedPlaylistIds, stats.selectedPlaylistIds);
   const trackCountChanged = previousCount
     ? Math.abs(stats.trackCount - previousCount) > Math.max(10, stats.trackCount * 0.05)
@@ -265,31 +404,29 @@ export async function updateProfile(db, llmConfig) {
 }
 
 async function generateAIPortrait(stats, llmConfig) {
-  const sample = stats.sampleTracks.map(t => `${t.name} - ${(t.artists || []).join('/')}`).join('、');
+  const sample = stats.sampleTracks.map(t => `${t.name} - ${(t.artists || []).join('/')}`).join(', ');
   const playlistText = stats.playlistProfiles.map(p =>
-    `${p.name}（${p.kind}，${p.trackCount}首）：${p.sampleTracks.map(t => `${t.name}-${(t.artists || []).join('/')}`).join('、')}`
+    `${p.name} (${p.kind}, ${p.trackCount} tracks): ${p.sampleTracks.map(t => `${t.name}-${(t.artists || []).join('/')}`).join(', ')}`
   ).join('\n');
 
   const text = await generateChatCompletion(llmConfig, [
     {
       role: 'system',
       content: [
-        '你是音乐画像分析师。只分析用户主动同步的网易云歌单曲目。',
-        '不要使用最近播放、AI电台推荐、在线搜索结果来推断长期口味。',
-        '只输出严格 JSON，不要 Markdown。',
-        'JSON schema: {"summary":"中文摘要120-400字","genres":[{"name":"...","weight":0-1,"evidence":["..."]}],"moods":[...],"artists":[...],"albums":[...],"languages":[...],"scenes":[...],"eras":[...],"energy":[...],"discoveryDirections":[{"name":"...","weight":0-1,"evidence":["..."]}],"avoidSignals":[{"name":"...","weight":0-1,"evidence":["..."]}]}',
-        'weight 表示长期偏好强度。avoidSignals 只填写曲库明显少或反差大的方向，不要凭空编造。'
+        'You are a music profile analyst. Return strict JSON only, no markdown.',
+        'Summarize the user music taste from playlist statistics and sampled tracks.',
+        'JSON schema: {"summary":"20-400 Chinese chars","genres":[{"name":"...","weight":0-1,"evidence":["..."]}],"moods":[...],"artists":[...],"albums":[...],"languages":[...],"scenes":[...],"eras":[...],"energy":[...],"discoveryDirections":[{"name":"...","weight":0-1,"evidence":["..."]}],"avoidSignals":[{"name":"...","weight":0-1,"evidence":["..."]}]}'
       ].join('\n')
     },
     {
       role: 'user',
       content: [
-        `曲库总量：${stats.trackCount} 首，歌单数：${stats.playlistCount}`,
-        `艺人 Top：${stats.topArtists.map(item => `${item.name}(${item.count})`).join('、')}`,
-        `专辑 Top：${stats.topAlbums.map(item => `${item.name}(${item.count})`).join('、')}`,
-        `规则初判：${JSON.stringify(stats.ruleSignals)}`,
-        `歌单级样本：\n${playlistText}`,
-        `曲库样本：${sample}`
+        `Track count: ${stats.trackCount}; playlist count: ${stats.playlistCount}`,
+        `Top artists: ${stats.topArtists.map(item => `${item.name}(${item.count})`).join(', ')}`,
+        `Top albums: ${stats.topAlbums.map(item => `${item.name}(${item.count})`).join(', ')}`,
+        `Rule signals: ${JSON.stringify(stats.ruleSignals)}`,
+        `Playlist samples: ${playlistText}`,
+        `Track samples: ${sample}`
       ].join('\n')
     }
   ], () => null);
@@ -304,7 +441,7 @@ async function generateAIPortrait(stats, llmConfig) {
 
 export function getProfile(db) {
   const row = db.prepare('SELECT summary, tags_json AS tagsJson, profile_json AS profileJson, updated_at AS updatedAt FROM music_profile WHERE id = 1').get();
-  if (!row) return { summary: '尚未生成音乐画像。', tags: [], structured: {}, updatedAt: null };
+  if (!row) return { summary: 'No music profile generated yet.', tags: [], structured: {}, updatedAt: null };
   return {
     summary: row.summary,
     tags: safeJson(row.tagsJson, []),
@@ -319,6 +456,7 @@ export function getLibrary(db) {
   const selectedIds = new Set(profileSelection.selectedIds);
   const loginUserId = getSetting(db, 'netease_user_id') || '';
   const loginNickname = getSetting(db, 'netease_user_nickname') || '';
+  const loginSource = getSetting(db, 'netease_login_source') || '';
   const syncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
   return {
     profile: getProfile(db),
@@ -334,6 +472,7 @@ export function getLibrary(db) {
     account: {
       userId: loginUserId,
       nickname: loginNickname,
+      source: loginSource,
       syncedUserId,
       accountMismatch: Boolean(loginUserId && syncedUserId && loginUserId !== syncedUserId)
     }
@@ -544,6 +683,19 @@ function normalizeIdList(values = []) {
     .filter(Boolean))];
 }
 
+function countTop(values = [], limit = 10) {
+  const counts = new Map();
+  for (const value of values) {
+    const name = String(value || '').trim();
+    if (!name) continue;
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
+    .slice(0, limit);
+}
+
 function sameStringSet(left, right) {
   if (!Array.isArray(left) || !Array.isArray(right)) return false;
   const leftIds = normalizeIdList(left).sort();
@@ -582,26 +734,26 @@ function buildFallbackStructuredProfile(stats) {
   const scenes = normalizeWeightedList(stats.ruleSignals.scenes);
   const eras = normalizeWeightedList(stats.ruleSignals.eras);
   const energy = normalizeWeightedList(stats.ruleSignals.energy);
-  const artists = stats.topArtists.slice(0, 12).map((item, index) => ({
+  const artists = stats.topArtists.slice(0, 12).map((item) => ({
     name: item.name,
     weight: weightedByCount(item.count, stats.trackCount),
-    evidence: [`用户歌单中出现 ${item.count} 首`, index < 3 ? '常听艺人 Top' : '歌单艺人频次较高'].filter(Boolean)
+    evidence: [`Appears in ${item.count} synced playlist tracks`]
   }));
   const albums = stats.topAlbums.slice(0, 10).map((item) => ({
     name: item.name,
     weight: weightedByCount(item.count, stats.trackCount),
-    evidence: [`用户歌单中出现 ${item.count} 首`]
+    evidence: [`Appears in ${item.count} synced playlist tracks`]
   }));
   const discoveryDirections = normalizeWeightedList([
-    ...genres.slice(0, 4).map(item => ({ ...item, evidence: [...(item.evidence || []), '由歌单曲目关键词推断'] })),
-    ...moods.slice(0, 3).map(item => ({ ...item, evidence: [...(item.evidence || []), '适合作为后续探索方向'] })),
-    ...scenes.slice(0, 3).map(item => ({ ...item, evidence: [...(item.evidence || []), '歌单场景信号'] }))
+    ...genres.slice(0, 4).map(item => ({ ...item, evidence: [...(item.evidence || []), 'Derived from playlist genre signals'] })),
+    ...moods.slice(0, 3).map(item => ({ ...item, evidence: [...(item.evidence || []), 'Derived from playlist mood signals'] })),
+    ...scenes.slice(0, 3).map(item => ({ ...item, evidence: [...(item.evidence || []), 'Derived from listening scene signals'] }))
   ]).slice(0, 8);
-  const topArtistText = artists.slice(0, 4).map(item => item.name).join('、') || '暂不明显';
-  const topMoodText = moods.slice(0, 3).map(item => item.name).join('、') || '日常陪伴';
+  const topArtistText = artists.slice(0, 4).map(item => item.name).join(', ') || 'mixed artists';
+  const topMoodText = moods.slice(0, 3).map(item => item.name).join(', ') || 'mixed moods';
   const summary = stats.trackCount
-    ? `已基于 ${stats.trackCount} 首用户主动同步的网易云歌单歌曲生成长期画像。你的歌单里常见艺人包括 ${topArtistText}，整体情绪偏向 ${topMoodText}。这份画像不会使用电台 DJ 推荐、在线搜索结果、播放记录或最近播放，避免推荐结果反向污染长期口味。`
-    : '尚未从用户歌单中找到可分析的歌曲。同步网易云歌单后，会只基于歌单内容生成长期音乐画像。';
+    ? `Based on ${stats.trackCount} synced playlist tracks, this profile leans toward ${topArtistText}, with mood signals around ${topMoodText}.`
+    : EMPTY_PROFILE_SUMMARY;
 
   return normalizeStructuredProfile({
     summary,
@@ -617,7 +769,6 @@ function buildFallbackStructuredProfile(stats) {
     avoidSignals: []
   }, stats);
 }
-
 function normalizeStructuredProfile(profile = {}, stats = {}) {
   const normalized = {
     source: 'playlist_tracks',
@@ -643,21 +794,21 @@ function normalizeStructuredProfile(profile = {}, stats = {}) {
     normalized.artists = stats.topArtists.slice(0, 12).map(item => ({
       name: item.name,
       weight: weightedByCount(item.count, stats.trackCount),
-      evidence: [`用户歌单中出现 ${item.count} 首`]
+      evidence: [`Appears in ${item.count} synced playlist tracks`]
     }));
   }
   if (!normalized.albums.length && stats.topAlbums?.length) {
     normalized.albums = stats.topAlbums.slice(0, 10).map(item => ({
       name: item.name,
       weight: weightedByCount(item.count, stats.trackCount),
-      evidence: [`用户歌单中出现 ${item.count} 首`]
+      evidence: [`Appears in ${item.count} synced playlist tracks`]
     }));
   }
   if (!normalized.summary) {
-    const artistText = normalized.artists.slice(0, 4).map(item => item.name).join('、') || '暂不明显';
+    const artistText = normalized.artists.slice(0, 4).map(item => item.name).join(', ') || 'mixed artists';
     normalized.summary = normalized.trackCount
-      ? `已基于 ${normalized.trackCount} 首用户歌单歌曲生成结构化画像，常听艺人包括 ${artistText}。`
-      : '尚未生成音乐画像。';
+      ? `Based on ${normalized.trackCount} synced playlist tracks, the profile leans toward ${artistText}.`
+      : EMPTY_PROFILE_SUMMARY;
   }
   return normalized;
 }
@@ -667,115 +818,74 @@ function inferRuleSignals(tracks, playlists = []) {
     ...tracks.flatMap(track => [track.name, track.album, ...(track.artists || [])]),
     ...playlists.map(playlist => playlist.name)
   ].filter(Boolean).join(' ').toLowerCase();
-  const cjkText = [
-    ...tracks.flatMap(track => [track.name, track.album, ...(track.artists || [])]),
-    ...playlists.map(playlist => playlist.name)
-  ].filter(Boolean).join(' ');
-
+  const count = tracks.length || 1;
   return {
     genres: scoreRuleSignals(baseText, [
-      ['华语流行', /华语|中文|国语|粤语|陈奕迅|周杰伦|林俊杰|五月天|苏打绿|吴青峰|王菲|孙燕姿/],
-      ['电子', /electronic|edm|remix|dj|house|techno|trance|dubstep|future bass|synth|电子|电音|混音/],
-      ['民谣', /folk|民谣|赵雷|宋冬野|马頔|尧十三/],
-      ['摇滚', /rock|摇滚|metal|punk|alternative/],
-      ['爵士', /jazz|爵士|swing|bossa/],
-      ['古典/器乐', /classic|classical|古典|piano|钢琴|orchestra|管弦|instrumental|纯音乐/],
-      ['影视原声', /ost|score|soundtrack|theme|原声|配乐|影视|电影|动画/],
-      ['说唱', /hip.?hop|rap|说唱|嘻哈/],
-      ['氛围/Lo-Fi', /ambient|lofi|lo-fi|氛围|白噪|冥想/]
-    ], tracks.length),
+      ['pop', /pop|娴佽|鍗庤|chinese/gi],
+      ['electronic', /electronic|edm|鐢甸煶|鐢靛瓙/gi],
+      ['soundtrack', /ost|soundtrack|鍘熷０|鍔ㄦ极|娓告垙/gi],
+      ['folk', /folk|姘戣埃/gi],
+      ['classical', /classical|piano|閽㈢惔|鍙ゅ吀/gi]
+    ], count),
     moods: scoreRuleSignals(baseText, [
-      ['夜晚', /night|moon|深夜|夜|晚安|凌晨|星|月/],
-      ['安静', /calm|quiet|silent|安静|轻柔|慢|独处/],
-      ['治愈', /heal|comfort|治愈|温柔|陪伴|暖|拥抱/],
-      ['怀旧', /old|classic|memory|nostalg|回忆|怀旧|老歌|从前/],
-      ['忧伤', /sad|blue|rain|melancholy|雨|伤心|难过|孤独|离别/],
-      ['浪漫', /love|romantic|恋爱|浪漫|情歌|喜欢/],
-      ['能量', /energy|power|燃|热血|快乐|兴奋|舞曲/]
-    ], tracks.length),
-    languages: detectLanguages(cjkText, tracks.length),
+      ['calm', /calm|quiet|瀹夐潤|娌绘剤|娓╂煍/gi],
+      ['nostalgic', /nostalgia|鎬€鏃鍥炲繂/gi],
+      ['sad', /sad|浼ゆ劅|emo|闅捐繃/gi],
+      ['bright', /happy|寮€蹇億蹇箰|鍏冩皵/gi]
+      ['romantic', /love|romantic|鐖辨儏|娴极/gi]
+    ], count),
+    languages: scoreRuleSignals(baseText, [
+      ['Chinese', /鍗庤|涓枃|鍥借|绮よ/gi],
+      ['English', /english|娆х編|ed sheeran|taylor|charlie puth/gi],
+      ['Japanese', /japanese|鏃ヨ|jpop|anime|鍔ㄦ极/gi]
+    ], count),
     scenes: scoreRuleSignals(baseText, [
-      ['睡前', /sleep|bed|晚安|睡前|失眠|深夜/],
-      ['专注', /focus|study|work|学习|工作|专注|钢琴|lofi/],
-      ['放松', /relax|chill|放松|休息|慢歌|咖啡/],
-      ['通勤', /drive|road|city|公路|城市|通勤|地铁/],
-      ['运动', /run|workout|运动|跑步|健身|燃/],
-      ['独处', /alone|solo|独处|一个人|孤独/]
-    ], tracks.length),
-    eras: detectEras(baseText, tracks.length),
-    energy: detectEnergy(baseText, tracks.length)
+      ['night', /night|娣卞|澶滄櫄|鐫″墠/gi],
+      ['focus', /focus|study|瀛︿範|涓撴敞/gi],
+      ['commute', /drive|commute|閫氬嫟/gi],
+      ['relax', /relax|鏀炬澗|chill/gi]
+    ], count),
+    eras: scoreRuleSignals(baseText, [
+      ['2010s', /2010|2011|2012|2013|2014|2015|2016|2017|2018|2019/gi],
+      ['2020s', /2020|2021|2022|2023|2024|2025|2026/gi]
+    ], count),
+    energy: scoreRuleSignals(baseText, [
+      ['low', /quiet|calm|piano|瀹夐潤|杞绘煍/gi],
+      ['medium', /pop|娴佽|鍗庤/gi],
+      ['high', /edm|rock|鐕億杩愬姩|鐢甸煶/gi]
+    ], count)
   };
 }
 
 function scoreRuleSignals(text, rules, trackCount) {
-  return rules.map(([name, pattern]) => {
-    const matches = text.match(new RegExp(pattern.source, `${pattern.flags.includes('i') ? pattern.flags : `${pattern.flags}i`}g`)) || [];
+  return rules.filter(Array.isArray).map(([name, pattern]) => {
+    if (!(pattern instanceof RegExp)) return null;
+    const flags = new Set(String(pattern.flags || '').split('').filter(Boolean));
+    flags.add('g');
+    flags.add('i');
+    const matches = text.match(new RegExp(pattern.source, [...flags].join(''))) || [];
     return {
       name,
-      weight: weightedByCount(matches.length, Math.max(trackCount, 1)),
-      evidence: matches.length ? [`关键词命中 ${matches.length} 次`] : []
+      weight: clampWeight(matches.length / Math.max(trackCount, 1) * 8),
+      evidence: matches.length ? [`${matches.length} text matches`] : []
     };
-  }).filter(item => item.weight > 0);
-}
-
-function detectLanguages(text, trackCount) {
-  const signals = [];
-  const cjk = (text.match(/[\u4e00-\u9fff]/g) || []).length;
-  const latin = (text.match(/[a-zA-Z]/g) || []).length;
-  const kana = (text.match(/[\u3040-\u30ff]/g) || []).length;
-  if (cjk) signals.push({ name: '中文', weight: weightedByCount(cjk / 12, trackCount), evidence: ['歌名/艺人中有中文信号'] });
-  if (latin) signals.push({ name: '英文/欧美', weight: weightedByCount(latin / 18, trackCount), evidence: ['歌名/艺人中有英文信号'] });
-  if (kana || /j-?pop|anime|日本|日语/.test(text.toLowerCase())) signals.push({ name: '日语', weight: weightedByCount(kana || 2, trackCount), evidence: ['歌名/歌单中有日语或日本音乐信号'] });
-  return signals;
-}
-
-function detectEras(text, trackCount) {
-  return scoreRuleSignals(text, [
-    ['经典老歌', /80s|90s|八十|九十|老歌|classic/],
-    ['千禧年代', /2000|00s|千禧|周杰伦|孙燕姿|王心凌|陶喆/],
-    ['近年流行', /2020|2021|2022|2023|2024|2025|2026|新歌/]
-  ], trackCount);
-}
-
-function detectEnergy(text, trackCount) {
-  const high = scoreRuleSignals(text, [['高能量', /edm|rock|燃|热血|舞曲|跑步|运动|快歌|power|energy/]], trackCount);
-  const low = scoreRuleSignals(text, [['低能量', /calm|sleep|安静|轻柔|慢歌|钢琴|lofi|氛围|晚安/]], trackCount);
-  const medium = trackCount ? [{ name: '中等能量', weight: 0.35, evidence: ['作为默认日常收听能量'] }] : [];
-  return [...high, ...low, ...medium];
-}
-
-function countTop(values, limit) {
-  const counts = new Map();
-  for (const value of values) {
-    const name = String(value || '').trim();
-    if (!name) continue;
-    counts.set(name, (counts.get(name) || 0) + 1);
-  }
-  return [...counts.entries()]
-    .map(([name, count]) => ({ name, count }))
-    .sort((a, b) => b.count - a.count || a.name.localeCompare(b.name))
-    .slice(0, limit);
+  }).filter(item => item?.weight > 0).sort((a, b) => b.weight - a.weight);
 }
 
 function normalizeWeightedList(items = []) {
-  const byName = new Map();
-  for (const raw of items || []) {
-    const name = String(typeof raw === 'string' ? raw : raw?.name || '').trim();
-    if (!name) continue;
-    const existing = byName.get(name.toLowerCase());
-    const weight = clampWeight(raw?.weight ?? raw?.score ?? 0.35);
-    const evidence = Array.isArray(raw?.evidence)
-      ? raw.evidence.map(item => String(item).trim()).filter(Boolean).slice(0, 4)
-      : [];
-    if (!existing || weight > existing.weight) {
-      byName.set(name.toLowerCase(), { name, weight, evidence });
-    } else if (existing) {
-      existing.evidence = [...new Set([...existing.evidence, ...evidence])].slice(0, 4);
-    }
-  }
-  return [...byName.values()].sort((a, b) => b.weight - a.weight || a.name.localeCompare(b.name));
+  if (!Array.isArray(items)) return [];
+  return items
+    .map((item) => {
+      if (typeof item === 'string') return { name: item, weight: 0.5, evidence: [] };
+      return {
+        name: String(item?.name || '').trim(),
+        weight: clampWeight(item?.weight ?? item?.score ?? 0.5),
+        evidence: Array.isArray(item?.evidence) ? item.evidence.map(String).slice(0, 5) : []
+      };
+    })
+    .filter(item => item.name)
+    .sort((a, b) => b.weight - a.weight);
 }
-
 function weightedByCount(count, total) {
   if (!count || !total) return 0;
   return clampWeight(0.18 + Math.min(0.75, Number(count) / Math.max(Number(total), 1) * 4));
@@ -810,12 +920,12 @@ function safeJson(value, fallback) {
 function inferTags(tracks) {
   const names = tracks.map((track) => `${track.name} ${track.album || ''}`).join(' ').toLowerCase();
   const tags = [];
-  if (/雨|rain|夜|night|凌晨|moon/.test(names)) tags.push('夜晚');
+  if (/pop|流行|华语|chinese/.test(names)) tags.push('华语流行');
   if (/live|现场|concert/.test(names)) tags.push('现场');
-  if (/lofi|jazz|爵士|ambient|氛围/.test(names)) tags.push('放松');
-  if (/rock|摇滚|metal|punk/.test(names)) tags.push('能量');
-  if (/classic|古典|piano|钢琴/.test(names)) tags.push('专注');
-  if (!tags.length) tags.push('私人收藏', '日常陪伴');
+  if (/lofi|jazz|chill|安静|治愈/.test(names)) tags.push('放松');
+  if (/rock|punk|摇滚/.test(names)) tags.push('能量');
+  if (/classic|piano|古典|钢琴/.test(names)) tags.push('古典/器乐');
+  if (!tags.length) tags.push('私人曲库');
   return tags.slice(0, 5);
 }
 
@@ -829,7 +939,7 @@ export async function resolvePlayableTrack(db, netease, track, { includeLyric = 
       playbackMode: normalized.originalId ? 'ncm-cli' : 'browser-demo',
       playable: Boolean(normalized.originalId),
       playbackError: normalized.originalId ? null : 'Demo track does not have a NetEase originalId.',
-      lyric: '[00:00.00] 本地演示曲目'
+      lyric: '[00:00.00] Pure music, please enjoy.',
     };
   }
   // Prefer community API direct URL, then keep ncm-cli as a playable fallback
@@ -871,7 +981,7 @@ export async function resolvePlayableTrack(db, netease, track, { includeLyric = 
     playUrl: url,
     playbackMode: url ? 'browser-direct' : 'ncm-cli',
     playable: Boolean(url || normalized.originalId),
-    playbackError: (url || normalized.originalId) ? null : '该歌曲暂无可用播放资源',
+    playbackError: (url || normalized.originalId) ? null : 'No playable URL found.',
     lyric: lyric || ''
   };
 }

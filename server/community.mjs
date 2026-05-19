@@ -1,14 +1,30 @@
 // Community API wrapper - uses NeteaseCloudMusicApi module for play URLs
 import { createRequire } from 'node:module';
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const apiPath = process.env.APPDATA + '\\npm\\node_modules\\NeteaseCloudMusicApi\\main.js';
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const apiPath = resolveCommunityApiFile('main.js');
 const require = createRequire('file:///' + apiPath.replace(/\\/g, '/'));
 const api = require(apiPath);
 
 let _cookie = null;
 let _cookiePath = null;
+
+export function resolveCommunityApiFile(fileName) {
+  const candidates = [
+    path.join(rootDir, 'node_modules', 'NeteaseCloudMusicApi', fileName),
+    path.join(rootDir, 'packaging', 'work', 'payload', 'app', 'npm', 'node_modules', 'NeteaseCloudMusicApi', fileName),
+    path.join(rootDir, 'packaging', 'verify', 'app', 'npm', 'node_modules', 'NeteaseCloudMusicApi', fileName),
+    path.join(process.env.APPDATA || '', 'npm', 'node_modules', 'NeteaseCloudMusicApi', fileName)
+  ];
+  const found = candidates.find((candidate) => candidate && existsSync(candidate));
+  if (!found) {
+    throw new Error(`Cannot find NeteaseCloudMusicApi ${fileName}. Run packaging/build-release.ps1 or install NeteaseCloudMusicApi.`);
+  }
+  return found;
+}
 
 export function loadCookie(rootDir) {
   const cookieFile = path.join(rootDir, 'netease_cookie.txt');
@@ -27,6 +43,184 @@ export function getCookie() {
 
 export function hasCookie() {
   return Boolean(_cookie);
+}
+
+export function getCookieStatus() {
+  return {
+    configured: true,
+    hasCookie: Boolean(_cookie),
+    cookiePath: _cookiePath || null
+  };
+}
+
+export function saveCookie(rootDir, cookie) {
+  const normalized = normalizeCookie(cookie);
+  if (!normalized) throw new Error('NetEase cookie is empty');
+  const cookieFile = _cookiePath || path.join(rootDir, 'netease_cookie.txt');
+  writeFileSync(cookieFile, normalized, 'utf8');
+  _cookie = normalized;
+  _cookiePath = cookieFile;
+  return getCookieStatus();
+}
+
+export function clearCookie(rootDir) {
+  const cookieFile = _cookiePath || path.join(rootDir, 'netease_cookie.txt');
+  try {
+    if (existsSync(cookieFile)) rmSync(cookieFile, { force: true });
+  } catch {
+    // Clearing login should not crash the app if the file is already locked.
+  }
+  _cookie = null;
+  _cookiePath = cookieFile;
+  return getCookieStatus();
+}
+
+export async function createCookieQrLogin() {
+  const keyResult = await api.login_qr_key({ timestamp: Date.now() });
+  const keyBody = keyResult.body || keyResult;
+  const keyData = keyBody.data || keyBody;
+  const key = keyData.unikey || keyData.uniKey || keyData.qrCodeKey || keyData.key;
+  if (!key) throw new Error('NeteaseCloudMusicApi did not return QR key');
+
+  const qrResult = await api.login_qr_create({ key, qrimg: true, timestamp: Date.now() });
+  const qrBody = qrResult.body || qrResult;
+  const qrData = qrBody.data || qrBody;
+  return {
+    ok: true,
+    data: {
+      code: qrBody.code,
+      key,
+      uniKey: key,
+      qrCodeKey: key,
+      qrCodeUrl: qrData.qrurl || qrData.qrCodeUrl || '',
+      qrurl: qrData.qrurl || qrData.qrCodeUrl || '',
+      qrImage: qrData.qrimg || qrData.qrImage || '',
+      qrimg: qrData.qrimg || qrData.qrImage || ''
+    }
+  };
+}
+
+export async function checkCookieQrLogin(key, rootDir) {
+  const result = await api.login_qr_check({ key: String(key), timestamp: Date.now() });
+  const body = result.body || result;
+  const code = Number(body.code || body.data?.code || 0);
+  const message = body.message || body.msg || body.data?.message || body.data?.msg || '';
+  const payload = {
+    ok: true,
+    data: {
+      code,
+      message,
+      msg: message
+    },
+    code,
+    message,
+    loggedIn: false,
+    cookieSaved: false,
+    hasCookie: hasCookie(),
+    loginMessage: qrCookieMessage(code, message)
+  };
+
+  if (code !== 803) return payload;
+
+  const cookie = extractCookie(result);
+  if (!cookie) {
+    return {
+      ...payload,
+      loginMessage: '授权已确认，但没有拿到网易云登录 cookie，请重新扫码'
+    };
+  }
+
+  saveCookie(rootDir, cookie);
+  let profile;
+  try {
+    profile = await getCookieUserProfile();
+  } catch (error) {
+    return {
+      ...payload,
+      data: {
+        ...payload.data,
+        loggedIn: false,
+        cookieSaved: true,
+        hasCookie: true
+      },
+      cookieSaved: true,
+      hasCookie: true,
+      loginMessage: `授权已确认，但无法读取网易云账号，请重新扫码：${error.message}`
+    };
+  }
+  return {
+    ...payload,
+    data: {
+      ...payload.data,
+      loggedIn: true,
+      cookieSaved: true,
+      hasCookie: true,
+      userId: profile.userId,
+      nickname: profile.nickname
+    },
+    loggedIn: true,
+    cookieSaved: true,
+    hasCookie: true,
+    userId: profile.userId,
+    nickname: profile.nickname,
+    loginMessage: `登录成功：${profile.nickname || profile.userId}`
+  };
+}
+
+export async function userAccount() {
+  assertCookie();
+  const result = await api.user_account({ cookie: _cookie });
+  return { data: result.body || result, raw: result };
+}
+
+export async function getCookieUserProfile() {
+  const response = await userAccount();
+  const profile = extractCommunityUserProfile(response);
+  if (!profile.userId) throw new Error('NeteaseCloudMusicApi user_account did not return userId');
+  return profile;
+}
+
+export function extractCommunityUserProfile(result) {
+  const data = result?.data || result?.body || result || {};
+  const profile = data.profile || data.userProfile || data.user || data.account || data;
+  const userId = profile.userId ?? profile.userID ?? profile.id ?? profile.user_id ?? data.userId ?? data.userID ?? data.id;
+  const nickname = profile.nickname ?? profile.nickName ?? profile.name ?? profile.userName ?? data.nickname ?? data.nickName ?? data.name ?? '';
+  return {
+    userId: userId === undefined || userId === null || userId === '' ? '' : String(userId),
+    nickname: String(nickname || '').trim()
+  };
+}
+
+export async function userPlaylists(uid, offset = 0, limit = 1000) {
+  assertCookie();
+  const result = await api.user_playlist({
+    uid: String(uid),
+    offset: Number(offset) || 0,
+    limit: Number(limit) || 1000,
+    cookie: _cookie
+  });
+  return { data: result.body || result, raw: result };
+}
+
+export async function playlistTrackAll(playlistId, offset = 0, limit = 200) {
+  assertCookie();
+  const result = await api.playlist_track_all({
+    id: String(playlistId),
+    offset: Number(offset) || 0,
+    limit: Number(limit) || 200,
+    cookie: _cookie
+  });
+  return { data: result.body || result, raw: result };
+}
+
+export async function recentSongs(offset = 0, limit = 50) {
+  assertCookie();
+  const result = await api.record_recent_song({
+    offset: Number(offset) || 0,
+    limit: Number(limit) || 50,
+    cookie: _cookie
+  });
+  return { data: result.body || result, raw: result };
 }
 
 export async function getSongUrl(songId, level = 'exhigh') {
@@ -111,4 +305,39 @@ export async function getLyric(songId) {
   } catch {
     return null;
   }
+}
+
+function assertCookie() {
+  if (!_cookie) throw new Error('NetEase MUSIC_U cookie is not available');
+}
+
+function normalizeCookie(cookie) {
+  if (Array.isArray(cookie)) return cookie.map(String).join('; ').trim();
+  if (cookie && typeof cookie === 'object') {
+    if (typeof cookie.cookie === 'string') return cookie.cookie.trim();
+    return Object.entries(cookie)
+      .map(([key, value]) => `${key}=${value}`)
+      .join('; ')
+      .trim();
+  }
+  return String(cookie || '').trim();
+}
+
+function extractCookie(result) {
+  const body = result?.body || result || {};
+  return normalizeCookie(
+    body.cookie ||
+    body.data?.cookie ||
+    result?.cookie ||
+    result?.headers?.['set-cookie'] ||
+    result?.headers?.get?.('set-cookie')
+  );
+}
+
+function qrCookieMessage(code, message) {
+  if (code === 801) return '等待扫码';
+  if (code === 802) return '已扫码，等待手机确认';
+  if (code === 800) return '二维码已过期';
+  if (code === 803) return message || '授权已确认';
+  return message || `二维码状态：${code || '未知'}`;
 }
