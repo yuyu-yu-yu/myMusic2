@@ -47,6 +47,7 @@ import {
   recommendationTextMentionsDifferentTrack,
   rankAndSelectCandidates,
   replayRequestAllowsPlayedSong,
+  scoreSearchTrackForPick,
   trackMatchesPlayedSongName,
   trackMatchesSongPick,
   TURN_ACTIONS
@@ -55,6 +56,7 @@ import { resolvePlayableTrack } from '../server/library.mjs';
 import { getMemories, getPreferences, nextRadioItem, removeAllMemories, removeMemory, startRadio, submitFeedback, updatePreferences } from '../server/radio.mjs';
 import { resolveAccountContext } from '../server/account-scope.mjs';
 import { generateDiary, getDiary } from '../server/diary.mjs';
+import { buildCanCanBackgroundPrompt, buildCanCanPersonaPrompt, shouldUseCanCanCreatorContext } from '../server/cancan-persona.mjs';
 
 function candidate(id, source, artists = ['Artist']) {
   return {
@@ -191,6 +193,92 @@ test('song search matching rejects unrelated mood-title results', () => {
   }, pick), false);
 });
 
+test('explicit song query treats LLM-guessed artists as weak hints', () => {
+  const request = { songTitle: '柑橘乌云', text: '放一首柑橘乌云' };
+  const llmPick = {
+    name: '柑橘乌云',
+    artists: ['徐佳莹'],
+    queries: ['柑橘乌云 徐佳莹']
+  };
+
+  assert.deepEqual(buildSongSearchQueries(llmPick, { request }), ['柑橘乌云']);
+
+  const effectivePick = { ...llmPick, artistMatchMode: 'soft' };
+  assert.equal(trackMatchesSongPick({
+    name: '柑橘乌云',
+    artists: ['Capper', 'LEGGO'],
+    album: '剑，蔷薇 SwordandRose.'
+  }, effectivePick), true);
+
+  assert.equal(trackMatchesSongPick({
+    name: '绿洲',
+    artists: ['徐佳莹'],
+    album: '极限'
+  }, effectivePick), false);
+});
+
+test('song search scoring prefers original versions over live covers and remixes', () => {
+  const pick = { name: '十面埋伏', artists: ['陈奕迅'] };
+  const original = scoreSearchTrackForPick({
+    name: '十面埋伏',
+    artists: ['陈奕迅'],
+    album: 'The Best Moment'
+  }, pick);
+  const live = scoreSearchTrackForPick({
+    name: '十面埋伏 (Live)',
+    artists: ['陈奕迅'],
+    album: 'Get A Life (Live)'
+  }, pick);
+  const remix = scoreSearchTrackForPick({
+    name: '十面埋伏',
+    artists: ['DJ风景线'],
+    album: '十面埋伏 DJ风景线 remix'
+  }, { ...pick, artistMatchMode: 'soft' });
+
+  assert.equal(original > live, true);
+  assert.equal(live >= 100, true);
+  assert.equal(remix < 100, true);
+});
+
+test('song search scoring honors an explicit live-version request', () => {
+  const pick = { name: '十面埋伏', artists: ['陈奕迅'], requestText: '想听十面埋伏现场版' };
+  const original = scoreSearchTrackForPick({
+    name: '十面埋伏',
+    artists: ['陈奕迅'],
+    album: 'The Best Moment'
+  }, pick);
+  const live = scoreSearchTrackForPick({
+    name: '十面埋伏 (Live)',
+    artists: ['陈奕迅'],
+    album: 'Get A Life (Live)'
+  }, pick);
+
+  assert.equal(live > original, true);
+});
+
+test('song search scoring keeps produced original above cover or type-beat variants', () => {
+  const pick = { name: 'Sad Wit Da Street', artists: ['SASIOVERLXRD'] };
+  const original = scoreSearchTrackForPick({
+    name: 'Sad Wit Da Street (Prod.Roy Chase)',
+    artists: ['SASIOVERLXRD'],
+    album: '冰冷热带鱼'
+  }, pick);
+  const typeBeat = scoreSearchTrackForPick({
+    name: '［Free］"Sad Wit Da Street"-SASIOVERLXRD Type Beat',
+    artists: ['Roman'],
+    album: '［Free］"Sad Wit Da Street"-SASIOVERLXRD Type Beat'
+  }, { ...pick, artistMatchMode: 'soft' });
+  const cover = scoreSearchTrackForPick({
+    name: 'Sad Wit Da Street',
+    artists: ['暴雨'],
+    album: 'SASIOVERLXRD 翻唱'
+  }, { ...pick, artistMatchMode: 'soft' });
+
+  assert.equal(original >= 100, true);
+  assert.equal(original > typeBeat, true);
+  assert.equal(original > cover, true);
+});
+
 test('played song matching ignores artist and version names', () => {
   const played = [
     { name: '好久不见', artists: ['陈奕迅'] },
@@ -218,10 +306,10 @@ test('played song matching ignores artist and version names', () => {
   }, played), false);
 });
 
-test('explicit replay requests only bypass dedupe for the requested song title', () => {
+test('explicit song requests bypass dedupe only for the requested song title', () => {
   const request = {
     songTitle: '爱情转移',
-    allowPlayedSongReplay: true
+    allowRequestedSongReplay: true
   };
 
   assert.equal(replayRequestAllowsPlayedSong({
@@ -237,7 +325,7 @@ test('explicit replay requests only bypass dedupe for the requested song title',
   assert.equal(replayRequestAllowsPlayedSong({
     name: '爱情转移',
     artists: ['陈奕迅']
-  }, { songTitle: '爱情转移', allowPlayedSongReplay: false }), false);
+  }, { songTitle: '爱情转移', allowRequestedSongReplay: false }), false);
 });
 
 test('final host text parser accepts confirmed-track DJ copy', () => {
@@ -824,6 +912,24 @@ test('memory prompt formatting has a bounded long-term memory section', () => {
   assert.equal(context.promptText.startsWith('相关长期记忆：'), true);
   assert.equal(context.promptText.length <= 860, true);
   assert.equal(context.sessionSummary, '用户今晚在聊工作压力。');
+});
+
+test('CanCan creator background is only included for related questions', () => {
+  assert.equal(shouldUseCanCanCreatorContext('灿灿这个名字是怎么来的？'), true);
+  assert.equal(shouldUseCanCanCreatorContext('你对我的印象是什么？'), true);
+  assert.equal(shouldUseCanCanCreatorContext('你还记得我吗？'), true);
+  assert.equal(shouldUseCanCanCreatorContext('我最近在写一个 AI DJ 项目'), false);
+  assert.equal(shouldUseCanCanCreatorContext('你记得我喜欢什么歌吗？'), false);
+  assert.equal(shouldUseCanCanCreatorContext('来首适合写代码的歌'), false);
+
+  const unrelated = buildCanCanBackgroundPrompt('来首适合写代码的歌');
+  assert.doesNotMatch(unrelated, /同济大学|女朋友|独立开发/);
+  assert.match(unrelated, /不要主动展开私人背景/);
+
+  const related = buildCanCanPersonaPrompt('你是谁，是谁创造了你？');
+  assert.match(related, /同济大学本科生/);
+  assert.match(related, /女朋友的名字/);
+  assert.match(related, /独立开发者/);
 });
 
 test('chat decision prompt receives relevant long-term memory without selecting a track', async (t) => {

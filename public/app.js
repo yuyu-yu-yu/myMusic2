@@ -35,6 +35,8 @@ let avatarRestoreTimer = null;
 let avatarFrameTimer = null;
 let avatarFrameSequenceToken = 0;
 let preferencesLoadPromise = null;
+const FALLBACK_BAR_COUNT = 44;
+const VISUALIZER_DEBUG = false;
 
 function makeAvatarFrameSequence(stateName, durations) {
   return {
@@ -154,74 +156,113 @@ let visualizerAnimId = null;
 let visualizerBuilt = false;
 const sourceCache = new Map();
 
+function visualizerLog(...args) {
+  if (VISUALIZER_DEBUG) console.log('[viz]', ...args);
+}
+
 function initVisualizer() {
   const fallback = document.querySelector('#equalizer-fallback');
   if (!fallback) return;
-  for (let i = 0; i < 20; i++) {
+  if (fallback.dataset.visualizerReady === 'true') return;
+  fallback.replaceChildren();
+  for (let i = 0; i < FALLBACK_BAR_COUNT; i++) {
     const bar = document.createElement('span');
     bar.className = 'bar';
-    bar.style.animationDelay = (i * 0.07) + 's';
-    bar.style.animationDuration = (0.5 + Math.random() * 0.8) + 's';
+    bar.style.animationDelay = (i * 0.035) + 's';
+    bar.style.animationDuration = (0.55 + (i % 7) * 0.08) + 's';
+    bar.style.setProperty('--fallback-height', `${18 + ((i * 13) % 34)}px`);
     fallback.appendChild(bar);
   }
+  fallback.dataset.visualizerReady = 'true';
+}
+
+function getOrCreateMediaSource(audioEl) {
+  if (!audioCtx || !audioEl) return null;
+  const cached = sourceCache.get(audioEl);
+  if (cached?.ctx === audioCtx && cached.source) return cached.source;
+  const source = audioCtx.createMediaElementSource(audioEl);
+  sourceCache.set(audioEl, { ctx: audioCtx, source });
+  return source;
 }
 
 function buildAudioGraph() {
-  if (visualizerBuilt) return;
+  if (visualizerBuilt) return true;
   const hostAudio = document.querySelector('#host-audio');
   const songAudio = document.querySelector('#song-audio');
-  if (!hostAudio || !songAudio) return;
+  if (!hostAudio || !songAudio) return false;
   try {
     hostAudio.crossOrigin = 'anonymous';
     songAudio.crossOrigin = 'anonymous';
-    audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-    sourceCache.set(hostAudio, audioCtx.createMediaElementSource(hostAudio));
-    sourceCache.set(songAudio, audioCtx.createMediaElementSource(songAudio));
-    visualizerBuilt = true;
-    console.log('[viz] graph built, sources cached:', sourceCache.size);
+    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+    if (!AudioContextCtor) return false;
+    if (!audioCtx) audioCtx = new AudioContextCtor();
+    const hostSource = getOrCreateMediaSource(hostAudio);
+    const songSource = getOrCreateMediaSource(songAudio);
+    visualizerBuilt = Boolean(hostSource && songSource);
+    visualizerLog('graph ready, sources cached:', sourceCache.size);
+    return visualizerBuilt;
   } catch(e) {
     console.warn('[viz] Web Audio not available:', e.message);
     visualizerBuilt = false;
+    return false;
+  }
+}
+
+function disconnectVisualizerGraph() {
+  for (const entry of sourceCache.values()) {
+    try { entry.source.disconnect(); } catch {}
+  }
+  if (analyser) {
+    try { analyser.disconnect(); } catch {}
+    analyser = null;
   }
 }
 
 function switchVisualizerTo(kind) {
-  console.log('[viz] switchVisualizerTo(' + kind + ') built:', visualizerBuilt);
-  if (!visualizerBuilt) {
-    const canvas = document.querySelector('#visualizer-canvas');
-    const fb = document.querySelector('#equalizer-fallback');
-    if (kind === 'off') {
-      if (canvas) canvas.style.display = 'none';
-      if (fb) fb.style.display = 'none';
-    } else {
-      if (canvas) canvas.style.display = 'none';
-      if (fb) fb.style.display = 'flex';
-    }
-    return;
-  }
+  visualizerLog('switchVisualizerTo(' + kind + ') built:', visualizerBuilt);
+  const canvas = document.querySelector('#visualizer-canvas');
+  const fb = document.querySelector('#equalizer-fallback');
 
-  if (audioCtx.state === 'suspended') audioCtx.resume();
-
-  for (const src of sourceCache.values()) {
-    try { src.disconnect(); } catch {}
-  }
-  if (analyser) { try { analyser.disconnect(); } catch {} analyser = null; }
-
-  if (kind === 'off') {
+  const hideAll = () => {
     stopDrawLoop();
-    const canvas = document.querySelector('#visualizer-canvas');
-    const fb = document.querySelector('#equalizer-fallback');
+    disconnectVisualizerGraph();
     if (canvas) { canvas.style.display = 'none'; canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height); }
     if (fb) fb.style.display = 'none';
+  };
+  const showFallback = () => {
+    initVisualizer();
+    stopDrawLoop();
+    disconnectVisualizerGraph();
+    if (canvas) { canvas.style.display = 'none'; canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height); }
+    if (fb) fb.style.display = 'flex';
+  };
+
+  if (kind === 'off') {
+    hideAll();
     return;
   }
 
   const audioEl = kind === 'host'
     ? document.querySelector('#host-audio')
     : document.querySelector('#song-audio');
-  const source = sourceCache.get(audioEl);
-  console.log('[viz] source for ' + kind + ':', !!source, 'el src:', (audioEl?.src || '').slice(-40));
-  if (!source) return;
+  const hasBrowserAudio = kind === 'host'
+    ? Boolean(audioEl?.currentSrc || audioEl?.src)
+    : Boolean(state.current?.track?.playUrl && (audioEl?.currentSrc || audioEl?.src));
+  if (!hasBrowserAudio || !buildAudioGraph()) {
+    showFallback();
+    return;
+  }
+
+  if (audioCtx?.state === 'suspended') audioCtx.resume().catch(() => {});
+
+  disconnectVisualizerGraph();
+
+  const source = getOrCreateMediaSource(audioEl);
+  visualizerLog('source for ' + kind + ':', !!source, 'el src:', (audioEl?.src || '').slice(-40));
+  if (!source) {
+    showFallback();
+    return;
+  }
 
   analyser = audioCtx.createAnalyser();
   analyser.fftSize = 64;
@@ -229,8 +270,6 @@ function switchVisualizerTo(kind) {
   source.connect(analyser);
   analyser.connect(audioCtx.destination);
 
-  const canvas = document.querySelector('#visualizer-canvas');
-  const fb = document.querySelector('#equalizer-fallback');
   if (canvas) canvas.style.display = 'block';
   if (fb) fb.style.display = 'none';
 
@@ -243,7 +282,7 @@ let _drawLogged = false;
 
 function startDrawLoop(canvas) {
   if (visualizerAnimId || !canvas) return;
-  console.log('[viz] startDrawLoop, analyser:', !!analyser, 'built:', visualizerBuilt);
+  visualizerLog('startDrawLoop, analyser:', !!analyser, 'built:', visualizerBuilt);
   _drawFrameCount = 0;
   _drawLogged = false;
   function frame() {
@@ -256,7 +295,7 @@ function startDrawLoop(canvas) {
     const bufferLength = analyser.frequencyBinCount;
     const dataArray = new Uint8Array(bufferLength);
     analyser.getByteFrequencyData(dataArray);
-    if (!_drawLogged && _drawFrameCount % 30 === 0) {
+    if (VISUALIZER_DEBUG && !_drawLogged && _drawFrameCount % 30 === 0) {
       const maxVal = Math.max(...dataArray);
       console.log('[viz] frame #' + _drawFrameCount, 'max freq:', maxVal, 'first 5:', [...dataArray.slice(0, 5)]);
       if (_drawFrameCount >= 120) _drawLogged = true;
@@ -546,10 +585,6 @@ function renderPlayer() {
   initVisualizer();
   initProgressBar();
   scheduleRadioPrefetch();
-  // Build audio graph on first user gesture (start button click)
-  document.querySelector('#start-btn').addEventListener('click', () => {
-    if (!visualizerBuilt) buildAudioGraph();
-  }, { once: true });
 }
 
 function ensureFeedbackButtons() {
@@ -1069,17 +1104,16 @@ function buildTrackCardHTML(track, explanation = null) {
 }
 
 function buildExplanationHTML(explanation = null) {
-  if (!explanation?.summary) return '';
-  const factors = Array.isArray(explanation.factors) ? explanation.factors : [];
-  const factorHtml = factors.length
-    ? `<div class="track-explanation-factors">${factors.map(factor =>
-        `<span>${escapeHtml(factor.text || '')}</span>`
-      ).join('')}</div>`
-    : '';
+  const factors = Array.isArray(explanation?.factors)
+    ? explanation.factors.map(factor => String(factor?.text || '').trim()).filter(Boolean)
+    : [];
+  if (!factors.length) return '';
+  const factorHtml = `<div class="track-explanation-factors">${factors.map(text =>
+    `<span>${escapeHtml(text)}</span>`
+  ).join('')}</div>`;
   return `
     <details class="track-explanation" onclick="event.stopPropagation()">
       <summary>推荐依据</summary>
-      <p>${escapeHtml(explanation.summary)}</p>
       ${factorHtml}
     </details>
   `;

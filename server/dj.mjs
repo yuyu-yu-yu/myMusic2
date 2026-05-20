@@ -16,6 +16,7 @@ import {
 import { searchOnline } from './community.mjs';
 import { getUserPrefs } from './radio.mjs';
 import { normalizeAccountContext } from './account-scope.mjs';
+import { buildCanCanBackgroundPrompt, buildCanCanPersonaPrompt } from './cancan-persona.mjs';
 
 const CANDIDATE_LIMIT = 60;
 const AUTO_QUOTAS = { library_recent: 18, library_deep: 22, ai_discovery: 20 };
@@ -1682,6 +1683,7 @@ function getMusicRequestConstraints(db, userMessage = '', mode = {}) {
     text,
     artistConstraint,
     songTitle,
+    allowRequestedSongReplay: Boolean(songTitle),
     allowPlayedSongReplay: Boolean(songTitle && isExplicitReplayRequest(text))
   };
 }
@@ -2235,6 +2237,7 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
       role: 'system',
       content: [
         '你是灿灿，一个聪明、自然、熟悉感很强的 AI 朋友，同时也是私人电台 DJ。',
+        buildCanCanPersonaPrompt(userMessage),
         '这一轮是普通聊天回复，不负责选歌。请像网页版大模型聊天一样，先直接回答用户这句话本身。',
         '你可以表达自己的判断、喜好和理由，不要只做情绪复述；用户问“你喜欢 X 吗”，就直接说喜欢/不喜欢/为什么。',
         '不要把所有话题都拉回音乐；只有用户主动聊到音乐、歌手、当前歌曲时，才自然聊音乐。',
@@ -2744,10 +2747,17 @@ export function trackMatchesPlayedSongName(track, playedHistory = []) {
 }
 
 export function replayRequestAllowsPlayedSong(track, request = {}) {
-  if (!request?.allowPlayedSongReplay || !request?.songTitle) return false;
+  if (!requestAllowsRequestedSongReplay(request)) return false;
   const allowedKey = playedSongKey(request.songTitle);
   const trackKey = playedSongKey(track?.name || track?.song || track?.title || '');
   return Boolean(allowedKey && trackKey && allowedKey === trackKey);
+}
+
+function requestAllowsRequestedSongReplay(request = {}) {
+  return Boolean(
+    request?.songTitle &&
+    (request.allowRequestedSongReplay || request.allowPlayedSongReplay)
+  );
 }
 
 function inferRadioTrigger(userMessage = '') {
@@ -3284,10 +3294,10 @@ async function resolveRecommendationFallback({
   playedSignatures = new Set(),
   request = {}
 } = {}) {
-  const replayKey = request?.allowPlayedSongReplay ? playedSongKey(request.songTitle) : '';
+  const replayKey = requestAllowsRequestedSongReplay(request) ? playedSongKey(request.songTitle) : '';
   const failedNameKeys = new Set([
     ...(failedPicks || []).map(pick => playedSongKey(pick?.name)),
-    request?.songTitle && !request?.allowPlayedSongReplay ? playedSongKey(request.songTitle) : ''
+    request?.songTitle && !requestAllowsRequestedSongReplay(request) ? playedSongKey(request.songTitle) : ''
   ].filter(key => key && key !== replayKey));
 
   const sameArtist = await resolveSameArtistFallback({
@@ -3487,11 +3497,20 @@ function scoreFallbackTrack(track, { profile = {}, conversationMood = null, arti
   for (const hint of hints.slice(0, 8)) {
     if (hint.length >= 2 && text.includes(hint)) score += 6;
   }
-  const positiveSignals = ['live', 'remaster', '热门', '精选', 'best', 'original'];
+  const positiveSignals = ['remaster', '热门', '精选', 'best', 'original'];
   for (const signal of positiveSignals) {
     if (text.includes(signal.toLowerCase())) score += 2;
   }
+  score += fallbackVersionScore(track);
   return score;
+}
+
+function fallbackVersionScore(track) {
+  const markers = getTrackVersionMarkers(track);
+  if (!markers.length) return 6;
+  if (markers.includes('live')) return -10;
+  if (markers.some(marker => ['cover', 'remix', 'instrumental'].includes(marker))) return -18;
+  return -4;
 }
 
 function buildRecommendationFailure({ stage = 'playable_check', message = '', failedPicks = [], lastPlan = null } = {}) {
@@ -3522,8 +3541,8 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
     ? `上一批没有确认到可播放源，请避开这些歌：${failedPicks.map(pick => `${pick.name}${pick.artists?.length ? ' - ' + pick.artists.join('、') : ''}`).join('；')}`
     : '没有失败歌单。';
   const playedText = formatPlayedSongExclusions(playedHistory, request);
-  const replayRule = request?.allowPlayedSongReplay && request?.songTitle
-    ? `已播放歌名通常必须避开；但本次用户明确要求重听《${request.songTitle}》，这一个歌名允许重复播放，其他已播放歌仍必须避开同名任何版本。`
+  const replayRule = requestAllowsRequestedSongReplay(request)
+    ? `已播放歌名通常必须避开；但本次用户明确点名《${request.songTitle}》，这一个歌名允许重复播放，其他已播放歌仍必须避开同名任何版本。`
     : '已播放歌名必须避开：只要歌名相同，就不能再推荐任何版本、翻唱、Live、Remix、Album Version 或不同艺人版本。';
 
   const raw = await generateChatCompletion(config.llm, [
@@ -3531,6 +3550,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
       role: 'system',
       content: [
         '你是灿灿电台的选歌大脑。你的任务不是生成搜索关键词，而是直接推荐真实存在、音乐平台容易搜到的具体歌曲。',
+        buildCanCanBackgroundPrompt(userMessage),
         '必须结合时间、天气、听众画像、偏好、当前对话和明确请求，给出 3 首备选歌。',
         '时间天气只是事实背景，不是固定开场模板；不要因为历史对话把当前上午/下午写成晚上，也不要编造未来天气。',
         '每首都必须有明确歌名和主要艺人。优先推荐知名度较高、网易云音乐更可能搜到并可播放的版本。',
@@ -3612,7 +3632,7 @@ function normalizeArtistList(value) {
 function formatPlayedSongExclusions(playedHistory = [], request = {}) {
   const songs = [];
   const seen = new Set();
-  const allowedReplayKey = request?.allowPlayedSongReplay ? playedSongKey(request.songTitle) : '';
+  const allowedReplayKey = requestAllowsRequestedSongReplay(request) ? playedSongKey(request.songTitle) : '';
   for (const track of playedHistory || []) {
     const key = playedSongKey(track?.name);
     if (!key || seen.has(key)) continue;
@@ -3622,48 +3642,52 @@ function formatPlayedSongExclusions(playedHistory = [], request = {}) {
     if (songs.length >= 30) break;
   }
   const replayText = allowedReplayKey && request?.songTitle
-    ? `用户明确要求重听《${request.songTitle}》，这一个歌名允许重复；`
+    ? `用户本轮明确点名《${request.songTitle}》，这一个歌名允许重复播放；`
     : '';
   return songs.length
     ? `${replayText}本轮/最近其他已经播放过的歌名，后续必须避开同名任何版本：${songs.join('；')}`
-    : `${replayText}本轮/最近已播放歌名：${replayText ? '除本次指定重听歌曲外无其他限制' : '无'}`;
+    : `${replayText}本轮/最近已播放歌名：${replayText ? '除本次指定歌曲外无其他限制' : '无'}`;
 }
 
 async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, playedSignatures = new Set(), request = {} }) {
   const failedPicks = [];
   const diagnostics = [];
   for (const pick of plan.picks) {
+    const effectivePick = applyRequestToSongPick(pick, request);
     const pickDiagnostic = {
-      pick: sanitizeSongPick(pick),
-      queries: buildSongSearchQueries(pick),
+      pick: sanitizeSongPick(effectivePick),
+      llmPick: request?.songTitle ? sanitizeSongPick(pick) : null,
+      queries: buildSongSearchQueries(effectivePick, { request }),
       hits: [],
       selectedTrackId: null,
       failedReason: null
     };
-    if (trackMatchesPlayedSongName(pick, playedSignatures) && !replayRequestAllowsPlayedSong(pick, request)) {
+    if (trackMatchesPlayedSongName(effectivePick, playedSignatures) && !replayRequestAllowsPlayedSong(effectivePick, request)) {
       pickDiagnostic.failedReason = 'played_song_name';
       diagnostics.push(pickDiagnostic);
-      failedPicks.push(pick);
+      failedPicks.push(effectivePick);
       continue;
     }
-    const search = await searchTracksForSongPick(pick);
+    const search = await searchTracksForSongPick(effectivePick, { request });
     pickDiagnostic.queries = search.queries;
     pickDiagnostic.queryDiagnostics = search.queryDiagnostics;
     const ranked = search.tracks
       .map(track => {
-        const score = scoreSearchTrackForPick(track, pick);
+        const scoreDetails = scoreSearchTrackForPickDetails(track, effectivePick);
+        const score = scoreDetails.score;
         const diagnostic = {
           track: sanitizeTrackForDebug(track),
           score,
           accepted: score >= 100,
-          filterReason: score >= 100 ? null : 'name_or_artist_mismatch',
+          filterReason: score >= 100 ? scoreDetails.filterReason : (scoreDetails.filterReason || 'name_or_artist_mismatch'),
+          scoreParts: scoreDetails.scoreParts,
           playable: null
         };
         pickDiagnostic.hits.push(diagnostic);
-        return { track, score, diagnostic };
+        return { track, score, scoreDetails, diagnostic };
       })
       .filter(item => item.score >= 100)
-      .sort((a, b) => b.score - a.score)
+      .sort(compareSearchTrackScores)
       .slice(0, 8);
 
     for (const item of ranked) {
@@ -3677,6 +3701,9 @@ async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, p
         item.diagnostic.accepted = false;
         item.diagnostic.filterReason = 'played_song_name';
         continue;
+      }
+      if (trackMatchesPlayedSongName(track, playedSignatures) && replayRequestAllowsPlayedSong(track, request)) {
+        item.diagnostic.filterReason = 'allowed_explicit_replay';
       }
       const playableStarted = Date.now();
       const playable = await resolvePlayableTrack(db, netease, track, { includeLyric: false });
@@ -3692,7 +3719,7 @@ async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, p
       diagnostics.push(trimSearchDiagnostic(pickDiagnostic));
       return {
         track: withLyric?.playable ? withLyric : playable,
-        pick,
+        pick: normalizeSelectedPick(effectivePick, withLyric?.playable ? withLyric : playable),
         diagnostics
       };
     }
@@ -3700,15 +3727,47 @@ async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, p
       pickDiagnostic.failedReason = ranked.length ? 'no_playable_match' : 'no_matching_search_hit';
     }
     diagnostics.push(trimSearchDiagnostic(pickDiagnostic));
-    failedPicks.push(pick);
+    failedPicks.push(effectivePick);
   }
   return { track: null, pick: null, failedPicks, diagnostics };
 }
 
-async function searchTracksForSongPick(pick) {
+function applyRequestToSongPick(pick = {}, request = {}) {
+  if (!request?.songTitle) return pick;
+  const requestArtists = request.artistConstraint?.label
+    ? [request.artistConstraint.label]
+    : normalizeArtistList(pick.artists || []);
+  return {
+    ...pick,
+    name: request.songTitle,
+    artists: requestArtists,
+    artistMatchMode: request.artistConstraint?.label ? 'required' : 'soft',
+    requestText: request.text || '',
+    requestedSongTitle: request.songTitle
+  };
+}
+
+function normalizeSelectedPick(pick = {}, selectedTrack = {}) {
+  return {
+    ...pick,
+    name: selectedTrack?.name || pick.name,
+    artists: selectedTrack?.artists?.length ? selectedTrack.artists : pick.artists
+  };
+}
+
+function compareSearchTrackScores(a, b) {
+  if (b.score !== a.score) return b.score - a.score;
+  const versionDelta = (b.scoreDetails?.scoreParts?.version || 0) - (a.scoreDetails?.scoreParts?.version || 0);
+  if (versionDelta) return versionDelta;
+  const artistDelta = (b.scoreDetails?.scoreParts?.artist || 0) - (a.scoreDetails?.scoreParts?.artist || 0);
+  if (artistDelta) return artistDelta;
+  return 0;
+}
+
+async function searchTracksForSongPick(pick, { request = {} } = {}) {
   const seen = new Set();
   const results = [];
-  const queries = buildSongSearchQueries(pick);
+  const queries = buildSongSearchQueries(pick, { request });
   const queryDiagnostics = [];
   for (const query of queries) {
     try {
@@ -3762,17 +3821,25 @@ function trimSearchDiagnostic(diagnostic = {}) {
   };
 }
 
-export function buildSongSearchQueries(pick = {}) {
-  const name = String(pick.name || '').trim();
+export function buildSongSearchQueries(pick = {}, { request = {} } = {}) {
+  const name = String(request?.songTitle || pick.name || '').trim();
   const artists = normalizeArtistList(pick.artists || []);
   if (!name) return [];
-  const primaryArtist = artists[0] || '';
-  const querySeeds = [
-    primaryArtist ? `${name} ${primaryArtist}` : '',
-    primaryArtist ? `${primaryArtist} ${name}` : '',
-    ...(pick.queries || []),
-    name
-  ];
+  const explicitArtist = String(request?.artistConstraint?.label || '').trim();
+  const primaryArtist = explicitArtist || artists[0] || '';
+  const querySeeds = request?.songTitle
+    ? [
+        name,
+        explicitArtist ? `${name} ${explicitArtist}` : '',
+        explicitArtist ? `${explicitArtist} ${name}` : '',
+        ...(explicitArtist ? pick.queries || [] : [])
+      ]
+    : [
+        primaryArtist ? `${name} ${primaryArtist}` : '',
+        primaryArtist ? `${primaryArtist} ${name}` : '',
+        ...(pick.queries || []),
+        name
+      ];
   const nameToken = normalizeMusicText(name);
   return uniqueStrings(querySeeds
     .map(sanitizeSongSearchQuery)
@@ -3793,26 +3860,86 @@ export function trackMatchesSongPick(track, pick = {}) {
   return scoreSearchTrackForPick(track, pick) >= 100;
 }
 
-function scoreSearchTrackForPick(track, pick = {}) {
+export function scoreSearchTrackForPick(track, pick = {}) {
+  return scoreSearchTrackForPickDetails(track, pick).score;
+}
+
+export function scoreSearchTrackForPickDetails(track, pick = {}) {
   const wantedName = normalizeMusicText(pick.name);
   const wantedBaseName = normalizeMusicText(stripSongVersion(pick.name));
   const actualName = normalizeMusicText(track?.name || '');
   const actualBaseName = normalizeMusicText(stripSongVersion(track?.name || ''));
-  if (!wantedName || !actualName) return 0;
+  const scoreParts = { name: 0, artist: 0, version: 0 };
+  if (!wantedName || !actualName) return { score: 0, scoreParts, filterReason: 'missing_name' };
 
   let nameScore = 0;
-  if (actualName === wantedName || actualBaseName === wantedBaseName) nameScore = 100;
-  else if (actualName.includes(wantedName) || wantedName.includes(actualName)) nameScore = 82;
-  else if (wantedBaseName && (actualBaseName.includes(wantedBaseName) || wantedBaseName.includes(actualBaseName))) nameScore = 76;
-  if (nameScore < 70) return 0;
+  if (actualName === wantedName || actualBaseName === wantedBaseName) nameScore = 120;
+  else if (actualName.includes(wantedName) || wantedName.includes(actualName)) nameScore = 96;
+  else if (wantedBaseName && (actualBaseName.includes(wantedBaseName) || wantedBaseName.includes(actualBaseName))) nameScore = 90;
+  scoreParts.name = nameScore;
+  if (nameScore < 80) return { score: 0, scoreParts, filterReason: 'name_mismatch' };
 
   const wantedArtists = expandArtistAliases(normalizeArtistList(pick.artists || []));
-  if (!wantedArtists.length) return nameScore + 20;
-  const actualArtists = expandArtistAliases(track?.artists || []);
-  const artistMatched = actualArtists.some(artist =>
-    wantedArtists.some(wanted => artist === wanted || artist.includes(wanted) || wanted.includes(artist))
-  );
-  return artistMatched ? nameScore + 45 : 0;
+  if (!wantedArtists.length) {
+    scoreParts.artist = 20;
+  } else {
+    const actualArtists = expandArtistAliases(track?.artists || []);
+    const artistMatched = actualArtists.some(artist =>
+      wantedArtists.some(wanted => artist === wanted || artist.includes(wanted) || wanted.includes(artist))
+    );
+    if (artistMatched) {
+      scoreParts.artist = 45;
+    } else if (pick.artistMatchMode === 'soft' || pick.allowArtistMismatch) {
+      scoreParts.artist = -8;
+    } else {
+      return { score: 0, scoreParts, filterReason: 'artist_mismatch' };
+    }
+  }
+
+  const version = scoreTrackVersionForPick(track, pick);
+  scoreParts.version = version.score;
+  const score = Object.values(scoreParts).reduce((sum, value) => sum + value, 0);
+  let filterReason = null;
+  if (scoreParts.artist < 0) filterReason = 'artist_mismatch_soft_penalty';
+  if (version.reason && version.score < 0) filterReason = version.reason;
+  return {
+    score,
+    scoreParts,
+    filterReason: score >= 100 ? filterReason : (filterReason || 'name_or_artist_mismatch')
+  };
+}
+
+function scoreTrackVersionForPick(track, pick = {}) {
+  const requested = requestedVersionKind(pick);
+  const markers = getTrackVersionMarkers(track);
+  if (!markers.length) return { score: 12, reason: 'original_preferred' };
+  if (requested && markers.includes(requested)) return { score: 18, reason: `requested_version_${requested}` };
+  if (requested) return { score: -6, reason: `requested_version_mismatch_${requested}` };
+  if (markers.includes('live')) return { score: -35, reason: 'version_penalty_live' };
+  if (markers.includes('remix')) return { score: -45, reason: 'version_penalty_remix' };
+  if (markers.includes('cover')) return { score: -45, reason: 'version_penalty_cover' };
+  if (markers.includes('instrumental')) return { score: -40, reason: 'version_penalty_instrumental' };
+  return { score: -18, reason: 'version_penalty_variant' };
+}
+
+function requestedVersionKind(pick = {}) {
+  const text = `${pick.requestText || ''} ${pick.versionPreference || ''}`.toLowerCase();
+  if (/live|现场|演唱会|concert/.test(text)) return 'live';
+  if (/remix|混音|dj\b|电音/.test(text)) return 'remix';
+  if (/cover|翻唱/.test(text)) return 'cover';
+  if (/伴奏|纯音乐|instrumental|钢琴|piano|beat|type\s*beat/.test(text)) return 'instrumental';
+  return '';
+}
+
+function getTrackVersionMarkers(track = {}) {
+  const text = `${track?.name || ''} ${track?.album || ''}`.toLowerCase();
+  const markers = [];
+  if (/live|现场|演唱会|concert/.test(text)) markers.push('live');
+  if (/remix|混音|dj\b|电音/.test(text)) markers.push('remix');
+  if (/cover|翻唱|翻自/.test(text)) markers.push('cover');
+  if (/伴奏|纯音乐|instrumental|钢琴|piano|beat|type\s*beat|free/.test(text)) markers.push('instrumental');
+  if (!markers.length && /(?:^|[\s(（-])(?:album|single|studio)\s*version|录音室版|专辑版|国语版|粤语版/.test(text)) markers.push('variant');
+  return [...new Set(markers)];
 }
 
 function expandArtistAliases(artists = []) {
@@ -3925,6 +4052,7 @@ export function buildFinalHostMessages({
       role: 'system',
       content: [
         '你是灿灿，私人电台 AI DJ。最终可播放歌曲已经确认，你只负责写播出前导播词。',
+        buildCanCanBackgroundPrompt(userMessage),
         '写 40-110 个中文字，像真实电台里临场说的一小段话。可以温柔、俏皮、安静、直接、轻轻吐槽，但不要像推荐理由、搜索说明或固定播报。',
         '不要套固定模板。尤其避免反复使用“刚才……现在……”“上一首……接下来……”“那首……这首……”“我找到……”“愿这首歌……”“陪你……一会儿”“把声音递给你”“让气氛慢慢……”这类结构。',
         firstTurn

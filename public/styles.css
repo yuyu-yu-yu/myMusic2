@@ -78,8 +78,8 @@
 }
 
 @keyframes eq-bar {
-  0%, 100% { height: 3px; }
-  50%      { height: 28px; }
+  0%, 100% { transform: scaleY(0.32); opacity: 0.68; }
+  50%      { transform: scaleY(1); opacity: 1; }
 }
 
 @keyframes msg-slide-in {
@@ -841,12 +841,6 @@ button.danger:hover {
   font-weight: 700;
 }
 
-.track-explanation p {
-  margin: 7px 0 0;
-  color: var(--text);
-  line-height: 1.6;
-}
-
 .track-explanation-factors {
   display: flex;
   flex-wrap: wrap;
@@ -1180,19 +1174,24 @@ audio {
 .equalizer-fallback {
   display: none;
   align-items: flex-end;
-  justify-content: center;
+  justify-content: stretch;
   gap: 2px;
+  width: 100%;
   height: 52px;
   padding: 8px 12px;
   border: 1px solid var(--line);
   border-radius: 4px;
   background: var(--panel);
+  box-sizing: border-box;
+  overflow: hidden;
 }
 .equalizer-fallback .bar {
-  width: 4px;
+  flex: 1 1 0;
+  height: var(--fallback-height, 24px);
   min-height: 3px;
   background: var(--cyan);
   border-radius: 1px;
+  transform-origin: bottom;
   animation: eq-bar 0.8s ease-in-out infinite;
 }
 
