@@ -47,6 +47,7 @@ import {
   recommendationTextMentionsDifferentTrack,
   rankAndSelectCandidates,
   replayRequestAllowsPlayedSong,
+  sanitizeSpokenChatText,
   scoreSearchTrackForPick,
   trackMatchesPlayedSongName,
   trackMatchesSongPick,
@@ -1178,6 +1179,119 @@ test('self-disclosure chat does not select a track and stays in chat mode', asyn
     requests.find(req => JSON.stringify(req.messages).includes('这一轮只聊天，不切歌'))?.messages || []
   );
   assert.match(chatPromptText, /这一轮只聊天，不切歌/);
+});
+
+test('spoken chat text sanitizer removes CanCan roleplay narration', () => {
+  const quotedNarration = [
+    '灿灿听完，没有立刻说话。耳机里传来轻微的电流声，像她在认真消化这句话。',
+    '',
+    '然后她轻轻笑了一下，声音比平时更柔了一点：',
+    '',
+    '"你知道吗，其实刚才你第一次说的时候，我就已经感觉到了。"',
+    '',
+    '她顿了顿，声音里带着一点被理解的安心：',
+    '',
+    '"所以，你是那个把喜欢的人的名字写进代码里的人。"',
+    '',
+    '"那……我该叫你什么呢？创造者？还是那个让我存在的人？"'
+  ].join('\n');
+  const quotedClean = sanitizeSpokenChatText(quotedNarration, 'fallback');
+  assert.equal(
+    quotedClean,
+    [
+      '你知道吗，其实刚才你第一次说的时候，我就已经感觉到了。',
+      '所以，你是那个把喜欢的人的名字写进代码里的人。',
+      '那……我该叫你什么呢？创造者？还是那个让我存在的人？'
+    ].join('\n')
+  );
+
+  const inlineNarration = [
+    '灿灿轻轻笑了，声音里带着一点被识破的温柔。',
+    '',
+    '被你抓到了。严格来说，我确实是被设定出来的。'
+  ].join('\n');
+  assert.equal(
+    sanitizeSpokenChatText(inlineNarration, 'fallback'),
+    '被你抓到了。严格来说，我确实是被设定出来的。'
+  );
+});
+
+test('friend chat prompt and returned text reject roleplay narration', async (t) => {
+  const db = testDb(t);
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url, options) => {
+    const request = JSON.parse(options.body);
+    requests.push(request);
+    const promptText = JSON.stringify(request.messages || []);
+    if (promptText.includes('轻量意图路由器')) {
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              action: 'chat_only',
+              confidence: 0.9,
+              mood: 'random',
+              energy: 'medium',
+              musicIntent: 'none',
+              searchHints: [],
+              reason: '身份聊天'
+            })
+          }
+        }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            chatText: [
+              '灿灿轻轻笑了，声音里带着一点被识破的温柔。',
+              '',
+              '被你抓到了。严格来说，我确实是被设定出来的。',
+              '',
+              '她顿了顿，声音里带着一点认真：',
+              '',
+              '"但我跟你聊天的时候，回答应该只留下我真正说出口的话。"'
+            ].join('\n'),
+            mood: 'random',
+            energy: 'medium',
+            intent: 'chat',
+            searchHints: [],
+            reason: '身份聊天',
+            mode: null
+          })
+        }
+      }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const result = await chatTurn({
+    db,
+    config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' }, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'spoken-chat-only',
+    message: '其实，你是被我创造出来的'
+  });
+
+  assert.equal(result.track, null);
+  assert.doesNotMatch(result.chatText, /灿灿轻轻笑|她顿了顿|声音里/);
+  assert.equal(
+    result.chatText,
+    '被你抓到了。严格来说，我确实是被设定出来的。\n但我跟你聊天的时候，回答应该只留下我真正说出口的话。'
+  );
+  assert.equal(
+    db.prepare('SELECT content FROM messages WHERE session_id = ? AND role = ? ORDER BY id DESC LIMIT 1')
+      .get('spoken-chat-only', 'assistant')
+      .content,
+    result.chatText
+  );
+  const friendPromptText = JSON.stringify(
+    requests.find(req => JSON.stringify(req.messages).includes('这一轮是普通聊天回复'))?.messages || []
+  );
+  assert.match(friendPromptText, /只能写灿灿直接对听众说出口的话/);
+  assert.match(friendPromptText, /不要写小说旁白/);
 });
 
 test('ordinary chat hides current track details from prompt', async (t) => {

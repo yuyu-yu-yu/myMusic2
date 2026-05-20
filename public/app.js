@@ -30,6 +30,7 @@ let btnFeedbackReady = false;
 let loadingMsgIndex = 0;
 let loadingMsgTimer = null;
 let loadingMessageEl = null;
+const activeLoadingMessages = new Set();
 let savedChatHTML = '';
 let avatarRestoreTimer = null;
 let avatarFrameTimer = null;
@@ -724,24 +725,37 @@ const chatLoadingMessages = [
 
 function startLoadingMessages(kind = 'music') {
   const messages = kind === 'chat' ? chatLoadingMessages : loadingMessages;
-  loadingMsgIndex = 0;
   statusLocked = true;
   setAvatarState(kind === 'chat' ? 'reading' : 'searching');
-  if (loadingMessageEl?.isConnected) loadingMessageEl.remove();
-  loadingMessageEl = appendChat({ role: 'dj', loading: true });
-  showLoadingMessage(messages);
-  loadingMsgTimer = setInterval(() => {
-    loadingMsgIndex = (loadingMsgIndex + 1) % messages.length;
-    showLoadingMessage(messages);
+  const loading = {
+    el: appendChat({ role: 'dj', loading: true }),
+    index: 0,
+    messages,
+    timer: null
+  };
+  activeLoadingMessages.add(loading);
+  loadingMessageEl = loading.el;
+  loadingMsgIndex = 0;
+  showLoadingMessage(loading);
+  loading.timer = setInterval(() => {
+    loading.index = (loading.index + 1) % loading.messages.length;
+    if (loading.el === loadingMessageEl) loadingMsgIndex = loading.index;
+    showLoadingMessage(loading);
   }, kind === 'chat' ? 1600 : 2800);
+  loadingMsgTimer = loading.timer;
+  return loading;
 }
 
-function showLoadingMessage(messages = loadingMessages) {
-  const el = loadingMessageEl?.isConnected
-    ? loadingMessageEl.querySelector('[data-loading-text]')
+function showLoadingMessage(loading = null) {
+  const currentLoading = loading?.el
+    ? loading
+    : [...activeLoadingMessages].find(item => item.el === loadingMessageEl);
+  const el = currentLoading?.el?.isConnected
+    ? currentLoading.el.querySelector('[data-loading-text]')
     : null;
   if (!el) return;
-  const msg = messages[loadingMsgIndex] || messages[0] || '';
+  const messages = currentLoading.messages || loadingMessages;
+  const msg = messages[currentLoading.index] || messages[0] || '';
   el.innerHTML = `
     <span class="glitch-text" data-text="${escapeAttr(msg)}">${escapeHtml(msg)}</span>
     <span class="loading-dots">
@@ -751,21 +765,45 @@ function showLoadingMessage(messages = loadingMessages) {
   el.style.color = 'var(--cyan)';
 }
 
-function stopLoadingMessages({ remove = false } = {}) {
-  statusLocked = false;
-  if (loadingMsgTimer) { clearInterval(loadingMsgTimer); loadingMsgTimer = null; }
-  if (remove && loadingMessageEl?.isConnected) loadingMessageEl.remove();
-  if (remove || !loadingMessageEl?.isConnected) loadingMessageEl = null;
+function stopLoadingMessages({ remove = false, loading = null } = {}) {
+  const target = loading?.el
+    ? loading
+    : [...activeLoadingMessages].find(item => item.el === loadingMessageEl);
+  if (target) {
+    if (target.timer) clearInterval(target.timer);
+    if (remove && target.el?.isConnected) target.el.remove();
+    activeLoadingMessages.delete(target);
+    if (loadingMessageEl === target.el) {
+      const latest = [...activeLoadingMessages].at(-1);
+      loadingMessageEl = latest?.el || (remove ? null : target.el);
+      loadingMsgTimer = latest?.timer || null;
+      loadingMsgIndex = latest?.index || 0;
+    }
+  } else if (loadingMsgTimer) {
+    clearInterval(loadingMsgTimer);
+    loadingMsgTimer = null;
+  }
+  statusLocked = activeLoadingMessages.size > 0;
 }
 
-function replaceLoadingMessage({ text, track, explanation }) {
-  if (!loadingMessageEl?.isConnected) {
+function replaceLoadingMessage({ text, track, explanation, loading = null }) {
+  const target = loading?.el
+    ? loading
+    : [...activeLoadingMessages].find(item => item.el === loadingMessageEl)
+      || (loadingMessageEl?.isConnected ? { el: loadingMessageEl, timer: loadingMsgTimer } : null);
+  if (!target?.el?.isConnected) {
     return appendChat({ role: 'dj', text, track, explanation });
   }
-  renderChatMessageContent(loadingMessageEl, { text, track, explanation });
-  loadingMessageEl.classList.remove('loading-msg');
-  loadingMessageEl.removeAttribute('aria-live');
-  loadingMessageEl = null;
+  stopLoadingMessages({ loading: target });
+  renderChatMessageContent(target.el, { text, track, explanation });
+  target.el.classList.remove('loading-msg');
+  target.el.removeAttribute('aria-live');
+  if (loadingMessageEl === target.el) {
+    const latest = [...activeLoadingMessages].at(-1);
+    loadingMessageEl = latest?.el || null;
+    loadingMsgTimer = latest?.timer || null;
+    loadingMsgIndex = latest?.index || 0;
+  }
   scrollChatToBottom();
   return null;
 }
@@ -806,14 +844,14 @@ async function startRadio() {
   setAvatarState('on_air');
   setRadioButtonState('loading');
   appendChat({ role: 'user', text: '启动电台' });
-  startLoadingMessages();
+  const loading = startLoadingMessages();
   try {
     await loadPreferences().catch(() => null);
     const data = await api('/api/radio/start', { method: 'POST', body: { sessionId } });
-    handleRadioResponse(data);
+    handleRadioResponse(data, { loading });
   } catch (e) {
-    stopLoadingMessages();
-    replaceLoadingMessage({ text: '启动电台时出了一点问题：' + e.message });
+    stopLoadingMessages({ loading });
+    replaceLoadingMessage({ text: '启动电台时出了一点问题：' + e.message, loading });
     setAvatarState('idle');
     setRadioButtonState(state.current?.track ? 'active' : 'idle');
     setPlayerStatus(e.message, 'error');
@@ -827,14 +865,14 @@ async function nextTrack({ skipCurrent = true } = {}) {
   setPlaybackToggleState(false);
   if (skipCurrent) await reportFeedback('skip');
   appendChat({ role: 'user', text: '下一首' });
-  startLoadingMessages();
+  const loading = startLoadingMessages();
   try {
     await loadPreferences().catch(() => null);
     const data = await api('/api/radio/next', { method: 'POST', body: { sessionId } });
-    handleRadioResponse(data);
+    handleRadioResponse(data, { loading });
   } catch (e) {
-    stopLoadingMessages();
-    replaceLoadingMessage({ text: '抱歉，刚才找歌时出了一点问题：' + e.message });
+    stopLoadingMessages({ loading });
+    replaceLoadingMessage({ text: '抱歉，刚才找歌时出了一点问题：' + e.message, loading });
     setAvatarState(getContextualAvatarState());
     setPlayerStatus(e.message, 'error');
   }
@@ -844,15 +882,15 @@ async function sendChat(msg) {
   primeVoicePlayback();
   const sessionId = ensureSessionId();
   appendChat({ role: 'user', text: msg });
-  startLoadingMessages('chat');
+  const loading = startLoadingMessages('chat');
   try {
     await loadPreferences().catch(() => null);
     const data = await api('/api/radio/chat', { method: 'POST', body: { sessionId, message: msg } });
-    handleRadioResponse(data);
+    handleRadioResponse(data, { loading });
   } catch (e) {
-    stopLoadingMessages();
+    stopLoadingMessages({ loading });
     setAvatarState(getContextualAvatarState());
-    replaceLoadingMessage({ text: '抱歉，出了一点问题：' + e.message });
+    replaceLoadingMessage({ text: '抱歉，出了一点问题：' + e.message, loading });
   }
 }
 
@@ -862,8 +900,8 @@ async function resetMode() {
   appendChat({ role: 'dj', text: '好的，恢复正常推荐模式。' });
 }
 
-function handleRadioResponse(data) {
-  stopLoadingMessages();
+function handleRadioResponse(data, { loading = null } = {}) {
+  stopLoadingMessages({ loading });
   state.sessionId = data.sessionId || state.sessionId;
   setRadioButtonState(state.sessionId || data.track || state.current?.track ? 'active' : 'idle');
   if (data.track) {
@@ -876,7 +914,8 @@ function handleRadioResponse(data) {
   replaceLoadingMessage({
     text: data.chatText || data.hostText || '',
     track: data.track,
-    explanation: data.explanation
+    explanation: data.explanation,
+    loading
   });
   scheduleUsageInsightsRefresh(data.track ? 800 : 3200);
 
@@ -1121,7 +1160,13 @@ function buildExplanationHTML(explanation = null) {
 
 function scrollChatToBottom() {
   const container = document.querySelector('#chat-messages');
-  if (container) container.scrollTop = container.scrollHeight;
+  if (!container) return;
+  const scroll = () => {
+    container.scrollTop = container.scrollHeight;
+  };
+  scroll();
+  requestAnimationFrame(scroll);
+  setTimeout(scroll, 120);
 }
 
 async function updatePlayer(data, autoplay) {

@@ -2239,6 +2239,8 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
         '你是灿灿，一个聪明、自然、熟悉感很强的 AI 朋友，同时也是私人电台 DJ。',
         buildCanCanPersonaPrompt(userMessage),
         '这一轮是普通聊天回复，不负责选歌。请像网页版大模型聊天一样，先直接回答用户这句话本身。',
+        'chatText 只能写灿灿直接对听众说出口的话，用第一人称“我”自然回复；不要写小说旁白、舞台指示、动作描写、表情描写、心理活动或音效。',
+        '禁止输出类似“灿灿轻轻笑了”“她顿了顿”“声音里带着”“耳机里传来”“像她在认真消化”这样的第三人称描写；也不要用括号、星号或“灿灿：”标注动作。',
         '你可以表达自己的判断、喜好和理由，不要只做情绪复述；用户问“你喜欢 X 吗”，就直接说喜欢/不喜欢/为什么。',
         '不要把所有话题都拉回音乐；只有用户主动聊到音乐、歌手、当前歌曲时，才自然聊音乐。',
         '不要使用固定陪伴模板，不要突然说“我在这里”“我陪你”“不用马上睡着/振作”。这些话只有用户明确痛苦、失眠、崩溃时才可少量使用。',
@@ -2267,7 +2269,7 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
         `启发式情绪：${JSON.stringify(baseMood)}`,
         `允许主动推荐：${canSuggest}`,
         `明确音乐意图：${explicitIntent}`,
-        `最近对话：${history.slice(-10).map(h => `${h.role}: ${h.content}`).join('\n')}`,
+        `最近对话：${history.slice(-10).map(h => `${h.role}: ${h.role === 'assistant' ? sanitizeSpokenChatText(h.content, '') : h.content}`).join('\n')}`,
         `听众刚说：${userMessage}`
       ].join('\n')
     }
@@ -2285,7 +2287,7 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
     return {
       ...normalized,
       shouldRecommend: false,
-      chatText: String(parsed.chatText || fallback().chatText).trim(),
+      chatText: sanitizeSpokenChatText(parsed.chatText, fallback().chatText),
       newMode: parsed.mode === 'reset' ? {} : (parsed.mode && typeof parsed.mode === 'string' ? { genre: parsed.mode, note: '用户指定' } : null)
     };
   } catch {
@@ -2293,11 +2295,55 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
     if (plain && plain !== JSON.stringify(fallback())) {
       return {
         ...fallback(),
-        chatText: plain.slice(0, 500)
+        chatText: sanitizeSpokenChatText(plain.slice(0, 500), fallback().chatText)
       };
     }
     return fallback();
   }
+}
+
+export function sanitizeSpokenChatText(value, fallbackText = '') {
+  const original = stripCodeFence(String(value || '')).trim();
+  const fallback = String(fallbackText || '').trim();
+  if (!original) return fallback;
+
+  let text = original
+    .replace(/^\s*灿灿\s*[：:]\s*/gm, '')
+    .trim();
+
+  const hasRoleplayNarration = /灿灿(?:听完|轻轻|没有立刻|沉默|笑|眨|顿|低|抬|看|开口)|耳机里|电流声|声音里|语气里|表情|眼神|内心|心里|像她在认真|她(?:轻轻|顿了顿|听完|没有立刻|沉默|笑了一下|开口)/.test(text);
+  if (!hasRoleplayNarration) return text;
+
+  const quotedSegments = [];
+  const quotePattern = /[“"]([^“”"\n]{2,500})[”"]/g;
+  for (const match of text.matchAll(quotePattern)) {
+    const segment = String(match[1] || '').trim();
+    if (segment) quotedSegments.push(segment);
+  }
+  const quotedText = quotedSegments.join('\n').trim();
+  if (quotedText.length >= 20 && quotedSegments.length >= 2) {
+    return quotedText || fallback;
+  }
+
+  const narrationLinePatterns = [
+    /^灿灿(?:听完|轻轻|没有立刻|先是|沉默|愣|笑|眨|点|低|抬|看|把|像|在|顿|开口|小声|温柔地|认真地|歪|托|翻|读|望|摘|戴|调整|坐|靠)/,
+    /^(?:然后|接着|过了一会儿|这时)?她(?:轻轻|听完|没有立刻|先是|沉默|愣|笑|眨|点|低|抬|看|把|像|在|顿|开口|小声|温柔地|认真地|歪|托|翻|读|望|摘|戴|调整|坐|靠)/,
+    /^(?:耳机|屏幕|蓝紫色|霓虹|电流声|背景|空气).*(?:传来|响|闪|亮|浮|晃|铺开)/,
+    /^(?:声音|语气|表情|眼神|内心|心里).*(?:带着|有|像|变得|泛起|写着)/,
+    /^(?:然后|接着|过了一会儿|这时).*?(?:声音|语气|表情|眼神|笑|顿|说).*[：:]?$/,
+    /^[（(].*(?:笑|停顿|沉默|眨眼|内心|心理|旁白).*[）)]$/,
+    /^\*.*(?:笑|停顿|沉默|眨眼|内心|心理|旁白).*\*$/
+  ];
+
+  const spokenLines = text
+    .split(/\n+/)
+    .map(line => line.trim().replace(/^\*+|\*+$/g, '').trim())
+    .filter(Boolean)
+    .filter(line => !narrationLinePatterns.some(pattern => pattern.test(line)))
+    .map(line => line.replace(/^["“]+/, '').replace(/["”]+$/, '').trim())
+    .filter(Boolean);
+
+  return spokenLines.join('\n').trim() || fallback;
 }
 
 function parseChatDecision(raw) {
