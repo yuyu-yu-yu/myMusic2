@@ -1597,6 +1597,15 @@ test('radio queue policy handles ordinary chat, explicit music, mood shifts, and
     searchHints: ['提神'],
     musicIntent: 'mood_signal'
   })), false);
+  assert.equal(queueItemMatchesMusicContext({
+    track: { id: 'eason-1', name: '旧歌', artists: ['陈奕迅'] },
+    contextSnapshot: normalizeMusicContext({ mood: 'calm', energy: 'low' })
+  }, normalizeMusicContext({
+    mood: 'calm',
+    energy: 'low',
+    avoidHints: ['陈奕迅'],
+    musicIntent: 'mood_signal'
+  })), false);
 
   const soft = decideQueuePolicy({
     analysis: normalizeMusicContext({ musicIntent: 'mood_signal', mood: 'energy', energy: 'high', searchHints: ['提神'], confidence: 0.8 }),
@@ -1727,7 +1736,7 @@ test('radio debug status returns sanitized queue, metrics, and diagnostics', (t)
   assert.equal(JSON.stringify(debug).includes('apiKey'), false);
 });
 
-test('queued recommendation returns queue explanation and does not retry failed tts', async (t) => {
+test('queued recommendation ignores old queued host text and tts before playback', async (t) => {
   const db = testDb(t);
   db.prepare('INSERT INTO tracks (id, name, artists, album, cover_url, duration_ms, raw_json, updated_at) VALUES (?,?,?,?,?,?,?,?)')
     .run('queue-song', 'Queue Song', JSON.stringify(['Artist A']), 'Album', null, 180000, '{}', new Date().toISOString());
@@ -1765,7 +1774,10 @@ test('queued recommendation returns queue explanation and does not retry failed 
   });
 
   assert.equal(result.queueHit, true);
+  assert.equal(result.queueReconciled, 'finalize_playback');
   assert.equal(result.track.id, 'queue-song');
+  assert.notEqual(result.chatText, 'host');
+  assert.match(result.chatText, /Queue Song/);
   assert.equal(result.ttsStatus, 'failed');
   assert.equal(result.ttsUrl, null);
   assert.match(result.explanation.summary, /queue|Queue|棰勫彇|预取/);
@@ -1773,6 +1785,75 @@ test('queued recommendation returns queue explanation and does not retry failed 
 
   for (let index = 0; index < 20; index += 1) {
     if (getRadioQueueStatus(db, 'queue-explanation').pendingCount === 0) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+});
+
+test('queued recommendation finalizes host text and tts with latest emotional context', async (t) => {
+  const db = testDb(t);
+  const oldContext = normalizeMusicContext({
+    version: 1,
+    mood: 'calm',
+    energy: 'low',
+    searchHints: ['安静'],
+    musicIntent: 'mood_signal',
+    confidence: 0.75
+  });
+  const newContext = normalizeMusicContext({
+    version: 2,
+    mood: 'calm',
+    energy: 'low',
+    searchHints: ['安静'],
+    musicIntent: 'mood_signal',
+    confidence: 0.8,
+    lastUserMessage: '我胃不舒服，想安静一下',
+    reason: '身体不舒服，需要更轻的陪伴'
+  });
+  db.prepare('INSERT INTO tracks (id, name, artists, album, cover_url, duration_ms, raw_json, updated_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run('quiet-song', '安静的歌', JSON.stringify(['Artist A']), 'Album', null, 180000, '{}', new Date().toISOString());
+  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
+    .run('queue-refresh-host', new Date().toISOString(), JSON.stringify({ musicContext: newContext }), JSON.stringify(normalizeRadioQueue([
+      {
+        id: 'ready-refresh',
+        status: 'ready',
+        contextVersion: 1,
+        contextSnapshot: oldContext,
+        track: { id: 'quiet-song', name: '安静的歌', artists: ['Artist A'], album: 'Album' },
+        chatText: '旧导播词，不应该继续直接使用。',
+        reason: 'prepared',
+        explanation: {
+          summary: 'old quiet context',
+          factors: [{ type: 'time', text: 'night' }],
+          source: 'llm_pick'
+        },
+        ttsStatus: 'ready',
+        ttsUrl: '/api/tts/old.mp3'
+      }
+    ])));
+
+  const result = await djTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'queue-refresh-host'
+  });
+
+  assert.equal(result.queueHit, true);
+  assert.equal(result.queueReconciled, 'finalize_playback');
+  assert.equal(result.track.id, 'quiet-song');
+  assert.notEqual(result.chatText, '旧导播词，不应该继续直接使用。');
+  assert.match(result.chatText, /安静的歌/);
+  assert.equal(result.ttsStatus, 'failed');
+  assert.equal(result.ttsUrl, null);
+  assert.equal(result.explanation.factors.some(factor => factor.text.includes('胃不舒服')), true);
+
+  const status = getRadioQueueStatus(db, 'queue-refresh-host');
+  assert.equal(status.queueMetrics.queueHitCount, 1);
+  assert.equal(status.queueMetrics.queueFinalizeCount, 1);
+  assert.equal(status.queueMetrics.lastQueueReconcileReason, 'queued_song_finalized_for_playback');
+
+  for (let index = 0; index < 20; index += 1) {
+    if (getRadioQueueStatus(db, 'queue-refresh-host').pendingCount === 0) break;
     await new Promise(resolve => setTimeout(resolve, 20));
   }
 });

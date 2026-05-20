@@ -48,6 +48,11 @@ const RADIO_QUEUE_LIMIT = 2;
 const RADIO_QUEUE_DIAGNOSTIC_LIMIT = 4;
 const RADIO_QUEUE_DIAGNOSTIC_TTL_MS = 10 * 60 * 1000;
 const QUEUE_ITEM_STATUSES = new Set(['pending', 'ready', 'failed', 'stale']);
+const QUEUE_RECONCILE_ACTIONS = Object.freeze({
+  USE_AS_IS: 'use_as_is',
+  FINALIZE_PLAYBACK: 'finalize_playback',
+  REPLACE_TRACK: 'replace_track'
+});
 const RADIO_QUEUE_POLICIES = Object.freeze({
   REFRESH_TAIL: 'refresh_tail',
   HARD_PREEMPT: 'hard_preempt',
@@ -121,20 +126,66 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   const normalizedUserMessage = String(userMessage || '').trim();
 
   if (useQueue && !normalizedUserMessage) {
-    const queued = consumeReadyRadioQueue(db, sessionId);
+    const queued = consumeReadyRadioQueue(db, sessionId, { recordHit: false });
     if (queued?.track) {
+      const reconciled = await reconcileQueuedItemBeforeCommit({
+        db,
+        config,
+        sessionId,
+        item: queued,
+        fallbackConversationMood: conversationMood,
+        accountContext: account
+      });
+      if (reconciled.action === QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK) {
+        appendStaleQueueDiagnostic(db, sessionId, queued, reconciled.reason || 'context_recommendation_shift');
+        updateQueueMetrics(db, sessionId, {
+          queueContextDiscardCount: 1,
+          syncFallbackCount: 1,
+          lastMissReason: 'queue_context_replaced',
+          lastQueueReconcileReason: reconciled.reason || 'context_recommendation_shift'
+        });
+        const latestMusicContext = normalizeMusicContext(getSessionContext(db, sessionId).musicContext || {});
+        const payload = await buildRadioRecommendation({
+          db,
+          config,
+          netease,
+          sessionId,
+          userMessage: null,
+          conversationMood: moodFromMusicContext(latestMusicContext),
+          accountContext: account
+        });
+        const response = await commitRadioRecommendation({
+          db,
+          config,
+          sessionId,
+          payload,
+          userMessage: null,
+          conversationMood: payload.conversationMood || moodFromMusicContext(latestMusicContext),
+          source: 'sync',
+          accountContext: account
+        });
+        scheduleRadioQueueFill({ db, config, netease, sessionId, reason: 'after_context_replace', accountContext: account });
+        return { ...response, queueHit: false, queueReconciled: reconciled.action };
+      }
+      const queuePayload = reconciled.payload || queued;
+      updateQueueMetrics(db, sessionId, {
+        queueHitCount: 1,
+        lastQueueHitAt: nowIso(),
+        lastMissReason: null,
+        lastQueueReconcileReason: reconciled.reason || reconciled.action
+      });
       const response = await commitRadioRecommendation({
         db,
         config,
         sessionId,
-        payload: queued,
+        payload: queuePayload,
         userMessage: null,
-        conversationMood: queued.conversationMood || queued.contextSnapshot || conversationMood,
+        conversationMood: queuePayload.conversationMood || queuePayload.contextSnapshot || conversationMood,
         source: 'queue',
         accountContext: account
       });
       scheduleRadioQueueFill({ db, config, netease, sessionId, reason: 'after_consume', accountContext: account });
-      return { ...response, queueHit: true };
+      return { ...response, queueHit: true, queueReconciled: reconciled.action };
     }
     updateQueueMetrics(db, sessionId, { queueMissCount: 1, lastMissReason: 'no_ready_queue_item' });
   }
@@ -175,7 +226,8 @@ async function buildRadioRecommendation({
   userMessage,
   conversationMood = null,
   extraAvoidTracks = [],
-  accountContext = null
+  accountContext = null,
+  deferHostAndSpeech = false
 }) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
@@ -220,15 +272,20 @@ async function buildRadioRecommendation({
     hostContext,
     environmentContext,
     avoidTracks: extraAvoidTracks,
-    accountContext: account
+    accountContext: account,
+    deferHostText: deferHostAndSpeech
   });
 
   const speech = speechDecisionForRecommendation(prefs);
-  const tts = speech.shouldSpeak
+  const tts = deferHostAndSpeech
+    ? { url: null, status: 'deferred', ms: 0, error: null }
+    : speech.shouldSpeak
     ? await synthesizeSpeechWithDiagnostics(config.tts, result.chatText)
     : { url: null, status: 'disabled', ms: 0, error: null };
-  if (tts.status === 'failed') updateQueueMetrics(db, sessionId, { ttsFailedCount: 1 });
-  setRadioDebugInfo(db, sessionId, { lastTtsDiagnostics: sanitizeTtsDiagnostics(tts) });
+  if (!deferHostAndSpeech) {
+    if (tts.status === 'failed') updateQueueMetrics(db, sessionId, { ttsFailedCount: 1 });
+    setRadioDebugInfo(db, sessionId, { lastTtsDiagnostics: sanitizeTtsDiagnostics(tts) });
+  }
   const musicContext = normalizeMusicContext(context.musicContext);
 
   return {
@@ -237,7 +294,7 @@ async function buildRadioRecommendation({
     createdAt: nowIso(),
     contextVersion: musicContext.version,
     contextSnapshot: musicContext,
-    chatText: result.chatText,
+    chatText: deferHostAndSpeech ? '' : result.chatText,
     track: result.track,
     reason: result.reason,
     explanation: result.explanation,
@@ -252,7 +309,8 @@ async function buildRadioRecommendation({
     environmentContext,
     newMode: result.newMode || null,
     conversationMood: recommendationMood,
-    accountContext: account
+    accountContext: account,
+    hostDeferred: deferHostAndSpeech
   };
 }
 
@@ -266,8 +324,8 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
   if (source === 'queue' && explanation) {
     explanation = normalizeRecommendationExplanation({
       ...explanation,
-      factors: [{ type: 'queue', text: '来自已准备好的预取队列' }, ...(explanation.factors || [])],
-      summary: `预取队列命中 + ${explanation.summary}`,
+      factors: [{ type: 'queue', text: '歌曲来自预取队列，导播词根据最新聊天生成' }, ...(explanation.factors || [])],
+      summary: `预取歌曲命中 + ${explanation.summary}`,
       source: explanation.source
     });
   }
@@ -679,6 +737,7 @@ export function normalizeRadioQueue(queue = []) {
       preemptReason: item?.preemptReason || null,
       reason: item?.reason || '',
       chatText: String(item?.chatText || '').trim(),
+      hostDeferred: Boolean(item?.hostDeferred),
       track,
       ttsUrl: item?.ttsUrl || null,
       ttsStatus: item?.ttsStatus || (item?.ttsUrl ? 'ready' : null),
@@ -721,9 +780,13 @@ function normalizeQueueMetrics(metrics = {}) {
     syncFallbackCount: Number(metrics.syncFallbackCount || 0),
     hardPreemptCount: Number(metrics.hardPreemptCount || 0),
     softPreemptCount: Number(metrics.softPreemptCount || 0),
+    queueFinalizeCount: Number(metrics.queueFinalizeCount || 0),
+    queueHostRefreshCount: Number(metrics.queueHostRefreshCount || 0),
+    queueContextDiscardCount: Number(metrics.queueContextDiscardCount || 0),
     ttsFailedCount: Number(metrics.ttsFailedCount || 0),
     lastQueueHitAt: metrics.lastQueueHitAt || null,
-    lastMissReason: metrics.lastMissReason || null
+    lastMissReason: metrics.lastMissReason || null,
+    lastQueueReconcileReason: metrics.lastQueueReconcileReason || null
   };
 }
 
@@ -739,9 +802,13 @@ function updateQueueMetrics(db, sessionId, patch = {}) {
       syncFallbackCount: current.syncFallbackCount + Number(patch.syncFallbackCount || 0),
       hardPreemptCount: current.hardPreemptCount + Number(patch.hardPreemptCount || 0),
       softPreemptCount: current.softPreemptCount + Number(patch.softPreemptCount || 0),
+      queueFinalizeCount: current.queueFinalizeCount + Number(patch.queueFinalizeCount || 0),
+      queueHostRefreshCount: current.queueHostRefreshCount + Number(patch.queueHostRefreshCount || 0),
+      queueContextDiscardCount: current.queueContextDiscardCount + Number(patch.queueContextDiscardCount || 0),
       ttsFailedCount: current.ttsFailedCount + Number(patch.ttsFailedCount || 0),
       lastQueueHitAt: patch.lastQueueHitAt ?? current.lastQueueHitAt,
-      lastMissReason: patch.lastMissReason ?? current.lastMissReason
+      lastMissReason: patch.lastMissReason ?? current.lastMissReason,
+      lastQueueReconcileReason: patch.lastQueueReconcileReason ?? current.lastQueueReconcileReason
     });
     return { ...context, queueMetrics: nextMetrics };
   });
@@ -760,7 +827,8 @@ function setRadioDebugInfo(db, sessionId, patch = {}) {
   }));
 }
 
-export function consumeReadyRadioQueue(db, sessionId) {
+export function consumeReadyRadioQueue(db, sessionId, options = {}) {
+  const recordHit = options?.recordHit !== false;
   const queue = getSessionQueue(db, sessionId);
   const context = getSessionContext(db, sessionId);
   const musicContext = normalizeMusicContext(context.musicContext || {});
@@ -776,16 +844,285 @@ export function consumeReadyRadioQueue(db, sessionId) {
         updatedAt: nowIso(),
         staleReason: 'context_mismatch'
       };
-      updateQueueMetrics(db, sessionId, { queueMissCount: 1, lastMissReason: 'stale_queue_head' });
+      updateQueueMetrics(db, sessionId, {
+        queueMissCount: 1,
+        queueContextDiscardCount: 1,
+        lastMissReason: 'stale_queue_head',
+        lastQueueReconcileReason: 'context_mismatch'
+      });
       continue;
     }
     queue.splice(index, 1);
     setSessionQueue(db, sessionId, queue);
-    updateQueueMetrics(db, sessionId, { queueHitCount: 1, lastQueueHitAt: nowIso(), lastMissReason: null });
+    if (recordHit) {
+      updateQueueMetrics(db, sessionId, { queueHitCount: 1, lastQueueHitAt: nowIso(), lastMissReason: null });
+    }
     return item;
   }
   setSessionQueue(db, sessionId, queue);
   return null;
+}
+
+async function reconcileQueuedItemBeforeCommit({
+  db,
+  config,
+  sessionId,
+  item,
+  fallbackConversationMood = null,
+  accountContext = null
+} = {}) {
+  const context = getSessionContext(db, sessionId);
+  const musicContext = normalizeMusicContext(context.musicContext || {});
+  const reason = queueReconcileReason(item, musicContext);
+  if (!item?.track?.id) {
+    return { action: QUEUE_RECONCILE_ACTIONS.USE_AS_IS, payload: item, reason: 'no_track' };
+  }
+  if (reason === QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK) {
+    return { action: QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK, payload: item, reason: 'context_recommendation_shift' };
+  }
+  try {
+    const finalized = await finalizeQueuedTrackForPlayback({
+      db,
+      config,
+      sessionId,
+      item,
+      musicContext,
+      context,
+      fallbackConversationMood,
+      accountContext
+    });
+    updateQueueMetrics(db, sessionId, {
+      queueFinalizeCount: 1,
+      lastQueueReconcileReason: 'queued_song_finalized_for_playback'
+    });
+    setRadioDebugInfo(db, sessionId, {
+      lastQueueReconcile: {
+        action: QUEUE_RECONCILE_ACTIONS.FINALIZE_PLAYBACK,
+        reason: 'queued_song_finalized_for_playback',
+        track: { id: finalized.track?.id, name: finalized.track?.name, artists: finalized.track?.artists || [] },
+        contextVersion: musicContext.version,
+        updatedAt: nowIso()
+      }
+    });
+    return {
+      action: QUEUE_RECONCILE_ACTIONS.FINALIZE_PLAYBACK,
+      payload: finalized,
+      reason: 'queued_song_finalized_for_playback'
+    };
+  } catch (error) {
+    const fallbackPayload = await buildFallbackFinalizedQueuedItem({
+      db,
+      config,
+      sessionId,
+      item,
+      musicContext,
+      context,
+      fallbackConversationMood,
+      accountContext
+    });
+    setRadioDebugInfo(db, sessionId, {
+      lastQueueReconcile: {
+        action: QUEUE_RECONCILE_ACTIONS.FINALIZE_PLAYBACK,
+        reason: 'queued_finalize_fallback',
+        error: String(error?.message || error).slice(0, 240),
+        contextVersion: musicContext.version,
+        updatedAt: nowIso()
+      }
+    });
+    updateQueueMetrics(db, sessionId, {
+      queueFinalizeCount: 1,
+      lastQueueReconcileReason: 'queued_finalize_fallback'
+    });
+    return { action: QUEUE_RECONCILE_ACTIONS.FINALIZE_PLAYBACK, payload: fallbackPayload, reason: 'queued_finalize_fallback' };
+  }
+}
+
+function queueReconcileReason(item = {}, musicContext = {}) {
+  const target = normalizeMusicContext(musicContext || {});
+  if (target.musicIntent === 'explicit_music') return QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK;
+  if (!queueItemMatchesMusicContext(item, target)) return QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK;
+  return '';
+}
+
+async function finalizeQueuedTrackForPlayback({
+  db,
+  config,
+  sessionId,
+  item,
+  musicContext,
+  context,
+  fallbackConversationMood = null,
+  accountContext = null
+} = {}) {
+  const account = normalizeAccountContext(accountContext);
+  const profile = getProfile(db, account);
+  const environmentContext = await getEnvironmentContext({ db, sessionId, config });
+  const { hour, timeOfDay, weather } = environmentContext;
+  const mode = getSessionMode(db, sessionId);
+  const prefs = normalizeRuntimePrefs(getUserPrefs(db, account));
+  const history = loadHistory(db, sessionId, account);
+  const conversationMood = moodFromMusicContext(musicContext) || fallbackConversationMood;
+  const latestUserMessage = String(musicContext.lastUserMessage || '').trim();
+  const hostContext = buildRadioHostContext(db, sessionId, context, latestUserMessage, account);
+  const sessionSummary = await updateSessionSummary(db, config, sessionId, account);
+  const longTermMemories = retrieveRelevantMemories(db, {
+    accountId: account.accountId,
+    text: latestUserMessage || musicContext.reason || '',
+    mood: conversationMood,
+    mode,
+    limit: LONG_MEMORY_LIMIT,
+    maxChars: LONG_MEMORY_MAX_CHARS
+  });
+  const memoryContext = buildMemoryContext({ sessionSummary, longTermMemories });
+  const selectedPick = queuedItemToSongPick(item, musicContext);
+  const plan = {
+    picks: [selectedPick],
+    hostDraft: '',
+    mode: null
+  };
+  const chatText = await generateFinalHostText({
+    config,
+    plan,
+    selectedPick,
+    selectedTrack: item.track,
+    profile,
+    prefs,
+    history,
+    timeOfDay,
+    hour,
+    weather,
+    conversationMood,
+    userMessage: latestUserMessage,
+    memoryContext,
+    hostContext,
+    environmentContext
+  });
+  const speech = speechDecisionForRecommendation(prefs);
+  const tts = speech.shouldSpeak
+    ? await synthesizeSpeechWithDiagnostics(config.tts, chatText)
+    : { url: null, status: 'disabled', ms: 0, error: null };
+  if (tts.status === 'failed') updateQueueMetrics(db, sessionId, { ttsFailedCount: 1 });
+  setRadioDebugInfo(db, sessionId, { lastTtsDiagnostics: sanitizeTtsDiagnostics(tts) });
+  return {
+    ...item,
+    updatedAt: nowIso(),
+    contextVersion: musicContext.version,
+    contextSnapshot: musicContext,
+    chatText,
+    reason: item.reason || selectedPick.reason,
+    explanation: addQueueFinalizeExplanation(item.explanation, musicContext),
+    ttsUrl: tts.url,
+    ttsStatus: tts.status,
+    ttsMs: tts.ms,
+    ttsError: tts.error,
+    speech,
+    profile,
+    weather,
+    environmentContext,
+    conversationMood,
+    accountContext: account
+  };
+}
+
+async function buildFallbackFinalizedQueuedItem({
+  db,
+  config,
+  sessionId,
+  item,
+  musicContext,
+  context = {},
+  fallbackConversationMood = null,
+  accountContext = null
+} = {}) {
+  const account = normalizeAccountContext(accountContext);
+  const prefs = normalizeRuntimePrefs(getUserPrefs(db, account));
+  const conversationMood = moodFromMusicContext(musicContext) || fallbackConversationMood;
+  const latestUserMessage = String(musicContext.lastUserMessage || '').trim();
+  let environmentContext = {};
+  try {
+    environmentContext = await getEnvironmentContext({ db, sessionId, config });
+  } catch {
+    environmentContext = {};
+  }
+  const hostContext = buildRadioHostContext(db, sessionId, context, latestUserMessage, account);
+  const chatText = buildConfirmedTrackHostFallback({
+    selectedTrack: item.track,
+    timeOfDay: environmentContext.timeOfDay || '',
+    weather: environmentContext.weather || '',
+    conversationMood,
+    userMessage: latestUserMessage,
+    hostContext
+  });
+  const speech = speechDecisionForRecommendation(prefs);
+  const tts = speech.shouldSpeak
+    ? await synthesizeSpeechWithDiagnostics(config.tts, chatText)
+    : { url: null, status: 'disabled', ms: 0, error: null };
+  if (tts.status === 'failed') updateQueueMetrics(db, sessionId, { ttsFailedCount: 1 });
+  setRadioDebugInfo(db, sessionId, { lastTtsDiagnostics: sanitizeTtsDiagnostics(tts) });
+  return {
+    ...item,
+    updatedAt: nowIso(),
+    contextVersion: musicContext.version,
+    contextSnapshot: musicContext,
+    chatText,
+    ttsUrl: tts.url,
+    ttsStatus: tts.status,
+    ttsMs: tts.ms,
+    ttsError: tts.error,
+    speech,
+    weather: environmentContext.weather || item.weather || '',
+    environmentContext,
+    conversationMood,
+    explanation: addQueueFinalizeExplanation(item.explanation, musicContext),
+    accountContext: account
+  };
+}
+
+function queuedItemToSongPick(item = {}, musicContext = {}) {
+  const track = item.track || {};
+  const artists = Array.isArray(track.artists) ? track.artists : [];
+  const reason = String(item.reason || item.explanation?.summary || musicContext.reason || '根据最新聊天状态继续衔接').trim();
+  return {
+    name: track.name || '',
+    artists,
+    reason,
+    hostLine: '',
+    queries: artists.length ? [`${track.name || ''} ${artists.join(' ')}`.trim()] : [track.name || ''].filter(Boolean)
+  };
+}
+
+function addQueueFinalizeExplanation(explanation = null, musicContext = {}) {
+  const base = normalizeRecommendationExplanation(explanation) || { summary: '', factors: [], source: 'fallback' };
+  const lastMessage = String(musicContext.lastUserMessage || '').trim();
+  const text = lastMessage
+    ? `歌曲来自预取队列，导播词根据最新聊天生成：${lastMessage.slice(0, 34)}`
+    : '歌曲来自预取队列，导播词根据最新聊天生成';
+  return normalizeRecommendationExplanation({
+    ...base,
+    summary: base.summary ? `预取歌曲命中，导播词已按最新聊天生成 + ${base.summary}` : text,
+    factors: [{ type: 'chat', text }, ...(base.factors || [])],
+    source: base.source
+  });
+}
+
+function appendStaleQueueDiagnostic(db, sessionId, item = {}, staleReason = 'context_recommendation_shift') {
+  if (!item?.track?.id) return;
+  const stale = normalizeRadioQueue([{
+    ...item,
+    status: 'stale',
+    updatedAt: nowIso(),
+    staleReason
+  }])[0];
+  if (!stale) return;
+  setSessionQueue(db, sessionId, [...getSessionQueue(db, sessionId), stale]);
+  setRadioDebugInfo(db, sessionId, {
+    lastQueueReconcile: {
+      action: QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK,
+      reason: staleReason,
+      track: { id: item.track.id, name: item.track.name, artists: item.track.artists || [] },
+      updatedAt: nowIso()
+    }
+  });
 }
 
 function clearRadioQueue(db, sessionId) {
@@ -877,6 +1214,7 @@ function sanitizeQueueItemForDebug(item = {}) {
     policy: item.policy,
     preemptReason: item.preemptReason,
     reason: item.reason,
+    hostDeferred: Boolean(item.hostDeferred),
     track: item.track ? sanitizeTrackForDebug(item.track) : null,
     explanation: normalizeRecommendationExplanation(item.explanation),
     ttsStatus: item.ttsStatus,
@@ -945,7 +1283,8 @@ function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill
         userMessage: null,
         conversationMood: moodFromMusicContext(musicContext),
         extraAvoidTracks: avoidTracks,
-        accountContext: account
+        accountContext: account,
+        deferHostAndSpeech: true
       });
       const readyItem = normalizeRadioQueue([{
         ...payload,
@@ -2474,6 +2813,7 @@ export function queueItemMatchesMusicContext(item = {}, musicContext = {}) {
   const itemContext = normalizeMusicContext(item.contextSnapshot || {});
   const target = normalizeMusicContext(musicContext || {});
   if (target.musicIntent === 'explicit_music') return false;
+  if (queueItemConflictsWithAvoidHints(item, target)) return false;
   if (itemContext.energy === 'high' && target.energy === 'low') return false;
   if (itemContext.energy === 'low' && target.energy === 'high') return false;
   if (target.mood !== 'random' && itemContext.mood !== 'random' && target.mood !== itemContext.mood) {
@@ -2493,6 +2833,23 @@ export function queueItemMatchesMusicContext(item = {}, musicContext = {}) {
     return false;
   }
   return true;
+}
+
+function queueItemConflictsWithAvoidHints(item = {}, musicContext = {}) {
+  const avoidHints = (musicContext.avoidHints || []).map(normalizeMusicText).filter(Boolean);
+  if (!avoidHints.length) return false;
+  const track = item.track || {};
+  const itemContext = normalizeMusicContext(item.contextSnapshot || {});
+  const searchable = [
+    track.name,
+    stripSongVersion(track.name),
+    ...(Array.isArray(track.artists) ? track.artists : []),
+    track.album,
+    ...(itemContext.searchHints || []),
+    ...(itemContext.preferenceHints || [])
+  ].map(normalizeMusicText).filter(Boolean).join(' ');
+  if (!searchable) return false;
+  return avoidHints.some(hint => hint.length >= 2 && searchable.includes(hint));
 }
 
 function applyQueuePolicyToSession({ db, config, netease, sessionId, queuePolicy = {}, musicContext = {}, currentTrack = null, accountContext = null }) {
@@ -3171,7 +3528,7 @@ function getArtistPenaltyByName(db, accountContext = null) {
   return penalties;
 }
 
-async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, hostContext = {}, environmentContext = {}, avoidTracks = [], accountContext = null }) {
+async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, hostContext = {}, environmentContext = {}, avoidTracks = [], accountContext = null, deferHostText = false }) {
   const account = normalizeAccountContext(accountContext);
   const playedHistory = mergePlayedTrackHistory(getPlayedTrackHistory(db, sessionId, 80, account), avoidTracks);
   const playedIds = new Set(playedHistory.map(track => String(track.id || '')).filter(Boolean));
@@ -3208,6 +3565,27 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
     const resolved = await resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, playedSignatures, request });
     setRadioDebugInfo(db, sessionId, { lastSearchDiagnostics: resolved.diagnostics || [] });
     if (resolved.track) {
+      const reason = resolved.pick.reason || '根据当前状态和音乐画像推荐';
+      const explanation = buildRecommendationExplanation({
+        selectedPick: resolved.pick,
+        selectedTrack: resolved.track,
+        userMessage,
+        conversationMood,
+        timeOfDay,
+        weather,
+        profile,
+        hostContext,
+        source: resolved.pick?.reason ? 'llm_pick' : 'fallback'
+      });
+      if (deferHostText) {
+        return {
+          chatText: '',
+          track: resolved.track,
+          reason,
+          explanation,
+          newMode
+        };
+      }
       const chatText = await generateFinalHostText({
         config,
         plan,
@@ -3228,18 +3606,8 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
       return {
         chatText,
         track: resolved.track,
-        reason: resolved.pick.reason || '根据当前状态和音乐画像推荐',
-        explanation: buildRecommendationExplanation({
-          selectedPick: resolved.pick,
-          selectedTrack: resolved.track,
-          userMessage,
-          conversationMood,
-          timeOfDay,
-          weather,
-          profile,
-          hostContext,
-          source: resolved.pick?.reason ? 'llm_pick' : 'fallback'
-        }),
+        reason,
+        explanation,
         newMode
       };
     }
@@ -3272,6 +3640,26 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
       lastRecommendationFailure: null,
       lastSearchDiagnostics: fallback.diagnostics || []
     });
+    const explanation = buildRecommendationExplanation({
+      selectedPick: fallback.pick,
+      selectedTrack: fallback.track,
+      userMessage,
+      conversationMood,
+      timeOfDay,
+      weather,
+      profile,
+      hostContext,
+      source: 'fallback'
+    });
+    if (deferHostText) {
+      return {
+        chatText: '',
+        track: fallback.track,
+        reason: fallback.reason,
+        explanation,
+        newMode
+      };
+    }
     const chatText = await generateFinalHostText({
       config,
       plan: fallbackPlan,
@@ -3293,17 +3681,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
       chatText,
       track: fallback.track,
       reason: fallback.reason,
-      explanation: buildRecommendationExplanation({
-        selectedPick: fallback.pick,
-        selectedTrack: fallback.track,
-        userMessage,
-        conversationMood,
-        timeOfDay,
-        weather,
-        profile,
-        hostContext,
-        source: 'fallback'
-      }),
+      explanation,
       newMode
     };
   }

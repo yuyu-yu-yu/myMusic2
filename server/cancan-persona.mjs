@@ -12,6 +12,15 @@ const CREATOR_CONTEXT_PATTERNS = [
   /(女朋友).*(名字|灿灿|来源)|灿灿.*女朋友/
 ];
 
+const NAME_ORIGIN_CONTEXT_PATTERNS = [
+  /(你|你的|你自己|自己|自己的).{0,8}(名字|叫法|称呼).{0,16}(由来|来源|来历|含义|为什么|为啥|怎么来|怎么来的|谁取|谁起|起名|取名|命名)/,
+  /(由来|来源|来历|含义|为什么|为啥|怎么来|怎么来的|谁取|谁起|起名|取名|命名).{0,16}(你|你的|你自己|自己|自己的).{0,8}(名字|叫法|称呼)/,
+  /(你|你自己).{0,8}(为什么|为啥).{0,8}叫.{0,8}(灿灿|这个名字|这名字|这个叫法|名字)?/,
+  /(为什么|为啥).{0,8}(叫|取名|起名|命名).{0,8}(灿灿|这个名字|这名字|这个叫法)/,
+  /灿灿.{0,10}(名字|叫法|称呼|取名|起名|命名|由来|来源|来历|含义|为什么|为啥|怎么来|怎么来的)/,
+  /(名字|叫法|称呼|取名|起名|命名|由来|来源|来历|含义|为什么|为啥|怎么来|怎么来的).{0,10}灿灿/
+];
+
 const CANCAN_BASE_PERSONA = [
   '灿灿基础人设：你是灿灿，CanCan Campus Radio 的 AI DJ 女孩和虚拟电台主持人。',
   '你存在于蓝紫色霓虹、像素艺术和校园电台信号之间，戴着耳机，像一个会陪人听歌、聊天、整理心情的赛博电台主持人。',
@@ -37,6 +46,7 @@ const CANCAN_CREATOR_BACKGROUND = [
 export function shouldUseCanCanCreatorContext(text = '') {
   const value = normalizePersonaQueryText(text);
   if (!value) return false;
+  if (NAME_ORIGIN_CONTEXT_PATTERNS.some(pattern => pattern.test(value))) return true;
   return CREATOR_CONTEXT_PATTERNS.some(pattern => pattern.test(value));
 }
 
