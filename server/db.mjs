@@ -2,16 +2,16 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
+export const DEFAULT_ACCOUNT_ID = 'local:default';
+
 export function openDatabase(rootDir = process.cwd()) {
   const dataDir = path.join(rootDir, 'data');
   fs.mkdirSync(dataDir, { recursive: true });
   const db = new DatabaseSync(path.join(dataDir, 'mymusic.sqlite'));
   db.exec('PRAGMA journal_mode = WAL');
   db.exec('PRAGMA foreign_keys = ON');
-  // Migration: add mode_json to existing radio_sessions
-  try { db.exec("ALTER TABLE radio_sessions ADD COLUMN mode_json TEXT NOT NULL DEFAULT '{}'"); } catch {}
-  try { db.exec("ALTER TABLE music_profile ADD COLUMN profile_json TEXT NOT NULL DEFAULT '{}'"); } catch {}
   migrate(db);
+  migrateAccountScope(db);
   return db;
 }
 
@@ -52,6 +52,7 @@ function migrate(db) {
 
     CREATE TABLE IF NOT EXISTS plays (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT NOT NULL DEFAULT 'local:default',
       track_id TEXT NOT NULL,
       played_at TEXT NOT NULL,
       source TEXT,
@@ -62,6 +63,7 @@ function migrate(db) {
 
     CREATE TABLE IF NOT EXISTS radio_sessions (
       id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL DEFAULT 'local:default',
       created_at TEXT NOT NULL,
       context_json TEXT NOT NULL DEFAULT '{}',
       queue_json TEXT NOT NULL DEFAULT '[]',
@@ -70,6 +72,7 @@ function migrate(db) {
 
     CREATE TABLE IF NOT EXISTS messages (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT NOT NULL DEFAULT 'local:default',
       session_id TEXT,
       role TEXT NOT NULL,
       content TEXT NOT NULL,
@@ -85,13 +88,15 @@ function migrate(db) {
     );
 
     CREATE TABLE IF NOT EXISTS diary_entries (
-      date TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL DEFAULT 'local:default',
+      date TEXT NOT NULL,
       title TEXT NOT NULL,
       content TEXT NOT NULL,
       mood_tags TEXT NOT NULL DEFAULT '[]',
       track_ids TEXT NOT NULL DEFAULT '[]',
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (account_id, date)
     );
 
     CREATE TABLE IF NOT EXISTS tts_cache (
@@ -104,6 +109,7 @@ function migrate(db) {
 
     CREATE TABLE IF NOT EXISTS track_feedback_events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT NOT NULL DEFAULT 'local:default',
       track_id TEXT NOT NULL,
       event_type TEXT NOT NULL,
       session_id TEXT,
@@ -114,16 +120,19 @@ function migrate(db) {
     );
 
     CREATE TABLE IF NOT EXISTS track_feedback_summary (
-      track_id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL DEFAULT 'local:default',
+      track_id TEXT NOT NULL,
       likes INTEGER NOT NULL DEFAULT 0,
       dislikes INTEGER NOT NULL DEFAULT 0,
       completions INTEGER NOT NULL DEFAULT 0,
       skips INTEGER NOT NULL DEFAULT 0,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (account_id, track_id)
     );
 
     CREATE TABLE IF NOT EXISTS user_memories (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT NOT NULL DEFAULT 'local:default',
       kind TEXT NOT NULL,
       content TEXT NOT NULL,
       tags_json TEXT NOT NULL DEFAULT '[]',
@@ -135,7 +144,196 @@ function migrate(db) {
       last_seen_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS account_settings (
+      account_id TEXT NOT NULL,
+      key TEXT NOT NULL,
+      value TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (account_id, key)
+    );
+
+    CREATE TABLE IF NOT EXISTS account_music_profiles (
+      account_id TEXT PRIMARY KEY,
+      summary TEXT NOT NULL,
+      tags_json TEXT NOT NULL DEFAULT '[]',
+      profile_json TEXT NOT NULL DEFAULT '{}',
+      updated_at TEXT NOT NULL
+    );
   `);
+}
+
+function migrateAccountScope(db) {
+  const bootstrapAccountId = getBootstrapAccountId(db);
+  try { db.exec("ALTER TABLE radio_sessions ADD COLUMN mode_json TEXT NOT NULL DEFAULT '{}'"); } catch {}
+  try { db.exec("ALTER TABLE music_profile ADD COLUMN profile_json TEXT NOT NULL DEFAULT '{}'"); } catch {}
+
+  addAccountIdColumn(db, 'user_memories', bootstrapAccountId);
+  addAccountIdColumn(db, 'radio_sessions', bootstrapAccountId);
+  addAccountIdColumn(db, 'messages', bootstrapAccountId);
+  addAccountIdColumn(db, 'plays', bootstrapAccountId);
+  addAccountIdColumn(db, 'track_feedback_events', bootstrapAccountId);
+  migrateFeedbackSummaryTable(db, bootstrapAccountId);
+  migrateDiaryEntriesTable(db, bootstrapAccountId);
+  seedAccountScopedSettings(db, bootstrapAccountId);
+  seedAccountMusicProfile(db, bootstrapAccountId);
+
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_user_memories_account_updated ON user_memories(account_id, updated_at DESC)'); } catch {}
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_messages_account_session ON messages(account_id, session_id, id)'); } catch {}
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_plays_account_played ON plays(account_id, played_at DESC)'); } catch {}
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_feedback_events_account_created ON track_feedback_events(account_id, created_at DESC)'); } catch {}
+}
+
+function addAccountIdColumn(db, table, accountId) {
+  if (!tableExists(db, table) || columnExists(db, table, 'account_id')) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN account_id TEXT NOT NULL DEFAULT '${DEFAULT_ACCOUNT_ID}'`);
+  db.prepare(`UPDATE ${table} SET account_id = ? WHERE account_id = ? OR account_id IS NULL OR account_id = ''`)
+    .run(normalizeAccountId(accountId), DEFAULT_ACCOUNT_ID);
+}
+
+function migrateFeedbackSummaryTable(db, accountId) {
+  if (!tableExists(db, 'track_feedback_summary')) return;
+  const columns = tableColumns(db, 'track_feedback_summary');
+  const hasAccountId = columns.some(column => column.name === 'account_id');
+  const trackPkOnly = columns.some(column => column.name === 'track_id' && Number(column.pk) === 1)
+    && !columns.some(column => column.name === 'account_id' && Number(column.pk) > 0);
+  if (hasAccountId && !trackPkOnly) return;
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS track_feedback_summary_new (
+        account_id TEXT NOT NULL,
+        track_id TEXT NOT NULL,
+        likes INTEGER NOT NULL DEFAULT 0,
+        dislikes INTEGER NOT NULL DEFAULT 0,
+        completions INTEGER NOT NULL DEFAULT 0,
+        skips INTEGER NOT NULL DEFAULT 0,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (account_id, track_id)
+      )
+    `);
+    const sql = hasAccountId
+      ? `INSERT OR REPLACE INTO track_feedback_summary_new (account_id, track_id, likes, dislikes, completions, skips, updated_at)
+         SELECT COALESCE(NULLIF(account_id, ''), ?), track_id, likes, dislikes, completions, skips, updated_at
+         FROM track_feedback_summary`
+      : `INSERT OR REPLACE INTO track_feedback_summary_new (account_id, track_id, likes, dislikes, completions, skips, updated_at)
+         SELECT ?, track_id, likes, dislikes, completions, skips, updated_at
+         FROM track_feedback_summary`;
+    db.prepare(sql).run(normalizeAccountId(accountId));
+    db.exec('DROP TABLE track_feedback_summary');
+    db.exec('ALTER TABLE track_feedback_summary_new RENAME TO track_feedback_summary');
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function migrateDiaryEntriesTable(db, accountId) {
+  if (!tableExists(db, 'diary_entries')) return;
+  const columns = tableColumns(db, 'diary_entries');
+  const hasAccountId = columns.some(column => column.name === 'account_id');
+  const datePkOnly = columns.some(column => column.name === 'date' && Number(column.pk) === 1)
+    && !columns.some(column => column.name === 'account_id' && Number(column.pk) > 0);
+  if (hasAccountId && !datePkOnly) return;
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS diary_entries_new (
+        account_id TEXT NOT NULL,
+        date TEXT NOT NULL,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        mood_tags TEXT NOT NULL DEFAULT '[]',
+        track_ids TEXT NOT NULL DEFAULT '[]',
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (account_id, date)
+      )
+    `);
+    const sql = hasAccountId
+      ? `INSERT OR REPLACE INTO diary_entries_new (account_id, date, title, content, mood_tags, track_ids, created_at, updated_at)
+         SELECT COALESCE(NULLIF(account_id, ''), ?), date, title, content, mood_tags, track_ids, created_at, updated_at
+         FROM diary_entries`
+      : `INSERT OR REPLACE INTO diary_entries_new (account_id, date, title, content, mood_tags, track_ids, created_at, updated_at)
+         SELECT ?, date, title, content, mood_tags, track_ids, created_at, updated_at
+         FROM diary_entries`;
+    db.prepare(sql).run(normalizeAccountId(accountId));
+    db.exec('DROP TABLE diary_entries');
+    db.exec('ALTER TABLE diary_entries_new RENAME TO diary_entries');
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+}
+
+function seedAccountScopedSettings(db, accountId) {
+  if (!tableExists(db, 'settings') || !tableExists(db, 'account_settings')) return;
+  const scopedKeys = [
+    'user_preferences',
+    'profile_excluded_playlist_ids',
+    'library_synced_user_id',
+    'library_synced_playlist_ids'
+  ];
+  const stmt = db.prepare(`
+    INSERT OR IGNORE INTO account_settings (account_id, key, value, updated_at)
+    SELECT ?, key, value, updated_at FROM settings WHERE key = ?
+  `);
+  for (const key of scopedKeys) stmt.run(normalizeAccountId(accountId), key);
+}
+
+function seedAccountMusicProfile(db, accountId) {
+  if (!tableExists(db, 'music_profile') || !tableExists(db, 'account_music_profiles')) return;
+  const row = db.prepare('SELECT summary, tags_json AS tagsJson, profile_json AS profileJson, updated_at AS updatedAt FROM music_profile WHERE id = 1').get();
+  if (!row) return;
+  db.prepare(`
+    INSERT OR IGNORE INTO account_music_profiles (account_id, summary, tags_json, profile_json, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+  `).run(normalizeAccountId(accountId), row.summary, row.tagsJson || '[]', row.profileJson || '{}', row.updatedAt || nowIso());
+}
+
+function getBootstrapAccountId(db) {
+  const loginSource = getSettingSafe(db, 'netease_login_source');
+  const cookieUserId = getSettingSafe(db, 'netease_cookie_user_id');
+  const openapiUserId = getSettingSafe(db, 'netease_user_id');
+  if (loginSource === 'cookie' && cookieUserId) return `netease:cookie:${cookieUserId}`;
+  if (loginSource === 'openapi' && openapiUserId) return `netease:openapi:${openapiUserId}`;
+  if (cookieUserId) return `netease:cookie:${cookieUserId}`;
+  if (openapiUserId) return `netease:openapi:${openapiUserId}`;
+  return DEFAULT_ACCOUNT_ID;
+}
+
+function tableExists(db, table) {
+  return Boolean(db.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").get(table));
+}
+
+function columnExists(db, table, column) {
+  return tableColumns(db, table).some(item => item.name === column);
+}
+
+function tableColumns(db, table) {
+  try {
+    return db.prepare(`PRAGMA table_info(${table})`).all();
+  } catch {
+    return [];
+  }
+}
+
+function getSettingSafe(db, key) {
+  try {
+    const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+    return row ? row.value : '';
+  } catch {
+    return '';
+  }
+}
+
+export function normalizeAccountId(accountId) {
+  const value = String(accountId || '').trim();
+  return value || DEFAULT_ACCOUNT_ID;
 }
 
 export function getSetting(db, key) {
@@ -148,6 +346,30 @@ export function setSetting(db, key, value) {
     INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
     ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
   `).run(key, value, nowIso());
+}
+
+export function getAccountSetting(db, accountId, key) {
+  const row = db.prepare('SELECT value FROM account_settings WHERE account_id = ? AND key = ?')
+    .get(normalizeAccountId(accountId), String(key));
+  return row ? row.value : null;
+}
+
+export function setAccountSetting(db, accountId, key, value) {
+  db.prepare(`
+    INSERT INTO account_settings (account_id, key, value, updated_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT(account_id, key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+  `).run(normalizeAccountId(accountId), String(key), String(value ?? ''), nowIso());
+}
+
+export function deleteAccountSettings(db, accountId, keys = []) {
+  const cleanKeys = (Array.isArray(keys) ? keys : [keys]).map(key => String(key || '').trim()).filter(Boolean);
+  if (!cleanKeys.length) return { ok: true, deleted: 0 };
+  const placeholders = cleanKeys.map(() => '?').join(',');
+  const result = db.prepare(`
+    DELETE FROM account_settings
+    WHERE account_id = ? AND key IN (${placeholders})
+  `).run(normalizeAccountId(accountId), ...cleanKeys);
+  return { ok: true, deleted: result.changes || 0 };
 }
 
 export function getSessionMode(db, sessionId) {
@@ -165,6 +387,7 @@ const feedbackColumns = {
 };
 
 export function recordTrackFeedback(db, {
+  accountId = DEFAULT_ACCOUNT_ID,
   trackId,
   eventType,
   sessionId = null,
@@ -175,14 +398,16 @@ export function recordTrackFeedback(db, {
   const id = String(trackId || '').trim();
   const type = String(eventType || '').trim();
   const column = feedbackColumns[type];
+  const scopedAccountId = normalizeAccountId(accountId);
   if (!id) throw new Error('trackId is required');
   if (!column) throw new Error('eventType must be one of like, dislike, complete, skip');
 
   const now = nowIso();
   db.prepare(`
-    INSERT INTO track_feedback_events (track_id, event_type, session_id, elapsed_ms, duration_ms, source, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO track_feedback_events (account_id, track_id, event_type, session_id, elapsed_ms, duration_ms, source, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
+    scopedAccountId,
     id,
     type,
     sessionId ? String(sessionId) : null,
@@ -193,33 +418,33 @@ export function recordTrackFeedback(db, {
   );
 
   db.prepare(`
-    INSERT INTO track_feedback_summary (track_id, ${column}, updated_at)
-    VALUES (?, 1, ?)
-    ON CONFLICT(track_id) DO UPDATE SET
+    INSERT INTO track_feedback_summary (account_id, track_id, ${column}, updated_at)
+    VALUES (?, ?, 1, ?)
+    ON CONFLICT(account_id, track_id) DO UPDATE SET
       ${column} = ${column} + 1,
       updated_at = excluded.updated_at
-  `).run(id, now);
+  `).run(scopedAccountId, id, now);
 
-  return getTrackFeedbackSummary(db, id);
+  return getTrackFeedbackSummary(db, id, scopedAccountId);
 }
 
-export function getTrackFeedbackSummary(db, trackId) {
+export function getTrackFeedbackSummary(db, trackId, accountId = DEFAULT_ACCOUNT_ID) {
   return db.prepare(`
-    SELECT track_id AS trackId, likes, dislikes, completions, skips, updated_at AS updatedAt
+    SELECT account_id AS accountId, track_id AS trackId, likes, dislikes, completions, skips, updated_at AS updatedAt
     FROM track_feedback_summary
-    WHERE track_id = ?
-  `).get(String(trackId));
+    WHERE account_id = ? AND track_id = ?
+  `).get(normalizeAccountId(accountId), String(trackId));
 }
 
-export function getFeedbackSummaryMap(db, trackIds) {
+export function getFeedbackSummaryMap(db, trackIds, accountId = DEFAULT_ACCOUNT_ID) {
   const ids = [...new Set((trackIds || []).map((id) => String(id || '').trim()).filter(Boolean))];
   if (!ids.length) return new Map();
   const placeholders = ids.map(() => '?').join(',');
   const rows = db.prepare(`
-    SELECT track_id AS trackId, likes, dislikes, completions, skips, updated_at AS updatedAt
+    SELECT account_id AS accountId, track_id AS trackId, likes, dislikes, completions, skips, updated_at AS updatedAt
     FROM track_feedback_summary
-    WHERE track_id IN (${placeholders})
-  `).all(...ids);
+    WHERE account_id = ? AND track_id IN (${placeholders})
+  `).all(normalizeAccountId(accountId), ...ids);
   return new Map(rows.map((row) => [String(row.trackId), row]));
 }
 
@@ -233,6 +458,7 @@ export const memoryKinds = new Set([
 ]);
 
 export function recordOrMergeUserMemory(db, {
+  accountId = DEFAULT_ACCOUNT_ID,
   kind,
   content,
   tags = [],
@@ -242,12 +468,13 @@ export function recordOrMergeUserMemory(db, {
 } = {}) {
   const normalizedKind = memoryKinds.has(kind) ? kind : null;
   const normalizedContent = String(content || '').trim();
+  const scopedAccountId = normalizeAccountId(accountId);
   if (!normalizedKind) throw new Error('invalid memory kind');
   if (!normalizedContent) throw new Error('memory content is required');
 
   const cleanTags = normalizeTags(tags);
   const now = nowIso();
-  const existing = findMergeCandidate(db, normalizedKind, normalizedContent, cleanTags);
+  const existing = findMergeCandidate(db, scopedAccountId, normalizedKind, normalizedContent, cleanTags);
 
   if (existing) {
     const mergedTags = [...new Set([...safeJson(existing.tagsJson, []), ...cleanTags])].slice(0, 12);
@@ -258,7 +485,7 @@ export function recordOrMergeUserMemory(db, {
       UPDATE user_memories
       SET content = ?, tags_json = ?, confidence = ?, importance = ?,
           evidence_count = ?, last_seen_at = ?, updated_at = ?
-      WHERE id = ?
+      WHERE id = ? AND account_id = ?
     `).run(
       preferMemoryContent(existing.content, normalizedContent),
       JSON.stringify(mergedTags),
@@ -267,17 +494,19 @@ export function recordOrMergeUserMemory(db, {
       evidenceCount,
       now,
       now,
-      existing.id
+      existing.id,
+      scopedAccountId
     );
-    return getUserMemory(db, existing.id);
+    return getUserMemory(db, existing.id, scopedAccountId);
   }
 
   const result = db.prepare(`
     INSERT INTO user_memories (
-      kind, content, tags_json, confidence, importance, evidence_count,
+      account_id, kind, content, tags_json, confidence, importance, evidence_count,
       source_session_id, first_seen_at, last_seen_at, updated_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `).run(
+    scopedAccountId,
     normalizedKind,
     normalizedContent,
     JSON.stringify(cleanTags),
@@ -289,49 +518,53 @@ export function recordOrMergeUserMemory(db, {
     now,
     now
   );
-  return getUserMemory(db, result.lastInsertRowid);
+  return getUserMemory(db, result.lastInsertRowid, scopedAccountId);
 }
 
-export function listUserMemories(db, limit = 200) {
+export function listUserMemories(db, options = 200) {
+  const { accountId, limit } = normalizeMemoryListOptions(options);
   return db.prepare(`
-    SELECT id, kind, content, tags_json AS tagsJson, confidence, importance,
+    SELECT id, account_id AS accountId, kind, content, tags_json AS tagsJson, confidence, importance,
            evidence_count AS evidenceCount, source_session_id AS sourceSessionId,
            first_seen_at AS firstSeenAt, last_seen_at AS lastSeenAt, updated_at AS updatedAt
     FROM user_memories
+    WHERE account_id = ?
     ORDER BY updated_at DESC, importance DESC, confidence DESC
     LIMIT ?
-  `).all(Math.max(1, Number(limit) || 200)).map(hydrateMemoryRow);
+  `).all(normalizeAccountId(accountId), Math.max(1, Number(limit) || 200)).map(hydrateMemoryRow);
 }
 
-export function getUserMemory(db, id) {
+export function getUserMemory(db, id, accountId = DEFAULT_ACCOUNT_ID) {
   const row = db.prepare(`
-    SELECT id, kind, content, tags_json AS tagsJson, confidence, importance,
+    SELECT id, account_id AS accountId, kind, content, tags_json AS tagsJson, confidence, importance,
            evidence_count AS evidenceCount, source_session_id AS sourceSessionId,
            first_seen_at AS firstSeenAt, last_seen_at AS lastSeenAt, updated_at AS updatedAt
     FROM user_memories
-    WHERE id = ?
-  `).get(Number(id));
+    WHERE id = ? AND account_id = ?
+  `).get(Number(id), normalizeAccountId(accountId));
   return row ? hydrateMemoryRow(row) : null;
 }
 
-export function deleteUserMemory(db, id) {
-  const result = db.prepare('DELETE FROM user_memories WHERE id = ?').run(Number(id));
+export function deleteUserMemory(db, id, accountId = DEFAULT_ACCOUNT_ID) {
+  const result = db.prepare('DELETE FROM user_memories WHERE id = ? AND account_id = ?')
+    .run(Number(id), normalizeAccountId(accountId));
   return { ok: true, deleted: result.changes || 0 };
 }
 
-export function clearUserMemories(db) {
-  const result = db.prepare('DELETE FROM user_memories').run();
+export function clearUserMemories(db, accountId = DEFAULT_ACCOUNT_ID) {
+  const result = db.prepare('DELETE FROM user_memories WHERE account_id = ?').run(normalizeAccountId(accountId));
   return { ok: true, deleted: result.changes || 0 };
 }
 
 export function retrieveRelevantMemories(db, {
+  accountId = DEFAULT_ACCOUNT_ID,
   text = '',
   mood = null,
   mode = null,
   limit = 8,
   maxChars = 800
 } = {}) {
-  const memories = listUserMemories(db, 300);
+  const memories = listUserMemories(db, { accountId, limit: 300 });
   if (!memories.length) return [];
   const queryTerms = extractMemoryTerms([text, mood?.mood, ...(mood?.searchHints || []), mode?.genre].filter(Boolean).join(' '));
   const scored = memories.map((memory) => ({
@@ -359,15 +592,15 @@ export function setSessionMode(db, sessionId, mode) {
     .run(JSON.stringify(mode || {}), sessionId);
 }
 
-function findMergeCandidate(db, kind, content, tags) {
+function findMergeCandidate(db, accountId, kind, content, tags) {
   const rows = db.prepare(`
     SELECT id, kind, content, tags_json AS tagsJson, confidence, importance,
            evidence_count AS evidenceCount
     FROM user_memories
-    WHERE kind = ?
+    WHERE account_id = ? AND kind = ?
     ORDER BY updated_at DESC
     LIMIT 100
-  `).all(kind);
+  `).all(normalizeAccountId(accountId), kind);
   const normalizedContent = normalizeMemoryText(content);
   let best = null;
   let bestScore = 0;
@@ -380,6 +613,19 @@ function findMergeCandidate(db, kind, content, tags) {
     }
   }
   return bestScore >= 0.62 ? best : null;
+}
+
+function normalizeMemoryListOptions(options) {
+  if (options && typeof options === 'object' && !Array.isArray(options)) {
+    return {
+      accountId: options.accountId || DEFAULT_ACCOUNT_ID,
+      limit: options.limit ?? 200
+    };
+  }
+  return {
+    accountId: DEFAULT_ACCOUNT_ID,
+    limit: options
+  };
 }
 
 function memorySimilarity(a, b, tagsA, tagsB) {
@@ -571,14 +817,15 @@ export function getTrackById(db, id) {
   return row ? hydrateTrackRow(row) : null;
 }
 
-export function listRecentPlays(db, limit = 30) {
+export function listRecentPlays(db, limit = 30, accountId = DEFAULT_ACCOUNT_ID) {
   return db.prepare(`
     SELECT p.*, t.name, t.artists, t.album, t.cover_url AS coverUrl, t.duration_ms AS durationMs, t.raw_json AS rawJson
     FROM plays p
     JOIN tracks t ON t.id = p.track_id
+    WHERE p.account_id = ?
     ORDER BY p.played_at DESC
     LIMIT ?
-  `).all(limit).map((row) => {
+  `).all(normalizeAccountId(accountId), limit).map((row) => {
     const raw = safeJson(row.rawJson, {});
     const rawOriginalId = raw?.originalId ?? raw?.song?.originalId ?? raw?.track?.originalId ?? null;
     const { rawJson, ...play } = row;

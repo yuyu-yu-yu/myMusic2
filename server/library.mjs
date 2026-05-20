@@ -1,4 +1,4 @@
-import { clearPlaylistLibrary, getSetting, listRecentPlays, normalizeTrack, nowIso, replacePlaylistTracks, savePlaylist, saveTrack, seedDemoLibrary, setSetting } from './db.mjs';
+import { deleteAccountSettings, getAccountSetting, getSetting, listRecentPlays, normalizeTrack, nowIso, replacePlaylistTracks, savePlaylist, saveTrack, seedDemoLibrary, setAccountSetting, setSetting } from './db.mjs';
 import {
   getSongUrl,
   getLyric as getCommunityLyric,
@@ -10,6 +10,7 @@ import {
 } from './community.mjs';
 import { generateChatCompletion } from './ai.mjs';
 import { getNeteaseLoginStatus } from './netease-auth.mjs';
+import { normalizeAccountContext, resolveAccountContext } from './account-scope.mjs';
 
 const PROFILE_EXCLUDED_PLAYLIST_IDS_KEY = 'profile_excluded_playlist_ids';
 const EMPTY_PROFILE_SUMMARY = '尚未选择用于生成音乐画像的歌单。';
@@ -19,6 +20,7 @@ const LIBRARY_SYNCED_USER_ID_KEY = 'library_synced_user_id';
 const LIBRARY_SYNCED_PLAYLIST_IDS_KEY = 'library_synced_playlist_ids';
 
 export async function syncLibrary(db, netease, options = {}) {
+  let accountContext = getLibraryAccountContext(db, options.accountContext);
   const onProgress = typeof options.onProgress === 'function' ? options.onProgress : () => {};
   const isCancelled = typeof options.isCancelled === 'function' ? options.isCancelled : () => false;
   const llmConfig = options.llmConfig;
@@ -50,7 +52,7 @@ export async function syncLibrary(db, netease, options = {}) {
 
   progress({ phase: 'checking_login' });
   assertNotCancelled();
-  clearLibraryAccountSnapshot(db);
+  clearLibraryAccountSnapshot(db, accountContext);
   result.tracks = 0;
   result.syncedPlaylists = 0;
   result.diagnostics.push({
@@ -66,17 +68,19 @@ export async function syncLibrary(db, netease, options = {}) {
   result.mode = syncSource.mode;
   result.source = syncSource.source;
   result.user = syncSource.user;
+  accountContext = accountContextFromSyncSource(syncSource, accountContext);
+  clearLibraryAccountSnapshot(db, accountContext);
 
   if (syncSource.source === 'demo') {
     progress({ phase: 'syncing_tracks', currentPlaylistIndex: 1, totalPlaylists: 1, currentPlaylistName: 'Demo Library' });
     seedDemoLibrary(db);
-    setActiveLibraryPlaylistIds(db, ['demo-liked']);
-    const tracks = listLibraryTracks(db, 100);
+    setActiveLibraryPlaylistIds(db, ['demo-liked'], accountContext);
+    const tracks = listLibraryTracks(db, 100, accountContext);
     result.tracks = tracks.length;
     result.playlists = 1;
     result.syncedPlaylists = 1;
     progress({ phase: 'updating_profile', syncedTracks: result.tracks, syncedPlaylists: result.syncedPlaylists });
-    await updateProfile(db, llmConfig);
+    await updateProfile(db, llmConfig, { accountContext });
     progress({ phase: 'done', syncedTracks: result.tracks, syncedPlaylists: result.syncedPlaylists });
     return result;
   }
@@ -90,7 +94,7 @@ export async function syncLibrary(db, netease, options = {}) {
       mode: result.mode,
       source: result.source,
       playlists: 0,
-      tracks: countLibraryTracks(db),
+      tracks: countLibraryTracks(db, accountContext),
       errors: [syncSource.error, ...result.errors],
       diagnostics: result.diagnostics,
       user: result.user
@@ -137,7 +141,7 @@ export async function syncLibrary(db, netease, options = {}) {
       mode: result.mode,
       source: result.source,
       playlists: 0,
-      tracks: countLibraryTracks(db),
+      tracks: countLibraryTracks(db, accountContext),
       errors: [noPlaylistMessage, ...result.errors],
       diagnostics: result.diagnostics,
       user: result.user
@@ -152,7 +156,7 @@ export async function syncLibrary(db, netease, options = {}) {
   pruneStalePlaylists(db, playlistById.keys());
   const playlists = [...playlistById.values()];
   result.playlists = playlists.length;
-  setActiveLibraryPlaylistIds(db, playlists.map((playlist) => playlist.id));
+  setActiveLibraryPlaylistIds(db, playlists.map((playlist) => playlist.id), accountContext);
 
   for (const playlist of playlists) {
     assertNotCancelled();
@@ -179,7 +183,7 @@ export async function syncLibrary(db, netease, options = {}) {
       });
       const trackIds = records.map((item) => saveTrack(db, item).id);
       replacePlaylistTracks(db, playlist.id, trackIds);
-      result.tracks = countLibraryTracks(db);
+      result.tracks = countLibraryTracks(db, accountContext);
       result.syncedPlaylists += 1;
       progress({
         phase: 'syncing_tracks',
@@ -204,18 +208,18 @@ export async function syncLibrary(db, netease, options = {}) {
     records.forEach((item) => {
       const track = saveTrack(db, item);
       db.prepare(`
-        INSERT INTO plays (track_id, played_at, source, reason, report_status)
-        VALUES (?, ?, ?, ?, ?)
-      `).run(track.id, item.playTime ? new Date(Number(item.playTime)).toISOString() : nowIso(), 'netease-recent', 'netease recent play', 'imported');
+        INSERT INTO plays (account_id, track_id, played_at, source, reason, report_status)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `).run(accountContext.accountId, track.id, item.playTime ? new Date(Number(item.playTime)).toISOString() : nowIso(), 'netease-recent', 'netease recent play', 'imported');
     });
   } catch (error) {
     result.errors.push(`最近播放同步失败：${formatErrorMessage(error, '网易云最近播放接口失败')}`);
   }
 
-  result.tracks = countLibraryTracks(db);
+  result.tracks = countLibraryTracks(db, accountContext);
   progress({ phase: 'updating_profile', syncedTracks: result.tracks, syncedPlaylists: result.syncedPlaylists });
-  await updateProfile(db, llmConfig);
-  if (result.user.userId) setSetting(db, LIBRARY_SYNCED_USER_ID_KEY, result.user.userId);
+  await updateProfile(db, llmConfig, { accountContext });
+  if (result.user.userId) setAccountSetting(db, accountContext.accountId, LIBRARY_SYNCED_USER_ID_KEY, result.user.userId);
   progress({ phase: 'done', syncedTracks: result.tracks, syncedPlaylists: result.syncedPlaylists });
   return result;
 }
@@ -340,10 +344,11 @@ function classifyCookiePlaylist(playlist = {}, userId = '') {
 }
 
 export async function updateProfile(db, llmConfig, options = {}) {
+  const accountContext = getLibraryAccountContext(db, options.accountContext);
   const force = Boolean(options.force);
   // Only analyze tracks the user actually synced from NetEase playlists (not AI recs or test searches)
-  const profileSelection = getProfileSelection(db);
-  const playlists = getProfilePlaylists(db, { selectedOnly: true });
+  const profileSelection = getProfileSelection(db, undefined, accountContext);
+  const playlists = getProfilePlaylists(db, { selectedOnly: true }, accountContext);
   const tracks = dedupePlaylistTracks(playlists);
   const stats = buildProfileStats(tracks, playlists);
   stats.selectedPlaylistIds = profileSelection.selectedIds;
@@ -354,15 +359,7 @@ export async function updateProfile(db, llmConfig, options = {}) {
 
   if (!stats.trackCount || !stats.playlistCount) {
     structured = normalizeStructuredProfile({ summary: EMPTY_PROFILE_SUMMARY }, stats);
-    db.prepare(`
-      INSERT INTO music_profile (id, summary, tags_json, profile_json, updated_at)
-      VALUES (1, ?, ?, ?, ?)
-      ON CONFLICT(id) DO UPDATE SET
-        summary = excluded.summary,
-        tags_json = excluded.tags_json,
-        profile_json = excluded.profile_json,
-        updated_at = excluded.updated_at
-    `).run(EMPTY_PROFILE_SUMMARY, JSON.stringify([]), JSON.stringify(structured), nowIso());
+    saveMusicProfile(db, accountContext, EMPTY_PROFILE_SUMMARY, [], structured);
     return {
       summary: EMPTY_PROFILE_SUMMARY,
       tags: [],
@@ -374,7 +371,7 @@ export async function updateProfile(db, llmConfig, options = {}) {
   }
 
   // LLM enriched profile 闂?only regenerate when needed
-  const existing = getProfile(db);
+  const existing = getProfile(db, accountContext);
   const lastUpdated = existing?.updatedAt ? new Date(existing.updatedAt).getTime() : 0;
   const hoursSinceUpdate = (Date.now() - lastUpdated) / 3600000;
   const previousCount = Number(existing?.structured?.trackCount || 0);
@@ -396,15 +393,7 @@ export async function updateProfile(db, llmConfig, options = {}) {
     structured = normalizeStructuredProfile({ ...structured, ...existing.structured, generatedAt: nowIso() }, stats);
   }
 
-  db.prepare(`
-    INSERT INTO music_profile (id, summary, tags_json, profile_json, updated_at)
-    VALUES (1, ?, ?, ?, ?)
-    ON CONFLICT(id) DO UPDATE SET
-      summary = excluded.summary,
-      tags_json = excluded.tags_json,
-      profile_json = excluded.profile_json,
-      updated_at = excluded.updated_at
-  `).run(summary, JSON.stringify(tags), JSON.stringify(structured), nowIso());
+  saveMusicProfile(db, accountContext, summary, tags, structured);
   return {
     summary,
     tags,
@@ -456,9 +445,62 @@ async function generateAIPortrait(stats, llmConfig) {
   };
 }
 
-export function getProfile(db) {
-  if (!hasCurrentAccountSnapshot(db)) return emptyProfile(UNSYNCED_ACCOUNT_SUMMARY);
-  const row = db.prepare('SELECT summary, tags_json AS tagsJson, profile_json AS profileJson, updated_at AS updatedAt FROM music_profile WHERE id = 1').get();
+function saveMusicProfile(db, accountContext, summary, tags, structured) {
+  const account = getLibraryAccountContext(db, accountContext);
+  const updatedAt = nowIso();
+  const tagsJson = JSON.stringify(tags || []);
+  const profileJson = JSON.stringify(structured || {});
+  db.prepare(`
+    INSERT INTO account_music_profiles (account_id, summary, tags_json, profile_json, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(account_id) DO UPDATE SET
+      summary = excluded.summary,
+      tags_json = excluded.tags_json,
+      profile_json = excluded.profile_json,
+      updated_at = excluded.updated_at
+  `).run(account.accountId, summary, tagsJson, profileJson, updatedAt);
+  db.prepare(`
+    INSERT INTO music_profile (id, summary, tags_json, profile_json, updated_at)
+    VALUES (1, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      summary = excluded.summary,
+      tags_json = excluded.tags_json,
+      profile_json = excluded.profile_json,
+      updated_at = excluded.updated_at
+  `).run(summary, tagsJson, profileJson, updatedAt);
+}
+
+function getLibraryAccountContext(db, accountContext = null) {
+  return accountContext ? normalizeAccountContext(accountContext) : resolveAccountContext(db);
+}
+
+function accountContextFromSyncSource(syncSource = {}, fallbackContext = {}) {
+  const userId = String(syncSource.user?.userId || fallbackContext.providerUserId || '').trim();
+  if (!userId) return normalizeAccountContext(fallbackContext);
+  const source = syncSource.source === 'cookie' ? 'cookie' : (syncSource.source === 'openapi' ? 'openapi' : fallbackContext.source);
+  if (source !== 'cookie' && source !== 'openapi') return normalizeAccountContext(fallbackContext);
+  return normalizeAccountContext({
+    accountId: `netease:${source}:${userId}`,
+    provider: 'netease',
+    providerUserId: userId,
+    source,
+    nickname: syncSource.user?.nickname || fallbackContext.nickname || '',
+    isAuthenticated: true,
+    cloudAccountId: fallbackContext.cloudAccountId || ''
+  });
+}
+
+function getScopedLibrarySetting(db, accountContext, key) {
+  const account = getLibraryAccountContext(db, accountContext);
+  const scoped = getAccountSetting(db, account.accountId, key);
+  return scoped ?? getSetting(db, key);
+}
+
+export function getProfile(db, accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
+  if (!hasCurrentAccountSnapshot(db, account)) return emptyProfile(UNSYNCED_ACCOUNT_SUMMARY);
+  const row = db.prepare('SELECT summary, tags_json AS tagsJson, profile_json AS profileJson, updated_at AS updatedAt FROM account_music_profiles WHERE account_id = ?').get(account.accountId)
+    || db.prepare('SELECT summary, tags_json AS tagsJson, profile_json AS profileJson, updated_at AS updatedAt FROM music_profile WHERE id = 1').get();
   if (!row) return { summary: '尚未生成音乐画像，请先同步当前网易云账号歌单。', tags: [], structured: {}, updatedAt: null };
   return {
     summary: row.summary,
@@ -468,13 +510,14 @@ export function getProfile(db) {
   };
 }
 
-export function getLibrary(db) {
-  const account = getCurrentLibraryAccount(db);
+export function getLibrary(db, accountContext = null) {
+  const accountContextResolved = getLibraryAccountContext(db, accountContext);
+  const account = getCurrentLibraryAccount(db, accountContextResolved);
   const loginUserId = account.userId;
   const loginNickname = account.nickname;
   const loginSource = account.source;
-  const syncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
-  if (!hasCurrentAccountSnapshot(db)) {
+  const syncedUserId = getScopedLibrarySetting(db, accountContextResolved, LIBRARY_SYNCED_USER_ID_KEY) || '';
+  if (!hasCurrentAccountSnapshot(db, accountContextResolved)) {
     return {
       profile: emptyProfile(UNSYNCED_ACCOUNT_SUMMARY),
       tracks: [],
@@ -493,19 +536,19 @@ export function getLibrary(db) {
       }
     };
   }
-  const playlists = getLibraryPlaylists(db);
-  const profileSelection = getProfileSelection(db, playlists);
+  const playlists = getLibraryPlaylists(db, accountContextResolved);
+  const profileSelection = getProfileSelection(db, playlists, accountContextResolved);
   const selectedIds = new Set(profileSelection.selectedIds);
   return {
-    profile: getProfile(db),
-    tracks: listLibraryTracks(db, 5000),
+    profile: getProfile(db, accountContextResolved),
+    tracks: listLibraryTracks(db, 5000, accountContextResolved),
     playlists: playlists.map((playlist) => ({
       ...playlist,
       profileSelected: selectedIds.has(playlist.id)
     })),
-    recent: listRecentPlays(db, 50),
-    totalTracks: countLibraryTracks(db),
-    totalPlaylistTracks: countPlaylistTrackLinks(db),
+    recent: listRecentPlays(db, 50, accountContextResolved.accountId),
+    totalTracks: countLibraryTracks(db, accountContextResolved),
+    totalPlaylistTracks: countPlaylistTrackLinks(db, accountContextResolved),
     profileSelection,
     account: {
       userId: loginUserId,
@@ -518,53 +561,87 @@ export function getLibrary(db) {
   };
 }
 
-export function clearLibraryAccountSnapshot(db) {
-  clearPlaylistLibrary(db);
+export function listProfileFallbackTracks(db, limit = 180, accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
+  const playlists = getProfilePlaylists(db, { selectedOnly: true }, account);
+  const tracks = [];
+  const seen = new Set();
+  for (const playlist of playlists) {
+    for (const [index, track] of (playlist.tracks || []).entries()) {
+      const id = String(track?.id || '').trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const originalId = extractTrackOriginalId(track);
+      tracks.push({
+        ...track,
+        originalId,
+        playbackMode: originalId ? 'ncm-cli' : track.playbackMode || null,
+        playable: Boolean(originalId || track.playable),
+        playlistId: playlist.id,
+        playlistName: playlist.name,
+        playlistKind: playlist.kind,
+        playlistPosition: index
+      });
+      if (tracks.length >= limit) return tracks;
+    }
+  }
+  return tracks;
+}
+
+export function clearLibraryAccountSnapshot(db, accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
+  const activeIds = getActiveLibraryPlaylistIds(db, account) || [];
+  if (activeIds.length) {
+    const placeholders = activeIds.map(() => '?').join(',');
+    db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id IN (${placeholders})`).run(...activeIds);
+  } else if (getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) && getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) === account.providerUserId) {
+    db.prepare('DELETE FROM playlist_tracks').run();
+  }
+  db.prepare('DELETE FROM account_music_profiles WHERE account_id = ?').run(account.accountId);
   db.prepare('DELETE FROM music_profile WHERE id = 1').run();
-  db.prepare('DELETE FROM settings WHERE key IN (?, ?, ?)').run(
+  deleteAccountSettings(db, account.accountId, [
     PROFILE_EXCLUDED_PLAYLIST_IDS_KEY,
     LIBRARY_SYNCED_USER_ID_KEY,
     LIBRARY_SYNCED_PLAYLIST_IDS_KEY
-  );
+  ]);
 }
 
-function isCurrentAccountSnapshotUsable(db) {
-  const loginUserId = getCurrentLibraryAccount(db).userId;
+function isCurrentAccountSnapshotUsable(db, accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
+  const loginUserId = getCurrentLibraryAccount(db, account).userId;
   if (!loginUserId) return true;
-  const syncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
+  const syncedUserId = getScopedLibrarySetting(db, account, LIBRARY_SYNCED_USER_ID_KEY) || '';
   return Boolean(syncedUserId && syncedUserId === loginUserId);
 }
 
-function hasCurrentAccountSnapshot(db) {
-  if (!isCurrentAccountSnapshotUsable(db)) return false;
-  const loginUserId = getCurrentLibraryAccount(db).userId;
+function hasCurrentAccountSnapshot(db, accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
+  if (!isCurrentAccountSnapshotUsable(db, account)) return false;
+  const loginUserId = getCurrentLibraryAccount(db, account).userId;
   if (!loginUserId) return true;
-  return getActiveLibraryPlaylistIds(db).length > 0;
+  return getActiveLibraryPlaylistIds(db, account).length > 0;
 }
 
-function getCurrentLibraryAccount(db) {
-  const loginSource = getSetting(db, 'netease_login_source') || '';
-  const cookieUserId = getSetting(db, 'netease_cookie_user_id') || '';
-  const cookieNickname = getSetting(db, 'netease_cookie_user_nickname') || '';
-  if (cookieUserId && (loginSource === 'cookie' || getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) === cookieUserId)) {
-    return { userId: cookieUserId, nickname: cookieNickname, source: 'cookie' };
-  }
+function getCurrentLibraryAccount(db, accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
   return {
-    userId: getSetting(db, 'netease_user_id') || '',
-    nickname: getSetting(db, 'netease_user_nickname') || '',
-    source: loginSource
+    userId: account.providerUserId || '',
+    nickname: account.nickname || '',
+    source: account.source
   };
 }
 
-function setActiveLibraryPlaylistIds(db, playlistIds = []) {
+function setActiveLibraryPlaylistIds(db, playlistIds = [], accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
   const ids = normalizeIdList(playlistIds);
-  setSetting(db, LIBRARY_SYNCED_PLAYLIST_IDS_KEY, JSON.stringify(ids));
+  setAccountSetting(db, account.accountId, LIBRARY_SYNCED_PLAYLIST_IDS_KEY, JSON.stringify(ids));
 }
 
-function getActiveLibraryPlaylistIds(db) {
-  const ids = normalizeIdList(safeJson(getSetting(db, LIBRARY_SYNCED_PLAYLIST_IDS_KEY), []));
+function getActiveLibraryPlaylistIds(db, accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
+  const ids = normalizeIdList(safeJson(getScopedLibrarySetting(db, account, LIBRARY_SYNCED_PLAYLIST_IDS_KEY), []));
   if (ids.length) return ids;
-  const loginUserId = getCurrentLibraryAccount(db).userId;
+  const loginUserId = getCurrentLibraryAccount(db, account).userId;
   if (loginUserId) return [];
   return null;
 }
@@ -578,9 +655,10 @@ function emptyProfile(summary = '尚未生成音乐画像，请先同步当前�
   };
 }
 
-export function updateProfilePlaylistSelection(db, selectedPlaylistIds = []) {
-  setProfilePlaylistSelection(db, selectedPlaylistIds);
-  return getLibrary(db);
+export function updateProfilePlaylistSelection(db, selectedPlaylistIds = [], accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
+  setProfilePlaylistSelection(db, selectedPlaylistIds, account);
+  return getLibrary(db, account);
 }
 
 export function extractRecords(data) {
@@ -674,18 +752,10 @@ function isPlaylistLike(item) {
 }
 
 function pruneStalePlaylists(db, activePlaylistIds = []) {
-  const ids = [...activePlaylistIds].map((id) => String(id || '').trim()).filter(Boolean);
-  if (!ids.length) return;
-  const placeholders = ids.map(() => '?').join(',');
-  db.exec('BEGIN IMMEDIATE');
-  try {
-    db.prepare(`DELETE FROM playlist_tracks WHERE playlist_id NOT IN (${placeholders})`).run(...ids);
-    db.prepare(`DELETE FROM playlists WHERE id NOT IN (${placeholders})`).run(...ids);
-    db.exec('COMMIT');
-  } catch (error) {
-    db.exec('ROLLBACK');
-    throw error;
-  }
+  // Tracks and playlists are shared cache rows. Account visibility is controlled
+  // by each account's active playlist-id snapshot.
+  void db;
+  void activePlaylistIds;
 }
 
 async function fetchAllPlaylistSongs(netease, playlist, pageSize = PLAYLIST_SYNC_PAGE_SIZE, onPage = null) {
@@ -725,9 +795,10 @@ function isFailedApiPayload(data) {
   return normalized !== 200;
 }
 
-function getProfilePlaylists(db, { selectedOnly = false } = {}) {
-  const playlists = getLibraryPlaylists(db);
-  const profileSelection = getProfileSelection(db, playlists);
+function getProfilePlaylists(db, { selectedOnly = false } = {}, accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
+  const playlists = getLibraryPlaylists(db, account);
+  const profileSelection = getProfileSelection(db, playlists, account);
   const selectedIds = new Set(profileSelection.selectedIds);
   const scopedPlaylists = selectedOnly
     ? playlists.filter((playlist) => selectedIds.has(playlist.id))
@@ -753,8 +824,8 @@ function getProfilePlaylists(db, { selectedOnly = false } = {}) {
   }));
 }
 
-function getLibraryPlaylists(db) {
-  const scope = getActiveLibraryPlaylistIds(db);
+function getLibraryPlaylists(db, accountContext = null) {
+  const scope = getActiveLibraryPlaylistIds(db, accountContext);
   if (scope && !scope.length) return [];
   const where = scope ? `WHERE p.id IN (${scope.map(() => '?').join(',')})` : '';
   return db.prepare(`
@@ -779,22 +850,22 @@ function getLibraryPlaylists(db) {
   });
 }
 
-function countLibraryTracks(db) {
-  const scope = getActiveLibraryPlaylistIds(db);
+function countLibraryTracks(db, accountContext = null) {
+  const scope = getActiveLibraryPlaylistIds(db, accountContext);
   if (scope && !scope.length) return 0;
   const where = scope ? `WHERE playlist_id IN (${scope.map(() => '?').join(',')})` : '';
   return db.prepare(`SELECT COUNT(DISTINCT track_id) AS count FROM playlist_tracks ${where}`).get(...(scope || [])).count;
 }
 
-function countPlaylistTrackLinks(db) {
-  const scope = getActiveLibraryPlaylistIds(db);
+function countPlaylistTrackLinks(db, accountContext = null) {
+  const scope = getActiveLibraryPlaylistIds(db, accountContext);
   if (scope && !scope.length) return 0;
   const where = scope ? `WHERE playlist_id IN (${scope.map(() => '?').join(',')})` : '';
   return db.prepare(`SELECT COUNT(*) AS count FROM playlist_tracks ${where}`).get(...(scope || [])).count;
 }
 
-function listLibraryTracks(db, limit = 5000) {
-  const scope = getActiveLibraryPlaylistIds(db);
+function listLibraryTracks(db, limit = 5000, accountContext = null) {
+  const scope = getActiveLibraryPlaylistIds(db, accountContext);
   if (scope && !scope.length) return [];
   const where = scope ? `WHERE pt.playlist_id IN (${scope.map(() => '?').join(',')})` : '';
   return db.prepare(`
@@ -812,7 +883,7 @@ function listLibraryTracks(db, limit = 5000) {
 
 function hydrateLibraryTrackRow(row) {
   const raw = safeJson(row.rawJson, {});
-  const rawOriginalId = raw?.originalId ?? raw?.song?.originalId ?? raw?.track?.originalId ?? null;
+  const rawOriginalId = extractTrackOriginalId({ raw });
   const playUrl = typeof raw?.playUrl === 'string' && raw.playUrl ? raw.playUrl : null;
   const { rawJson, firstPosition, playlistUpdatedAt, ...track } = row;
   return {
@@ -825,9 +896,17 @@ function hydrateLibraryTrackRow(row) {
   };
 }
 
-function getProfileSelection(db, playlists = getLibraryPlaylists(db)) {
+function extractTrackOriginalId(track = {}) {
+  const raw = track.raw || {};
+  const rawOriginalId = raw?.originalId ?? raw?.song?.originalId ?? raw?.track?.originalId ?? track.originalId ?? null;
+  return rawOriginalId === null || rawOriginalId === undefined || rawOriginalId === '' ? null : String(rawOriginalId);
+}
+
+function getProfileSelection(db, playlists = null, accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
+  playlists = playlists || getLibraryPlaylists(db, account);
   const playlistIds = normalizeIdList(playlists.map((playlist) => playlist.id));
-  const excludedIds = normalizeIdList(safeJson(getSetting(db, PROFILE_EXCLUDED_PLAYLIST_IDS_KEY), []))
+  const excludedIds = normalizeIdList(safeJson(getScopedLibrarySetting(db, account, PROFILE_EXCLUDED_PLAYLIST_IDS_KEY), []))
     .filter((id) => playlistIds.includes(id));
   const excludedSet = new Set(excludedIds);
   const selectedIds = playlistIds.filter((id) => !excludedSet.has(id));
@@ -851,12 +930,13 @@ function getPlaylistRemoteTrackCount(playlist = {}) {
   return Number.isFinite(number) && number >= 0 ? Math.floor(number) : null;
 }
 
-function setProfilePlaylistSelection(db, selectedPlaylistIds = []) {
-  const playlistIds = normalizeIdList(getLibraryPlaylists(db).map((playlist) => playlist.id));
+function setProfilePlaylistSelection(db, selectedPlaylistIds = [], accountContext = null) {
+  const account = getLibraryAccountContext(db, accountContext);
+  const playlistIds = normalizeIdList(getLibraryPlaylists(db, account).map((playlist) => playlist.id));
   const selectedSet = new Set(normalizeIdList(selectedPlaylistIds));
   const excludedIds = playlistIds.filter((id) => !selectedSet.has(id));
-  setSetting(db, PROFILE_EXCLUDED_PLAYLIST_IDS_KEY, JSON.stringify(excludedIds));
-  return getProfileSelection(db);
+  setAccountSetting(db, account.accountId, PROFILE_EXCLUDED_PLAYLIST_IDS_KEY, JSON.stringify(excludedIds));
+  return getProfileSelection(db, null, account);
 }
 
 function dedupePlaylistTracks(playlists = []) {

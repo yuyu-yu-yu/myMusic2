@@ -7,10 +7,14 @@ import {
   clearUserMemories,
   deleteUserMemory,
   listUserMemories,
+  linkPlaylistTrack,
   openDatabase,
   recordOrMergeUserMemory,
   recordTrackFeedback,
-  retrieveRelevantMemories
+  retrieveRelevantMemories,
+  savePlaylist,
+  saveTrack,
+  setSetting
 } from '../server/db.mjs';
 import {
   analyzeConversationMood,
@@ -49,6 +53,8 @@ import {
 } from '../server/dj.mjs';
 import { resolvePlayableTrack } from '../server/library.mjs';
 import { getMemories, getPreferences, nextRadioItem, removeAllMemories, removeMemory, startRadio, submitFeedback, updatePreferences } from '../server/radio.mjs';
+import { resolveAccountContext } from '../server/account-scope.mjs';
+import { generateDiary, getDiary } from '../server/diary.mjs';
 
 function candidate(id, source, artists = ['Artist']) {
   return {
@@ -729,6 +735,83 @@ test('memory API surfaces recently updated memories first', (t) => {
   const memories = getMemories({ db }).memories;
   assert.equal(memories[0].id, recentMemory.id);
   assert.equal(listUserMemories(db)[0].id, recentMemory.id);
+});
+
+test('account context resolves local, cookie, and openapi accounts', (t) => {
+  const db = testDb(t);
+
+  assert.equal(resolveAccountContext(db).accountId, 'local:default');
+
+  setSetting(db, 'netease_login_source', 'cookie');
+  setSetting(db, 'netease_cookie_user_id', 'cookie-user');
+  setSetting(db, 'netease_cookie_user_nickname', 'Cookie');
+  setSetting(db, 'netease_user_id', 'openapi-user');
+  assert.equal(resolveAccountContext(db).accountId, 'netease:cookie:cookie-user');
+
+  setSetting(db, 'netease_login_source', 'openapi');
+  assert.equal(resolveAccountContext(db).accountId, 'netease:openapi:openapi-user');
+});
+
+test('account-scoped memories, preferences, and feedback do not cross accounts', (t) => {
+  const db = testDb(t);
+  const accountA = { accountId: 'netease:cookie:a', provider: 'netease', source: 'cookie', providerUserId: 'a', isAuthenticated: true };
+  const accountB = { accountId: 'netease:cookie:b', provider: 'netease', source: 'cookie', providerUserId: 'b', isAuthenticated: true };
+  saveTrack(db, { id: 'shared-track', name: 'Shared Song', artists: ['Artist'], album: 'Album' });
+
+  recordOrMergeUserMemory(db, {
+    accountId: accountA.accountId,
+    kind: 'need',
+    content: 'Account A needs quiet support during late-night work.',
+    tags: ['quiet', 'work']
+  });
+  updatePreferences({ db, accountContext: accountA, payload: { voiceMode: 'all', note: 'A note' } });
+  submitFeedback({ db, accountContext: accountA, payload: { trackId: 'shared-track', eventType: 'like', sessionId: 'a-session' } });
+
+  assert.equal(getMemories({ db, accountContext: accountA }).memories.length, 1);
+  assert.equal(getMemories({ db, accountContext: accountB }).memories.length, 0);
+  assert.equal(getPreferences({ db, accountContext: accountA }).preferences.note, 'A note');
+  assert.equal(getPreferences({ db, accountContext: accountB }).preferences.note, '');
+  assert.equal(getPreferences({ db, accountContext: accountA }).feedbackSummary.totals.likes, 1);
+  assert.equal(getPreferences({ db, accountContext: accountB }).feedbackSummary.totals.likes, 0);
+
+  assert.equal(removeAllMemories({ db, accountContext: accountB }).deleted, 0);
+  assert.equal(getMemories({ db, accountContext: accountA }).memories.length, 1);
+});
+
+test('account-scoped diaries allow the same date per account', async (t) => {
+  const db = testDb(t);
+  const accountA = { accountId: 'netease:cookie:a', provider: 'netease', source: 'cookie', providerUserId: 'a', isAuthenticated: true };
+  const accountB = { accountId: 'netease:cookie:b', provider: 'netease', source: 'cookie', providerUserId: 'b', isAuthenticated: true };
+  saveTrack(db, { id: 'song-a', name: 'Song A', artists: ['Artist A'], album: 'Album A' });
+  saveTrack(db, { id: 'song-b', name: 'Song B', artists: ['Artist B'], album: 'Album B' });
+  db.prepare('INSERT INTO plays (account_id, track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?,?)')
+    .run(accountA.accountId, 'song-a', '2026-05-20T08:00:00.000Z', 'test', 'A', 'imported');
+  db.prepare('INSERT INTO plays (account_id, track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?,?)')
+    .run(accountB.accountId, 'song-b', '2026-05-20T09:00:00.000Z', 'test', 'B', 'imported');
+
+  const config = { llm: {} };
+  const diaryA = await generateDiary(db, config, '2026-05-20', accountA);
+  const diaryB = await generateDiary(db, config, '2026-05-20', accountB);
+
+  assert.equal(diaryA.date, '2026-05-20');
+  assert.equal(diaryB.date, '2026-05-20');
+  assert.notEqual(getDiary(db, '2026-05-20', accountA).trackIds[0], getDiary(db, '2026-05-20', accountB).trackIds[0]);
+});
+
+test('same session id is not reused across accounts', async (t) => {
+  const db = testDb(t);
+  const accountA = { accountId: 'netease:cookie:a', provider: 'netease', source: 'cookie', providerUserId: 'a', isAuthenticated: true };
+  const accountB = { accountId: 'netease:cookie:b', provider: 'netease', source: 'cookie', providerUserId: 'b', isAuthenticated: true };
+  const config = { llm: {}, tts: {}, weather: {} };
+  const netease = { isConfigured: () => false };
+
+  const first = await chatTurn({ db, config, netease, sessionId: 'shared-session', message: 'hello from A', accountContext: accountA });
+  const second = await chatTurn({ db, config, netease, sessionId: 'shared-session', message: 'hello from B', accountContext: accountB });
+
+  assert.equal(first.sessionId, 'shared-session');
+  assert.notEqual(second.sessionId, 'shared-session');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE account_id = ?').get(accountA.accountId).count, 2);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM messages WHERE account_id = ?').get(accountB.accountId).count, 2);
 });
 
 test('memory prompt formatting has a bounded long-term memory section', () => {
@@ -1627,4 +1710,31 @@ test('conversation mood can override weak long-term profile signal', () => {
   });
 
   assert.equal(selected[0].track.id, 'mood');
+});
+
+test('DJ recommendation falls back to current profile playlists when LLM has no picks', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  const playlist = savePlaylist(db, { id: 'fallback-playlist', name: 'Fallback Playlist', trackCount: 1 }, 'created');
+  const track = saveTrack(db, {
+    id: 'fallback-track',
+    originalId: 'fallback-original-id',
+    name: 'Fallback Song',
+    artists: ['Fallback Artist'],
+    album: 'Fallback Album'
+  });
+  linkPlaylistTrack(db, playlist.id, track.id, 0);
+
+  const result = await djTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'profile-fallback-session',
+    userMessage: null,
+    useQueue: false
+  });
+
+  assert.equal(result.track?.name, 'Fallback Song');
+  assert.equal(result.explanation?.source, 'fallback');
+  assert.doesNotMatch(result.chatText, /没能生成|可靠歌名|no playable/i);
 });

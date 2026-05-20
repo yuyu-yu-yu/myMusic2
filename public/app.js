@@ -19,7 +19,9 @@ const state = {
   profileSelectionDirty: false,
   librarySyncNotice: '',
   radioPrefetchPromise: null,
-  playbackHistory: []
+  playbackHistory: [],
+  demoSelfCheck: null,
+  demoSelfCheckRunning: false
 };
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
@@ -951,7 +953,10 @@ function playHostSpeech(data, onEnd) {
     return;
   }
 
+  let finished = false;
   const finish = () => {
+    if (finished) return;
+    finished = true;
     if (hostAudio) {
       hostAudio.onended = null;
       hostAudio.onplay = null;
@@ -959,39 +964,39 @@ function playHostSpeech(data, onEnd) {
     onEnd?.();
   };
 
+  if (!data.ttsUrl || !hostAudio) {
+    if (hostAudio) hostAudio.src = '';
+    console.warn('[tts skipped]', data.ttsError || data.ttsStatus || 'no synthesized audio');
+    finish();
+    return;
+  }
+
   setAvatarState('talking');
   switchVisualizerTo('host');
   if (data.track) setPlaybackToggleState(true);
 
   try {
-    if (data.ttsUrl && hostAudio) {
-      hostAudio.muted = false;
-      hostAudio.src = data.ttsUrl;
-      hostAudio.onended = finish;
-      hostAudio.onplay = () => {
-        setAvatarState('talking');
-        switchVisualizerTo('host');
-        if (data.track) setPlaybackToggleState(true);
-      };
-      hostAudio.play().catch((error) => {
-        console.warn('[tts play fallback]', error?.message || error);
-        speakText(text, finish);
-      });
-    } else {
-      if (hostAudio) hostAudio.src = '';
-      speakText(text, finish);
-    }
-  } catch {
-    speakText(text, finish);
+    hostAudio.muted = false;
+    hostAudio.src = data.ttsUrl;
+    hostAudio.onended = finish;
+    hostAudio.onplay = () => {
+      setAvatarState('talking');
+      switchVisualizerTo('host');
+      if (data.track) setPlaybackToggleState(true);
+    };
+    hostAudio.play().catch((error) => {
+      console.warn('[tts skipped]', error?.message || error);
+      finish();
+    });
+  } catch (error) {
+    console.warn('[tts skipped]', error?.message || error);
+    finish();
   }
 }
 
 function primeVoicePlayback() {
   const hostAudio = document.querySelector('#host-audio');
-  if (!hostAudio || hostAudio.dataset.voicePrimed === 'true') {
-    primeSpeechSynthesis();
-    return;
-  }
+  if (!hostAudio || hostAudio.dataset.voicePrimed === 'true') return;
   if (hostAudio.src && !hostAudio.paused && !hostAudio.ended) return;
 
   const previousSrc = hostAudio.getAttribute('src') || '';
@@ -1018,18 +1023,6 @@ function primeVoicePlayback() {
       hostAudio.muted = previousMuted;
       delete hostAudio.dataset.voicePriming;
     });
-  primeSpeechSynthesis();
-}
-
-function primeSpeechSynthesis() {
-  if (!('speechSynthesis' in window) || window.__speechSynthesisPrimed) return;
-  try {
-    const utterance = new SpeechSynthesisUtterance(' ');
-    utterance.volume = 0;
-    utterance.rate = 1;
-    speechSynthesis.speak(utterance);
-    window.__speechSynthesisPrimed = true;
-  } catch {}
 }
 
 function appendChat({ role, text, track, explanation, loading = false }) {
@@ -1238,19 +1231,6 @@ async function startSongPlayback() {
   setPlaybackToggleState(true);
   switchVisualizerTo('song');
   playCurrentTrack();
-}
-
-function speakText(text, onEnd) {
-  if (!text || !('speechSynthesis' in window)) {
-    onEnd?.();
-    return;
-  }
-  speechSynthesis.cancel();
-  const utterance = new SpeechSynthesisUtterance(text);
-  utterance.lang = 'zh-CN';
-  utterance.rate = 0.96;
-  utterance.onend = () => onEnd?.();
-  speechSynthesis.speak(utterance);
 }
 
 function markPlaybackStarted(track, source) {
@@ -1880,6 +1860,21 @@ async function renderSettings() {
         </div>
       </div>
     </section>
+    <section class="page-panel self-check-panel">
+      <div class="panel-header">
+        <div>
+          <p class="eyebrow">Demo Check</p>
+          <h2>运行自检</h2>
+        </div>
+        <button id="demo-self-check-btn" class="primary small" ${state.demoSelfCheckRunning ? 'disabled' : ''}>
+          ${state.demoSelfCheckRunning ? '检查中...' : '运行自检'}
+        </button>
+      </div>
+      <p class="muted">演示前检查 LLM、TTS、网易云登录、歌单同步和当前播放源。</p>
+      <div id="demo-self-check-content" class="self-check-content">
+        ${buildDemoSelfCheckHTML(state.demoSelfCheck, state.demoSelfCheckRunning)}
+      </div>
+    </section>
     <section class="page-panel radio-debug-panel">
       <details>
         <summary>
@@ -1941,6 +1936,7 @@ async function renderSettings() {
     renderSettings();
   });
   document.querySelector('#qr-btn')?.addEventListener('click', () => startQrLogin());
+  document.querySelector('#demo-self-check-btn')?.addEventListener('click', () => runDemoSelfCheck());
   document.querySelector('#radio-debug-refresh')?.addEventListener('click', () => refreshRadioDebugPanel());
   document.querySelector('#qr-refresh-btn')?.addEventListener('click', async () => {
     const statusEl = document.querySelector('#qr-status');
@@ -1954,6 +1950,91 @@ async function renderSettings() {
     await api('/api/memories', { method: 'DELETE' });
     renderSettings();
   });
+}
+
+async function runDemoSelfCheck() {
+  const button = document.querySelector('#demo-self-check-btn');
+  const content = document.querySelector('#demo-self-check-content');
+  state.demoSelfCheckRunning = true;
+  if (button) {
+    button.disabled = true;
+    button.textContent = '检查中...';
+  }
+  if (content) content.innerHTML = buildDemoSelfCheckHTML(state.demoSelfCheck, true);
+  try {
+    const result = await api('/api/diagnostics/self-check', {
+      method: 'POST',
+      body: {
+        sessionId: state.sessionId,
+        trackId: state.current?.track?.id || ''
+      }
+    });
+    state.demoSelfCheck = result;
+    if (content) content.innerHTML = buildDemoSelfCheckHTML(result, false);
+  } catch (error) {
+    state.demoSelfCheck = {
+      ok: false,
+      summary: '自检请求失败。',
+      checks: [{
+        id: 'request',
+        label: '自检请求',
+        status: 'fail',
+        detail: error.message || '请求失败'
+      }]
+    };
+    if (content) content.innerHTML = buildDemoSelfCheckHTML(state.demoSelfCheck, false);
+  } finally {
+    state.demoSelfCheckRunning = false;
+    if (button) {
+      button.disabled = false;
+      button.textContent = '运行自检';
+    }
+  }
+}
+
+function buildDemoSelfCheckHTML(result = null, loading = false) {
+  if (loading) {
+    return `
+      <div class="self-check-placeholder">
+        <strong>正在检查演示链路...</strong>
+        <span>这会实际测试模型、语音、网易云登录和播放源。</span>
+      </div>
+    `;
+  }
+  if (!result) {
+    return `
+      <div class="self-check-placeholder">
+        <strong>尚未运行自检</strong>
+        <span>点击右上角按钮，在演示前确认关键服务是否可用。</span>
+      </div>
+    `;
+  }
+  const checks = Array.isArray(result.checks) ? result.checks : [];
+  return `
+    <div class="self-check-summary ${result.ok ? 'ok' : 'warn'}">
+      <strong>${escapeHtml(result.summary || (result.ok ? '核心演示链路正常。' : '发现需要处理的问题。'))}</strong>
+      <span>${escapeHtml(result.checkedAt || '')}</span>
+    </div>
+    <div class="self-check-grid">
+      ${checks.map(selfCheckCardHTML).join('')}
+    </div>
+  `;
+}
+
+function selfCheckCardHTML(check = {}) {
+  const status = ['ok', 'warn', 'fail', 'skip'].includes(check.status) ? check.status : 'warn';
+  const labels = { ok: 'OK', warn: 'WARN', fail: 'FAIL', skip: 'SKIP' };
+  return `
+    <article class="self-check-card ${status}">
+      <div>
+        <span>${escapeHtml(check.label || check.id || '检查项')}</span>
+        <strong>${escapeHtml(labels[status])}</strong>
+      </div>
+      <p>${escapeHtml(check.detail || '')}</p>
+      ${check.action ? `<small>${escapeHtml(check.action)}</small>` : ''}
+      ${typeof check.ms === 'number' ? `<em>${escapeHtml(String(check.ms))}ms</em>` : ''}
+    </article>
+  `;
 }
 
 async function refreshRadioDebugPanel() {

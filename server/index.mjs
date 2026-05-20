@@ -13,6 +13,8 @@ import { chatRadio, getMemories, getPreferences, getRadioDebug, nextRadioItem, p
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
 import { checkCookieQrLogin, clearCookie, createCookieQrLogin, getCookieStatus, getCookieUserProfile, loadCookie, resolveCommunityApiFile } from './community.mjs';
+import { runDemoSelfCheck } from './diagnostics.mjs';
+import { publicAccountContext, resolveAccountContext } from './account-scope.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -106,6 +108,7 @@ function startLibrarySyncJob() {
     try {
       const result = await syncLibrary(db, netease, {
         llmConfig: config.llm,
+        accountContext: resolveAccountContext(db),
         isCancelled: () => librarySyncStatus.jobId !== jobId,
         onProgress: (progress) => {
           if (librarySyncStatus.jobId !== jobId) return;
@@ -152,6 +155,22 @@ function startLibrarySyncJob() {
 const routes = {
   'GET /api/health': async () => ({ ok: true, config: tokenStatus(publicConfigStatus(config)) }),
   'GET /api/config/status': async () => tokenStatus(publicConfigStatus(config)),
+  'GET /api/account/current': async () => ({
+    ok: true,
+    account: publicAccountContext(resolveAccountContext(db))
+  }),
+  'POST /api/diagnostics/self-check': async (req) => {
+    const body = await readJson(req);
+    return runDemoSelfCheck({
+      db,
+      config,
+      netease,
+      rootDir,
+      sessionId: body.sessionId || '',
+      trackId: body.trackId || '',
+      syncStatus: getLibrarySyncStatus()
+    });
+  },
   'POST /api/auth/netease-cookie/qrcode': async () => attachQrImage(await createCookieQrLogin()),
   'POST /api/auth/netease-cookie/qrcode/check': async (req) => {
     const body = await readJson(req);
@@ -161,7 +180,7 @@ const routes = {
     if (result.loggedIn && result.userId) {
       const previousSyncedUserId = getSetting(db, LIBRARY_SYNCED_USER_ID_KEY) || '';
       invalidateLibrarySyncStatus('NetEase cookie login changed, please start sync again.');
-      clearLibraryAccountSnapshot(db);
+      clearLibraryAccountSnapshot(db, resolveAccountContext(db));
       saveNeteaseUserProfile(db, { userId: result.userId, nickname: result.nickname || '' });
       setSetting(db, 'netease_login_source', 'cookie');
       setSetting(db, 'netease_cookie_user_id', result.userId);
@@ -183,7 +202,7 @@ const routes = {
   'POST /api/auth/netease-cookie/logout': async () => {
     invalidateLibrarySyncStatus('NetEase cookie login cleared, please start sync again.');
     clearCookie(rootDir);
-    clearLibraryAccountSnapshot(db);
+    clearLibraryAccountSnapshot(db, resolveAccountContext(db));
     setSetting(db, 'netease_cookie_user_id', '');
     setSetting(db, 'netease_cookie_user_nickname', '');
     setSetting(db, 'netease_cookie_checked_at', '');
@@ -204,7 +223,7 @@ const routes = {
     const login = await resolveQrOpenApiLogin({ db, netease, result });
     if (login.loggedIn) {
       invalidateLibrarySyncStatus('NetEase OpenAPI login changed, please start sync again.');
-      clearLibraryAccountSnapshot(db);
+      clearLibraryAccountSnapshot(db, resolveAccountContext(db));
     }
     return attachLoginMeta(result, { ...login, hasToken: netease.hasToken() });
   },
@@ -217,37 +236,38 @@ const routes = {
   },
   'POST /api/library/sync': async () => startLibrarySyncJob(),
   'GET /api/library/sync/status': async () => getLibrarySyncStatus(),
-  'GET /api/library': async () => getLibrary(db),
-  'GET /api/library/profile': async () => getProfile(db),
+  'GET /api/library': async () => getLibrary(db, resolveAccountContext(db)),
+  'GET /api/library/profile': async () => getProfile(db, resolveAccountContext(db)),
   'PUT /api/library/profile-playlists': async (req) => {
     const body = await readJson(req);
     if (!Array.isArray(body.selectedPlaylistIds)) return jsonError('selectedPlaylistIds must be an array', 400);
-    return updateProfilePlaylistSelection(db, body.selectedPlaylistIds);
+    return updateProfilePlaylistSelection(db, body.selectedPlaylistIds, resolveAccountContext(db));
   },
   'POST /api/library/profile/update': async () => {
-    await updateProfile(db, config.llm, { force: true });
-    return getLibrary(db);
+    const accountContext = resolveAccountContext(db);
+    await updateProfile(db, config.llm, { force: true, accountContext });
+    return getLibrary(db, accountContext);
   },
   'POST /api/radio/start': async (req) => {
     const body = await readJson(req);
-    return startRadio({ db, config, netease, sessionId: body.sessionId });
+    return startRadio({ db, config, netease, sessionId: body.sessionId, accountContext: resolveAccountContext(db) });
   },
   'POST /api/radio/prefetch': async (req) => {
     const body = await readJson(req);
-    return prefetchRadio({ db, config, netease, sessionId: body.sessionId, force: Boolean(body.force) });
+    return prefetchRadio({ db, config, netease, sessionId: body.sessionId, force: Boolean(body.force), accountContext: resolveAccountContext(db) });
   },
   'GET /api/radio/debug': async (req) => {
     const url = new URL(req.url, 'http://local');
     const sessionId = url.searchParams.get('sessionId') || '';
-    return getRadioDebug({ db, sessionId });
+    return getRadioDebug({ db, sessionId, accountContext: resolveAccountContext(db) });
   },
   'POST /api/radio/chat': async (req) => {
     const body = await readJson(req);
-    return chatRadio({ db, config, netease, sessionId: body.sessionId, message: body.message || '' });
+    return chatRadio({ db, config, netease, sessionId: body.sessionId, message: body.message || '', accountContext: resolveAccountContext(db) });
   },
   'POST /api/radio/next': async (req) => {
     const body = await readJson(req);
-    return nextRadioItem({ db, config, netease, sessionId: body.sessionId || crypto.randomUUID(), userMessage: body.message || '' });
+    return nextRadioItem({ db, config, netease, sessionId: body.sessionId || crypto.randomUUID(), userMessage: body.message || '', accountContext: resolveAccountContext(db) });
   },
   'POST /api/play/report': async (req) => {
     const body = await readJson(req);
@@ -255,14 +275,14 @@ const routes = {
   },
   'POST /api/feedback': async (req) => {
     const body = await readJson(req);
-    return submitFeedback({ db, payload: body });
+    return submitFeedback({ db, payload: body, accountContext: resolveAccountContext(db) });
   },
-  'GET /api/memories': async () => getMemories({ db }),
-  'DELETE /api/memories': async () => removeAllMemories({ db }),
-  'GET /api/preferences': async () => getPreferences({ db }),
+  'GET /api/memories': async () => getMemories({ db, accountContext: resolveAccountContext(db) }),
+  'DELETE /api/memories': async () => removeAllMemories({ db, accountContext: resolveAccountContext(db) }),
+  'GET /api/preferences': async () => getPreferences({ db, accountContext: resolveAccountContext(db) }),
   'PUT /api/preferences': async (req) => {
     const body = await readJson(req);
-    return updatePreferences({ db, payload: body });
+    return updatePreferences({ db, payload: body, accountContext: resolveAccountContext(db) });
   },
   'POST /api/player/play': async (req) => {
     const body = await readJson(req);
@@ -274,11 +294,14 @@ const routes = {
   'POST /api/player/stop': async () => player.stop(),
   'POST /api/player/next': async () => player.next(),
   'GET /api/player/state': async () => player.state(),
-  'GET /api/diary': async () => listDiaries(db),
-  'GET /api/diary/today': async () => getDiary(db, today()) || generateDiary(db, config, today()),
+  'GET /api/diary': async () => listDiaries(db, resolveAccountContext(db)),
+  'GET /api/diary/today': async () => {
+    const accountContext = resolveAccountContext(db);
+    return getDiary(db, today(), accountContext) || generateDiary(db, config, today(), accountContext);
+  },
   'POST /api/diary/generate': async (req) => {
     const body = await readJson(req);
-    return generateDiary(db, config, body.date || today());
+    return generateDiary(db, config, body.date || today(), resolveAccountContext(db));
   }
 };
 
@@ -397,7 +420,7 @@ const server = http.createServer(async (req, res) => {
     if (req.url.startsWith('/api/tts/')) return serveTts(req, res);
     const pathname = new URL(req.url, 'http://local').pathname;
     if (req.method === 'DELETE' && /^\/api\/memories\/\d+$/.test(pathname)) {
-      return sendJson(res, removeMemory({ db, id: pathname.split('/').pop() }));
+      return sendJson(res, removeMemory({ db, id: pathname.split('/').pop(), accountContext: resolveAccountContext(db) }));
     }
     const key = `${req.method} ${pathname}`;
     if (routes[key]) {
@@ -407,7 +430,8 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.url.startsWith('/api/diary/') && req.method === 'GET') {
       const date = decodeURIComponent(req.url.split('/').pop());
-      return sendJson(res, getDiary(db, date) || await generateDiary(db, config, date));
+      const accountContext = resolveAccountContext(db);
+      return sendJson(res, getDiary(db, date, accountContext) || await generateDiary(db, config, date, accountContext));
     }
     if (pathname.startsWith('/api/')) {
       return sendJson(res, { ok: false, error: `API route not found: ${req.method} ${pathname}` }, 404);

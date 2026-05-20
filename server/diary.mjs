@@ -1,19 +1,21 @@
 import { generateChatCompletion } from './ai.mjs';
 import { listRecentPlays, nowIso } from './db.mjs';
 import { getProfile } from './library.mjs';
+import { normalizeAccountContext, resolveAccountContext } from './account-scope.mjs';
 
-export async function generateDiary(db, config, date = today()) {
+export async function generateDiary(db, config, date = today(), accountContext = null) {
+  const account = getDiaryAccountContext(db, accountContext);
   const start = `${date}T00:00:00.000Z`;
   const end = `${date}T23:59:59.999Z`;
   const plays = db.prepare(`
     SELECT p.*, t.name, t.artists, t.album
     FROM plays p
     JOIN tracks t ON t.id = p.track_id
-    WHERE p.played_at BETWEEN ? AND ?
+    WHERE p.account_id = ? AND p.played_at BETWEEN ? AND ?
     ORDER BY p.played_at ASC
-  `).all(start, end).map((row) => ({ ...row, artists: JSON.parse(row.artists || '[]') }));
-  const fallbackPlays = plays.length ? plays : listRecentPlays(db, 8);
-  const profile = getProfile(db);
+  `).all(account.accountId, start, end).map((row) => ({ ...row, artists: JSON.parse(row.artists || '[]') }));
+  const fallbackPlays = plays.length ? plays : listRecentPlays(db, 8, account.accountId);
+  const profile = getProfile(db, account);
   const trackNames = fallbackPlays.map((play) => `${play.name} - ${(play.artists || []).join('/')}`).join('；');
   const content = await generateChatCompletion(
     config.llm,
@@ -27,20 +29,21 @@ export async function generateDiary(db, config, date = today()) {
   const title = `${date} 的音乐日记`;
   const ids = fallbackPlays.map((play) => play.track_id || play.id).filter(Boolean);
   db.prepare(`
-    INSERT INTO diary_entries (date, title, content, mood_tags, track_ids, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-    ON CONFLICT(date) DO UPDATE SET
+    INSERT INTO diary_entries (account_id, date, title, content, mood_tags, track_ids, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(account_id, date) DO UPDATE SET
       title = excluded.title,
       content = excluded.content,
       mood_tags = excluded.mood_tags,
       track_ids = excluded.track_ids,
       updated_at = excluded.updated_at
-  `).run(date, title, content, JSON.stringify(moodTags), JSON.stringify(ids), nowIso(), nowIso());
-  return getDiary(db, date);
+  `).run(account.accountId, date, title, content, JSON.stringify(moodTags), JSON.stringify(ids), nowIso(), nowIso());
+  return getDiary(db, date, account);
 }
 
-export function getDiary(db, date = today()) {
-  const row = db.prepare('SELECT * FROM diary_entries WHERE date = ?').get(date);
+export function getDiary(db, date = today(), accountContext = null) {
+  const account = getDiaryAccountContext(db, accountContext);
+  const row = db.prepare('SELECT * FROM diary_entries WHERE account_id = ? AND date = ?').get(account.accountId, date);
   if (!row) return null;
   return {
     date: row.date,
@@ -53,9 +56,10 @@ export function getDiary(db, date = today()) {
   };
 }
 
-export function listDiaries(db) {
-  return db.prepare('SELECT date, title, content, mood_tags AS moodTags, updated_at AS updatedAt FROM diary_entries ORDER BY date DESC LIMIT 30')
-    .all()
+export function listDiaries(db, accountContext = null) {
+  const account = getDiaryAccountContext(db, accountContext);
+  return db.prepare('SELECT date, title, content, mood_tags AS moodTags, updated_at AS updatedAt FROM diary_entries WHERE account_id = ? ORDER BY date DESC LIMIT 30')
+    .all(account.accountId)
     .map((row) => ({ ...row, moodTags: JSON.parse(row.moodTags || '[]') }));
 }
 
@@ -76,4 +80,8 @@ function inferMoodTags(content, plays) {
   if (/专注|工作|学习/.test(text)) tags.push('专注');
   if (!tags.length) tags.push('私人电台');
   return tags.slice(0, 4);
+}
+
+function getDiaryAccountContext(db, accountContext = null) {
+  return accountContext ? normalizeAccountContext(accountContext) : resolveAccountContext(db);
 }

@@ -2302,6 +2302,127 @@ audio {
   border-bottom: 1px solid rgba(124, 132, 180, 0.13);
 }
 
+button.small {
+  min-height: 36px;
+  padding: 9px 14px;
+  font-size: 12px;
+}
+
+.self-check-panel {
+  margin-top: 14px;
+}
+
+.self-check-panel > .muted {
+  margin: 4px 0 16px;
+}
+
+.self-check-content {
+  display: grid;
+  gap: 12px;
+}
+
+.self-check-placeholder,
+.self-check-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  min-height: 58px;
+  padding: 14px 16px;
+  border: 1px solid rgba(0, 240, 255, 0.14);
+  border-radius: 6px;
+  background:
+    linear-gradient(90deg, rgba(0, 240, 255, 0.06), rgba(255, 0, 255, 0.025)),
+    rgba(8, 10, 24, 0.52);
+}
+
+.self-check-placeholder strong,
+.self-check-summary strong {
+  color: var(--text);
+}
+
+.self-check-placeholder span,
+.self-check-summary span {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.self-check-summary.ok {
+  border-color: rgba(0, 255, 136, 0.28);
+}
+
+.self-check-summary.warn {
+  border-color: rgba(255, 205, 96, 0.28);
+}
+
+.self-check-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+}
+
+.self-check-card {
+  position: relative;
+  min-height: 132px;
+  padding: 13px;
+  border: 1px solid rgba(0, 240, 255, 0.1);
+  border-radius: 6px;
+  background:
+    linear-gradient(180deg, rgba(0, 240, 255, 0.035), rgba(255, 0, 255, 0.02)),
+    rgba(18, 18, 42, 0.58);
+}
+
+.self-check-card.ok { border-color: rgba(0, 255, 136, 0.28); }
+.self-check-card.warn { border-color: rgba(255, 205, 96, 0.36); }
+.self-check-card.fail { border-color: rgba(255, 92, 130, 0.42); }
+.self-check-card.skip { border-color: rgba(124, 132, 180, 0.2); }
+
+.self-check-card > div {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 9px;
+}
+
+.self-check-card span,
+.self-check-card small,
+.self-check-card em {
+  color: var(--muted);
+  font-size: 12px;
+  font-style: normal;
+}
+
+.self-check-card strong {
+  color: var(--cyan);
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.self-check-card.ok strong { color: var(--neon-green); }
+.self-check-card.warn strong { color: var(--gold); }
+.self-check-card.fail strong { color: #ff6b8a; }
+.self-check-card.skip strong { color: var(--muted); }
+
+.self-check-card p {
+  margin: 0 0 8px;
+  color: var(--text);
+  line-height: 1.55;
+}
+
+.self-check-card small {
+  display: block;
+  line-height: 1.45;
+}
+
+.self-check-card em {
+  position: absolute;
+  right: 12px;
+  bottom: 10px;
+  opacity: 0.72;
+}
+
 .radio-debug-panel {
   margin-top: 14px;
 }
@@ -2639,6 +2760,7 @@ audio {
     grid-template-columns: repeat(2, 1fr);
   }
 
+  .self-check-grid,
   .debug-grid,
   .debug-line,
   .debug-search > p:first-child {

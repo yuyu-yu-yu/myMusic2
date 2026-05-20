@@ -4,31 +4,42 @@ import { chatTurn, djTurn, getRadioDebugStatus, prefetchRadioQueue } from './dj.
 import {
   clearUserMemories,
   deleteUserMemory,
+  getAccountSetting,
+  getSetting,
   getTrackById,
   listUserMemories,
-  nowIso,
   recordOrMergeUserMemory,
-  recordTrackFeedback
+  recordTrackFeedback,
+  setAccountSetting
 } from './db.mjs';
+import { normalizeAccountContext, publicAccountContext, resolveAccountContext } from './account-scope.mjs';
 
-export async function startRadio({ db, config, netease, sessionId }) {
-  return djTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), userMessage: null });
+export async function startRadio({ db, config, netease, sessionId, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  const result = await djTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), userMessage: null, accountContext: account });
+  return attachAccount(result, account);
 }
 
-export async function chatRadio({ db, config, netease, sessionId, message }) {
-  return chatTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), message: message || '' });
+export async function chatRadio({ db, config, netease, sessionId, message, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  const result = await chatTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), message: message || '', accountContext: account });
+  return attachAccount(result, account);
 }
 
-export async function nextRadioItem({ db, config, netease, sessionId, userMessage }) {
-  return djTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), userMessage: userMessage || null });
+export async function nextRadioItem({ db, config, netease, sessionId, userMessage, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  const result = await djTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), userMessage: userMessage || null, accountContext: account });
+  return attachAccount(result, account);
 }
 
-export function prefetchRadio({ db, config, netease, sessionId, force = false }) {
-  return prefetchRadioQueue({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), force });
+export function prefetchRadio({ db, config, netease, sessionId, force = false, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(prefetchRadioQueue({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), force, accountContext: account }), account);
 }
 
-export function getRadioDebug({ db, sessionId }) {
-  return getRadioDebugStatus(db, sessionId);
+export function getRadioDebug({ db, sessionId, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(getRadioDebugStatus(db, sessionId, account), account);
 }
 
 export async function reportPlay({ db, netease, payload }) {
@@ -41,9 +52,11 @@ export async function reportPlay({ db, netease, payload }) {
   } catch (e) { return { ok: false, error: e.message }; }
 }
 
-export function submitFeedback({ db, payload }) {
+export function submitFeedback({ db, payload, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
   try {
     const feedback = recordTrackFeedback(db, {
+      accountId: account.accountId,
       trackId: payload.trackId || payload.songId,
       eventType: payload.eventType,
       sessionId: payload.sessionId,
@@ -52,6 +65,7 @@ export function submitFeedback({ db, payload }) {
       source: payload.source
     });
     maybeRecordFeedbackMemory(db, {
+      accountId: account.accountId,
       trackId: payload.trackId || payload.songId,
       eventType: payload.eventType,
       sessionId: payload.sessionId,
@@ -60,58 +74,69 @@ export function submitFeedback({ db, payload }) {
     return {
       ok: true,
       feedback,
-      feedbackSummary: getFeedbackSummary(db),
-      memories: listUserMemories(db, 8)
+      feedbackSummary: getFeedbackSummary(db, account.accountId),
+      memories: listUserMemories(db, { accountId: account.accountId, limit: 8 }),
+      account: publicAccountContext(account)
     };
   } catch (error) {
     return { __error: true, ok: false, error: error.message, status: 400 };
   }
 }
 
-export function getMemories({ db }) {
-  const memories = listUserMemories(db);
+export function getMemories({ db, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  const memories = listUserMemories(db, { accountId: account.accountId, limit: 200 });
   return {
     ok: true,
     memories,
-    updatedAt: memories[0]?.updatedAt || null
+    updatedAt: memories[0]?.updatedAt || null,
+    account: publicAccountContext(account)
   };
 }
 
-export function removeMemory({ db, id }) {
-  return deleteUserMemory(db, id);
+export function removeMemory({ db, id, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(deleteUserMemory(db, id, account.accountId), account);
 }
 
-export function removeAllMemories({ db }) {
-  return clearUserMemories(db);
+export function removeAllMemories({ db, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(clearUserMemories(db, account.accountId), account);
 }
 
-export function getUserPrefs(db) {
+export function getUserPrefs(db, accountContext = null) {
+  const account = getRequestAccount(db, accountContext);
   try {
-    const raw = db.prepare('SELECT value FROM settings WHERE key = ?').get('user_preferences');
-    return raw ? JSON.parse(raw.value) : {};
+    const scoped = getAccountSetting(db, account.accountId, 'user_preferences');
+    const raw = scoped ?? getSetting(db, 'user_preferences');
+    return raw ? JSON.parse(raw) : {};
   } catch { return {}; }
 }
 
-export function setUserPrefs(db, prefs) {
-  db.prepare('INSERT INTO settings (key, value, updated_at) VALUES (?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at')
-    .run('user_preferences', JSON.stringify(prefs), nowIso());
+export function setUserPrefs(db, prefs, accountContext = null) {
+  const account = getRequestAccount(db, accountContext);
+  setAccountSetting(db, account.accountId, 'user_preferences', JSON.stringify(prefs));
 }
 
-export function getPreferences({ db }) {
+export function getPreferences({ db, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
   return {
     ok: true,
-    preferences: normalizePreferences(getUserPrefs(db)),
-    feedbackSummary: getFeedbackSummary(db)
+    preferences: normalizePreferences(getUserPrefs(db, account)),
+    feedbackSummary: getFeedbackSummary(db, account.accountId),
+    account: publicAccountContext(account)
   };
 }
 
-export function updatePreferences({ db, payload }) {
-  const next = normalizePreferences({ ...getUserPrefs(db), ...(payload || {}) });
-  setUserPrefs(db, next);
+export function updatePreferences({ db, payload, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  const next = normalizePreferences({ ...getUserPrefs(db, account), ...(payload || {}) });
+  setUserPrefs(db, next, account);
   return {
     ok: true,
     preferences: next,
-    feedbackSummary: getFeedbackSummary(db)
+    feedbackSummary: getFeedbackSummary(db, account.accountId),
+    account: publicAccountContext(account)
   };
 }
 
@@ -126,7 +151,7 @@ function normalizePreferences(raw = {}) {
   };
 }
 
-function getFeedbackSummary(db) {
+function getFeedbackSummary(db, accountId) {
   const cutoff = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
   const totals = db.prepare(`
     SELECT
@@ -137,8 +162,8 @@ function getFeedbackSummary(db) {
       COUNT(*) AS events,
       MAX(created_at) AS updatedAt
     FROM track_feedback_events
-    WHERE created_at >= ?
-  `).get(cutoff);
+    WHERE account_id = ? AND created_at >= ?
+  `).get(accountId, cutoff);
   const topRows = db.prepare(`
     SELECT e.track_id AS trackId,
            COALESCE(SUM(CASE WHEN e.event_type = 'like' THEN 1 ELSE 0 END), 0) AS likes,
@@ -149,12 +174,12 @@ function getFeedbackSummary(db) {
            t.name, t.artists, t.cover_url AS coverUrl
     FROM track_feedback_events e
     LEFT JOIN tracks t ON t.id = e.track_id
-    WHERE e.created_at >= ?
+    WHERE e.account_id = ? AND e.created_at >= ?
     GROUP BY e.track_id
     ORDER BY (likes * 3 + completions - dislikes * 2 - skips) DESC,
              updatedAt DESC
     LIMIT 8
-  `).all(cutoff);
+  `).all(accountId, cutoff);
   return {
     totals: {
       likes: Number(totals?.likes || 0),
@@ -180,7 +205,7 @@ function safeJson(value, fallback) {
   }
 }
 
-function maybeRecordFeedbackMemory(db, { trackId, eventType, sessionId, feedback }) {
+function maybeRecordFeedbackMemory(db, { accountId, trackId, eventType, sessionId, feedback }) {
   const type = String(eventType || '');
   const likes = Number(feedback?.likes || 0);
   const dislikes = Number(feedback?.dislikes || 0);
@@ -193,6 +218,7 @@ function maybeRecordFeedbackMemory(db, { trackId, eventType, sessionId, feedback
   try {
     if (type === 'like' && likes >= 3) {
       recordOrMergeUserMemory(db, {
+        accountId,
         kind: 'music_preference',
         content: `用户多次喜欢 ${title}${artists}，后续可把相近气质的歌曲作为安全推荐方向。`,
         tags: ['喜欢', track?.name, ...(track?.artists || [])].filter(Boolean),
@@ -202,6 +228,7 @@ function maybeRecordFeedbackMemory(db, { trackId, eventType, sessionId, feedback
       });
     } else if (type === 'complete' && completions >= 4) {
       recordOrMergeUserMemory(db, {
+        accountId,
         kind: 'music_preference',
         content: `用户多次完整听完 ${title}${artists}，这类歌曲可作为较稳妥的陪伴选择。`,
         tags: ['完整听完', track?.name, ...(track?.artists || [])].filter(Boolean),
@@ -211,6 +238,7 @@ function maybeRecordFeedbackMemory(db, { trackId, eventType, sessionId, feedback
       });
     } else if ((type === 'skip' && skips >= 3) || (type === 'dislike' && dislikes >= 2)) {
       recordOrMergeUserMemory(db, {
+        accountId,
         kind: 'music_preference',
         content: `用户多次跳过或不喜欢 ${title}${artists}，后续推荐相近歌曲时要谨慎。`,
         tags: ['跳过', '不喜欢', track?.name, ...(track?.artists || [])].filter(Boolean),
@@ -222,4 +250,15 @@ function maybeRecordFeedbackMemory(db, { trackId, eventType, sessionId, feedback
   } catch {
     // Feedback must never fail because a memory could not be written.
   }
+}
+
+function getRequestAccount(db, accountContext) {
+  return accountContext ? normalizeAccountContext(accountContext) : resolveAccountContext(db);
+}
+
+function attachAccount(result, accountContext) {
+  return {
+    ...(result || {}),
+    account: publicAccountContext(accountContext)
+  };
 }
