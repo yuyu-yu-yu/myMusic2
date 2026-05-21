@@ -1022,6 +1022,26 @@ button.danger:hover {
   border-radius: 3px;
   color: var(--cyan);
   background: rgba(0, 240, 255, 0.05);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.track-explanation-factors span.is-structured {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+}
+
+.track-explanation-factors strong {
+  flex: 0 0 auto;
+  color: var(--yellow);
+  font-weight: 700;
+}
+
+.track-explanation-factors em {
+  min-width: 0;
+  color: var(--cyan);
+  font-style: normal;
 }
 
 .chat-form-inline {

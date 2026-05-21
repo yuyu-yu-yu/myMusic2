@@ -24,6 +24,8 @@ const state = {
   playbackHistory: [],
   demoSelfCheck: null,
   demoSelfCheckRunning: false,
+  radioTurnSeq: 0,
+  activeRadioTurn: null,
   aiMusicMode: readStoredAiMusicMode()
 };
 
@@ -913,6 +915,72 @@ function ensureSessionId() {
   return state.sessionId;
 }
 
+function beginRadioTurn() {
+  if (state.activeRadioTurn?.controller && !state.activeRadioTurn.controller.signal.aborted) {
+    state.activeRadioTurn.controller.abort();
+  }
+  if (state.activeRadioTurn?.loading) {
+    stopLoadingMessages({ remove: true, loading: state.activeRadioTurn.loading });
+  }
+  interruptPendingHostSpeech();
+  suppressCurrentSongAutoAdvance();
+
+  const controller = typeof AbortController === 'function' ? new AbortController() : null;
+  const turn = {
+    id: ++state.radioTurnSeq,
+    controller,
+    loading: null
+  };
+  state.activeRadioTurn = turn;
+  return turn;
+}
+
+function attachRadioTurnLoading(radioTurn, loading) {
+  if (!isActiveRadioTurn(radioTurn)) return;
+  radioTurn.loading = loading;
+}
+
+function clearRadioTurnLoading(radioTurn, loading) {
+  if (!radioTurn || state.activeRadioTurn?.id !== radioTurn.id) return;
+  if (!loading || radioTurn.loading === loading) radioTurn.loading = null;
+}
+
+function isActiveRadioTurn(radioTurn) {
+  return !radioTurn || state.activeRadioTurn?.id === radioTurn.id;
+}
+
+function isInterruptedRadioTurn(radioTurn, error = null) {
+  return Boolean(radioTurn && (
+    !isActiveRadioTurn(radioTurn) ||
+    radioTurn.controller?.signal.aborted ||
+    error?.name === 'AbortError'
+  ));
+}
+
+function radioTurnSignal(radioTurn) {
+  return radioTurn?.controller?.signal;
+}
+
+function isCurrentPlaybackTurn(radioTurn, track) {
+  return isActiveRadioTurn(radioTurn) && (!track?.id || state.current?.track?.id === track.id);
+}
+
+function interruptPendingHostSpeech() {
+  const hostAudio = document.querySelector('#host-audio');
+  if (hostAudio && hostAudio.dataset.voicePriming !== 'true') {
+    hostAudio.onended = null;
+    hostAudio.onplay = null;
+    hostAudio.pause();
+  }
+  window.speechSynthesis?.cancel?.();
+}
+
+function suppressCurrentSongAutoAdvance() {
+  const songAudio = document.querySelector('#song-audio');
+  if (!songAudio) return;
+  songAudio.onended = null;
+}
+
 function scheduleRadioPrefetch({ force = false } = {}) {
   if (state.aiMusicMode) return Promise.resolve(null);
   if (state.radioPrefetchPromise && !force) return state.radioPrefetchPromise;
@@ -936,28 +1004,42 @@ function scheduleRadioPrefetch({ force = false } = {}) {
 }
 
 async function startRadio() {
+  const radioTurn = beginRadioTurn();
   primeVoicePlayback();
   const sessionId = ensureSessionId();
   setAvatarState('on_air');
   setRadioButtonState('loading');
   appendChat({ role: 'user', text: state.aiMusicMode ? '开启 AI 原创模式' : '启动电台' });
   const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : 'music');
+  attachRadioTurnLoading(radioTurn, loading);
   try {
     await loadPreferences().catch(() => null);
+    if (!isActiveRadioTurn(radioTurn)) return;
     const data = state.aiMusicMode
-      ? await requestAiMusicTrack({ sessionId, trigger: 'start' })
-      : await api('/api/radio/start', { method: 'POST', body: { sessionId } });
-    handleRadioResponse(data, { loading });
+      ? await requestAiMusicTrack({ sessionId, trigger: 'start', signal: radioTurnSignal(radioTurn) })
+      : await api('/api/radio/start', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
+    handleRadioResponse(data, { loading, radioTurn });
   } catch (e) {
+    if (isInterruptedRadioTurn(radioTurn, e)) {
+      stopLoadingMessages({ remove: true, loading });
+      clearRadioTurnLoading(radioTurn, loading);
+      return;
+    }
     if (state.aiMusicMode) {
       try {
-        const fallback = await api('/api/radio/start', { method: 'POST', body: { sessionId } });
-        handleRadioResponse(withAiMusicFallbackNotice(fallback, e), { loading });
+        const fallback = await api('/api/radio/start', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
+        handleRadioResponse(withAiMusicFallbackNotice(fallback, e), { loading, radioTurn });
         return;
       } catch (fallbackError) {
         e = fallbackError;
       }
     }
+    if (isInterruptedRadioTurn(radioTurn, e)) {
+      stopLoadingMessages({ remove: true, loading });
+      clearRadioTurnLoading(radioTurn, loading);
+      return;
+    }
+    clearRadioTurnLoading(radioTurn, loading);
     stopLoadingMessages({ loading });
     replaceLoadingMessage({ text: '启动电台时出了一点问题：' + e.message, loading });
     setAvatarState('idle');
@@ -967,29 +1049,44 @@ async function startRadio() {
 }
 
 async function nextTrack({ skipCurrent = true } = {}) {
+  const radioTurn = beginRadioTurn();
   primeVoicePlayback();
   const sessionId = ensureSessionId();
   setAvatarState('searching');
   setPlaybackToggleState(false);
   if (skipCurrent) await reportFeedback('skip');
+  if (!isActiveRadioTurn(radioTurn)) return;
   appendChat({ role: 'user', text: state.aiMusicMode ? '生成此刻歌曲' : '下一首' });
   const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : 'music');
+  attachRadioTurnLoading(radioTurn, loading);
   try {
     await loadPreferences().catch(() => null);
+    if (!isActiveRadioTurn(radioTurn)) return;
     const data = state.aiMusicMode
-      ? await requestAiMusicTrack({ sessionId, trigger: 'next' })
-      : await api('/api/radio/next', { method: 'POST', body: { sessionId } });
-    handleRadioResponse(data, { loading });
+      ? await requestAiMusicTrack({ sessionId, trigger: 'next', signal: radioTurnSignal(radioTurn) })
+      : await api('/api/radio/next', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
+    handleRadioResponse(data, { loading, radioTurn });
   } catch (e) {
+    if (isInterruptedRadioTurn(radioTurn, e)) {
+      stopLoadingMessages({ remove: true, loading });
+      clearRadioTurnLoading(radioTurn, loading);
+      return;
+    }
     if (state.aiMusicMode) {
       try {
-        const fallback = await api('/api/radio/next', { method: 'POST', body: { sessionId } });
-        handleRadioResponse(withAiMusicFallbackNotice(fallback, e), { loading });
+        const fallback = await api('/api/radio/next', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
+        handleRadioResponse(withAiMusicFallbackNotice(fallback, e), { loading, radioTurn });
         return;
       } catch (fallbackError) {
         e = fallbackError;
       }
     }
+    if (isInterruptedRadioTurn(radioTurn, e)) {
+      stopLoadingMessages({ remove: true, loading });
+      clearRadioTurnLoading(radioTurn, loading);
+      return;
+    }
+    clearRadioTurnLoading(radioTurn, loading);
     stopLoadingMessages({ loading });
     replaceLoadingMessage({ text: '抱歉，刚才找歌时出了一点问题：' + e.message, loading });
     setAvatarState(getContextualAvatarState());
@@ -997,7 +1094,7 @@ async function nextTrack({ skipCurrent = true } = {}) {
   }
 }
 
-async function requestAiMusicTrack({ sessionId, trigger }) {
+async function requestAiMusicTrack({ sessionId, trigger, signal }) {
   setPlayerStatus('灿灿正在根据状态生成音乐', '');
   const currentTrack = state.current?.track
     ? {
@@ -1009,6 +1106,7 @@ async function requestAiMusicTrack({ sessionId, trigger }) {
     : null;
   return api('/api/ai-music/generate', {
     method: 'POST',
+    signal,
     body: {
       sessionId,
       trigger,
@@ -1055,8 +1153,14 @@ async function resetMode() {
   appendChat({ role: 'dj', text: '好的，恢复正常推荐模式。' });
 }
 
-function handleRadioResponse(data, { loading = null } = {}) {
+function handleRadioResponse(data, { loading = null, radioTurn = null } = {}) {
+  if (isInterruptedRadioTurn(radioTurn)) {
+    stopLoadingMessages({ remove: true, loading });
+    clearRadioTurnLoading(radioTurn, loading);
+    return false;
+  }
   stopLoadingMessages({ loading });
+  clearRadioTurnLoading(radioTurn, loading);
   state.sessionId = data.sessionId || state.sessionId;
   setRadioButtonState(state.sessionId || data.track || state.current?.track ? 'active' : 'idle');
   if (data.track) {
@@ -1082,16 +1186,21 @@ function handleRadioResponse(data, { loading = null } = {}) {
     setPlayerStatus(state.current?.track ? '继续播放中' : '等待中', '');
     if (responseShouldSpeak(data)) {
       playHostSpeech(data, () => {
+        if (!isActiveRadioTurn(radioTurn)) return;
         setAvatarState(getContextualAvatarState());
         switchVisualizerTo(state.current?.track ? 'song' : 'off');
-      });
+      }, { radioTurn });
     }
-    return;
+    return true;
   }
 
   setPlayerStatus('歌曲就绪', 'playing');
-  if (responseShouldSpeak(data)) playHostSpeech(data, () => startSongPlayback());
-  else startSongPlayback();
+  if (responseShouldSpeak(data)) playHostSpeech(data, () => {
+    if (!isActiveRadioTurn(radioTurn)) return;
+    startSongPlayback(radioTurn);
+  }, { radioTurn });
+  else startSongPlayback(radioTurn);
+  return true;
 }
 
 function rememberCurrentForHistory(nextData = {}) {
@@ -1134,6 +1243,7 @@ async function previousTrack() {
     return;
   }
 
+  const radioTurn = beginRadioTurn();
   primeVoicePlayback();
   stopVisualizer();
   setAvatarState('searching');
@@ -1160,7 +1270,7 @@ async function previousTrack() {
     explanation: previous.explanation
   });
   setPlayerStatus('回到上一首', 'playing');
-  startSongPlayback();
+  startSongPlayback(radioTurn);
 }
 
 function responseShouldSpeak(data = {}) {
@@ -1173,11 +1283,12 @@ function responseShouldSpeak(data = {}) {
   return Boolean(data.track);
 }
 
-function playHostSpeech(data, onEnd) {
+function playHostSpeech(data, onEnd, { radioTurn = null } = {}) {
   const text = data.chatText || data.hostText || '';
   const hostAudio = document.querySelector('#host-audio');
   if (!responseShouldSpeak(data) || !text) {
     if (hostAudio) hostAudio.src = '';
+    if (!isActiveRadioTurn(radioTurn)) return;
     onEnd?.();
     return;
   }
@@ -1190,6 +1301,7 @@ function playHostSpeech(data, onEnd) {
       hostAudio.onended = null;
       hostAudio.onplay = null;
     }
+    if (!isActiveRadioTurn(radioTurn)) return;
     onEnd?.();
   };
 
@@ -1209,6 +1321,7 @@ function playHostSpeech(data, onEnd) {
     hostAudio.src = data.ttsUrl;
     hostAudio.onended = finish;
     hostAudio.onplay = () => {
+      if (!isActiveRadioTurn(radioTurn)) return;
       setAvatarState('talking');
       switchVisualizerTo('host');
       if (data.track) setPlaybackToggleState(true);
@@ -1299,11 +1412,11 @@ function buildTrackCardHTML(track, explanation = null) {
 
 function buildExplanationHTML(explanation = null) {
   const factors = Array.isArray(explanation?.factors)
-    ? explanation.factors.map(factor => String(factor?.text || '').trim()).filter(Boolean)
+    ? explanation.factors.flatMap(normalizeExplanationFactor).filter(Boolean)
     : [];
   if (!factors.length) return '';
   const factorHtml = `<div class="track-explanation-factors">${factors.map(text =>
-    `<span>${escapeHtml(text)}</span>`
+    buildExplanationFactorHTML(text)
   ).join('')}</div>`;
   return `
     <details class="track-explanation" onclick="event.stopPropagation()">
@@ -1311,6 +1424,59 @@ function buildExplanationHTML(explanation = null) {
       ${factorHtml}
     </details>
   `;
+}
+
+function normalizeExplanationFactor(factor) {
+  if (!factor) return [];
+  if (typeof factor === 'string') return splitExplanationText(factor);
+  const label = String(factor.label || '').trim();
+  const value = sanitizeExplanationValue(factor.value || '');
+  if (label && value) return [{ label, value }];
+  return splitExplanationText(String(factor.text || '').trim());
+}
+
+function splitExplanationText(text = '') {
+  const value = sanitizeExplanationValue(text);
+  if (!value) return null;
+  if (/最近表达[：:]|偏好线索[：:]/.test(value) && !value.match(/^([^：:]{2,10})[：:]\s*(.+)$/)) {
+    return splitLegacyMixedExplanation(value);
+  }
+  const match = value.match(/^([^：:]{2,10})[：:]\s*(.+)$/);
+  if (!match) return [{ label: '', value }];
+  const label = match[1].trim();
+  const content = sanitizeExplanationValue(match[2]);
+  return content ? [{ label, value: content }] : [];
+}
+
+function splitLegacyMixedExplanation(value = '') {
+  const factors = [];
+  const state = sanitizeExplanationValue(value.split(/最近表达[：:]|偏好线索[：:]/)[0]);
+  const recent = value.match(/最近表达[：:]\s*(.*?)(?=，?\s*(偏好线索[：:]|$))/);
+  const hints = value.match(/偏好线索[：:]\s*(.*)$/);
+  if (state) factors.push({ label: '当前状态', value: state });
+  if (recent?.[1]) factors.push({ label: '最近表达', value: sanitizeExplanationValue(recent[1]) });
+  if (hints?.[1]) factors.push({ label: '音乐线索', value: sanitizeExplanationValue(hints[1]) });
+  return factors.length ? factors : [{ label: '', value }];
+}
+
+function sanitizeExplanationValue(value = '') {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .replace(/AI 原创电台模式已开启[，。；;]*/g, '')
+    .replace(/对话分析[：:].*?(?=当前偏好状态[：:]|用户备注[：:]|生成方式[：:]|$)/g, '')
+    .replace(/当前偏好状态[：:][^，。；;]*/g, '')
+    .replace(/用户备注[：:][^，。；;]*/g, '')
+    .replace(/生成方式[：:][^，。；;]*/g, '')
+    .replace(/Music-2\.6(?:-free)?/gi, '')
+    .replace(/[，,]\s*[，,]+/g, '，')
+    .replace(/^[，,。；;\s]+|[，,。；;\s]+$/g, '')
+    .trim()
+    .slice(0, 80);
+}
+
+function buildExplanationFactorHTML(factor) {
+  if (!factor?.label) return `<span>${escapeHtml(factor?.value || '')}</span>`;
+  return `<span class="is-structured"><strong>${escapeHtml(factor.label)}</strong><em>${escapeHtml(factor.value)}</em></span>`;
 }
 
 function scrollChatToBottom() {
@@ -1447,7 +1613,8 @@ function syncLyricTime(currentTimeSec) {
   }
 }
 
-async function startSongPlayback() {
+async function startSongPlayback(radioTurn = null) {
+  if (!isActiveRadioTurn(radioTurn)) return;
   const track = state.current?.track;
   const songAudio = document.querySelector('#song-audio');
 
@@ -1458,20 +1625,30 @@ async function startSongPlayback() {
     setAvatarState('listening');
     setPlaybackToggleState(true);
     switchVisualizerTo('song');
-    songAudio.play().catch(() => playCurrentTrack());
-    songAudio.onerror = () => playCurrentTrack();
+    songAudio.play().catch(() => playCurrentTrack(radioTurn));
+    songAudio.onerror = () => {
+      if (!isCurrentPlaybackTurn(radioTurn, track)) return;
+      playCurrentTrack(radioTurn);
+    };
     songAudio.onended = async () => {
+      if (!isCurrentPlaybackTurn(radioTurn, track)) return;
       stopVisualizer();
       setAvatarState('searching');
       setPlaybackToggleState(false);
       await reportFeedback('complete');
+      if (!isCurrentPlaybackTurn(radioTurn, track)) return;
       nextTrack({ skipCurrent: false });
     };
     songAudio.onplay = () => {
+      if (!isCurrentPlaybackTurn(radioTurn, track)) return;
       setAvatarState('listening');
       api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
     };
-    songAudio.ontimeupdate = () => { syncLyricTime(songAudio.currentTime); updateProgressBar(); };
+    songAudio.ontimeupdate = () => {
+      if (!isCurrentPlaybackTurn(radioTurn, track)) return;
+      syncLyricTime(songAudio.currentTime);
+      updateProgressBar();
+    };
     return;
   }
 
@@ -1479,7 +1656,7 @@ async function startSongPlayback() {
   setAvatarState('listening');
   setPlaybackToggleState(true);
   switchVisualizerTo('song');
-  playCurrentTrack();
+  playCurrentTrack(radioTurn);
 }
 
 function markPlaybackStarted(track, source) {
@@ -1655,15 +1832,17 @@ function initProgressBar() {
   });
 }
 
-async function playCurrentTrack() {
+async function playCurrentTrack(radioTurn = null) {
   const track = state.current?.track;
+  if (!isCurrentPlaybackTurn(radioTurn, track)) return;
   if (!track?.id) {
     setPlayerStatus('没有可播放的歌曲', 'error');
     return;
   }
   setPlayerStatus(`正在调用 ncm-cli 播放：${track.name || track.id}`, 'playing');
   try {
-    const result = await api('/api/player/play', { method: 'POST', body: { trackId: track.id, maxSkips: 0 } });
+    const result = await api('/api/player/play', { method: 'POST', body: { trackId: track.id, maxSkips: 0 }, signal: radioTurnSignal(radioTurn) });
+    if (!isCurrentPlaybackTurn(radioTurn, track)) return;
     if (result.track && result.track.id !== track.id) {
       throw new Error(`播放器返回了另一首歌：${result.track.name || result.track.id}`);
     }
@@ -1673,6 +1852,7 @@ async function playCurrentTrack() {
     setPlayerStatus(`正在播放：${track.name}`, 'playing');
     api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
   } catch (error) {
+    if (isInterruptedRadioTurn(radioTurn, error) || !isCurrentPlaybackTurn(radioTurn, track)) return;
     setPlaybackToggleState(false);
     setPlayerStatus(error.message, 'error');
   }
@@ -2979,7 +3159,8 @@ async function api(path, options = {}) {
   const response = await fetch(path, {
     method: options.method || 'GET',
     headers: options.body ? { 'content-type': 'application/json' } : undefined,
-    body: options.body ? JSON.stringify(options.body) : undefined
+    body: options.body ? JSON.stringify(options.body) : undefined,
+    signal: options.signal
   });
   const data = await response.json();
   if (!response.ok || data.ok === false || data.__error) {

@@ -74,8 +74,8 @@ test('MiniMax music generation posts lyrics and saves returned audio', async (t)
   assert.deepEqual(fs.readFileSync(filePath), audioBytes);
   assert.match(result.track.lyric, /^\[Verse\]/);
   assert.equal(result.aiMusic.lyricsGeneration.status, 'generated');
-  assert.equal(result.explanation.factors.some(factor => factor.text === '当前氛围：需要专注 / 情绪稳定'), true);
-  assert.equal(result.explanation.factors.some(factor => factor.text === '你的画像偏好：synthpop / night'), true);
+  assert.equal(result.explanation.factors.some(factor => factor.text === '当前状态：需要专注 / 情绪稳定'), true);
+  assert.equal(result.explanation.factors.some(factor => factor.text === '音乐画像：synthpop / night'), true);
   assert.equal(result.explanation.factors.some(factor => factor.text === '人声类型：女音'), true);
   assert.equal(result.explanation.factors.some(factor => factor.text.includes('生成方式')), false);
   assert.equal(result.explanation.factors.some(factor => factor.text.includes('Music-2.6')), false);
@@ -145,13 +145,22 @@ test('AI music explanation uses concise recommendation chips', () => {
   });
 
   assert.deepEqual(explanation.factors.map(factor => factor.text), [
-    '当前场景：上海 / 下午六点半 / 阴天',
+    '当前状态：有点饿 / 情绪平稳',
     '最近表达：我有点饿了',
-    '当前氛围：有点饿 / 情绪平稳',
-    '你的画像偏好：华语流行 / 欧美流行 / 影视感 / 轻电子',
+    '场景时间：上海 / 下午六点半 / 阴天',
+    '音乐画像：华语流行 / 欧美流行 / 影视感 / 轻电子',
+    '生成方向：轻暖、松弛、有陪伴感',
     '人声类型：女音'
   ]);
-  assert.equal(explanation.factors.every(factor => factor.text.length <= 80), true);
+  assert.deepEqual(explanation.factors.map(factor => factor.label), [
+    '当前状态',
+    '最近表达',
+    '场景时间',
+    '音乐画像',
+    '生成方向',
+    '人声类型'
+  ]);
+  assert.equal(explanation.factors.every(factor => factor.value && factor.text.length <= 80), true);
   assert.doesNotMatch(explanation.factors.map(factor => factor.text).join('\n'), /当前偏好状态|用户备注|AI 原创电台模式已开启|对话分析|生成方式|Music-2\.6/);
 });
 

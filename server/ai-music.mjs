@@ -129,11 +129,11 @@ export function buildMusicPrompt({ payload = {}, profile = {} } = {}) {
 
 export function buildAiMusicExplanation({ payload = {}, profile = {}, lyricsResult = {}, usedModel = '' } = {}) {
   const factors = [];
-  const add = (type, text) => {
-    const value = cleanText(text, 80);
+  const add = (type, label, text, maxLength = 48) => {
+    const value = cleanFactorValue(text, maxLength);
     if (!value) return;
-    if (factors.some(factor => factor.text === value)) return;
-    factors.push({ type, text: value });
+    if (factors.some(factor => factor.type === type || factor.text === `${label}：${value}`)) return;
+    factors.push({ type, label, value, text: `${label}：${value}` });
   };
 
   const moment = inferMoment(payload);
@@ -141,15 +141,16 @@ export function buildAiMusicExplanation({ payload = {}, profile = {}, lyricsResu
   const location = cleanText(payload.location || env.city || env.location || '上海', 20);
   const time = summarizeLocalTime(env);
   const weather = summarizeWeather(payload.weather || env.weather || payload.sessionContext?.weather || '');
-  const recent = getRecentUserMessages(payload).at(-1);
-  const profileText = summarizeProfileForPrompt(profile);
+  const recent = summarizeRecentExpression(payload);
+  const profileText = summarizeProfileForPrompt(profile).replace(/、/g, ' / ');
   const vocal = '女音';
 
-  add('scene', `当前场景：${[location, time, weather].filter(Boolean).join(' / ')}`);
-  if (recent) add('chat', `最近表达：${recent.slice(0, 28)}`);
-  add('mood', `当前氛围：${formatMomentForFactor(moment)}`);
-  add('profile', `你的画像偏好：${profileText.replace(/、/g, ' / ')}`);
-  add('voice', `人声类型：${vocal}`);
+  add('state', '当前状态', formatMomentForFactor(moment), 34);
+  if (recent) add('chat', '最近表达', recent, 34);
+  add('scene', '场景时间', [location, time, weather].filter(Boolean).join(' / '), 42);
+  add('profile', '音乐画像', profileText, 50);
+  add('direction', '生成方向', moment.songGoal, 34);
+  add('voice', '人声类型', vocal, 8);
 
   return {
     summary: 'AI 原创歌曲：按此刻状态、场景和音乐画像生成。',
@@ -398,43 +399,16 @@ function formatMomentForFactor(moment = {}) {
     .replace(/，/g, ' / ')
     .replace(/。/g, '')
     .trim();
-  if (state) return state.slice(0, 48);
+  if (state) return cleanFactorValue(state, 48);
   return '贴近当下状态';
 }
 
-function summarizeProfileDetail(profile = {}) {
-  const structured = profile.structured || {};
-  const groups = [
-    ['偏好艺人', structured.artists],
-    ['偏好专辑', structured.albums],
-    ['偏好场景', structured.scenes],
-    ['回避信号', structured.avoidSignals]
-  ].map(([label, items]) => {
-    const names = (items || []).map(item => cleanText(item?.name, 20)).filter(Boolean).slice(0, 3);
-    return names.length ? `${label}：${names.join('、')}` : '';
-  }).filter(Boolean);
-  return groups.join('；').slice(0, 260);
-}
-
-function describeCurrentState(payload = {}) {
-  const prefs = payload.preferences || {};
-  const mood = normalizeMoodWord(prefs.moodMode || payload.mood);
-  const moment = inferMoment(payload);
-  const recent = getRecentUserMessages(payload).slice(-2);
+function summarizeRecentExpression(payload = {}) {
   const musicContext = getMusicContext(payload);
-  const hints = [
-    ...(musicContext.searchHints || []),
-    ...(musicContext.preferenceHints || [])
-  ].map(item => cleanText(item, 18)).filter(Boolean).slice(0, 4);
-  const note = cleanText(prefs.note || payload.note || '', 120);
-  return [
-    moment.label,
-    recent.length ? `最近表达：${recent.join(' / ')}` : '',
-    musicContext.reason ? `对话分析：${cleanText(musicContext.reason, 80)}` : '',
-    hints.length ? `偏好线索：${hints.join('、')}` : '',
-    `当前偏好状态：${mood}`,
-    note ? `用户备注：${note}` : ''
-  ].filter(Boolean).join('，');
+  const latest = getRecentUserMessages(payload).at(-1) || musicContext.lastUserMessage || '';
+  return cleanFactorValue(latest, 34)
+    .replace(/^用户[：: ]*/, '')
+    .replace(/^我听见你说[：: ]*/, '');
 }
 
 function getEnvironmentContext(payload = {}) {
@@ -678,6 +652,21 @@ function formatLrcTime(seconds) {
 
 function cleanText(value, maxLength = 120) {
   return String(value || '').replace(/\s+/g, ' ').trim().slice(0, maxLength);
+}
+
+function cleanFactorValue(value, maxLength = 48) {
+  return String(value || '')
+    .replace(/\s+/g, ' ')
+    .replace(/当前偏好状态[:：][^，。；;]*/g, '')
+    .replace(/用户备注[:：][^，。；;]*/g, '')
+    .replace(/对话分析[:：]/g, '')
+    .replace(/AI 原创电台模式已开启[，。；;]*/g, '')
+    .replace(/生成方式[:：][^，。；;]*/g, '')
+    .replace(/Music-2\.6(?:-free)?/gi, '')
+    .replace(/[，,]\s*[，,]+/g, '，')
+    .replace(/^[，,。；;\s]+|[，,。；;\s]+$/g, '')
+    .trim()
+    .slice(0, maxLength);
 }
 
 function cleanTextBlock(value, maxLength = 3500) {
