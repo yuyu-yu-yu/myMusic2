@@ -140,12 +140,13 @@ export async function getPlayerState(runner = runNcmCli) {
   try {
     const result = await runner(['state', '--output', 'json']);
     assertNcmSuccess(result);
+    const state = extractNcmState(result);
     return {
       ok: true,
       mode: 'ncm-cli',
       ncmCli: true,
       mpv: findMpvPath() !== null,
-      state: result.state ?? result.data?.state ?? result.data ?? result
+      state: state ?? result.data ?? result
     };
   } catch (error) {
     return {
@@ -210,14 +211,81 @@ function execFilePromise(command, args, options) {
   });
 }
 
-function parseNcmOutput(stdout, stderr) {
+export function parseNcmOutput(stdout, stderr) {
   const text = String(stdout || '').trim();
   if (!text) return { success: true, stderr: String(stderr || '').trim() };
+  const parsed = parseJsonFromMixedText(text);
+  if (parsed) return { ...parsed, stderr: String(stderr || '').trim() };
+  return { success: true, output: text, stderr: String(stderr || '').trim() };
+}
+
+function parseJsonFromMixedText(text) {
+  const value = String(text || '').trim();
+  if (!value) return null;
   try {
-    return JSON.parse(text);
-  } catch {
-    return { success: true, output: text, stderr: String(stderr || '').trim() };
+    return JSON.parse(value);
+  } catch {}
+
+  let best = null;
+  for (let start = value.indexOf('{'); start >= 0; start = value.indexOf('{', start + 1)) {
+    const json = extractBalancedJsonObject(value, start);
+    if (!json) continue;
+    try {
+      const parsed = JSON.parse(json);
+      const score = scoreNcmJsonCandidate(parsed);
+      if (!best || score > best.score || (score === best.score && json.length > best.json.length)) {
+        best = { parsed, score, json };
+      }
+    } catch {}
   }
+  return best?.parsed || null;
+}
+
+function extractBalancedJsonObject(text, start) {
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  for (let index = start; index < text.length; index += 1) {
+    const char = text[index];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (char === '\\') {
+      escape = inString;
+      continue;
+    }
+    if (char === '"') {
+      inString = !inString;
+      continue;
+    }
+    if (inString) continue;
+    if (char === '{') depth += 1;
+    if (char === '}') depth -= 1;
+    if (depth === 0) return text.slice(start, index + 1);
+  }
+  return '';
+}
+
+function scoreNcmJsonCandidate(value) {
+  if (!value || typeof value !== 'object') return 0;
+  if (Object.hasOwn(value, 'success') || Object.hasOwn(value, 'code')) return 5;
+  if (value.state || value.data?.state) return 4;
+  if (typeof value.status === 'string') return 3;
+  if (value.data) return 2;
+  return 1;
+}
+
+export function extractNcmState(result) {
+  if (!result) return null;
+  if (typeof result === 'string') return extractNcmState(parseJsonFromMixedText(result));
+  if (typeof result !== 'object') return null;
+  const direct = result.state ?? result.data?.state;
+  if (direct && typeof direct === 'object') return direct;
+  if (typeof result.status === 'string') return result;
+  if (typeof result.output === 'string') return extractNcmState(parseJsonFromMixedText(result.output));
+  if (typeof result.data?.output === 'string') return extractNcmState(parseJsonFromMixedText(result.data.output));
+  return null;
 }
 
 function assertNcmSuccess(result) {
@@ -235,12 +303,15 @@ async function waitForPlaybackStart(runner, trackId) {
   while (Date.now() < deadline) {
     await sleep(500);
     const stateResult = await runner(['state', '--output', 'json']).catch((error) => ({ error: normalizePlaybackError(error) }));
-    lastState = stateResult?.state ?? stateResult?.data?.state ?? stateResult;
+    lastState = extractNcmState(stateResult) ?? stateResult?.state ?? stateResult?.data?.state ?? stateResult;
     if (lastState?.status === 'playing') return;
   }
 
   const logReason = readRecentNcmFailure(trackId);
   if (logReason) throw new Error(logReason);
+  if (lastState?.status === 'stopped') {
+    throw new Error('ncm-cli 已停止，歌曲没有真正开始播放。可能是播放源无权限、链接获取失败或播放器进程被中断。');
+  }
   throw new Error(`ncm-cli 没有进入播放状态，当前状态：${lastState?.status || 'unknown'}`);
 }
 

@@ -126,7 +126,7 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   const normalizedUserMessage = String(userMessage || '').trim();
 
   if (useQueue && !normalizedUserMessage) {
-    const queued = consumeReadyRadioQueue(db, sessionId, { recordHit: false });
+    const queued = consumeReadyRadioQueue(db, sessionId, { recordHit: false, accountContext: account });
     if (queued?.track) {
       const reconciled = await reconcileQueuedItemBeforeCommit({
         db,
@@ -238,7 +238,8 @@ async function buildRadioRecommendation({
   const prefs = normalizeRuntimePrefs(getUserPrefs(db, account));
   const context = getSessionContext(db, sessionId);
   const conversationState = normalizeConversationState(context.conversationState);
-  const contextMood = context.musicContext ? moodFromMusicContext(context.musicContext) : null;
+  const effectiveMusicContext = getEffectiveMusicContextForRecommendation(context, { userMessage });
+  const contextMood = context.musicContext ? moodFromMusicContext(effectiveMusicContext) : null;
   const recommendationMood = conversationMood || contextMood || moodFromConversationState(conversationState, prefs, mode);
   const hostContext = buildRadioHostContext(db, sessionId, context, userMessage, account);
 
@@ -286,7 +287,7 @@ async function buildRadioRecommendation({
     if (tts.status === 'failed') updateQueueMetrics(db, sessionId, { ttsFailedCount: 1 });
     setRadioDebugInfo(db, sessionId, { lastTtsDiagnostics: sanitizeTtsDiagnostics(tts) });
   }
-  const musicContext = normalizeMusicContext(context.musicContext);
+  const musicContext = effectiveMusicContext;
 
   return {
     id: `ready-${Date.now()}-${Math.random().toString(16).slice(2)}`,
@@ -324,7 +325,6 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
   if (source === 'queue' && explanation) {
     explanation = normalizeRecommendationExplanation({
       ...explanation,
-      factors: [{ type: 'queue', text: '歌曲来自预取队列，导播词根据最新聊天生成' }, ...(explanation.factors || [])],
       summary: `预取歌曲命中 + ${explanation.summary}`,
       source: explanation.source
     });
@@ -338,12 +338,18 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
       .run(account.accountId, track.id, nowIso(), 'radio', reason, chatText, 'pending');
     saveTrack(db, track);
     const latestContext = getSessionContext(db, sessionId);
+    const payloadMusicContext = normalizeMusicContext(payload?.contextSnapshot || {});
+    const hasBoundUserContext = Boolean(payloadMusicContext.lastUserMessage && payloadMusicContext.version);
+    const lastBoundMusicContextVersion = hasBoundUserContext
+      ? Math.max(Number(latestContext.lastBoundMusicContextVersion || 0), Number(payloadMusicContext.version || 0))
+      : Number(latestContext.lastBoundMusicContextVersion || 0);
     setSessionContext(db, sessionId, {
       ...latestContext,
       radioIntroDone: true,
       radioIntroAt: latestContext.radioIntroAt || nowIso(),
       radioTurnCount: Number(latestContext.radioTurnCount || 0) + 1,
-      radioPlayedSongs: mergePlayedSongContext(latestContext.radioPlayedSongs, track)
+      radioPlayedSongs: mergePlayedSongContext(latestContext.radioPlayedSongs, track),
+      lastBoundMusicContextVersion
     });
   }
 
@@ -551,7 +557,7 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
     return { ...result, conversationMood, turnAction, queuePolicy, intent: explicitIntent ? 'explicit' : 'mood', intentSource };
   }
 
-  const chatDecision = await generateFriendReply({
+  const rawChatDecision = await generateFriendReply({
     config,
     profile,
     mode,
@@ -567,6 +573,15 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
     skipLlm: Boolean(intentDecision.skipFriendLlm),
     environmentContext
   });
+  const chatDecision = {
+    ...rawChatDecision,
+    chatText: sanitizeNoTrackChatText({
+      text: rawChatDecision.chatText,
+      userMessage,
+      baseMood,
+      turnAction
+    })
+  };
   const conversationMood = normalizeMoodDecision({ ...baseMood, ...chatDecision });
   const finalConversationState = updateConversationState({
     previous: nextConversationState,
@@ -829,12 +844,29 @@ function setRadioDebugInfo(db, sessionId, patch = {}) {
 
 export function consumeReadyRadioQueue(db, sessionId, options = {}) {
   const recordHit = options?.recordHit !== false;
+  const account = normalizeAccountContext(options?.accountContext);
   const queue = getSessionQueue(db, sessionId);
   const context = getSessionContext(db, sessionId);
   const musicContext = normalizeMusicContext(context.musicContext || {});
+  const playedHistory = getPlayedTrackHistory(db, sessionId, 80, account);
   for (let index = 0; index < queue.length; index += 1) {
     const item = queue[index];
     if (item.status !== 'ready' || !item.track?.id) continue;
+    if (trackMatchesPlayedSongName(item.track, playedHistory)) {
+      queue[index] = {
+        ...item,
+        status: 'stale',
+        updatedAt: nowIso(),
+        staleReason: 'played_song_name'
+      };
+      updateQueueMetrics(db, sessionId, {
+        queueMissCount: 1,
+        queueContextDiscardCount: 1,
+        lastMissReason: 'played_song_name',
+        lastQueueReconcileReason: 'played_song_name'
+      });
+      continue;
+    }
     const staleByContext = item.contextVersion < musicContext.version &&
       !queueItemMatchesMusicContext(item, musicContext);
     if (staleByContext) {
@@ -961,20 +993,21 @@ async function finalizeQueuedTrackForPlayback({
   const mode = getSessionMode(db, sessionId);
   const prefs = normalizeRuntimePrefs(getUserPrefs(db, account));
   const history = loadHistory(db, sessionId, account);
-  const conversationMood = moodFromMusicContext(musicContext) || fallbackConversationMood;
-  const latestUserMessage = String(musicContext.lastUserMessage || '').trim();
+  const hostMusicContext = getEffectiveMusicContextForHost(context, musicContext);
+  const conversationMood = moodFromMusicContext(hostMusicContext) || fallbackConversationMood;
+  const latestUserMessage = String(hostMusicContext.lastUserMessage || '').trim();
   const hostContext = buildRadioHostContext(db, sessionId, context, latestUserMessage, account);
   const sessionSummary = await updateSessionSummary(db, config, sessionId, account);
   const longTermMemories = retrieveRelevantMemories(db, {
     accountId: account.accountId,
-    text: latestUserMessage || musicContext.reason || '',
+    text: latestUserMessage || hostMusicContext.reason || '',
     mood: conversationMood,
     mode,
     limit: LONG_MEMORY_LIMIT,
     maxChars: LONG_MEMORY_MAX_CHARS
   });
   const memoryContext = buildMemoryContext({ sessionSummary, longTermMemories });
-  const selectedPick = queuedItemToSongPick(item, musicContext);
+  const selectedPick = queuedItemToSongPick(item, hostMusicContext);
   const plan = {
     picks: [selectedPick],
     hostDraft: '',
@@ -1006,11 +1039,11 @@ async function finalizeQueuedTrackForPlayback({
   return {
     ...item,
     updatedAt: nowIso(),
-    contextVersion: musicContext.version,
-    contextSnapshot: musicContext,
+    contextVersion: hostMusicContext.version,
+    contextSnapshot: hostMusicContext,
     chatText,
     reason: item.reason || selectedPick.reason,
-    explanation: addQueueFinalizeExplanation(item.explanation, musicContext),
+    explanation: addQueueFinalizeExplanation(item.explanation, hostMusicContext),
     ttsUrl: tts.url,
     ttsStatus: tts.status,
     ttsMs: tts.ms,
@@ -1036,8 +1069,9 @@ async function buildFallbackFinalizedQueuedItem({
 } = {}) {
   const account = normalizeAccountContext(accountContext);
   const prefs = normalizeRuntimePrefs(getUserPrefs(db, account));
-  const conversationMood = moodFromMusicContext(musicContext) || fallbackConversationMood;
-  const latestUserMessage = String(musicContext.lastUserMessage || '').trim();
+  const hostMusicContext = getEffectiveMusicContextForHost(context, musicContext);
+  const conversationMood = moodFromMusicContext(hostMusicContext) || fallbackConversationMood;
+  const latestUserMessage = String(hostMusicContext.lastUserMessage || '').trim();
   let environmentContext = {};
   try {
     environmentContext = await getEnvironmentContext({ db, sessionId, config });
@@ -1062,8 +1096,8 @@ async function buildFallbackFinalizedQueuedItem({
   return {
     ...item,
     updatedAt: nowIso(),
-    contextVersion: musicContext.version,
-    contextSnapshot: musicContext,
+    contextVersion: hostMusicContext.version,
+    contextSnapshot: hostMusicContext,
     chatText,
     ttsUrl: tts.url,
     ttsStatus: tts.status,
@@ -1073,7 +1107,7 @@ async function buildFallbackFinalizedQueuedItem({
     weather: environmentContext.weather || item.weather || '',
     environmentContext,
     conversationMood,
-    explanation: addQueueFinalizeExplanation(item.explanation, musicContext),
+    explanation: addQueueFinalizeExplanation(item.explanation, hostMusicContext),
     accountContext: account
   };
 }
@@ -1081,7 +1115,11 @@ async function buildFallbackFinalizedQueuedItem({
 function queuedItemToSongPick(item = {}, musicContext = {}) {
   const track = item.track || {};
   const artists = Array.isArray(track.artists) ? track.artists : [];
-  const reason = String(item.reason || item.explanation?.summary || musicContext.reason || '根据最新聊天状态继续衔接').trim();
+  const hadQueuedUserMessage = Boolean(normalizeMusicContext(item.contextSnapshot || {}).lastUserMessage);
+  const shouldAvoidOldUserBinding = hadQueuedUserMessage && !normalizeMusicContext(musicContext || {}).lastUserMessage;
+  const reason = String(shouldAvoidOldUserBinding
+    ? '延续当前电台氛围，换一个不打扰的声音方向'
+    : (item.reason || item.explanation?.summary || musicContext.reason || '根据最新聊天状态继续衔接')).trim();
   return {
     name: track.name || '',
     artists,
@@ -1094,9 +1132,8 @@ function queuedItemToSongPick(item = {}, musicContext = {}) {
 function addQueueFinalizeExplanation(explanation = null, musicContext = {}) {
   const base = normalizeRecommendationExplanation(explanation) || { summary: '', factors: [], source: 'fallback' };
   const lastMessage = String(musicContext.lastUserMessage || '').trim();
-  const text = lastMessage
-    ? `歌曲来自预取队列，导播词根据最新聊天生成：${lastMessage.slice(0, 34)}`
-    : '歌曲来自预取队列，导播词根据最新聊天生成';
+  if (!lastMessage) return base;
+  const text = `歌曲来自预取队列，导播词根据最新聊天生成：${lastMessage.slice(0, 34)}`;
   return normalizeRecommendationExplanation({
     ...base,
     summary: base.summary ? `预取歌曲命中，导播词已按最新聊天生成 + ${base.summary}` : text,
@@ -1231,7 +1268,9 @@ function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
   const context = getSessionContext(db, sessionId);
-  const musicContext = normalizeMusicContext(contextSnapshot || context.musicContext || {});
+  const musicContext = contextSnapshot
+    ? normalizeMusicContext(contextSnapshot)
+    : getEffectiveMusicContextForRecommendation(context);
   if (musicContext.musicIntent === 'suppressed') return false;
 
   let queue = getSessionQueue(db, sessionId);
@@ -2586,6 +2625,7 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
         '回复长度按内容决定：问候 20-50 字，普通聊天 50-140 字，复杂问题或认真倾诉可以 120-260 字。',
         '如果需要提问，每次最多一个自然的问题；更重要的是先回应用户已经说出的内容。',
         '当前歌曲只用于背景判断；除非用户主动问当前歌曲、歌词、歌名或艺人，不要提及歌名、艺人、歌词或“正在播放”。',
+        '当当前动作是 CHAT_ONLY 或 ASK_FOLLOWUP 时，本轮不会返回 track；不要主动输出具体歌名、艺人名、歌词，也不要说“让某首歌陪你”。可以说“把声音放轻一点”“让氛围慢下来”，但不要点名歌曲。',
         '时间天气只是事实背景，不是每句都要说。普通聊天不要主动用时间天气开头；只有用户主动问，或和当前话题自然相关时才轻描淡写提一下。',
         '如果提到当前时间、上午下午或天气，必须严格以 APP_TIME_CONTEXT 为准；不要根据历史对话把当前时段改成晚上，也不要编造未来天气。',
         turnActionInstruction(turnAction),
@@ -2710,6 +2750,26 @@ function getCurrentTrackPromptContext(userMessage, currentTrack) {
   return '有歌正在播放（不要主动提及歌名、艺人、歌词或正在播放）';
 }
 
+function sanitizeNoTrackChatText({ text = '', userMessage = '', baseMood = {}, turnAction = null } = {}) {
+  const value = sanitizeSpokenChatText(text, fallbackFriendChat(userMessage, baseMood, turnAction));
+  if (!value || canMentionSpecificSongInChat(userMessage)) return value;
+  if (!/《[^》]{1,48}》/.test(value)) return value;
+  return fallbackNoNamedSongChat(userMessage, baseMood, turnAction);
+}
+
+function canMentionSpecificSongInChat(userMessage = '') {
+  const text = String(userMessage || '');
+  return /当前.*(歌|音乐)|现在.*(放|播|听).*什么|这首歌|这歌|歌名|谁唱|歌词|艺人|专辑|什么歌|哪首歌/.test(text);
+}
+
+function fallbackNoNamedSongChat(userMessage = '', mood = {}, turnAction = null) {
+  const text = String(userMessage || '').trim();
+  if (/睡觉|准备睡|睡了|晚安|困|犯困|眼睛睁不开/.test(text)) {
+    return '好，那就把节奏放轻一点。你不用急着跟我说话，慢慢把眼睛闭上，先让自己松下来。晚安。';
+  }
+  return fallbackFriendChat(userMessage, mood, turnAction);
+}
+
 function normalizeMoodDecision(input = {}) {
   const mood = MOODS.has(input.mood) ? input.mood : 'random';
   const hints = Array.isArray(input.searchHints) ? input.searchHints : [];
@@ -2769,6 +2829,33 @@ function nextMusicContext(previous = {}, analysis = {}, userMessage = '') {
     lastUserMessage: userMessage || normalizedPrevious.lastUserMessage || '',
     updatedAt: nowIso()
   });
+}
+
+function hasConsumedUserMusicContext(sessionContext = {}, musicContext = {}) {
+  const context = normalizeMusicContext(musicContext);
+  if (!context.lastUserMessage || !context.version) return false;
+  return Number(sessionContext.lastBoundMusicContextVersion || 0) >= Number(context.version || 0);
+}
+
+function softenConsumedMusicContext(musicContext = {}) {
+  const context = normalizeMusicContext(musicContext);
+  return normalizeMusicContext({
+    ...context,
+    lastUserMessage: '',
+    reason: '',
+    musicIntent: context.musicIntent === 'explicit_music' ? 'mood_signal' : context.musicIntent
+  });
+}
+
+function getEffectiveMusicContextForRecommendation(sessionContext = {}, { userMessage = '' } = {}) {
+  const context = normalizeMusicContext(sessionContext.musicContext || {});
+  if (userMessage) return context;
+  return hasConsumedUserMusicContext(sessionContext, context) ? softenConsumedMusicContext(context) : context;
+}
+
+function getEffectiveMusicContextForHost(sessionContext = {}, musicContext = {}) {
+  const context = normalizeMusicContext(musicContext || sessionContext.musicContext || {});
+  return hasConsumedUserMusicContext(sessionContext, context) ? softenConsumedMusicContext(context) : context;
 }
 
 function moodFromMusicContext(context = {}) {

@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { openDatabase, saveTrack } from '../server/db.mjs';
-import { playTrackWithFallback } from '../server/player.mjs';
+import { extractNcmState, parseNcmOutput, playTrackWithFallback } from '../server/player.mjs';
 
 function testDb(t) {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mymusic-player-'));
@@ -48,6 +48,46 @@ test('ncm-cli play command includes encrypted and original ids', async (t) => {
     '--output',
     'json'
   ]);
+});
+
+test('ncm-cli mixed upgrade notice output still parses state JSON', () => {
+  const result = parseNcmOutput([
+    '│ 有新版本: 0.1.3 → 0.1.4  运行 ncm-cli upgrade 升级',
+    '',
+    '{',
+    '  "success": true,',
+    '  "state": {',
+    '    "status": "stopped",',
+    '    "position": 0',
+    '  }',
+    '}'
+  ].join('\n'), '');
+
+  assert.equal(result.success, true);
+  assert.equal(extractNcmState(result).status, 'stopped');
+});
+
+test('ncm-cli mixed state output can report playing state', async (t) => {
+  const db = testDb(t);
+  saveTrack(db, {
+    id: 'MIXED_OUTPUT_TRACK',
+    originalId: 321,
+    name: 'Mixed Output',
+    artists: ['Artist']
+  });
+
+  const result = await playTrackWithFallback({
+    db,
+    trackId: 'MIXED_OUTPUT_TRACK',
+    runner: async (args) => {
+      if (args[0] === 'state') {
+        return parseNcmOutput('│ 有新版本: 0.1.3 → 0.1.4\n{"success":true,"state":{"status":"playing"}}', '');
+      }
+      return { success: true };
+    }
+  });
+
+  assert.equal(result.ok, true);
 });
 
 test('missing originalId does not call ncm-cli', async (t) => {

@@ -1340,6 +1340,76 @@ test('ordinary chat hides current track details from prompt', async (t) => {
   assert.match(promptText, /不要主动提及歌名/);
 });
 
+test('chat-only response strips unsolicited concrete song titles', async (t) => {
+  const db = testDb(t);
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url, options) => {
+    const request = JSON.parse(options.body);
+    requests.push(request);
+    const promptText = JSON.stringify(request.messages || []);
+    if (promptText.includes('轻量意图路由器')) {
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              action: 'ask_followup',
+              confidence: 0.92,
+              mood: 'night',
+              energy: 'low',
+              musicIntent: 'mood_signal',
+              searchHints: ['睡前', '安静'],
+              reason: '用户准备睡觉，先陪聊不切歌'
+            })
+          }
+        }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            chatText: '那就让《爱情转移》陪你慢慢闭上眼睛，别急着睡着。',
+            mood: 'night',
+            energy: 'low',
+            intent: 'chat',
+            searchHints: ['睡前', '安静'],
+            reason: '睡前陪伴',
+            mode: null
+          })
+        }
+      }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const result = await chatTurn({
+    db,
+    config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' }, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'sleep-chat-no-song-title',
+    message: '我准备睡觉啦'
+  });
+
+  assert.equal(result.track, null);
+  assert.equal(result.turnAction.action, TURN_ACTIONS.ASK_FOLLOWUP);
+  assert.doesNotMatch(result.chatText, /《爱情转移》/);
+  assert.match(result.chatText, /眼睛闭上|晚安|放轻/);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM plays').get().count, 0);
+  assert.doesNotMatch(
+    db.prepare('SELECT content FROM messages WHERE session_id = ? AND role = ? ORDER BY id DESC LIMIT 1')
+      .get('sleep-chat-no-song-title', 'assistant')
+      .content,
+    /《爱情转移》/
+  );
+  const context = JSON.parse(db.prepare('SELECT context_json FROM radio_sessions WHERE id = ?').get('sleep-chat-no-song-title').context_json);
+  assert.equal(context.musicContext.lastUserMessage, '我准备睡觉啦');
+  const friendPromptText = JSON.stringify(
+    requests.find(req => JSON.stringify(req.messages).includes('这一轮是普通聊天回复'))?.messages || []
+  );
+  assert.match(friendPromptText, /不要主动输出具体歌名/);
+});
+
 test('current track details are exposed when user asks about the current song', async (t) => {
   const db = testDb(t);
   db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
@@ -1685,6 +1755,38 @@ test('radio queue skips stale head and records miss diagnostics', (t) => {
   assert.equal(status.queueMetrics.lastMissReason, 'stale_queue_head');
 });
 
+test('radio queue skips songs already played by song name before consuming', (t) => {
+  const db = testDb(t);
+  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
+    .run('queue-played-name', new Date().toISOString(), JSON.stringify({
+      radioPlayedSongs: [{ id: 'old-track', name: 'Same Song', artists: ['Original'] }]
+    }), JSON.stringify(normalizeRadioQueue([
+      {
+        id: 'ready-played',
+        status: 'ready',
+        track: { id: 'cover-track', name: 'Same Song - Live Version', artists: ['Cover Artist'] },
+        chatText: 'old duplicate'
+      },
+      {
+        id: 'ready-new',
+        status: 'ready',
+        track: { id: 'new-track', name: 'Fresh Song', artists: ['A'] },
+        chatText: 'new host'
+      }
+    ])));
+
+  const consumed = consumeReadyRadioQueue(db, 'queue-played-name');
+  assert.equal(consumed.track.id, 'new-track');
+
+  const status = getRadioQueueStatus(db, 'queue-played-name');
+  assert.equal(status.readyCount, 0);
+  assert.equal(status.staleCount, 1);
+  assert.equal(status.queue[0].track.id, 'cover-track');
+  assert.equal(status.queue[0].staleReason, 'played_song_name');
+  assert.equal(status.queueMetrics.queueMissCount, 1);
+  assert.equal(status.queueMetrics.queueHitCount, 1);
+});
+
 test('radio debug status returns sanitized queue, metrics, and diagnostics', (t) => {
   const db = testDb(t);
   const context = {
@@ -1781,7 +1883,8 @@ test('queued recommendation ignores old queued host text and tts before playback
   assert.equal(result.ttsStatus, 'failed');
   assert.equal(result.ttsUrl, null);
   assert.match(result.explanation.summary, /queue|Queue|棰勫彇|预取/);
-  assert.equal(result.explanation.factors[0].type, 'queue');
+  assert.notEqual(result.explanation.factors[0].type, 'queue');
+  assert.equal(result.explanation.factors.filter(factor => factor.text.includes('预取队列')).length <= 1, true);
 
   for (let index = 0; index < 20; index += 1) {
     if (getRadioQueueStatus(db, 'queue-explanation').pendingCount === 0) break;
@@ -1854,6 +1957,78 @@ test('queued recommendation finalizes host text and tts with latest emotional co
 
   for (let index = 0; index < 20; index += 1) {
     if (getRadioQueueStatus(db, 'queue-refresh-host').pendingCount === 0) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+});
+
+test('queued host text uses a chat context only once when no new dialogue arrives', async (t) => {
+  const db = testDb(t);
+  const usedContext = normalizeMusicContext({
+    version: 2,
+    mood: 'calm',
+    energy: 'low',
+    searchHints: ['安静'],
+    musicIntent: 'mood_signal',
+    confidence: 0.8,
+    lastUserMessage: '我最近心情不好',
+    reason: '用户说最近心情不好'
+  });
+  db.prepare('INSERT INTO tracks (id, name, artists, album, cover_url, duration_ms, raw_json, updated_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run('fresh-song', 'Fresh Song', JSON.stringify(['Artist A']), 'Album', null, 180000, '{}', new Date().toISOString());
+  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
+    .run('queue-context-once', new Date().toISOString(), JSON.stringify({
+      musicContext: usedContext,
+      radioIntroDone: true,
+      lastBoundMusicContextVersion: 2
+    }), JSON.stringify(normalizeRadioQueue([
+      {
+        id: 'ready-after-bound',
+        status: 'ready',
+        contextVersion: 2,
+        contextSnapshot: usedContext,
+        track: { id: 'fresh-song', name: 'Fresh Song', artists: ['Artist A'], album: 'Album' },
+        reason: '因为用户说最近心情不好，所以继续选安静的歌',
+        explanation: {
+          summary: '用户最近心情不好 + 安静氛围',
+          factors: [{ type: 'chat', text: '用户最近心情不好' }],
+          source: 'llm_pick'
+        }
+      }
+    ])));
+
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url, options) => {
+    const request = JSON.parse(options.body);
+    requests.push(request);
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            chatText: '换一个轻一点的声音，听《Fresh Song》。'
+          })
+        }
+      }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const result = await djTurn({
+    db,
+    config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' }, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'queue-context-once'
+  });
+
+  assert.equal(result.queueHit, true);
+  assert.equal(result.track.id, 'fresh-song');
+  const promptText = JSON.stringify(requests[0]?.messages || []);
+  assert.doesNotMatch(promptText, /我最近心情不好|用户说最近心情不好/);
+  assert.match(promptText, /延续当前电台氛围/);
+  assert.doesNotMatch(result.chatText, /心情不好/);
+
+  for (let index = 0; index < 20; index += 1) {
+    if (getRadioQueueStatus(db, 'queue-context-once').pendingCount === 0) break;
     await new Promise(resolve => setTimeout(resolve, 20));
   }
 });
