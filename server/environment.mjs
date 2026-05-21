@@ -7,11 +7,13 @@ const WEATHER_CACHE_MS = 10 * 60 * 1000;
 
 export async function resolveRequestEnvironment(req, config = {}, { includeWeather = false } = {}) {
   const fallback = fallbackEnvironment(config);
+  const clientHints = extractClientEnvironmentHints(req);
   const ip = extractClientIp(req);
-  const geo = await resolveIpGeo(ip, config.ipGeo, fallback);
+  const geo = applyClientHints(await resolveIpGeo(ip, config.ipGeo, fallback), clientHints, fallback);
   const environment = {
     ...fallback,
     ...geo,
+    clientTimeZone: clientHints.timeZone || undefined,
     ip: maskIp(ip),
     updatedAt: new Date().toISOString()
   };
@@ -48,6 +50,13 @@ export function extractClientIp(req) {
   const realIp = firstHeaderValue(headers['x-real-ip']);
   const candidate = forwarded || realIp || req?.socket?.remoteAddress || '';
   return normalizeIp(candidate);
+}
+
+export function extractClientEnvironmentHints(req) {
+  const headers = req?.headers || {};
+  const timeZone = normalizeTimeZone(firstHeaderValue(headers['x-demo-time-zone']));
+  const locale = firstHeaderValue(headers['x-demo-locale']).slice(0, 40);
+  return { timeZone, locale };
 }
 
 function firstHeaderValue(value) {
@@ -100,6 +109,37 @@ async function resolveIpGeo(ip, ipGeoConfig = {}, fallback) {
       error: error?.message || String(error)
     };
   }
+}
+
+function applyClientHints(geo, clientHints, fallback) {
+  const timeZone = clientHints.timeZone;
+  if (!timeZone) return geo;
+  if (geo?.source === 'ip-api' && geo.countryCode !== 'CN' && timeZone === 'Asia/Shanghai') {
+    return {
+      source: 'client-time-zone',
+      city: fallback.city || 'Shanghai',
+      countryCode: fallback.countryCode || 'CN',
+      timeZone,
+      latitude: fallback.latitude,
+      longitude: fallback.longitude,
+      ipGeoSource: geo.source,
+      ipGeoCity: geo.city,
+      ipGeoCountryCode: geo.countryCode
+    };
+  }
+  if (geo?.source === 'fallback') {
+    return {
+      ...geo,
+      timeZone
+    };
+  }
+  return geo;
+}
+
+function normalizeTimeZone(value) {
+  const text = String(value || '').trim();
+  if (!/^[A-Za-z_]+(?:\/[A-Za-z0-9_+\-]+){1,3}$/.test(text)) return '';
+  return text.slice(0, 80);
 }
 
 async function getCachedEnvironmentWeather(environment, weatherConfig = {}) {

@@ -89,6 +89,43 @@ test('environment resolver falls back for private IPs without network lookup', a
   assert.equal(called, false);
 });
 
+test('environment resolver prefers Shanghai fallback when browser timezone contradicts overseas proxy IP', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  globalThis.fetch = async () => ({
+    ok: true,
+    async json() {
+      return {
+        status: 'success',
+        countryCode: 'US',
+        city: 'Los Angeles',
+        lat: 34.0549,
+        lon: -118.243,
+        timezone: 'America/Los_Angeles'
+      };
+    }
+  });
+
+  const environment = await resolveRequestEnvironment(
+    mockRequest({
+      'x-forwarded-for': '154.64.1.166',
+      'x-demo-time-zone': 'Asia/Shanghai',
+      'x-demo-locale': 'zh-CN'
+    }),
+    baseConfig()
+  );
+
+  assert.equal(environment.source, 'client-time-zone');
+  assert.equal(environment.city, 'Shanghai');
+  assert.equal(environment.countryCode, 'CN');
+  assert.equal(environment.timeZone, 'Asia/Shanghai');
+  assert.equal(environment.ipGeoCity, 'Los Angeles');
+  assert.equal(environment.ipGeoCountryCode, 'US');
+});
+
 test('environment weather uses IP coordinates and falls back cleanly on weather failure', async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => {
@@ -155,4 +192,3 @@ test('environment weather uses IP coordinates and falls back cleanly on weather 
   assert.equal(scopedConfig.weather.latitude, 23.1291);
   assert.equal(scopedConfig.app.timeZone, 'Asia/Shanghai');
 });
-

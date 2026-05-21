@@ -3182,7 +3182,8 @@ function statusRow(label, ok, detail = '') {
 
 async function api(path, options = {}) {
   const headers = {
-    'X-Demo-Visitor-Id': ensureDemoVisitorId()
+    'X-Demo-Visitor-Id': ensureDemoVisitorId(),
+    ...clientEnvironmentHeaders()
   };
   if (options.body) headers['content-type'] = 'application/json';
   const response = await fetch(path, {
@@ -3196,6 +3197,18 @@ async function api(path, options = {}) {
     throw new Error(data.error || `HTTP ${response.status}`);
   }
   return data;
+}
+
+function clientEnvironmentHeaders() {
+  const headers = {};
+  try {
+    const timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (timeZone) headers['X-Demo-Time-Zone'] = timeZone;
+  } catch {}
+  try {
+    if (navigator.language) headers['X-Demo-Locale'] = navigator.language;
+  } catch {}
+  return headers;
 }
 
 async function loadPreferences({ force = false } = {}) {
