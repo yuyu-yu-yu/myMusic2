@@ -5,8 +5,14 @@ myMusic is a local-first AI music radio. It reads your NetEase Cloud Music libra
 ## Run
 
 1. Copy `.env.example` to `.env.local`.
-2. Fill in NetEase OpenAPI, LLM, and TTS settings. Weather defaults to Open-Meteo for Shanghai and does not require an API key.
-3. Start the app:
+2. Install dependencies:
+
+```powershell
+npm install
+```
+
+3. Fill in NetEase OpenAPI, LLM, and TTS settings. Weather defaults to Open-Meteo for Shanghai and does not require an API key.
+4. Start the app:
 
 ```powershell
 npm run dev
@@ -14,7 +20,15 @@ npm run dev
 
 Open `http://127.0.0.1:3000`.
 
-The current implementation intentionally uses only Node built-ins, so no `npm install` is required for the first local version.
+The app uses Node built-ins for the custom server and SQLite, plus `NeteaseCloudMusicApi` for NetEase cookie login and playback URL helpers.
+
+## Deploy
+
+For the Tencent Cloud shared-account demo deployment, see:
+
+```txt
+docs/deploy-tencent-cloud.md
+```
 
 ## TTS and Weather
 

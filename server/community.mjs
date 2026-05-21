@@ -27,7 +27,7 @@ export function resolveCommunityApiFile(fileName) {
 }
 
 export function loadCookie(rootDir) {
-  const cookieFile = path.join(rootDir, 'netease_cookie.txt');
+  const cookieFile = resolveCookieFile(rootDir);
   if (existsSync(cookieFile)) {
     _cookie = readFileSync(cookieFile, 'utf8').trim();
     _cookiePath = cookieFile;
@@ -56,7 +56,7 @@ export function getCookieStatus() {
 export function saveCookie(rootDir, cookie) {
   const normalized = normalizeCookie(cookie);
   if (!normalized) throw new Error('NetEase cookie is empty');
-  const cookieFile = _cookiePath || path.join(rootDir, 'netease_cookie.txt');
+  const cookieFile = _cookiePath || resolveCookieFile(rootDir);
   writeFileSync(cookieFile, normalized, 'utf8');
   _cookie = normalized;
   _cookiePath = cookieFile;
@@ -64,7 +64,7 @@ export function saveCookie(rootDir, cookie) {
 }
 
 export function clearCookie(rootDir) {
-  const cookieFile = _cookiePath || path.join(rootDir, 'netease_cookie.txt');
+  const cookieFile = _cookiePath || resolveCookieFile(rootDir);
   try {
     if (existsSync(cookieFile)) rmSync(cookieFile, { force: true });
   } catch {
@@ -73,6 +73,12 @@ export function clearCookie(rootDir) {
   _cookie = null;
   _cookiePath = cookieFile;
   return getCookieStatus();
+}
+
+function resolveCookieFile(rootDir) {
+  return process.env.NETEASE_COOKIE_FILE
+    ? path.resolve(process.env.NETEASE_COOKIE_FILE)
+    : path.join(rootDir, 'netease_cookie.txt');
 }
 
 export async function createCookieQrLogin() {

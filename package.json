@@ -9,6 +9,9 @@
     "start": "node start.mjs",
     "test": "node --experimental-sqlite --test"
   },
+  "dependencies": {
+    "NeteaseCloudMusicApi": "^4.32.0"
+  },
   "engines": {
     "node": ">=25"
   }

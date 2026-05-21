@@ -1,0 +1,17 @@
+services:
+  mymusic:
+    build: .
+    restart: unless-stopped
+    env_file:
+      - .env.production
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3000
+      COMMUNITY_API_PORT: 4000
+      NETEASE_COOKIE_FILE: /app/data/netease_cookie.txt
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./data:/app/data
+      - ./cache:/app/cache

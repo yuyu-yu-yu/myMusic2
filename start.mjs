@@ -1,4 +1,4 @@
-// Start both community API (port 4000) and myMusic (port 3000)
+// Start both community API and myMusic.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)));
 const communityApp = resolveCommunityApiFile('app.js');
+const appPort = String(process.env.PORT || 3000);
 const communityPort = Number(process.env.COMMUNITY_API_PORT || 4000);
 let community = null;
 
@@ -32,7 +33,7 @@ const mymusic = spawn('node', [
   path.join('server', 'index.mjs')
 ], {
   cwd: rootDir,
-  env: { ...process.env, PORT: '3000' },
+  env: { ...process.env, PORT: appPort },
   stdio: 'inherit'
 });
 

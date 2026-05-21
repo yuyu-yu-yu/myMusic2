@@ -1,5 +1,8 @@
 .env
 .env.local
+.env.production
+fresh_token.txt
+netease_cookie.txt
 data/
 cache/
 node_modules/

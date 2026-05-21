@@ -1,0 +1,17 @@
+.git
+.agents
+.claude
+.pi
+node_modules
+npm-debug.log
+*.log
+.env
+.env.local
+.env.production
+data
+cache
+release
+packaging/work
+packaging/verify
+Thumbs.db
+.DS_Store
