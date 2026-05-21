@@ -545,6 +545,7 @@ function renderPlayer() {
   const chatForm = document.querySelector('#chat-form');
   const modeResetBtn = document.querySelector('#mode-reset-btn');
   const aiMusicToggle = document.querySelector('#ai-music-toggle');
+  const aiMusicDownload = document.querySelector('#ai-music-download');
   const { likeBtn, dislikeBtn } = ensureFeedbackButtons();
 
   startBtn.addEventListener('click', () => {
@@ -559,6 +560,9 @@ function renderPlayer() {
   });
   modeResetBtn.addEventListener('click', () => resetMode());
   aiMusicToggle?.addEventListener('click', () => setAiMusicMode(!state.aiMusicMode));
+  aiMusicDownload?.addEventListener('click', (event) => {
+    if (aiMusicDownload.getAttribute('aria-disabled') === 'true') event.preventDefault();
+  });
   likeBtn.addEventListener('click', () => {
     setAvatarState('happy', { temporaryMs: 1400 });
     showLikeBurst();
@@ -591,6 +595,7 @@ function renderPlayer() {
   initVisualizer();
   initProgressBar();
   updateAiMusicToggle();
+  updateAiMusicDownload(state.current?.track || null);
   scheduleRadioPrefetch();
 }
 
@@ -659,6 +664,46 @@ function updateAiMusicToggle() {
   button.classList.toggle('is-active', state.aiMusicMode);
   button.setAttribute('aria-pressed', state.aiMusicMode ? 'true' : 'false');
   button.title = state.aiMusicMode ? '关闭 AI 原创电台模式' : '开启 AI 原创电台模式';
+}
+
+function updateAiMusicDownload(track = null) {
+  const link = document.querySelector('#ai-music-download');
+  const label = document.querySelector('#ai-music-download-label');
+  if (!link) return;
+
+  const canDownload = Boolean(track?.aiGenerated && track?.playUrl);
+  link.classList.toggle('is-ready', canDownload);
+  link.classList.toggle('is-disabled', !canDownload);
+  link.setAttribute('aria-disabled', canDownload ? 'false' : 'true');
+  link.tabIndex = canDownload ? 0 : -1;
+
+  if (canDownload) {
+    link.href = track.playUrl;
+    link.download = buildAiMusicDownloadFilename(track);
+    link.title = '下载当前 AI 原创歌曲';
+    link.setAttribute('aria-label', '下载本次AI原创的歌曲');
+    label && (label.textContent = '下载AI原创');
+  } else {
+    link.href = '#';
+    link.removeAttribute('download');
+    link.title = 'AI 原创歌曲生成后可下载';
+    link.setAttribute('aria-label', 'AI 原创歌曲生成后可下载');
+    label && (label.textContent = '下载AI原创');
+  }
+}
+
+function buildAiMusicDownloadFilename(track = {}) {
+  const base = sanitizeDownloadFilename(track.name || 'AI原创歌曲') || 'AI原创歌曲';
+  return `${base}-灿灿AI原创.mp3`;
+}
+
+function sanitizeDownloadFilename(value = '') {
+  return String(value || '')
+    .replace(/[\\/:*?"<>|]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/^[.\-\s]+|[.\-\s]+$/g, '')
+    .slice(0, 80);
 }
 
 async function handleDislike() {
@@ -1283,6 +1328,7 @@ async function updatePlayer(data, autoplay) {
   const track = data.track || {};
   document.querySelector('#track-title').textContent = track.name || 'myMusic';
   document.querySelector('#track-artist').textContent = (track.artists || []).join(' / ') || '等待启动';
+  updateAiMusicDownload(track);
   buildLyricDOM(data.track?.lyric || '', { syncMode: data.track?.lyricSync || 'timed' });
 
   const songAudio = document.querySelector('#song-audio');
