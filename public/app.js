@@ -1,6 +1,9 @@
 import { animate } from '/vendor/anime.esm.min.js';
 
 const AI_MUSIC_MODE_STORAGE_KEY = 'mymusic:aiMusicMode';
+const DEMO_VISITOR_STORAGE_KEY = 'mymusic:demoVisitorId';
+
+let fallbackDemoVisitorId = null;
 
 const state = {
   sessionId: null,
@@ -28,6 +31,25 @@ const state = {
   activeRadioTurn: null,
   aiMusicMode: readStoredAiMusicMode()
 };
+
+function ensureDemoVisitorId() {
+  try {
+    let id = sessionStorage.getItem(DEMO_VISITOR_STORAGE_KEY);
+    if (!id) {
+      id = createDemoVisitorId();
+      sessionStorage.setItem(DEMO_VISITOR_STORAGE_KEY, id);
+    }
+    return id;
+  } catch {
+    fallbackDemoVisitorId ||= createDemoVisitorId();
+    return fallbackDemoVisitorId;
+  }
+}
+
+function createDemoVisitorId() {
+  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
+  return `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+}
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
 let statusLocked = false;
@@ -1927,6 +1949,7 @@ async function renderLibrary() {
   const data = await api('/api/library');
   state.library = data;
   state.profileSelectionDirty = profileSelectionNeedsUpdate(data);
+  const isDemoGuestLibrary = data.account?.source === 'guest';
   const structured = data.profile?.structured || {};
   view.innerHTML = `
     <section class="page-panel">
@@ -1949,7 +1972,7 @@ async function renderLibrary() {
         <div class="stat"><span class="muted">最近播放</span><strong>${data.recent.length}</strong></div>
       </div>
       <div class="library-actions">
-        <button id="sync-btn" class="primary">同步网易云音乐</button>
+        <button id="sync-btn" class="primary" ${isDemoGuestLibrary ? 'disabled' : ''}>同步网易云音乐</button>
         <button id="profile-update-btn" class="ghost profile-update-btn">更新音乐画像</button>
       </div>
       <div id="library-sync-progress" class="library-sync-progress" hidden></div>
@@ -1960,6 +1983,7 @@ async function renderLibrary() {
     </section>
   `;
   document.querySelector('#sync-btn').addEventListener('click', async () => {
+    if (isDemoGuestLibrary) return;
     const btn = document.querySelector('#sync-btn');
     const status = document.querySelector('#library-selection-status');
     return handleLibrarySyncClick(btn, status);
@@ -2248,6 +2272,7 @@ async function renderSettings() {
     api('/api/memories').catch(() => ({ memories: [] }))
   ]);
   const memories = memoryData.memories || [];
+  const demoGuestMode = Boolean(status.demo?.guestMode);
   view.innerHTML = `
     <section class="page-panel">
       <p class="eyebrow">Settings</p>
@@ -2283,8 +2308,8 @@ async function renderSettings() {
             </div>
             <img id="cookie-qr-img" class="qr-img" src="" alt="试用版登录二维码" style="display:none" />
           </div>
-          <button id="cookie-qr-btn" class="trial-login-primary">扫码登录网易云</button>
-          <button id="cookie-logout-btn" class="ghost trial-login-secondary" ${cookieLogin.hasCookie ? '' : 'disabled'}>退出登录</button>
+          <button id="cookie-qr-btn" class="trial-login-primary" ${demoGuestMode ? 'disabled' : ''}>扫码登录网易云</button>
+          <button id="cookie-logout-btn" class="ghost trial-login-secondary" ${cookieLogin.hasCookie && !demoGuestMode ? '' : 'disabled'}>退出登录</button>
           <p id="cookie-qr-status" class="muted"></p>
         </div>
       </div>
@@ -2349,8 +2374,8 @@ async function renderSettings() {
           ${statusRow('OpenAPI token', status.neteaseToken)}
         </table>
         <div class="netease-login compact">
-          <button id="qr-btn" class="ghost">开发者 OpenAPI 扫码</button>
-          <button id="qr-refresh-btn" class="ghost">刷新 OpenAPI token</button>
+          <button id="qr-btn" class="ghost" ${demoGuestMode ? 'disabled' : ''}>开发者 OpenAPI 扫码</button>
+          <button id="qr-refresh-btn" class="ghost" ${demoGuestMode ? 'disabled' : ''}>刷新 OpenAPI token</button>
           <p id="qr-status"></p>
           <img id="qr-img" class="qr-img" src="" alt="OpenAPI 登录二维码" style="display:none" />
         </div>
@@ -3156,9 +3181,13 @@ function statusRow(label, ok, detail = '') {
 }
 
 async function api(path, options = {}) {
+  const headers = {
+    'X-Demo-Visitor-Id': ensureDemoVisitorId()
+  };
+  if (options.body) headers['content-type'] = 'application/json';
   const response = await fetch(path, {
     method: options.method || 'GET',
-    headers: options.body ? { 'content-type': 'application/json' } : undefined,
+    headers,
     body: options.body ? JSON.stringify(options.body) : undefined,
     signal: options.signal
   });

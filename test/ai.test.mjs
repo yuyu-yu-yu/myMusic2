@@ -207,6 +207,52 @@ test('Open-Meteo weather geocodes city and returns Chinese summary', async (t) =
   assert.match(calls[1], /timezone=Asia%2FShanghai/);
 });
 
+test('Open-Meteo weather uses provided coordinates without geocoding', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const href = String(url);
+    calls.push(href);
+    assert.match(href, /api\.open-meteo\.com\/v1\/forecast/);
+    return {
+      ok: true,
+      async json() {
+        return {
+          current: {
+            temperature_2m: 24.2,
+            apparent_temperature: 25,
+            relative_humidity_2m: 63,
+            precipitation: 0,
+            rain: 0,
+            weather_code: 1,
+            wind_speed_10m: 5
+          }
+        };
+      }
+    };
+  };
+
+  const summary = await getWeatherSummary({
+    provider: 'openmeteo',
+    city: 'Guangzhou',
+    countryCode: 'CN',
+    timeZone: 'Asia/Shanghai',
+    latitude: 23.1291,
+    longitude: 113.2644
+  });
+
+  assert.match(summary, /^Guangzhou /);
+  assert.match(summary, /24°C/);
+  assert.equal(calls.length, 1);
+  assert.match(calls[0], /latitude=23\.1291/);
+  assert.match(calls[0], /longitude=113\.2644/);
+  assert.doesNotMatch(calls[0], /geocoding-api/);
+});
+
 test('Open-Meteo weather failure returns fallback summary', async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => {

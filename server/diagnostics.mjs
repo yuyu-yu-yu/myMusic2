@@ -13,7 +13,8 @@ export async function runDemoSelfCheck({
   rootDir,
   sessionId = '',
   trackId = '',
-  syncStatus = null
+  syncStatus = null,
+  accountContext = null
 } = {}) {
   const checkedAt = new Date().toISOString();
   const checks = [];
@@ -22,10 +23,10 @@ export async function runDemoSelfCheck({
   checks.push(await timedCheck('tts', 'TTS', () => checkTts(config?.tts || {}, rootDir)));
   checks.push(await timedCheck('netease_cookie', '网易云扫码登录', () => checkCookie()));
   checks.push(await timedCheck('community_api', 'NeteaseCloudMusicApi', () => checkCommunityApi()));
-  checks.push(await timedCheck('library', '当前账号歌单', () => checkLibrary(db, syncStatus)));
-  checks.push(await timedCheck('play_source', '当前播放源', () => checkPlaySource(db, netease, trackId)));
+  checks.push(await timedCheck('library', '当前账号歌单', () => checkLibrary(db, syncStatus, accountContext)));
+  checks.push(await timedCheck('play_source', '当前播放源', () => checkPlaySource(db, netease, trackId, accountContext)));
 
-  const recentFailure = getRecentRecommendationFailure(db, sessionId);
+  const recentFailure = getRecentRecommendationFailure(db, sessionId, accountContext);
   checks.push({
     id: 'recent_failure',
     label: '最近推荐失败',
@@ -131,8 +132,8 @@ async function checkCommunityApi() {
   }
 }
 
-async function checkLibrary(db, syncStatus) {
-  const library = getLibrary(db);
+async function checkLibrary(db, syncStatus, accountContext) {
+  const library = getLibrary(db, accountContext);
   const account = library.account || {};
   if (account.accountMismatch) {
     return { status: 'fail', detail: '当前登录账号与已同步账号不一致。', action: '重新同步当前网易云账号歌单。' };
@@ -149,10 +150,10 @@ async function checkLibrary(db, syncStatus) {
   return { status: 'ok', detail: `已同步 ${library.playlists.length} 个歌单，${library.totalTracks} 首去重歌曲。` };
 }
 
-async function checkPlaySource(db, netease, trackId) {
+async function checkPlaySource(db, netease, trackId, accountContext) {
   let track = trackId ? getTrackById(db, trackId) : null;
   if (!track) {
-    const recent = listRecentPlays(db, 1)[0];
+    const recent = listRecentPlays(db, 1, accountContext?.accountId)[0];
     track = recent || null;
   }
   if (!track) {
@@ -165,10 +166,12 @@ async function checkPlaySource(db, netease, trackId) {
   return { status: 'ok', detail: `《${resolved.name || track.name}》播放源可用。` };
 }
 
-function getRecentRecommendationFailure(db, sessionId) {
+function getRecentRecommendationFailure(db, sessionId, accountContext) {
   const id = String(sessionId || '').trim();
   if (!id) return null;
-  const row = db.prepare('SELECT context_json AS contextJson FROM radio_sessions WHERE id = ?').get(id);
+  const row = accountContext?.accountId
+    ? db.prepare('SELECT context_json AS contextJson FROM radio_sessions WHERE id = ? AND account_id = ?').get(id, accountContext.accountId)
+    : db.prepare('SELECT context_json AS contextJson FROM radio_sessions WHERE id = ?').get(id);
   if (!row) return null;
   const context = safeJson(row.contextJson, {});
   const debug = context.radioDebug || {};

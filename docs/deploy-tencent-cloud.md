@@ -1,6 +1,6 @@
 # Tencent Cloud Lightweight Server Demo Deploy
 
-This guide deploys myMusic as a shared-account demo on a Tencent Cloud Lightweight Application Server.
+This guide deploys myMusic as a shared NetEase demo account with isolated visitor sandboxes on a Tencent Cloud Lightweight Application Server.
 
 ## 1. Cloud Console Setup
 
@@ -58,7 +58,20 @@ nano .env.production
 
 Fill only server-side keys in `.env.production`. Never put API keys in `public/` files.
 
-For the first shared demo, `TTS_PROVIDER` can stay empty so browsers use speech synthesis fallback. You can also leave NetEase OpenAPI values empty and scan the NetEase cookie login QR code from the web UI after deploy.
+For the judging demo, keep the dedicated NetEase demo account logged in and enable visitor sandboxes:
+
+```dotenv
+DEMO_GUEST_MODE=true
+DEMO_GUEST_TTL_HOURS=24
+IP_GEO_PROVIDER=ip-api
+WEATHER_PROVIDER=openmeteo
+WEATHER_CITY=上海
+WEATHER_COUNTRY_CODE=CN
+```
+
+In guest mode, visitors share the demo account's NetEase cookie, library, and initial music profile, but their chat, feedback, preferences, memories, radio sessions, plays, and diaries are written into separate `demo:guest:*` scopes. The web UI sends a temporary `X-Demo-Visitor-Id` per browser tab session. Stale visitor data is cleaned by TTL.
+
+`TTS_PROVIDER` can stay empty so browsers use speech synthesis fallback, or you can configure Volcengine TTS for the same voice as local. You can also leave NetEase OpenAPI values empty and scan the NetEase cookie login QR code once from the web UI before turning on guest mode.
 
 ## 4. Start The Demo
 
@@ -81,7 +94,7 @@ Open:
 http://YOUR_SERVER_IP:3000
 ```
 
-Then scan the NetEase QR code with the dedicated demo account and sync the library.
+Then scan the NetEase QR code with the dedicated demo account and sync the library before enabling guest mode. After guest mode is enabled, login/logout and library sync endpoints are locked so visitors cannot replace the shared account.
 
 ## 5. Optional Port 80 Reverse Proxy
 
@@ -126,11 +139,10 @@ Back up demo data:
 tar -czf mymusic-backup-$(date +%Y%m%d-%H%M%S).tgz data cache
 ```
 
-Reset shared demo state if test users pollute preferences or memories:
+Clean visitor sandboxes if needed without deleting the shared demo account, library, cookie, or provider keys:
 
 ```bash
-docker compose down
-mv data "data-reset-$(date +%Y%m%d-%H%M%S)"
-mkdir -p data
-docker compose up -d
+sqlite3 data/mymusic.sqlite "DELETE FROM account_settings WHERE account_id LIKE 'demo:guest:%'; DELETE FROM account_music_profiles WHERE account_id LIKE 'demo:guest:%'; DELETE FROM messages WHERE account_id LIKE 'demo:guest:%'; DELETE FROM radio_sessions WHERE account_id LIKE 'demo:guest:%'; DELETE FROM plays WHERE account_id LIKE 'demo:guest:%'; DELETE FROM track_feedback_events WHERE account_id LIKE 'demo:guest:%'; DELETE FROM track_feedback_summary WHERE account_id LIKE 'demo:guest:%'; DELETE FROM user_memories WHERE account_id LIKE 'demo:guest:%'; DELETE FROM diary_entries WHERE account_id LIKE 'demo:guest:%';"
 ```
+
+For a full reset, back up `data/` first, then remove only after confirming you are comfortable re-scanning the demo NetEase account and re-syncing the library.

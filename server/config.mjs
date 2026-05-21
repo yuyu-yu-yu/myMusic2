@@ -33,6 +33,10 @@ export function getConfig() {
     app: {
       timeZone: env.APP_TIME_ZONE || 'Asia/Shanghai'
     },
+    demo: {
+      guestMode: parseBoolean(env.DEMO_GUEST_MODE),
+      guestTtlHours: Math.max(1, Number(env.DEMO_GUEST_TTL_HOURS || 24) || 24)
+    },
     netease: {
       baseUrl: env.NETEASE_BASE_URL || 'https://openapi.music.163.com',
       appId: env.NETEASE_APP_ID || '',
@@ -93,6 +97,11 @@ export function getConfig() {
       countryCode: env.WEATHER_COUNTRY_CODE || 'CN',
       apiKey: env.WEATHER_API_KEY || '',
       timeZone: env.WEATHER_TIME_ZONE || env.APP_TIME_ZONE || 'Asia/Shanghai'
+    },
+    ipGeo: {
+      provider: env.IP_GEO_PROVIDER || 'ip-api',
+      timeoutMs: Math.max(500, Number(env.IP_GEO_TIMEOUT_MS || 2500) || 2500),
+      cacheMs: Math.max(60000, Number(env.IP_GEO_CACHE_MS || 10 * 60 * 1000) || 10 * 60 * 1000)
     }
   };
 }
@@ -131,6 +140,14 @@ export function publicConfigStatus(config) {
       provider: config.weather.provider || null,
       city: config.weather.city || null,
       timeZone: config.weather.timeZone || config.app?.timeZone || null
+    },
+    demo: {
+      guestMode: Boolean(config.demo?.guestMode),
+      guestTtlHours: config.demo?.guestTtlHours || 24
     }
   };
+}
+
+function parseBoolean(value) {
+  return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
 }

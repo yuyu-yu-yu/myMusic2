@@ -16,6 +16,8 @@ import { checkCookieQrLogin, clearCookie, createCookieQrLogin, getCookieStatus, 
 import { runDemoSelfCheck } from './diagnostics.mjs';
 import { publicAccountContext, resolveAccountContext } from './account-scope.mjs';
 import { generateAiMusic } from './ai-music.mjs';
+import { cleanupDemoGuest, cleanupExpiredDemoGuests, getVisitorIdFromRequest, resolveRequestAccountContext } from './demo-guest.mjs';
+import { configWithEnvironment, resolveRequestEnvironment } from './environment.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -39,6 +41,14 @@ loadCookie(rootDir);
 const publicDir = path.join(rootDir, 'public');
 const cacheDir = path.join(rootDir, 'cache', 'tts');
 const LIBRARY_SYNCED_USER_ID_KEY = 'library_synced_user_id';
+
+if (config.demo?.guestMode) {
+  cleanupExpiredDemoGuests(db, config.demo.guestTtlHours);
+  const guestCleanupTimer = setInterval(() => {
+    cleanupExpiredDemoGuests(db, config.demo.guestTtlHours);
+  }, 60 * 60 * 1000);
+  guestCleanupTimer.unref?.();
+}
 
 let librarySyncStatus = createIdleLibrarySyncStatus();
 
@@ -155,25 +165,35 @@ function startLibrarySyncJob() {
 
 const routes = {
   'GET /api/health': async () => ({ ok: true, config: tokenStatus(publicConfigStatus(config)) }),
-  'GET /api/config/status': async () => tokenStatus(publicConfigStatus(config)),
-  'GET /api/account/current': async () => ({
+  'GET /api/config/status': async (req) => tokenStatus(publicConfigStatus(await getRequestConfig(req))),
+  'GET /api/environment': async (req) => ({ ok: true, environment: await resolveRequestEnvironment(req, config, { includeWeather: true }) }),
+  'GET /api/account/current': async (req) => ({
     ok: true,
-    account: publicAccountContext(resolveAccountContext(db))
+    account: publicAccountContext(getRequestAccount(req))
   }),
+  'POST /api/demo/guest/close': async (req) => {
+    const body = await readJson(req);
+    return cleanupDemoGuest(db, getVisitorIdFromRequest(req, body));
+  },
   'POST /api/diagnostics/self-check': async (req) => {
     const body = await readJson(req);
+    const requestConfig = await getRequestConfig(req);
+    const accountContext = getRequestAccount(req);
     return runDemoSelfCheck({
       db,
-      config,
+      config: requestConfig,
       netease,
       rootDir,
       sessionId: body.sessionId || '',
       trackId: body.trackId || '',
-      syncStatus: getLibrarySyncStatus()
+      syncStatus: getLibrarySyncStatus(),
+      accountContext
     });
   },
-  'POST /api/auth/netease-cookie/qrcode': async () => attachQrImage(await createCookieQrLogin()),
+  'POST /api/auth/netease-cookie/qrcode': async () => demoAuthLocked() || attachQrImage(await createCookieQrLogin()),
   'POST /api/auth/netease-cookie/qrcode/check': async (req) => {
+    const locked = demoAuthLocked();
+    if (locked) return locked;
     const body = await readJson(req);
     const key = body.key || body.qrCodeKey || body.uniKey || body.unikey;
     if (!key) return jsonError('qrCodeKey is required', 400);
@@ -201,6 +221,8 @@ const routes = {
   },
   'GET /api/auth/netease-cookie/status': async () => getCookieLoginStatus(),
   'POST /api/auth/netease-cookie/logout': async () => {
+    const locked = demoAuthLocked();
+    if (locked) return locked;
     invalidateLibrarySyncStatus('NetEase cookie login cleared, please start sync again.');
     clearCookie(rootDir);
     clearLibraryAccountSnapshot(db, resolveAccountContext(db));
@@ -215,8 +237,10 @@ const routes = {
     }
     return { ok: true, loggedOut: true, ...(await getCookieLoginStatus()) };
   },
-  'POST /api/auth/netease/qrcode': async () => attachQrImage(await netease.qrcode()),
+  'POST /api/auth/netease/qrcode': async () => demoAuthLocked() || attachQrImage(await netease.qrcode()),
   'POST /api/auth/netease/qrcode/check': async (req) => {
+    const locked = demoAuthLocked();
+    if (locked) return locked;
     const body = await readJson(req);
     const key = body.key || body.qrCodeKey;
     if (!key) return jsonError('qrCodeKey is required', 400);
@@ -232,47 +256,49 @@ const routes = {
     ...(await getNeteaseLoginStatus({ db, netease }))
   }),
   'POST /api/auth/netease/refresh': async () => {
+    const locked = demoAuthLocked();
+    if (locked) return locked;
     const ok = await tryRefreshToken(db, netease);
     return { ok, token: netease.hasToken() };
   },
-  'POST /api/library/sync': async () => startLibrarySyncJob(),
+  'POST /api/library/sync': async () => demoGuestModeLocked('Demo 模式下曲库同步已锁定，访客会使用当前 demo 曲库快照。') || startLibrarySyncJob(),
   'GET /api/library/sync/status': async () => getLibrarySyncStatus(),
-  'GET /api/library': async () => getLibrary(db, resolveAccountContext(db)),
-  'GET /api/library/profile': async () => getProfile(db, resolveAccountContext(db)),
+  'GET /api/library': async (req) => getLibrary(db, getRequestAccount(req)),
+  'GET /api/library/profile': async (req) => getProfile(db, getRequestAccount(req)),
   'PUT /api/library/profile-playlists': async (req) => {
     const body = await readJson(req);
     if (!Array.isArray(body.selectedPlaylistIds)) return jsonError('selectedPlaylistIds must be an array', 400);
-    return updateProfilePlaylistSelection(db, body.selectedPlaylistIds, resolveAccountContext(db));
+    return updateProfilePlaylistSelection(db, body.selectedPlaylistIds, getRequestAccount(req));
   },
-  'POST /api/library/profile/update': async () => {
-    const accountContext = resolveAccountContext(db);
-    await updateProfile(db, config.llm, { force: true, accountContext });
+  'POST /api/library/profile/update': async (req) => {
+    const accountContext = getRequestAccount(req);
+    await updateProfile(db, (await getRequestConfig(req)).llm, { force: true, accountContext });
     return getLibrary(db, accountContext);
   },
   'POST /api/radio/start': async (req) => {
     const body = await readJson(req);
-    return startRadio({ db, config, netease, sessionId: body.sessionId, accountContext: resolveAccountContext(db) });
+    return startRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId, accountContext: getRequestAccount(req) });
   },
   'POST /api/radio/prefetch': async (req) => {
     const body = await readJson(req);
-    return prefetchRadio({ db, config, netease, sessionId: body.sessionId, force: Boolean(body.force), accountContext: resolveAccountContext(db) });
+    return prefetchRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId, force: Boolean(body.force), accountContext: getRequestAccount(req) });
   },
   'GET /api/radio/debug': async (req) => {
     const url = new URL(req.url, 'http://local');
     const sessionId = url.searchParams.get('sessionId') || '';
-    return getRadioDebug({ db, sessionId, accountContext: resolveAccountContext(db) });
+    return getRadioDebug({ db, sessionId, accountContext: getRequestAccount(req) });
   },
   'POST /api/radio/chat': async (req) => {
     const body = await readJson(req);
-    return chatRadio({ db, config, netease, sessionId: body.sessionId, message: body.message || '', accountContext: resolveAccountContext(db) });
+    return chatRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId, message: body.message || '', accountContext: getRequestAccount(req) });
   },
   'POST /api/radio/next': async (req) => {
     const body = await readJson(req);
-    return nextRadioItem({ db, config, netease, sessionId: body.sessionId || crypto.randomUUID(), userMessage: body.message || '', accountContext: resolveAccountContext(db) });
+    return nextRadioItem({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), userMessage: body.message || '', accountContext: getRequestAccount(req) });
   },
   'POST /api/ai-music/generate': async (req) => {
     const body = await readJson(req);
-    const accountContext = resolveAccountContext(db);
+    const accountContext = getRequestAccount(req);
     const recentMessages = getRecentMessagesForAiMusic(db, body.sessionId, accountContext);
     const sessionContext = getSessionContextForAiMusic(db, body.sessionId, accountContext);
     const result = await generateAiMusic({
@@ -295,14 +321,14 @@ const routes = {
   },
   'POST /api/feedback': async (req) => {
     const body = await readJson(req);
-    return submitFeedback({ db, payload: body, accountContext: resolveAccountContext(db) });
+    return submitFeedback({ db, payload: body, accountContext: getRequestAccount(req) });
   },
-  'GET /api/memories': async () => getMemories({ db, accountContext: resolveAccountContext(db) }),
-  'DELETE /api/memories': async () => removeAllMemories({ db, accountContext: resolveAccountContext(db) }),
-  'GET /api/preferences': async () => getPreferences({ db, accountContext: resolveAccountContext(db) }),
+  'GET /api/memories': async (req) => getMemories({ db, accountContext: getRequestAccount(req) }),
+  'DELETE /api/memories': async (req) => removeAllMemories({ db, accountContext: getRequestAccount(req) }),
+  'GET /api/preferences': async (req) => getPreferences({ db, accountContext: getRequestAccount(req) }),
   'PUT /api/preferences': async (req) => {
     const body = await readJson(req);
-    return updatePreferences({ db, payload: body, accountContext: resolveAccountContext(db) });
+    return updatePreferences({ db, payload: body, accountContext: getRequestAccount(req) });
   },
   'POST /api/player/play': async (req) => {
     const body = await readJson(req);
@@ -314,16 +340,34 @@ const routes = {
   'POST /api/player/stop': async () => player.stop(),
   'POST /api/player/next': async () => player.next(),
   'GET /api/player/state': async () => player.state(),
-  'GET /api/diary': async () => listDiaries(db, resolveAccountContext(db)),
-  'GET /api/diary/today': async () => {
-    const accountContext = resolveAccountContext(db);
-    return getDiary(db, today(), accountContext) || generateDiary(db, config, today(), accountContext);
+  'GET /api/diary': async (req) => listDiaries(db, getRequestAccount(req)),
+  'GET /api/diary/today': async (req) => {
+    const accountContext = getRequestAccount(req);
+    return getDiary(db, today(), accountContext) || generateDiary(db, await getRequestConfig(req), today(), accountContext);
   },
   'POST /api/diary/generate': async (req) => {
     const body = await readJson(req);
-    return generateDiary(db, config, body.date || today(), resolveAccountContext(db));
+    return generateDiary(db, await getRequestConfig(req), body.date || today(), getRequestAccount(req));
   }
 };
+
+function getRequestAccount(req) {
+  return resolveRequestAccountContext(db, config, req);
+}
+
+async function getRequestConfig(req) {
+  const environment = await resolveRequestEnvironment(req, config);
+  return configWithEnvironment(config, environment);
+}
+
+function demoAuthLocked() {
+  return demoGuestModeLocked('Demo 模式下网易云账号已锁定，访客不能退出或重扫共享账号。');
+}
+
+function demoGuestModeLocked(message) {
+  if (!config.demo?.guestMode) return null;
+  return jsonError(message, 403);
+}
 
 function tokenStatus(status) {
   return { ...status, neteaseToken: netease.hasToken(), neteaseCookie: getCookieStatus().hasCookie };
@@ -468,7 +512,7 @@ const server = http.createServer(async (req, res) => {
     if (req.url.startsWith('/api/tts/')) return serveTts(req, res);
     const pathname = new URL(req.url, 'http://local').pathname;
     if (req.method === 'DELETE' && /^\/api\/memories\/\d+$/.test(pathname)) {
-      return sendJson(res, removeMemory({ db, id: pathname.split('/').pop(), accountContext: resolveAccountContext(db) }));
+      return sendJson(res, removeMemory({ db, id: pathname.split('/').pop(), accountContext: getRequestAccount(req) }));
     }
     const key = `${req.method} ${pathname}`;
     if (routes[key]) {
@@ -478,8 +522,8 @@ const server = http.createServer(async (req, res) => {
     }
     if (req.url.startsWith('/api/diary/') && req.method === 'GET') {
       const date = decodeURIComponent(req.url.split('/').pop());
-      const accountContext = resolveAccountContext(db);
-      return sendJson(res, getDiary(db, date, accountContext) || await generateDiary(db, config, date, accountContext));
+      const accountContext = getRequestAccount(req);
+      return sendJson(res, getDiary(db, date, accountContext) || await generateDiary(db, await getRequestConfig(req), date, accountContext));
     }
     if (pathname.startsWith('/api/')) {
       return sendJson(res, { ok: false, error: `API route not found: ${req.method} ${pathname}` }, 404);

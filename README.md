@@ -30,6 +30,15 @@ For the Tencent Cloud shared-account demo deployment, see:
 docs/deploy-tencent-cloud.md
 ```
 
+The cloud demo can run with one dedicated NetEase demo account while giving each visitor an isolated temporary sandbox:
+
+```dotenv
+DEMO_GUEST_MODE=true
+DEMO_GUEST_TTL_HOURS=24
+```
+
+When enabled, each browser tab session sends `X-Demo-Visitor-Id`; visitor chat, memories, feedback, preferences, plays, and diaries do not affect other visitors or the shared demo account.
+
 ## TTS and Weather
 
 Real host narration uses Volcengine/Doubao TTS when these values are set:
@@ -55,6 +64,8 @@ WEATHER_PROVIDER=openmeteo
 WEATHER_CITY=上海
 WEATHER_COUNTRY_CODE=CN
 ```
+
+On the cloud demo, the server can derive each visitor's city, time zone, and weather from the request IP via `IP_GEO_PROVIDER=ip-api`, then query Open-Meteo by latitude/longitude. If IP lookup or weather lookup fails, it falls back to `WEATHER_CITY` and `APP_TIME_ZONE`.
 
 The radio prompt receives the current hour, live weather summary, user chat message, music profile, and selected track.
 

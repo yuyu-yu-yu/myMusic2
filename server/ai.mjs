@@ -273,7 +273,13 @@ export async function getWeatherSummary(config) {
 
 async function getOpenMeteoSummary(config, city) {
   try {
-    const location = await geocodeOpenMeteo(city, config.countryCode || 'CN');
+    const location = hasCoordinates(config)
+      ? {
+          name: city,
+          latitude: Number(config.latitude),
+          longitude: Number(config.longitude)
+        }
+      : await geocodeOpenMeteo(city, config.countryCode || 'CN');
     const url = new URL('https://api.open-meteo.com/v1/forecast');
     url.searchParams.set('latitude', String(location.latitude));
     url.searchParams.set('longitude', String(location.longitude));
@@ -301,6 +307,10 @@ async function getOpenMeteoSummary(config, city) {
   } catch (error) {
     return `${city}，天气获取失败：${error.message}。按当前时间和本地音乐画像推荐。`;
   }
+}
+
+function hasCoordinates(config = {}) {
+  return Number.isFinite(Number(config.latitude)) && Number.isFinite(Number(config.longitude));
 }
 
 async function geocodeOpenMeteo(city, countryCode) {
