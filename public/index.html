@@ -36,9 +36,9 @@
       <section class="player-shell">
         <div class="left-col">
           <div class="now-panel">
-            <div id="ai-dj-avatar" class="ai-dj-avatar" data-state="idle" aria-label="AI DJ CanCan">
+            <div id="ai-dj-avatar" class="ai-dj-avatar" data-state="idle" aria-label="AI DJ 灿灿">
               <video id="avatar-video" class="avatar-video" muted loop playsinline preload="auto"></video>
-              <img id="avatar-image" class="avatar-image" src="/avatar/source/cancan.png" alt="AI DJ CanCan" />
+              <img id="avatar-image" class="avatar-image" src="/avatar/source/cancan.png" alt="AI DJ 灿灿" />
               <span class="avatar-status">ON AIR</span>
             </div>
             <div class="track-meta">
@@ -72,6 +72,15 @@
             <span id="progress-duration" class="progress-time">00:00</span>
           </div>
           <button id="start-btn" class="primary start-wide">启动电台</button>
+          <div class="ai-music-mode">
+            <button id="ai-music-toggle" class="ai-music-toggle" type="button" aria-pressed="false">
+              <span class="ai-music-toggle-led" aria-hidden="true"></span>
+              <span class="ai-music-toggle-copy">
+                <strong>AI 原创电台模式</strong>
+                <small>开启后下一首由灿灿根据状态生成</small>
+              </span>
+            </button>
+          </div>
           <div id="lyric" class="lyric"></div>
         </div>
         <div class="chat-panel">

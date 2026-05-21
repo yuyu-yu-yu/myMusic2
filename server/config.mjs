@@ -58,6 +58,12 @@ export function getConfig() {
       apiKey: env.LLM_API_KEY || '',
       model: env.LLM_MODEL || ''
     },
+    minimax: {
+      baseUrl: env.MINIMAX_MUSIC_BASE_URL || env.MINIMAX_BASE_URL || 'https://api.minimaxi.com',
+      apiKey: env.MINIMAX_API_KEY || env.MINIMAX_MUSIC_API_KEY || '',
+      model: env.MINIMAX_MUSIC_MODEL || 'music-2.6-free',
+      allowPaidMusic: String(env.MINIMAX_ALLOW_PAID_MUSIC || '').toLowerCase() === 'true'
+    },
     tts: {
       provider: env.TTS_PROVIDER || '',
       baseUrl: env.TTS_BASE_URL || '',
@@ -110,6 +116,10 @@ export function publicConfigStatus(config) {
     llm: {
       configured: Boolean(config.llm.baseUrl && config.llm.apiKey && config.llm.model),
       model: config.llm.model || null
+    },
+    minimax: {
+      configured: Boolean(config.minimax?.apiKey),
+      model: config.minimax?.model || null
     },
     tts: {
       configured: ttsConfigured,

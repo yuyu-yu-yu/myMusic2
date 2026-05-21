@@ -4,6 +4,7 @@ data/
 cache/
 node_modules/
 release/
+public/ai-music/generated/
 packaging/work/
 packaging/verify/
 .claude/worktrees/

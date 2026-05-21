@@ -5,7 +5,7 @@ import crypto from 'node:crypto';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
-import { openDatabase, getSetting, setSetting } from './db.mjs';
+import { openDatabase, getSetting, saveTrack, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { extractOpenApiTokenPayload, getNeteaseLoginStatus, resolveQrOpenApiLogin, saveNeteaseUserProfile, saveOpenApiToken } from './netease-auth.mjs';
 import { clearLibraryAccountSnapshot, getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
@@ -15,6 +15,7 @@ import { createNcmPlayer } from './player.mjs';
 import { checkCookieQrLogin, clearCookie, createCookieQrLogin, getCookieStatus, getCookieUserProfile, loadCookie, resolveCommunityApiFile } from './community.mjs';
 import { runDemoSelfCheck } from './diagnostics.mjs';
 import { publicAccountContext, resolveAccountContext } from './account-scope.mjs';
+import { generateAiMusic } from './ai-music.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -269,6 +270,25 @@ const routes = {
     const body = await readJson(req);
     return nextRadioItem({ db, config, netease, sessionId: body.sessionId || crypto.randomUUID(), userMessage: body.message || '', accountContext: resolveAccountContext(db) });
   },
+  'POST /api/ai-music/generate': async (req) => {
+    const body = await readJson(req);
+    const accountContext = resolveAccountContext(db);
+    const recentMessages = getRecentMessagesForAiMusic(db, body.sessionId, accountContext);
+    const sessionContext = getSessionContextForAiMusic(db, body.sessionId, accountContext);
+    const result = await generateAiMusic({
+      config: config.minimax,
+      rootDir,
+      profile: getProfile(db, accountContext),
+      payload: {
+        ...body,
+        recentMessages: recentMessages.length ? recentMessages : (body.recentMessages || []),
+        sessionContext
+      }
+    });
+    if (result?.__error) return result;
+    if (result?.track) saveTrack(db, result.track);
+    return { ...result, account: publicAccountContext(accountContext) };
+  },
   'POST /api/play/report': async (req) => {
     const body = await readJson(req);
     return reportPlay({ db, netease, payload: body });
@@ -307,6 +327,34 @@ const routes = {
 
 function tokenStatus(status) {
   return { ...status, neteaseToken: netease.hasToken(), neteaseCookie: getCookieStatus().hasCookie };
+}
+
+function getRecentMessagesForAiMusic(db, sessionId = '', accountContext = {}) {
+  const id = String(sessionId || '').trim();
+  if (!id) return [];
+  try {
+    return db.prepare(
+      'SELECT role, content FROM messages WHERE account_id = ? AND session_id = ? ORDER BY id DESC LIMIT 12'
+    ).all(accountContext.accountId, id).reverse().map(row => ({
+      role: row.role,
+      content: row.content
+    }));
+  } catch {
+    return [];
+  }
+}
+
+function getSessionContextForAiMusic(db, sessionId = '', accountContext = {}) {
+  const id = String(sessionId || '').trim();
+  if (!id) return {};
+  try {
+    const row = db.prepare(
+      'SELECT context_json AS contextJson FROM radio_sessions WHERE id = ? AND account_id = ?'
+    ).get(id, accountContext.accountId);
+    return row ? JSON.parse(row.contextJson || '{}') : {};
+  } catch {
+    return {};
+  }
 }
 
 let qrcodeModule = null;

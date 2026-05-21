@@ -1,5 +1,7 @@
 import { animate } from '/vendor/anime.esm.min.js';
 
+const AI_MUSIC_MODE_STORAGE_KEY = 'mymusic:aiMusicMode';
+
 const state = {
   sessionId: null,
   current: null,
@@ -21,7 +23,8 @@ const state = {
   radioPrefetchPromise: null,
   playbackHistory: [],
   demoSelfCheck: null,
-  demoSelfCheckRunning: false
+  demoSelfCheckRunning: false,
+  aiMusicMode: readStoredAiMusicMode()
 };
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
@@ -541,6 +544,7 @@ function renderPlayer() {
   const playToggleBtn = document.querySelector('#play-toggle-btn');
   const chatForm = document.querySelector('#chat-form');
   const modeResetBtn = document.querySelector('#mode-reset-btn');
+  const aiMusicToggle = document.querySelector('#ai-music-toggle');
   const { likeBtn, dislikeBtn } = ensureFeedbackButtons();
 
   startBtn.addEventListener('click', () => {
@@ -554,6 +558,7 @@ function renderPlayer() {
     else resumePlayback();
   });
   modeResetBtn.addEventListener('click', () => resetMode());
+  aiMusicToggle?.addEventListener('click', () => setAiMusicMode(!state.aiMusicMode));
   likeBtn.addEventListener('click', () => {
     setAvatarState('happy', { temporaryMs: 1400 });
     showLikeBurst();
@@ -585,6 +590,7 @@ function renderPlayer() {
   initButtonFeedback();
   initVisualizer();
   initProgressBar();
+  updateAiMusicToggle();
   scheduleRadioPrefetch();
 }
 
@@ -619,6 +625,40 @@ function setPlaybackToggleState(isPlaying) {
   const label = isPlaying ? '暂停' : '继续';
   button.title = label;
   button.setAttribute('aria-label', label);
+}
+
+function readStoredAiMusicMode() {
+  try {
+    return localStorage.getItem(AI_MUSIC_MODE_STORAGE_KEY) === 'on';
+  } catch {
+    return false;
+  }
+}
+
+function setAiMusicMode(enabled, { announce = true } = {}) {
+  state.aiMusicMode = Boolean(enabled);
+  try {
+    localStorage.setItem(AI_MUSIC_MODE_STORAGE_KEY, state.aiMusicMode ? 'on' : 'off');
+  } catch {
+    // Storage failures should not block the local playback mode switch.
+  }
+  updateAiMusicToggle();
+  if (announce) {
+    appendChat({
+      role: 'dj',
+      text: state.aiMusicMode
+        ? 'AI 原创电台模式已开启，后续歌曲会由灿灿根据此刻状态和音乐画像生成。'
+        : 'AI 原创电台模式已关闭，后续恢复普通推荐播放。'
+    });
+  }
+}
+
+function updateAiMusicToggle() {
+  const button = document.querySelector('#ai-music-toggle');
+  if (!button) return;
+  button.classList.toggle('is-active', state.aiMusicMode);
+  button.setAttribute('aria-pressed', state.aiMusicMode ? 'true' : 'false');
+  button.title = state.aiMusicMode ? '关闭 AI 原创电台模式' : '开启 AI 原创电台模式';
 }
 
 async function handleDislike() {
@@ -717,6 +757,13 @@ const loadingMessages = [
   '灿灿正在连接赛博音乐网络...',
 ];
 
+const aiMusicLoadingMessages = [
+  '灿灿正在读取此刻状态...',
+  '灿灿正在匹配你的音乐画像...',
+  '灿灿正在写更贴近当下的歌词...',
+  '灿灿正在把最近对话做成旋律...',
+];
+
 const chatLoadingMessages = [
   '灿灿正在回复...',
   '灿灿正在读你的消息...',
@@ -724,7 +771,11 @@ const chatLoadingMessages = [
 ];
 
 function startLoadingMessages(kind = 'music') {
-  const messages = kind === 'chat' ? chatLoadingMessages : loadingMessages;
+  const messages = kind === 'chat'
+    ? chatLoadingMessages
+    : kind === 'aiMusic'
+    ? aiMusicLoadingMessages
+    : loadingMessages;
   statusLocked = true;
   setAvatarState(kind === 'chat' ? 'reading' : 'searching');
   const loading = {
@@ -818,6 +869,7 @@ function ensureSessionId() {
 }
 
 function scheduleRadioPrefetch({ force = false } = {}) {
+  if (state.aiMusicMode) return Promise.resolve(null);
   if (state.radioPrefetchPromise && !force) return state.radioPrefetchPromise;
   const sessionId = ensureSessionId();
   state.radioPrefetchPromise = api('/api/radio/prefetch', {
@@ -843,13 +895,24 @@ async function startRadio() {
   const sessionId = ensureSessionId();
   setAvatarState('on_air');
   setRadioButtonState('loading');
-  appendChat({ role: 'user', text: '启动电台' });
-  const loading = startLoadingMessages();
+  appendChat({ role: 'user', text: state.aiMusicMode ? '开启 AI 原创模式' : '启动电台' });
+  const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : 'music');
   try {
     await loadPreferences().catch(() => null);
-    const data = await api('/api/radio/start', { method: 'POST', body: { sessionId } });
+    const data = state.aiMusicMode
+      ? await requestAiMusicTrack({ sessionId, trigger: 'start' })
+      : await api('/api/radio/start', { method: 'POST', body: { sessionId } });
     handleRadioResponse(data, { loading });
   } catch (e) {
+    if (state.aiMusicMode) {
+      try {
+        const fallback = await api('/api/radio/start', { method: 'POST', body: { sessionId } });
+        handleRadioResponse(withAiMusicFallbackNotice(fallback, e), { loading });
+        return;
+      } catch (fallbackError) {
+        e = fallbackError;
+      }
+    }
     stopLoadingMessages({ loading });
     replaceLoadingMessage({ text: '启动电台时出了一点问题：' + e.message, loading });
     setAvatarState('idle');
@@ -864,18 +927,65 @@ async function nextTrack({ skipCurrent = true } = {}) {
   setAvatarState('searching');
   setPlaybackToggleState(false);
   if (skipCurrent) await reportFeedback('skip');
-  appendChat({ role: 'user', text: '下一首' });
-  const loading = startLoadingMessages();
+  appendChat({ role: 'user', text: state.aiMusicMode ? '生成此刻歌曲' : '下一首' });
+  const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : 'music');
   try {
     await loadPreferences().catch(() => null);
-    const data = await api('/api/radio/next', { method: 'POST', body: { sessionId } });
+    const data = state.aiMusicMode
+      ? await requestAiMusicTrack({ sessionId, trigger: 'next' })
+      : await api('/api/radio/next', { method: 'POST', body: { sessionId } });
     handleRadioResponse(data, { loading });
   } catch (e) {
+    if (state.aiMusicMode) {
+      try {
+        const fallback = await api('/api/radio/next', { method: 'POST', body: { sessionId } });
+        handleRadioResponse(withAiMusicFallbackNotice(fallback, e), { loading });
+        return;
+      } catch (fallbackError) {
+        e = fallbackError;
+      }
+    }
     stopLoadingMessages({ loading });
     replaceLoadingMessage({ text: '抱歉，刚才找歌时出了一点问题：' + e.message, loading });
     setAvatarState(getContextualAvatarState());
     setPlayerStatus(e.message, 'error');
   }
+}
+
+async function requestAiMusicTrack({ sessionId, trigger }) {
+  setPlayerStatus('灿灿正在根据状态生成音乐', '');
+  const currentTrack = state.current?.track
+    ? {
+      id: state.current.track.id,
+      name: state.current.track.name,
+      artists: state.current.track.artists || [],
+      album: state.current.track.album || ''
+    }
+    : null;
+  return api('/api/ai-music/generate', {
+    method: 'POST',
+    body: {
+      sessionId,
+      trigger,
+      preferences: state.preferences || {},
+      currentTrack
+    }
+  });
+}
+
+function withAiMusicFallbackNotice(data = {}, error = {}) {
+  return {
+    ...data,
+    chatText: `AI 原创生成暂时失败，先切回普通推荐。${data.chatText || data.hostText || ''}`,
+    ttsUrl: null,
+    ttsStatus: 'disabled',
+    speech: { shouldSpeak: false, mode: 'off' },
+    aiMusic: {
+      enabled: true,
+      status: 'fallback',
+      error: error?.message || String(error || '')
+    }
+  };
 }
 
 async function sendChat(msg) {
@@ -1173,7 +1283,7 @@ async function updatePlayer(data, autoplay) {
   const track = data.track || {};
   document.querySelector('#track-title').textContent = track.name || 'myMusic';
   document.querySelector('#track-artist').textContent = (track.artists || []).join(' / ') || '等待启动';
-  buildLyricDOM(data.track?.lyric || '');
+  buildLyricDOM(data.track?.lyric || '', { syncMode: data.track?.lyricSync || 'timed' });
 
   const songAudio = document.querySelector('#song-audio');
   if (track.playUrl) {
@@ -1195,7 +1305,7 @@ async function updatePlayer(data, autoplay) {
   if (duration) duration.textContent = '00:00';
 }
 
-function buildLyricDOM(lrcText) {
+function buildLyricDOM(lrcText, { syncMode = 'timed' } = {}) {
   const container = document.querySelector('#lyric');
   if (!container) return;
 
@@ -1226,7 +1336,21 @@ function buildLyricDOM(lrcText) {
   const viewport = document.createElement('div');
   viewport.className = 'lyric-viewport';
 
-  if (!lines.length) {
+  if (!lines.length && syncMode === 'plain') {
+    viewport.classList.add('lyric-viewport-plain');
+    const plainLines = String(lrcText)
+      .split(/\r?\n/)
+      .map(line => line.trim())
+      .filter(Boolean);
+    plainLines.forEach((line) => {
+      const el = document.createElement('p');
+      const isSection = /^\[[^\]]+\]$/.test(line);
+      el.className = isSection ? 'lyric-section-label' : 'lyric-line lyric-line-plain';
+      el.textContent = line.replace(/^\[|\]$/g, '');
+      viewport.appendChild(el);
+    });
+    if (!plainLines.length) viewport.innerHTML = '<p class="lyric-empty">暂无歌词</p>';
+  } else if (!lines.length) {
     viewport.innerHTML = '<p class="lyric-empty">纯音乐，请欣赏</p>';
   } else {
     lines.forEach((line, i) => {
