@@ -68,6 +68,7 @@ const VISUALIZER_DEBUG = false;
 
 function makeAvatarFrameSequence(stateName, durations) {
   return {
+    spriteSrc: `/avatar/sprites/${stateName}.png`,
     loopMs: durations.reduce((total, durationMs) => total + durationMs, 0),
     frames: durations.map((durationMs, index) => ({
       src: `/avatar/frames/${stateName}/${String(index).padStart(2, '0')}.png`,
@@ -386,6 +387,9 @@ function stopAvatarFrameSequence() {
 
 function playAvatarVideoOrFallback(root, video, image, src) {
   root.classList.remove('is-frame-sequence');
+  root.classList.remove('is-sprite-sequence');
+  const sprite = root.querySelector('#avatar-sprite');
+  if (sprite) sprite.hidden = true;
   if (image) image.src = '/avatar/source/cancan.png';
 
   if (!video || !src) {
@@ -421,6 +425,26 @@ function playAvatarVideoOrFallback(root, video, image, src) {
   }
 }
 
+function ensureAvatarSprite(root) {
+  let sprite = root.querySelector('#avatar-sprite');
+  let strip = root.querySelector('#avatar-sprite-strip');
+  if (!sprite) {
+    sprite = document.createElement('div');
+    sprite.id = 'avatar-sprite';
+    sprite.className = 'avatar-sprite';
+    sprite.hidden = true;
+    root.prepend(sprite);
+  }
+  if (!strip) {
+    strip = document.createElement('img');
+    strip.id = 'avatar-sprite-strip';
+    strip.className = 'avatar-sprite-strip';
+    strip.alt = '';
+    sprite.appendChild(strip);
+  }
+  return { sprite, strip };
+}
+
 function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
   if (!image || !sequence?.frames?.length) {
     playAvatarVideoOrFallback(root, video, image, fallbackSrc);
@@ -430,23 +454,56 @@ function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
   stopAvatarFrameSequence();
   const token = avatarFrameSequenceToken;
   let index = 0;
+  const { sprite, strip } = ensureAvatarSprite(root);
+
+  const showSpriteFrame = () => {
+    if (token !== avatarFrameSequenceToken) return;
+    const frame = sequence.frames[index % sequence.frames.length];
+    strip.style.transform = `translate3d(-${(index * 100) / sequence.frames.length}%, 0, 0)`;
+    index = (index + 1) % sequence.frames.length;
+    avatarFrameTimer = setTimeout(showSpriteFrame, frame.durationMs || sequence.loopMs / sequence.frames.length);
+  };
 
   root.classList.remove('is-fallback');
   root.classList.add('is-frame-sequence');
+  root.classList.add('is-sprite-sequence');
   if (video) {
     video.pause();
     video.hidden = true;
     video.onerror = null;
     video.onloadeddata = null;
   }
-  image.hidden = false;
+  image.hidden = true;
+  sprite.hidden = false;
+  strip.style.width = `${sequence.frames.length * 100}%`;
+  strip.style.transform = 'translate3d(0, 0, 0)';
 
+  strip.onerror = () => {
+    if (token !== avatarFrameSequenceToken) return;
+    root.classList.remove('is-sprite-sequence');
+    sprite.hidden = true;
+    image.hidden = false;
+    playAvatarImageFrameSequence(root, video, image, sequence, fallbackSrc, token);
+  };
+  strip.onload = () => {
+    if (token !== avatarFrameSequenceToken) return;
+    showSpriteFrame();
+  };
+
+  if (strip.getAttribute('src') !== sequence.spriteSrc) {
+    strip.src = sequence.spriteSrc;
+  } else if (strip.complete) {
+    showSpriteFrame();
+  }
+}
+
+function playAvatarImageFrameSequence(root, video, image, sequence, fallbackSrc, token) {
+  let index = 0;
   image.onerror = () => {
     if (token !== avatarFrameSequenceToken) return;
     stopAvatarFrameSequence();
     playAvatarVideoOrFallback(root, video, image, fallbackSrc);
   };
-
   const showFrame = () => {
     if (token !== avatarFrameSequenceToken) return;
     const frame = sequence.frames[index % sequence.frames.length];
@@ -454,7 +511,6 @@ function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
     index = (index + 1) % sequence.frames.length;
     avatarFrameTimer = setTimeout(showFrame, frame.durationMs || sequence.loopMs / sequence.frames.length);
   };
-
   showFrame();
 }
 

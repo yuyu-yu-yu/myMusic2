@@ -1132,14 +1132,34 @@ button.danger:hover {
 }
 
 .avatar-video,
-.avatar-image {
+.avatar-image,
+.avatar-sprite {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
+}
+
+.avatar-video,
+.avatar-image {
   object-fit: cover;
   image-rendering: pixelated;
   transform-origin: 50% 58%;
+}
+
+.avatar-sprite {
+  overflow: hidden;
+  image-rendering: pixelated;
+}
+
+.avatar-sprite-strip {
+  display: block;
+  height: 100%;
+  max-width: none;
+  image-rendering: pixelated;
+  transform: translate3d(0, 0, 0);
+  transform-origin: 0 0;
+  will-change: transform;
 }
 
 .avatar-video {
@@ -1151,7 +1171,8 @@ button.danger:hover {
 }
 
 .avatar-video[hidden],
-.avatar-image[hidden] {
+.avatar-image[hidden],
+.avatar-sprite[hidden] {
   display: none;
 }
 
@@ -1179,6 +1200,10 @@ button.danger:hover {
 
 .ai-dj-avatar.is-frame-sequence .avatar-image {
   object-fit: contain;
+}
+
+.ai-dj-avatar.is-sprite-sequence .avatar-image {
+  animation: none;
 }
 
 .avatar-status {

@@ -1,4 +1,4 @@
-const CACHE = 'mymusic-v4';
+const CACHE = 'mymusic-v5';
 const ASSETS = ['/', '/styles.css', '/app.js', '/manifest.webmanifest', '/assets/icon.svg', '/avatar/source/cancan.png'];
 
 self.addEventListener('install', (event) => {
