@@ -99,6 +99,17 @@ const avatarStateAliases = {
   searching_music: 'searching',
   reading_book: 'reading'
 };
+const avatarStateLabels = {
+  idle: 'IDLE',
+  listening: 'LISTENING',
+  talking: 'TALKING',
+  searching: 'SEARCH',
+  reading: 'READING',
+  happy: 'HAPPY',
+  on_air: 'ON AIR'
+};
+const AVATAR_MIN_TALKING_MS = 1800;
+const AVATAR_MAX_TALKING_MS = 6800;
 const SILENT_AUDIO_DATA_URI = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQQAAAAAAA==';
 
 const mixerOptions = {
@@ -141,6 +152,12 @@ document.addEventListener('click', (event) => {
 if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
+
+globalThis.myMusicAvatar = {
+  states: Object.keys(avatarFrameSequences),
+  setState: setAvatarState,
+  getState: () => document.querySelector('#ai-dj-avatar')?.dataset.state || state.avatarState
+};
 
 render();
 
@@ -454,6 +471,8 @@ function setAvatarState(nextState = 'idle', options = {}) {
   if (!root) return;
 
   root.dataset.state = normalized;
+  const status = root.querySelector('.avatar-status');
+  if (status) status.textContent = avatarStateLabels[normalized] || 'ON AIR';
 
   const video = document.querySelector('#avatar-video');
   const image = document.querySelector('#avatar-image');
@@ -1029,7 +1048,7 @@ async function startRadio() {
   const radioTurn = beginRadioTurn();
   primeVoicePlayback();
   const sessionId = ensureSessionId();
-  setAvatarState('on_air');
+  setAvatarState('searching');
   setRadioButtonState('loading');
   appendChat({ role: 'user', text: state.aiMusicMode ? '开启 AI 原创模式' : '启动电台' });
   const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : 'music');
@@ -1305,6 +1324,12 @@ function responseShouldSpeak(data = {}) {
   return Boolean(data.track);
 }
 
+function estimateAvatarSpeechMs(text = '') {
+  const compactLength = String(text || '').replace(/\s+/g, '').length;
+  const estimatedMs = compactLength * 95;
+  return Math.min(AVATAR_MAX_TALKING_MS, Math.max(AVATAR_MIN_TALKING_MS, estimatedMs));
+}
+
 function playHostSpeech(data, onEnd, { radioTurn = null } = {}) {
   const text = data.chatText || data.hostText || '';
   const hostAudio = document.querySelector('#host-audio');
@@ -1327,16 +1352,21 @@ function playHostSpeech(data, onEnd, { radioTurn = null } = {}) {
     onEnd?.();
   };
 
-  if (!data.ttsUrl || !hostAudio) {
-    if (hostAudio) hostAudio.src = '';
-    console.warn('[tts skipped]', data.ttsError || data.ttsStatus || 'no synthesized audio');
-    finish();
-    return;
-  }
+  const visualSpeechMs = estimateAvatarSpeechMs(text);
+  const finishAfterVisualHold = () => {
+    setTimeout(finish, visualSpeechMs);
+  };
 
   setAvatarState('talking');
   switchVisualizerTo('host');
   if (data.track) setPlaybackToggleState(true);
+
+  if (!data.ttsUrl || !hostAudio) {
+    if (hostAudio) hostAudio.src = '';
+    console.warn('[tts skipped]', data.ttsError || data.ttsStatus || 'no synthesized audio');
+    finishAfterVisualHold();
+    return;
+  }
 
   try {
     hostAudio.muted = false;
@@ -1350,11 +1380,11 @@ function playHostSpeech(data, onEnd, { radioTurn = null } = {}) {
     };
     hostAudio.play().catch((error) => {
       console.warn('[tts skipped]', error?.message || error);
-      finish();
+      finishAfterVisualHold();
     });
   } catch (error) {
     console.warn('[tts skipped]', error?.message || error);
-    finish();
+    finishAfterVisualHold();
   }
 }
 
