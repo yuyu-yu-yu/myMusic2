@@ -23,13 +23,16 @@ export async function generateAiMusic({ config = {}, rootDir = process.cwd(), pr
   }
 
   const id = `ai-minimax-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`;
-  const title = buildTitle(payload);
+  const fallbackTitle = buildTitle(payload);
   const prompt = buildMusicPrompt({ payload, profile });
+  const lyricsResult = await generateLyricsWithFallback(minimax, prompt);
+  const title = lyricsResult.title || fallbackTitle;
+  const lyrics = lyricsResult.lyrics;
   const requestPayload = {
     model: minimax.model,
     prompt,
-    lyrics: '',
-    lyrics_optimizer: true,
+    lyrics,
+    lyrics_optimizer: !lyrics,
     is_instrumental: false,
     output_format: 'url',
     stream: false,
@@ -62,7 +65,7 @@ export async function generateAiMusic({ config = {}, rootDir = process.cwd(), pr
   await fs.writeFile(outputPath, audioBuffer);
 
   const durationMs = normalizeDurationMs(response?.extra_info?.music_duration);
-  const generatedLyrics = extractGeneratedLyrics(response);
+  const generatedLyrics = lyrics || extractGeneratedLyrics(response);
   const track = {
     id,
     name: title,
@@ -86,15 +89,7 @@ export async function generateAiMusic({ config = {}, rootDir = process.cwd(), pr
     chatText: `AI 原创电台已完成：${title}。这首歌是灿灿根据最近状态和音乐画像生成的。`,
     track,
     reason: 'minimax_ai_music',
-    explanation: {
-      summary: 'AI 原创歌曲：优先根据此刻状态、最近播放上下文和用户音乐画像生成。',
-      source: 'minimax_music',
-      factors: [
-        { type: 'mode', text: 'AI 原创电台模式已开启' },
-        { type: 'state', text: describeCurrentState(payload) },
-        { type: 'profile', text: summarizeProfile(profile) }
-      ]
-    },
+    explanation: buildAiMusicExplanation({ payload, profile, lyricsResult, usedModel }),
     speech: { shouldSpeak: false, mode: 'off' },
     ttsUrl: null,
     ttsStatus: 'disabled',
@@ -106,6 +101,13 @@ export async function generateAiMusic({ config = {}, rootDir = process.cwd(), pr
       paidModelBlocked: configuredModel !== minimax.model,
       prompt,
       lyrics: generatedLyrics,
+      lyricsGeneration: {
+        status: lyricsResult.status,
+        title: lyricsResult.title,
+        styleTags: lyricsResult.styleTags,
+        error: lyricsResult.error,
+        traceId: lyricsResult.traceId
+      },
       durationMs,
       generatedMs: Date.now() - startedAt,
       traceId: response?.trace_id || null
@@ -123,6 +125,37 @@ export function buildMusicPrompt({ payload = {}, profile = {} } = {}) {
     '人声类型：女音',
     `生成一首${moment.songGoal}的完整中文流行歌曲。`
   ].filter(Boolean).join(' ').slice(0, 2000);
+}
+
+export function buildAiMusicExplanation({ payload = {}, profile = {}, lyricsResult = {}, usedModel = '' } = {}) {
+  const factors = [];
+  const add = (type, text) => {
+    const value = cleanText(text, 80);
+    if (!value) return;
+    if (factors.some(factor => factor.text === value)) return;
+    factors.push({ type, text: value });
+  };
+
+  const moment = inferMoment(payload);
+  const env = getEnvironmentContext(payload);
+  const location = cleanText(payload.location || env.city || env.location || '上海', 20);
+  const time = summarizeLocalTime(env);
+  const weather = summarizeWeather(payload.weather || env.weather || payload.sessionContext?.weather || '');
+  const recent = getRecentUserMessages(payload).at(-1);
+  const profileText = summarizeProfileForPrompt(profile);
+  const vocal = '女音';
+
+  add('scene', `当前场景：${[location, time, weather].filter(Boolean).join(' / ')}`);
+  if (recent) add('chat', `最近表达：${recent.slice(0, 28)}`);
+  add('mood', `当前氛围：${formatMomentForFactor(moment)}`);
+  add('profile', `你的画像偏好：${profileText.replace(/、/g, ' / ')}`);
+  add('voice', `人声类型：${vocal}`);
+
+  return {
+    summary: 'AI 原创歌曲：按此刻状态、场景和音乐画像生成。',
+    source: 'minimax_music',
+    factors: factors.slice(0, 6)
+  };
 }
 
 export function buildStructuredLyrics({ payload = {}, profile = {} } = {}) {
@@ -170,6 +203,71 @@ export function buildLrcFromStructuredLyrics(lyrics = '', durationMs = DEFAULT_D
   const totalSeconds = Math.max(30, Math.floor((Number(durationMs) || DEFAULT_DURATION_MS) / 1000));
   const spacing = Math.max(4, Math.floor(totalSeconds / (lines.length + 1)));
   return lines.map((line, index) => `[${formatLrcTime(index * spacing)}] ${line}`).join('\n');
+}
+
+async function generateLyricsWithFallback(minimax, prompt) {
+  try {
+    const response = await callMiniMaxLyrics(minimax, {
+      mode: 'write_full_song',
+      prompt
+    });
+    const lyrics = cleanTextBlock(response?.lyrics || '', 3500);
+    if (!lyrics) {
+      return {
+        status: 'empty',
+        lyrics: '',
+        title: '',
+        styleTags: cleanText(response?.style_tags || response?.styleTags || '', 240),
+        error: '',
+        traceId: response?.trace_id || null
+      };
+    }
+    return {
+      status: 'generated',
+      lyrics,
+      title: cleanText(response?.song_title || response?.songTitle || '', 80),
+      styleTags: cleanText(response?.style_tags || response?.styleTags || '', 240),
+      error: '',
+      traceId: response?.trace_id || null
+    };
+  } catch (error) {
+    return {
+      status: 'fallback',
+      lyrics: '',
+      title: '',
+      styleTags: '',
+      error: error?.message || String(error || ''),
+      traceId: null
+    };
+  }
+}
+
+async function callMiniMaxLyrics(minimax, body) {
+  const url = `${minimax.baseUrl.replace(/\/+$/, '')}/v1/lyrics_generation`;
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${minimax.apiKey}`,
+      'content-type': 'application/json'
+    },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout?.(REQUEST_TIMEOUT_MS)
+  });
+
+  const text = await response.text();
+  let data = null;
+  try {
+    data = text ? JSON.parse(text) : null;
+  } catch {
+    throw new Error(`MiniMax 返回了非 JSON 歌词响应：HTTP ${response.status}`);
+  }
+
+  const statusCode = data?.base_resp?.status_code;
+  if (!response.ok || (statusCode !== undefined && Number(statusCode) !== 0)) {
+    const message = data?.base_resp?.status_msg || data?.error || data?.message || `HTTP ${response.status}`;
+    throw new Error(`MiniMax 歌词生成失败：${message}`);
+  }
+  return data;
 }
 
 async function callMiniMaxMusic(minimax, body) {
@@ -292,6 +390,16 @@ function summarizeProfileForPrompt(profile = {}) {
     .replace(/R&B/gi, 'R&B')
     .replace(/\s+/g, '');
   return text || '华语流行、轻电子、情绪陪伴';
+}
+
+function formatMomentForFactor(moment = {}) {
+  const state = String(moment.userState || moment.label || '')
+    .replace(/^用户/, '')
+    .replace(/，/g, ' / ')
+    .replace(/。/g, '')
+    .trim();
+  if (state) return state.slice(0, 48);
+  return '贴近当下状态';
 }
 
 function summarizeProfileDetail(profile = {}) {
