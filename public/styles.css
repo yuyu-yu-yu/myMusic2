@@ -176,9 +176,6 @@ body {
     transform-origin: top left;
   }
 
-  .player-shell {
-    height: calc((100vh / var(--desktop-visual-scale)) - 130px);
-  }
 }
 
 a {
@@ -443,6 +440,12 @@ button.danger:hover {
   gap: 18px;
   height: calc(100vh - 130px);
   min-height: 600px;
+}
+
+@media (min-width: 900px) {
+  .player-shell {
+    height: calc((100vh / var(--desktop-visual-scale)) - 130px);
+  }
 }
 
 .left-col {
