@@ -6,7 +6,6 @@
 
 :root {
   color-scheme: dark;
-  --desktop-ui-scale: 0.8;
   /* Core backgrounds */
   --bg: #06060e;
   --panel: #0c0c1a;
@@ -155,12 +154,6 @@ body {
   font-family: var(--font-body);
   font-size: 12px;
   line-height: 1.5;
-}
-
-@media (min-width: 900px) {
-  body {
-    zoom: var(--desktop-ui-scale);
-  }
 }
 
 a {
