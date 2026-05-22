@@ -39,7 +39,9 @@ import {
   getTimeContext,
   hasExplicitMusicIntent,
   normalizeMusicContext,
+  normalizeSessionConstraints,
   normalizeRadioQueue,
+  parseSessionConstraintUpdate,
   parseDjModelResponse,
   parseFinalHostText,
   parseSongPlanResponse,
@@ -49,6 +51,7 @@ import {
   replayRequestAllowsPlayedSong,
   sanitizeSpokenChatText,
   scoreSearchTrackForPick,
+  trackViolatesSessionConstraints,
   trackMatchesPlayedSongName,
   trackMatchesSongPick,
   TURN_ACTIONS
@@ -192,6 +195,38 @@ test('song search matching rejects unrelated mood-title results', () => {
     name: '陪你度过漫长岁月',
     artists: ['其他歌手']
   }, pick), false);
+});
+
+test('session constraints parse and block avoided artists or songs', () => {
+  const update = parseSessionConstraintUpdate('\u6362\u6362\u611f\u89c9\uff0c\u540e\u9762\u4e0d\u542c\u9648\u5955\u8fc5\u548c\u738b\u83f2\u7684\u6b4c');
+  const constraints = normalizeSessionConstraints({ avoidTerms: update.avoidTerms });
+
+  assert.deepEqual(constraints.avoidTerms, ['\u9648\u5955\u8fc5', '\u738b\u83f2']);
+  assert.equal(trackViolatesSessionConstraints({
+    id: 'eason-1',
+    name: '\u5bcc\u58eb\u5c71\u4e0b',
+    artists: ['\u9648\u5955\u8fc5'],
+    album: "What's Going On...?"
+  }, constraints), true);
+  assert.equal(trackViolatesSessionConstraints({
+    id: 'faye-1',
+    name: '\u7ea2\u8c46',
+    artists: ['\u738b\u83f2'],
+    album: '\u5531\u6e38'
+  }, constraints), true);
+  assert.equal(trackViolatesSessionConstraints({
+    id: 'jay-1',
+    name: '\u4e03\u91cc\u9999',
+    artists: ['\u5468\u6770\u4f26'],
+    album: '\u4e03\u91cc\u9999'
+  }, constraints), false);
+});
+
+test('session constraints can be reset by a normal recommendation request', () => {
+  const update = parseSessionConstraintUpdate('\u6062\u590d\u6b63\u5e38\u63a8\u8350');
+
+  assert.equal(update.reset, true);
+  assert.deepEqual(normalizeSessionConstraints({ avoidTerms: [] }).avoidTerms, []);
 });
 
 test('explicit song query treats LLM-guessed artists as weak hints', () => {
@@ -585,6 +620,18 @@ test('playable resolution keeps originalId tracks eligible for ncm-cli fallback'
   }, { includeLyric: false });
 
   assert.equal(missingOriginalId.playable, false);
+
+  const strictBrowserPlayback = await resolvePlayableTrack(null, netease, {
+    id: 'encrypted-vip',
+    originalId: '123456',
+    name: 'VIP Song',
+    artists: ['Artist']
+  }, { includeLyric: false, requireBrowserPlayUrl: true });
+
+  assert.equal(strictBrowserPlayback.playable, false);
+  assert.equal(strictBrowserPlayback.playUrl, null);
+  assert.equal(strictBrowserPlayback.playbackMode, null);
+  assert.match(strictBrowserPlayback.playbackError, /browser-playable/);
 });
 
 test('feedback and artist cooldown change candidate order', () => {

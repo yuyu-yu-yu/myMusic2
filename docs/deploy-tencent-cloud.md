@@ -63,9 +63,10 @@ For the judging demo, keep the dedicated NetEase demo account logged in and enab
 ```dotenv
 DEMO_GUEST_MODE=true
 DEMO_GUEST_TTL_HOURS=24
+REQUIRE_BROWSER_PLAY_URL=true
 IP_GEO_PROVIDER=ip-api
 WEATHER_PROVIDER=openmeteo
-WEATHER_CITY=上海
+WEATHER_CITY=Shanghai
 WEATHER_COUNTRY_CODE=CN
 ```
 

@@ -1234,16 +1234,19 @@ function inferTags(tracks) {
   return tags.slice(0, 5);
 }
 
-export async function resolvePlayableTrack(db, netease, track, { includeLyric = true } = {}) {
+export async function resolvePlayableTrack(db, netease, track, { includeLyric = true, requireBrowserPlayUrl = false } = {}) {
   if (!track) return null;
   const normalized = normalizeTrack(track);
   if (!netease.isConfigured() || normalized.id.startsWith('demo-')) {
+    const demoUrl = `/assets/${normalized.id}.mp3`;
     return {
       ...normalized,
-      playUrl: `/assets/${normalized.id}.mp3`,
-      playbackMode: normalized.originalId ? 'ncm-cli' : 'browser-demo',
-      playable: Boolean(normalized.originalId),
-      playbackError: normalized.originalId ? null : 'Demo track does not have a NetEase originalId.',
+      playUrl: demoUrl,
+      playbackMode: requireBrowserPlayUrl ? 'browser-demo' : (normalized.originalId ? 'ncm-cli' : 'browser-demo'),
+      playable: requireBrowserPlayUrl ? normalized.id.startsWith('demo-') : Boolean(normalized.originalId),
+      playbackError: requireBrowserPlayUrl
+        ? (normalized.id.startsWith('demo-') ? null : 'No browser-playable URL found.')
+        : (normalized.originalId ? null : 'Demo track does not have a NetEase originalId.'),
       lyric: '[00:00.00] Pure music, please enjoy.',
     };
   }
@@ -1284,9 +1287,9 @@ export async function resolvePlayableTrack(db, netease, track, { includeLyric = 
   return {
     ...normalized,
     playUrl: url,
-    playbackMode: url ? 'browser-direct' : 'ncm-cli',
-    playable: Boolean(url || normalized.originalId),
-    playbackError: (url || normalized.originalId) ? null : 'No playable URL found.',
+    playbackMode: url ? 'browser-direct' : (requireBrowserPlayUrl ? null : 'ncm-cli'),
+    playable: requireBrowserPlayUrl ? Boolean(url) : Boolean(url || normalized.originalId),
+    playbackError: (requireBrowserPlayUrl ? url : (url || normalized.originalId)) ? null : 'No browser-playable URL found.',
     lyric: lyric || ''
   };
 }

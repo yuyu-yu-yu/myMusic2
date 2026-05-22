@@ -237,10 +237,14 @@ async function buildRadioRecommendation({
   const mode = getSessionMode(db, sessionId);
   const prefs = normalizeRuntimePrefs(getUserPrefs(db, account));
   const context = getSessionContext(db, sessionId);
+  const sessionConstraints = getSessionConstraintsFromContext(context);
   const conversationState = normalizeConversationState(context.conversationState);
   const effectiveMusicContext = getEffectiveMusicContextForRecommendation(context, { userMessage });
   const contextMood = context.musicContext ? moodFromMusicContext(effectiveMusicContext) : null;
-  const recommendationMood = conversationMood || contextMood || moodFromConversationState(conversationState, prefs, mode);
+  const recommendationMood = mergeSessionConstraintsIntoMood(
+    conversationMood || contextMood || moodFromConversationState(conversationState, prefs, mode),
+    sessionConstraints
+  );
   const hostContext = buildRadioHostContext(db, sessionId, context, userMessage, account);
 
   const history = loadHistory(db, sessionId, account);
@@ -273,6 +277,7 @@ async function buildRadioRecommendation({
     hostContext,
     environmentContext,
     avoidTracks: extraAvoidTracks,
+    sessionConstraints,
     accountContext: account,
     deferHostText: deferHostAndSpeech
   });
@@ -411,7 +416,11 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
   const context = getSessionContext(db, sessionId);
   const conversationState = normalizeConversationState(context.conversationState);
   const environmentContext = await getEnvironmentContext({ db, sessionId, config });
-  const baseMood = analyzeTurnContext({
+  const constraintUpdate = parseSessionConstraintUpdate(userMessage);
+  const previousSessionConstraints = getSessionConstraintsFromContext(context);
+  const sessionConstraints = applySessionConstraintUpdate(previousSessionConstraints, constraintUpdate);
+  const constraintsChanged = !sessionConstraintsEqual(previousSessionConstraints, sessionConstraints);
+  let baseMood = analyzeTurnContext({
     history,
     userMessage,
     profile,
@@ -421,6 +430,7 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
     conversationState,
     environmentContext
   });
+  baseMood = mergeSessionConstraintsIntoMood(baseMood, sessionConstraints);
   const sessionSummary = await updateSessionSummary(db, config, sessionId, account);
   const longTermMemories = retrieveRelevantMemories(db, {
     accountId: account.accountId,
@@ -471,7 +481,7 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
   });
 
   if (turnAction.action === TURN_ACTIONS.RECOMMEND_AND_PLAY) {
-    const conversationMood = normalizeMoodDecision({
+    const conversationMood = mergeSessionConstraintsIntoMood(normalizeMoodDecision({
       ...baseMood,
       shouldRecommend: true,
       mood: turnAction.mood || baseMood.mood,
@@ -482,13 +492,14 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
         ? uniqueStrings([...(turnAction.searchHints || []), ...(baseMood.searchHints || [])], 6)
         : baseMood.searchHints,
       reason: turnAction.reason || baseMood.reason
-    });
+    }), sessionConstraints);
     const musicContext = nextMusicContext(getSessionContext(db, sessionId).musicContext, conversationMood, userMessage);
-    const queuePolicy = decideQueuePolicy({
+    let queuePolicy = decideQueuePolicy({
       analysis: musicContext,
       turnAction,
       currentQueueItem: firstReadyQueueItem(getSessionQueue(db, sessionId))
     });
+    if (constraintsChanged) queuePolicy = { action: RADIO_QUEUE_POLICIES.HARD_PREEMPT, reason: 'session constraints changed' };
     const shouldQueueInsteadOfImmediate = Boolean(
       currentTrack?.id &&
       userMessage &&
@@ -506,7 +517,8 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       setSessionContext(db, sessionId, {
         ...getSessionContext(db, sessionId),
         conversationState: nextConversationState,
-        musicContext
+        musicContext,
+        sessionConstraints
       });
       applyQueuePolicyToSession({ db, config, netease, sessionId, queuePolicy, musicContext, currentTrack, accountContext: account });
       const speech = speechDecisionForChat(prefs);
@@ -538,7 +550,8 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
         lastSuggestedAtUserCount: userMessageCountAfterThisTurn
       },
       lastSuggestedAtUserCount: userMessageCountAfterThisTurn,
-      musicContext
+      musicContext,
+      sessionConstraints
     });
     const result = await djTurn({ db, config, netease, sessionId, userMessage, conversationMood, useQueue: false, accountContext: account });
     setSessionContext(db, sessionId, {
@@ -552,7 +565,8 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
         ...getSessionContext(db, sessionId).musicContext,
         version: musicContext.version,
         updatedAt: nowIso()
-      })
+      }),
+      sessionConstraints
     });
     return { ...result, conversationMood, turnAction, queuePolicy, intent: explicitIntent ? 'explicit' : 'mood', intentSource };
   }
@@ -582,7 +596,7 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       turnAction
     })
   };
-  const conversationMood = normalizeMoodDecision({ ...baseMood, ...chatDecision });
+  const conversationMood = mergeSessionConstraintsIntoMood(normalizeMoodDecision({ ...baseMood, ...chatDecision }), sessionConstraints);
   const finalConversationState = updateConversationState({
     previous: nextConversationState,
     analysis: conversationMood,
@@ -591,11 +605,12 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
     userMessageCount: userMessageCountAfterThisTurn
   });
   const musicContext = nextMusicContext(getSessionContext(db, sessionId).musicContext, conversationMood, userMessage);
-  const queuePolicy = decideQueuePolicy({
+  let queuePolicy = decideQueuePolicy({
     analysis: musicContext,
     turnAction,
     currentQueueItem: firstReadyQueueItem(getSessionQueue(db, sessionId))
   });
+  if (constraintsChanged) queuePolicy = { action: RADIO_QUEUE_POLICIES.HARD_PREEMPT, reason: 'session constraints changed' };
 
   if (userMessage) saveMessage(db, sessionId, 'user', userMessage, account);
   saveMessage(db, sessionId, 'assistant', chatDecision.chatText, account);
@@ -610,7 +625,8 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
   setSessionContext(db, sessionId, {
     ...getSessionContext(db, sessionId),
     conversationState: finalConversationState,
-    musicContext
+    musicContext,
+    sessionConstraints
   });
   applyQueuePolicyToSession({ db, config, netease, sessionId, queuePolicy, musicContext, currentTrack, accountContext: account });
   const speech = speechDecisionForChat(prefs);
@@ -848,10 +864,26 @@ export function consumeReadyRadioQueue(db, sessionId, options = {}) {
   const queue = getSessionQueue(db, sessionId);
   const context = getSessionContext(db, sessionId);
   const musicContext = normalizeMusicContext(context.musicContext || {});
+  const sessionConstraints = getSessionConstraintsFromContext(context);
   const playedHistory = getPlayedTrackHistory(db, sessionId, 80, account);
   for (let index = 0; index < queue.length; index += 1) {
     const item = queue[index];
     if (item.status !== 'ready' || !item.track?.id) continue;
+    if (trackViolatesSessionConstraints(item.track, sessionConstraints)) {
+      queue[index] = {
+        ...item,
+        status: 'stale',
+        updatedAt: nowIso(),
+        staleReason: 'session_constraint'
+      };
+      updateQueueMetrics(db, sessionId, {
+        queueMissCount: 1,
+        queueContextDiscardCount: 1,
+        lastMissReason: 'session_constraint',
+        lastQueueReconcileReason: 'session_constraint'
+      });
+      continue;
+    }
     if (trackMatchesPlayedSongName(item.track, playedHistory)) {
       queue[index] = {
         ...item,
@@ -1226,6 +1258,7 @@ export function getRadioDebugStatus(db, sessionId, accountContext = null) {
   return {
     ok: true,
     sessionId: id,
+    sessionConstraints: normalizeSessionConstraints(context.sessionConstraints || {}),
     musicContext: normalizeMusicContext(context.musicContext || {}),
     conversationState: normalizeConversationState(context.conversationState || {}),
     queue: queue.map(sanitizeQueueItemForDebug),
@@ -1394,6 +1427,13 @@ function replacePendingQueueItem(db, sessionId, pendingId, readyItem, accountCon
     markPendingQueueItemFailed(db, sessionId, pendingId, {
       failedStage: 'dedupe',
       error: 'prefetched track was already played'
+    });
+    return;
+  }
+  if (trackViolatesSessionConstraints(readyItem.track, getSessionConstraintsFromContext(getSessionContext(db, sessionId)))) {
+    markPendingQueueItemFailed(db, sessionId, pendingId, {
+      failedStage: 'session_constraint',
+      error: 'prefetched track violates current session constraints'
     });
     return;
   }
@@ -2052,7 +2092,7 @@ export function extractRequestedArtistConstraint(text, tracks = [], mode = {}) {
   return findKnownArtistConstraint(modeText) || findLibraryArtistConstraint(modeText, tracks);
 }
 
-function getMusicRequestConstraints(db, userMessage = '', mode = {}) {
+function getMusicRequestConstraints(db, userMessage = '', mode = {}, sessionConstraints = {}) {
   const text = String(userMessage || '').trim();
   const tracks = safeListTracks(db);
   const artistConstraint = extractRequestedArtistConstraint(text, tracks, mode);
@@ -2061,6 +2101,7 @@ function getMusicRequestConstraints(db, userMessage = '', mode = {}) {
     text,
     artistConstraint,
     songTitle,
+    sessionConstraints: normalizeSessionConstraints(sessionConstraints),
     allowRequestedSongReplay: Boolean(songTitle),
     allowPlayedSongReplay: Boolean(songTitle && isExplicitReplayRequest(text))
   };
@@ -2579,11 +2620,124 @@ function extractPreferenceHints(text) {
 }
 
 function extractAvoidHints(text) {
+  return extractSessionAvoidTerms(text);
+}
+
+export function parseSessionConstraintUpdate(text) {
+  const value = String(text || '').trim();
+  if (!value) return { type: 'none', avoidTerms: [], reset: false, changed: false };
+  if (/(恢复正常推荐|取消.*(?:限制|禁听|不听|不要|别放|少放)|后面都听|以后都听|接下来都听)/.test(value)) {
+    return { type: 'reset', avoidTerms: [], reset: true, changed: true };
+  }
+  const avoidTerms = extractSessionAvoidTerms(value);
+  return avoidTerms.length
+    ? { type: 'avoid', avoidTerms, reset: false, changed: true }
+    : { type: 'none', avoidTerms: [], reset: false, changed: false };
+}
+
+export function normalizeSessionConstraints(input = {}) {
+  const avoidTerms = uniqueStrings([
+    ...(input.avoidTerms || []),
+    ...(input.avoidArtists || []),
+    ...(input.avoidSongs || [])
+  ].map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12);
+  return {
+    avoidTerms,
+    updatedAt: input.updatedAt || null
+  };
+}
+
+export function applySessionConstraintUpdate(previous = {}, update = {}) {
+  const current = normalizeSessionConstraints(previous);
+  if (update.reset) return { avoidTerms: [], updatedAt: nowIso() };
+  const nextTerms = uniqueStrings([
+    ...current.avoidTerms,
+    ...(update.avoidTerms || [])
+  ].map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12);
+  return {
+    avoidTerms: nextTerms,
+    updatedAt: nextTerms.join('|') === current.avoidTerms.join('|') ? current.updatedAt : nowIso()
+  };
+}
+
+function sessionConstraintsEqual(a = {}, b = {}) {
+  return normalizeSessionConstraints(a).avoidTerms.join('|') === normalizeSessionConstraints(b).avoidTerms.join('|');
+}
+
+function mergeSessionConstraintsIntoMood(mood = {}, sessionConstraints = {}) {
+  const baseMood = mood && typeof mood === 'object' ? mood : {};
+  const constraints = normalizeSessionConstraints(sessionConstraints);
+  if (!constraints.avoidTerms.length) return normalizeMoodDecision(baseMood);
+  const normalized = normalizeMoodDecision(baseMood);
+  return normalizeMoodDecision({
+    ...normalized,
+    avoidHints: uniqueStrings([...(normalized.avoidHints || []), ...constraints.avoidTerms], 12)
+  });
+}
+
+function extractSessionAvoidTerms(text) {
   const value = String(text || '');
-  const hints = [];
-  const avoidMatch = value.match(/(?:不要|不想听|不喜欢|别放|少放)([^，。？！,.!?]{1,16})/);
-  if (avoidMatch?.[1]) hints.push(avoidMatch[1].trim());
-  return hints;
+  const terms = [];
+  const pattern = /(?:后面|以后|接下来|之后|下面|本场|这场)?(?:都)?(?:不要再听|别再放|不要听|不再听|不听|不要|别放|少放|不想听|不喜欢)([^，。？！,.!?]{1,48})/g;
+  let match = null;
+  while ((match = pattern.exec(value))) {
+    terms.push(...splitSessionConstraintTerms(match[1]));
+  }
+  return uniqueStrings(terms.map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12);
+}
+
+function splitSessionConstraintTerms(value) {
+  return String(value || '')
+    .replace(/(?:的)?(?:这个歌手|这位歌手|歌曲|歌手|作品|音乐|艺人|这类|这种|这些|歌)$/g, '')
+    .split(/(?:和|跟|与|及|还有|以及|、|，|,|\/|&|\+|\s+)/)
+    .map(cleanSessionConstraintTerm)
+    .filter(Boolean);
+}
+
+function cleanSessionConstraintTerm(value) {
+  return String(value || '')
+    .replace(/[《》"'“”‘’]/g, '')
+    .replace(/^(后面|以后|接下来|之后|下面|本场|这场|都|再|给我|帮我|请|不听|不要|别放|少放|不想听|不喜欢)+/g, '')
+    .replace(/(?:的)?(?:这个歌手|这位歌手|歌曲|歌手|作品|音乐|艺人|这类|这种|这些|歌|了|吧|啦|哈)+$/g, '')
+    .trim();
+}
+
+function isUsefulSessionConstraintTerm(value) {
+  const normalized = normalizeMusicText(value);
+  if (normalized.length < 2 || normalized.length > 24) return false;
+  return !/^(这首|这歌|这个|这个版本|这版|当前|当前这首|现在这首|这一首|它|他|她|音乐|歌曲|歌)$/.test(value);
+}
+
+function getSessionConstraintsFromContext(context = {}) {
+  return normalizeSessionConstraints(context.sessionConstraints || {});
+}
+
+function formatSessionConstraintsForPrompt(sessionConstraints = {}) {
+  const constraints = normalizeSessionConstraints(sessionConstraints);
+  return constraints.avoidTerms.length
+    ? `本场禁听：${constraints.avoidTerms.join('、')}。这些歌手或歌名都不能推荐，也不能作为兜底歌曲。`
+    : '本场禁听：无。';
+}
+
+export function trackViolatesSessionConstraints(track = {}, sessionConstraints = {}) {
+  const terms = normalizeSessionConstraints(sessionConstraints).avoidTerms
+    .map(normalizeMusicText)
+    .filter(term => term.length >= 2);
+  if (!terms.length) return false;
+  const searchable = [
+    track?.name,
+    stripSongVersion(track?.name),
+    ...(Array.isArray(track?.artists) ? track.artists : []),
+    track?.album
+  ].map(normalizeMusicText).filter(Boolean).join(' ');
+  return terms.some(term => searchable.includes(term));
+}
+
+function songPickViolatesSessionConstraints(pick = {}, sessionConstraints = {}) {
+  return trackViolatesSessionConstraints({
+    name: pick?.name,
+    artists: normalizeArtistList(pick?.artists || [])
+  }, sessionConstraints);
 }
 
 function rejectsMusic(text) {
@@ -3615,12 +3769,12 @@ function getArtistPenaltyByName(db, accountContext = null) {
   return penalties;
 }
 
-async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, hostContext = {}, environmentContext = {}, avoidTracks = [], accountContext = null, deferHostText = false }) {
+async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, hostContext = {}, environmentContext = {}, avoidTracks = [], sessionConstraints = {}, accountContext = null, deferHostText = false }) {
   const account = normalizeAccountContext(accountContext);
   const playedHistory = mergePlayedTrackHistory(getPlayedTrackHistory(db, sessionId, 80, account), avoidTracks);
   const playedIds = new Set(playedHistory.map(track => String(track.id || '')).filter(Boolean));
   const playedSignatures = buildPlayedSignatureSet(playedHistory);
-  const request = getMusicRequestConstraints(db, userMessage, mode);
+  const request = getMusicRequestConstraints(db, userMessage, mode, sessionConstraints);
   const failedPicks = [];
   let lastPlan = null;
   let newMode = null;
@@ -3649,7 +3803,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
     if (!newMode) newMode = modeDecisionFromPlan(plan);
     if (!plan.picks.length) break;
 
-    const resolved = await resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, playedSignatures, request });
+    const resolved = await resolveSongPlanTrack({ db, config, netease, sessionId, plan, playedIds, playedSignatures, request });
     setRadioDebugInfo(db, sessionId, { lastSearchDiagnostics: resolved.diagnostics || [] });
     if (resolved.track) {
       const reason = resolved.pick.reason || '根据当前状态和音乐画像推荐';
@@ -3703,6 +3857,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
 
   const fallback = await resolveRecommendationFallback({
     db,
+    config,
     netease,
     sessionId,
     profile,
@@ -3792,6 +3947,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
 
 async function resolveRecommendationFallback({
   db,
+  config,
   netease,
   profile,
   timeOfDay,
@@ -3813,6 +3969,7 @@ async function resolveRecommendationFallback({
 
   const sameArtist = await resolveSameArtistFallback({
     db,
+    config,
     netease,
     failedPicks,
     playedIds,
@@ -3824,6 +3981,7 @@ async function resolveRecommendationFallback({
 
   const profileFallback = await resolveProfileLibraryFallback({
     db,
+    config,
     netease,
     profile,
     conversationMood,
@@ -3850,11 +4008,11 @@ async function resolveRecommendationFallback({
   };
 }
 
-async function resolveSameArtistFallback({ db, netease, failedPicks = [], request = {}, playedIds, playedSignatures, failedNameKeys }) {
+async function resolveSameArtistFallback({ db, config, netease, failedPicks = [], request = {}, playedIds, playedSignatures, failedNameKeys }) {
   const artists = uniqueStrings([
     ...(failedPicks || []).flatMap(pick => pick?.artists || []),
     request?.artistConstraint?.label || ''
-  ], 5);
+  ], 5).filter(artist => !trackViolatesSessionConstraints({ name: '', artists: [artist] }, request.sessionConstraints));
   const diagnostics = [];
   if (!artists.length) {
     return { track: null, stage: 'netease_search', message: '没有可用于同艺人兜底的艺人信息。', diagnostics };
@@ -3884,19 +4042,24 @@ async function resolveSameArtistFallback({ db, netease, failedPicks = [], reques
         playable: null
       };
       diagnostic.hits.push(hit);
+      if (trackViolatesSessionConstraints(track, request.sessionConstraints)) {
+        hit.accepted = false;
+        hit.filterReason = 'session_constraint';
+        continue;
+      }
       if (shouldSkipFallbackTrack(track, { playedIds, playedSignatures, failedNameKeys, request })) {
         hit.accepted = false;
         hit.filterReason = 'played_or_failed_song';
         continue;
       }
-      const playable = await resolvePlayableTrack(db, netease, track, { includeLyric: false });
+      const playable = await resolvePlayableTrack(db, netease, track, playableResolveOptions(config, { includeLyric: false }));
       hit.playable = Boolean(playable?.playable);
       if (!playable?.playable) {
         hit.accepted = false;
         hit.filterReason = 'not_playable';
         continue;
       }
-      const withLyric = await resolvePlayableTrack(db, netease, playable, { includeLyric: true });
+      const withLyric = await resolvePlayableTrack(db, netease, playable, playableResolveOptions(config, { includeLyric: true }));
       const selectedTrack = withLyric?.playable ? withLyric : playable;
       diagnostic.selectedTrackId = String(selectedTrack.id || '');
       diagnostics.push(trimSearchDiagnostic(diagnostic));
@@ -3923,7 +4086,7 @@ async function resolveSameArtistFallback({ db, netease, failedPicks = [], reques
   return { track: null, stage: 'netease_search', message: '同艺人兜底没有找到可播放歌曲。', diagnostics };
 }
 
-async function resolveProfileLibraryFallback({ db, netease, profile = {}, conversationMood = null, playedIds, playedSignatures, failedNameKeys, request = {} }) {
+async function resolveProfileLibraryFallback({ db, config, netease, profile = {}, conversationMood = null, playedIds, playedSignatures, failedNameKeys, request = {} }) {
   const tracks = listProfileFallbackTracks(db, 220);
   const diagnostics = [{
     pick: { name: 'profile_library_fallback', artists: [], reason: 'profile_fallback' },
@@ -3937,6 +4100,7 @@ async function resolveProfileLibraryFallback({ db, netease, profile = {}, conver
 
   const ranked = tracks
     .filter(track => !shouldSkipFallbackTrack(track, { playedIds, playedSignatures, failedNameKeys, request }))
+    .filter(track => !trackViolatesSessionConstraints(track, request.sessionConstraints))
     .map((track, index) => ({ track, score: scoreFallbackTrack(track, { profile, conversationMood }) - index * 0.01 }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 32);
@@ -3950,14 +4114,14 @@ async function resolveProfileLibraryFallback({ db, netease, profile = {}, conver
       playable: null
     };
     diagnostics[0].hits.push(hit);
-    const playable = await resolvePlayableTrack(db, netease, item.track, { includeLyric: false });
+    const playable = await resolvePlayableTrack(db, netease, item.track, playableResolveOptions(config, { includeLyric: false }));
     hit.playable = Boolean(playable?.playable);
     if (!playable?.playable) {
       hit.accepted = false;
       hit.filterReason = 'not_playable';
       continue;
     }
-    const withLyric = await resolvePlayableTrack(db, netease, playable, { includeLyric: true });
+    const withLyric = await resolvePlayableTrack(db, netease, playable, playableResolveOptions(config, { includeLyric: true }));
     const selectedTrack = withLyric?.playable ? withLyric : playable;
     diagnostics[0].selectedTrackId = String(selectedTrack.id || '');
     const reason = 'LLM 推荐未确认到可播放源，改用当前账号画像/歌单兜底。';
@@ -4033,6 +4197,13 @@ function buildRecommendationFailure({ stage = 'playable_check', message = '', fa
   };
 }
 
+function playableResolveOptions(config = {}, options = {}) {
+  return {
+    ...options,
+    requireBrowserPlayUrl: Boolean(config?.playback?.requireBrowserPlayUrl)
+  };
+}
+
 async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood, memoryContext, request, failedPicks = [], playedHistory = [], hostContext = {}, environmentContext = {} }) {
   const fallbackPlan = {
     picks: [],
@@ -4048,6 +4219,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
     request?.artistConstraint?.label ? `指定艺人：${request.artistConstraint.label}` : '',
     request?.songTitle ? `指定歌名：${request.songTitle}` : ''
   ].filter(Boolean).join('；') || '无明确歌名/艺人约束';
+  const sessionConstraintText = formatSessionConstraintsForPrompt(request?.sessionConstraints);
   const failedText = failedPicks.length
     ? `上一批没有确认到可播放源，请避开这些歌：${failedPicks.map(pick => `${pick.name}${pick.artists?.length ? ' - ' + pick.artists.join('、') : ''}`).join('；')}`
     : '没有失败歌单。';
@@ -4068,6 +4240,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         '“深夜、安静、陪伴、适合放松、开心、提神”等只能用于理解氛围，不能当作歌曲名或主搜索词，除非它本来就是你明确推荐的真实歌名且给出了艺人。',
         '搜索 queries 必须像音乐软件里会输入的短词，优先“歌名 艺人”和“艺人 歌名”。不要输出长句。',
         '如果用户明确指定艺人、歌名或风格，必须优先满足；不确定时选更常见、更好搜的歌曲。',
+        '如果存在本场禁听，禁听优先级高于听众画像、历史偏好和兜底推荐；不要推荐禁听歌手，也不要推荐歌名命中禁听词的歌曲。',
         '如果用户说“他的另一首/她的另一首/这个歌手的另一首/换这位歌手”，优先参考最近播放歌曲的艺人，把它理解成当前或上一首歌的主艺人。',
         replayRule,
         'hostLine 只是备用素材，不是最终导播词。不要写成“刚才……现在……”“上一首……接下来……”或“接下来放……”。可以只写一个自然的导播方向。',
@@ -4084,6 +4257,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
         modeText,
         `明确请求：${requestText}`,
+        sessionConstraintText,
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
         formatRecentHostPlays(hostContext.recentPlays),
         playedText,
@@ -4160,7 +4334,7 @@ function formatPlayedSongExclusions(playedHistory = [], request = {}) {
     : `${replayText}本轮/最近已播放歌名：${replayText ? '除本次指定歌曲外无其他限制' : '无'}`;
 }
 
-async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, playedSignatures = new Set(), request = {} }) {
+async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, playedIds, playedSignatures = new Set(), request = {} }) {
   const failedPicks = [];
   const diagnostics = [];
   for (const pick of plan.picks) {
@@ -4175,6 +4349,12 @@ async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, p
     };
     if (trackMatchesPlayedSongName(effectivePick, playedSignatures) && !replayRequestAllowsPlayedSong(effectivePick, request)) {
       pickDiagnostic.failedReason = 'played_song_name';
+      diagnostics.push(pickDiagnostic);
+      failedPicks.push(effectivePick);
+      continue;
+    }
+    if (songPickViolatesSessionConstraints(effectivePick, request.sessionConstraints)) {
+      pickDiagnostic.failedReason = 'session_constraint';
       diagnostics.push(pickDiagnostic);
       failedPicks.push(effectivePick);
       continue;
@@ -4203,6 +4383,11 @@ async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, p
 
     for (const item of ranked) {
       const track = item.track;
+      if (trackViolatesSessionConstraints(track, request.sessionConstraints)) {
+        item.diagnostic.accepted = false;
+        item.diagnostic.filterReason = 'session_constraint';
+        continue;
+      }
       if (playedIds.has(String(track.id)) && !replayRequestAllowsPlayedSong(track, request)) {
         item.diagnostic.accepted = false;
         item.diagnostic.filterReason = 'played_track_id';
@@ -4217,7 +4402,7 @@ async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, p
         item.diagnostic.filterReason = 'allowed_explicit_replay';
       }
       const playableStarted = Date.now();
-      const playable = await resolvePlayableTrack(db, netease, track, { includeLyric: false });
+      const playable = await resolvePlayableTrack(db, netease, track, playableResolveOptions(config, { includeLyric: false }));
       item.diagnostic.playable = Boolean(playable?.playable);
       item.diagnostic.playableMs = Date.now() - playableStarted;
       if (!playable?.playable) {
@@ -4225,7 +4410,7 @@ async function resolveSongPlanTrack({ db, netease, sessionId, plan, playedIds, p
         item.diagnostic.filterReason = 'not_playable';
         continue;
       }
-      const withLyric = await resolvePlayableTrack(db, netease, playable, { includeLyric: true });
+      const withLyric = await resolvePlayableTrack(db, netease, playable, playableResolveOptions(config, { includeLyric: true }));
       pickDiagnostic.selectedTrackId = String((withLyric?.playable ? withLyric : playable)?.id || '');
       diagnostics.push(trimSearchDiagnostic(pickDiagnostic));
       return {

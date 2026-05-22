@@ -24,7 +24,7 @@ export async function runDemoSelfCheck({
   checks.push(await timedCheck('netease_cookie', '网易云扫码登录', () => checkCookie()));
   checks.push(await timedCheck('community_api', 'NeteaseCloudMusicApi', () => checkCommunityApi()));
   checks.push(await timedCheck('library', '当前账号歌单', () => checkLibrary(db, syncStatus, accountContext)));
-  checks.push(await timedCheck('play_source', '当前播放源', () => checkPlaySource(db, netease, trackId, accountContext)));
+  checks.push(await timedCheck('play_source', '当前播放源', () => checkPlaySource(db, config, netease, trackId, accountContext)));
 
   const recentFailure = getRecentRecommendationFailure(db, sessionId, accountContext);
   checks.push({
@@ -150,7 +150,7 @@ async function checkLibrary(db, syncStatus, accountContext) {
   return { status: 'ok', detail: `已同步 ${library.playlists.length} 个歌单，${library.totalTracks} 首去重歌曲。` };
 }
 
-async function checkPlaySource(db, netease, trackId, accountContext) {
+async function checkPlaySource(db, config, netease, trackId, accountContext) {
   let track = trackId ? getTrackById(db, trackId) : null;
   if (!track) {
     const recent = listRecentPlays(db, 1, accountContext?.accountId)[0];
@@ -159,7 +159,10 @@ async function checkPlaySource(db, netease, trackId, accountContext) {
   if (!track) {
     return { status: 'skip', detail: '暂无当前歌曲或最近播放记录。' };
   }
-  const resolved = await withTimeout(resolvePlayableTrack(db, netease, track, { includeLyric: false }), SELF_CHECK_TIMEOUT_MS, null);
+  const resolved = await withTimeout(resolvePlayableTrack(db, netease, track, {
+    includeLyric: false,
+    requireBrowserPlayUrl: Boolean(config?.playback?.requireBrowserPlayUrl)
+  }), SELF_CHECK_TIMEOUT_MS, null);
   if (!resolved?.playable) {
     return { status: 'fail', detail: `《${track.name || track.id}》当前无法解析播放源。`, action: '重新同步歌单或换一首歌测试。' };
   }

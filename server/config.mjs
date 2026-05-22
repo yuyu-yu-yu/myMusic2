@@ -37,6 +37,9 @@ export function getConfig() {
       guestMode: parseBoolean(env.DEMO_GUEST_MODE),
       guestTtlHours: Math.max(1, Number(env.DEMO_GUEST_TTL_HOURS || 24) || 24)
     },
+    playback: {
+      requireBrowserPlayUrl: parseBoolean(env.REQUIRE_BROWSER_PLAY_URL)
+    },
     netease: {
       baseUrl: env.NETEASE_BASE_URL || 'https://openapi.music.163.com',
       appId: env.NETEASE_APP_ID || '',
@@ -144,6 +147,9 @@ export function publicConfigStatus(config) {
     demo: {
       guestMode: Boolean(config.demo?.guestMode),
       guestTtlHours: config.demo?.guestTtlHours || 24
+    },
+    playback: {
+      requireBrowserPlayUrl: Boolean(config.playback?.requireBrowserPlayUrl)
     }
   };
 }
