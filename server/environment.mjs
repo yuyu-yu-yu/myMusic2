@@ -25,6 +25,32 @@ export async function resolveRequestEnvironment(req, config = {}, { includeWeath
   return environment;
 }
 
+export async function resolveRequestEnvironmentContext(req, config = {}, { includeWeather = false, date = new Date() } = {}) {
+  const environment = await resolveRequestEnvironment(req, config, { includeWeather });
+  return buildEnvironmentContext(environment, config, date);
+}
+
+export function buildEnvironmentContext(environment = {}, config = {}, date = new Date()) {
+  const timeZone = environment.timeZone || config.weather?.timeZone || config.app?.timeZone || DEFAULT_TIME_ZONE;
+  const parts = getZonedDateTimeParts(date, timeZone);
+  const hour = Number(parts.hour);
+  const timeOfDay = hour < 6 ? '深夜' : hour < 9 ? '清晨' : hour < 12 ? '上午' : hour < 14 ? '中午' : hour < 18 ? '下午' : hour < 21 ? '傍晚' : '夜晚';
+  const weather = String(environment.weather || '').trim();
+  return {
+    hour,
+    timeOfDay,
+    localDate: `${parts.year}-${parts.month}-${parts.day}`,
+    localTime: `${parts.hour}:${parts.minute}`,
+    timeZone,
+    city: environment.city || config.weather?.city || '上海',
+    countryCode: environment.countryCode || config.weather?.countryCode || 'CN',
+    weather,
+    weatherUpdatedAt: weather ? environment.updatedAt || new Date(date).toISOString() : '',
+    environmentSource: environment.source || 'fallback',
+    clientTimeZone: environment.clientTimeZone || undefined
+  };
+}
+
 export function configWithEnvironment(config = {}, environment = {}) {
   const timeZone = environment.timeZone || config.weather?.timeZone || config.app?.timeZone || DEFAULT_TIME_ZONE;
   return {
@@ -140,6 +166,38 @@ function normalizeTimeZone(value) {
   const text = String(value || '').trim();
   if (!/^[A-Za-z_]+(?:\/[A-Za-z0-9_+\-]+){1,3}$/.test(text)) return '';
   return text.slice(0, 80);
+}
+
+function getZonedDateTimeParts(date, timeZone) {
+  try {
+    const formatter = new Intl.DateTimeFormat('zh-CN', {
+      timeZone,
+      hour12: false,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit'
+    });
+    const parts = Object.fromEntries(formatter.formatToParts(date).map(part => [part.type, part.value]));
+    return {
+      year: parts.year,
+      month: parts.month,
+      day: parts.day,
+      hour: parts.hour === '24' ? '00' : parts.hour,
+      minute: parts.minute
+    };
+  } catch {
+    const fallback = new Date(date);
+    const pad = value => String(value).padStart(2, '0');
+    return {
+      year: String(fallback.getFullYear()),
+      month: pad(fallback.getMonth() + 1),
+      day: pad(fallback.getDate()),
+      hour: pad(fallback.getHours()),
+      minute: pad(fallback.getMinutes())
+    };
+  }
 }
 
 async function getCachedEnvironmentWeather(environment, weatherConfig = {}) {

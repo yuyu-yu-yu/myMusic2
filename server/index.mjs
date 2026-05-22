@@ -17,7 +17,7 @@ import { runDemoSelfCheck } from './diagnostics.mjs';
 import { publicAccountContext, resolveAccountContext } from './account-scope.mjs';
 import { generateAiMusic } from './ai-music.mjs';
 import { cleanupDemoGuest, cleanupExpiredDemoGuests, getVisitorIdFromRequest, resolveRequestAccountContext } from './demo-guest.mjs';
-import { configWithEnvironment, resolveRequestEnvironment } from './environment.mjs';
+import { configWithEnvironment, resolveRequestEnvironment, resolveRequestEnvironmentContext } from './environment.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -300,13 +300,22 @@ const routes = {
     const body = await readJson(req);
     const accountContext = getRequestAccount(req);
     const recentMessages = getRecentMessagesForAiMusic(db, body.sessionId, accountContext);
-    const sessionContext = getSessionContextForAiMusic(db, body.sessionId, accountContext);
+    const storedSessionContext = getSessionContextForAiMusic(db, body.sessionId, accountContext);
+    const environmentContext = await resolveRequestEnvironmentContext(req, config, { includeWeather: true });
+    const weather = environmentContext.weather || storedSessionContext.weather || '';
+    const sessionContext = {
+      ...storedSessionContext,
+      weather,
+      environmentContext
+    };
     const result = await generateAiMusic({
       config: config.minimax,
       rootDir,
       profile: getProfile(db, accountContext),
       payload: {
         ...body,
+        weather,
+        environmentContext,
         recentMessages: recentMessages.length ? recentMessages : (body.recentMessages || []),
         sessionContext
       }

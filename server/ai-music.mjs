@@ -349,9 +349,11 @@ function shouldRetryWithFreeModel(error) {
 }
 
 function buildTitle(payload = {}) {
+  const rawTime = cleanText(getEnvironmentContext(payload).localTime || '', 20);
+  const match = rawTime.match(/(\d{1,2}):(\d{2})/);
   const date = new Date();
-  const hh = String(date.getHours()).padStart(2, '0');
-  const mm = String(date.getMinutes()).padStart(2, '0');
+  const hh = String(match ? Number(match[1]) : date.getHours()).padStart(2, '0');
+  const mm = String(match ? Number(match[2]) : date.getMinutes()).padStart(2, '0');
   const moment = inferMoment(payload);
   return `${moment.title} ${hh}:${mm}`;
 }

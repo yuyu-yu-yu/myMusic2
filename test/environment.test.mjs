@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { configWithEnvironment, extractClientIp, resolveRequestEnvironment } from '../server/environment.mjs';
+import { configWithEnvironment, extractClientIp, resolveRequestEnvironment, resolveRequestEnvironmentContext } from '../server/environment.mjs';
 
 function mockRequest(headers = {}, remoteAddress = '127.0.0.1') {
   return { headers, socket: { remoteAddress } };
@@ -86,6 +86,37 @@ test('environment resolver falls back for private IPs without network lookup', a
   assert.equal(environment.city, 'Shanghai');
   assert.equal(environment.countryCode, 'CN');
   assert.equal(environment.timeZone, 'Asia/Shanghai');
+  assert.equal(called, false);
+});
+
+test('environment context uses browser timezone for AI music local time', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  let called = false;
+  globalThis.fetch = async () => {
+    called = true;
+    throw new Error('unexpected fetch');
+  };
+
+  const environmentContext = await resolveRequestEnvironmentContext(
+    mockRequest({
+      'x-forwarded-for': '192.168.1.8',
+      'x-demo-time-zone': 'Asia/Shanghai',
+      'x-demo-locale': 'zh-CN'
+    }),
+    baseConfig(),
+    { date: new Date('2026-05-22T18:07:00.000Z') }
+  );
+
+  assert.equal(environmentContext.localDate, '2026-05-23');
+  assert.equal(environmentContext.localTime, '02:07');
+  assert.equal(environmentContext.hour, 2);
+  assert.equal(environmentContext.timeOfDay, '深夜');
+  assert.equal(environmentContext.timeZone, 'Asia/Shanghai');
+  assert.equal(environmentContext.city, 'Shanghai');
   assert.equal(called, false);
 });
 
