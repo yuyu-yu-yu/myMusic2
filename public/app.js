@@ -1716,7 +1716,13 @@ function syncLyricTime(currentTimeSec) {
   if (activeIndex >= 0) {
     const activeEl = viewport.querySelector(`.lyric-line[data-index="${activeIndex}"]`);
     if (activeEl) {
-      activeEl.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      const viewportRect = viewport.getBoundingClientRect();
+      const activeRect = activeEl.getBoundingClientRect();
+      const targetTop = viewport.scrollTop
+        + activeRect.top
+        - viewportRect.top
+        - ((viewport.clientHeight - activeRect.height) / 2);
+      viewport.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
     }
   }
 }
