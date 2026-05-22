@@ -175,6 +175,10 @@ body {
     transform: scale(var(--desktop-visual-scale));
     transform-origin: top left;
   }
+
+  .player-shell {
+    height: calc((100vh / var(--desktop-visual-scale)) - 130px);
+  }
 }
 
 a {
