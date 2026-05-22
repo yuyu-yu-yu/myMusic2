@@ -1686,6 +1686,7 @@ function buildLyricDOM(lrcText, { syncMode = 'timed' } = {}) {
   }
 
   container.appendChild(viewport);
+  updateLyricCenterPadding(viewport);
 }
 
 function syncLyricTime(currentTimeSec) {
@@ -1726,9 +1727,28 @@ function syncLyricTime(currentTimeSec) {
 function centerLyricLine(viewport, lineEl) {
   requestAnimationFrame(() => {
     if (!viewport?.isConnected || !lineEl?.isConnected) return;
-    const targetTop = lineEl.offsetTop + (lineEl.offsetHeight / 2) - (viewport.clientHeight / 2);
-    viewport.scrollTo({ top: Math.max(0, targetTop), behavior: 'auto' });
+    updateLyricCenterPadding(viewport, lineEl);
+    const viewportRect = viewport.getBoundingClientRect();
+    const lineRect = lineEl.getBoundingClientRect();
+    const targetTop = viewport.scrollTop
+      + (lineRect.top + lineRect.height / 2)
+      - (viewportRect.top + viewportRect.height / 2);
+    const maxTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+    viewport.scrollTo({
+      top: Math.min(maxTop, Math.max(0, targetTop)),
+      behavior: 'auto'
+    });
   });
+}
+
+function updateLyricCenterPadding(viewport, lineEl = null) {
+  if (!viewport?.isConnected) return;
+  if (viewport.classList.contains('lyric-viewport-plain')) return;
+  const sampleLine = lineEl || viewport.querySelector('.lyric-line');
+  const viewportHeight = viewport.getBoundingClientRect().height || viewport.clientHeight;
+  const lineHeight = sampleLine?.getBoundingClientRect().height || 52;
+  const centerPadding = Math.max(28, Math.round((viewportHeight - lineHeight) / 2));
+  viewport.style.setProperty('--lyric-center-padding', `${centerPadding}px`);
 }
 
 async function startSongPlayback(radioTurn = null) {
