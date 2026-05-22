@@ -503,8 +503,6 @@ button.danger:hover {
 }
 
 .ai-music-mode {
-  display: grid;
-  gap: 7px;
   width: 100%;
 }
 
@@ -545,7 +543,7 @@ button.danger:hover {
 
 .ai-music-toggle-copy {
   display: grid;
-  gap: 2px;
+  gap: 3px;
   min-width: 0;
 }
 
@@ -570,12 +568,11 @@ button.danger:hover {
 }
 
 .ai-music-hint {
-  margin: 0;
-  padding: 0 2px 0 26px;
-  color: rgba(224, 224, 255, 0.62);
+  margin-top: 2px;
+  color: rgba(0, 255, 65, 0.78);
   font-size: 11px;
-  line-height: 1.45;
-  letter-spacing: 0;
+  line-height: 1.35;
+  letter-spacing: 0.02em;
 }
 
 .ai-music-mode:has(.ai-music-toggle.is-active) .ai-music-hint {
