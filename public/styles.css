@@ -1469,7 +1469,7 @@ audio {
   height: 100%;
   overflow-y: auto;
   scroll-behavior: smooth;
-  padding: 48px 20px;
+  padding: calc(50% - 26px) 20px;
   -webkit-mask-image: linear-gradient(
     to bottom,
     transparent 0%,
