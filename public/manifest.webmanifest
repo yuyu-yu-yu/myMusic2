@@ -1,6 +1,6 @@
 {
-  "name": "myMusic",
-  "short_name": "myMusic",
+  "name": "灿灿校园电台",
+  "short_name": "灿灿电台",
   "start_url": "/",
   "display": "standalone",
   "background_color": "#10131a",

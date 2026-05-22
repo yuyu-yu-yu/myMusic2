@@ -7,15 +7,14 @@
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="preload" href="/assets/fusion-pixel-12px-monospaced-zh_hans.ttf" as="font" type="font/ttf" crossorigin />
     <link rel="stylesheet" href="/styles.css" />
-    <title>myMusic</title>
+    <title>灿灿校园电台</title>
   </head>
   <body>
     <div id="crt-overlay"></div>
     <div id="app">
       <header class="topbar">
-        <a class="brand" href="/" data-link>
-          <span class="brand-mark">m</span>
-          <span>myMusic</span>
+        <a class="brand" href="/" data-link aria-label="灿灿校园电台">
+          <span class="brand-title">灿灿校园电台</span>
         </a>
         <nav class="nav">
           <a href="/" data-link>电台</a>
@@ -85,6 +84,7 @@
                 <small>开启后下一首由灿灿根据状态生成</small>
               </span>
             </button>
+            <p class="ai-music-hint">生成时间约一分钟，请耐心等待</p>
           </div>
           <div id="lyric" class="lyric"></div>
         </div>

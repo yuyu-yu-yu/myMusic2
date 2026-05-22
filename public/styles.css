@@ -391,22 +391,22 @@ button.danger:hover {
 .brand {
   display: inline-flex;
   align-items: center;
-  gap: 10px;
   font-weight: 700;
   font-family: var(--font-mono);
-  letter-spacing: 0.04em;
+  letter-spacing: 0.08em;
+  color: var(--text);
+  text-shadow: 0 0 8px rgba(0, 240, 255, 0.25);
 }
 
-.brand-mark {
-  display: grid;
-  place-items: center;
-  width: 34px;
-  height: 34px;
-  border-radius: 4px;
-  background: var(--cyan);
-  color: #06060e;
-  font-family: var(--font-mono);
-  font-weight: 900;
+.brand-title {
+  display: inline-block;
+  font-size: 13px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.brand:hover {
+  color: var(--cyan);
 }
 
 .nav {
@@ -503,6 +503,8 @@ button.danger:hover {
 }
 
 .ai-music-mode {
+  display: grid;
+  gap: 7px;
   width: 100%;
 }
 
@@ -565,6 +567,20 @@ button.danger:hover {
 
 .ai-music-toggle.is-active .ai-music-toggle-copy small {
   color: rgba(224, 224, 255, 0.8);
+}
+
+.ai-music-hint {
+  margin: 0;
+  padding: 0 2px 0 26px;
+  color: rgba(224, 224, 255, 0.62);
+  font-size: 11px;
+  line-height: 1.45;
+  letter-spacing: 0;
+}
+
+.ai-music-mode:has(.ai-music-toggle.is-active) .ai-music-hint {
+  color: rgba(0, 255, 65, 0.86);
+  text-shadow: 0 0 8px rgba(0, 255, 65, 0.22);
 }
 
 .ai-music-download {

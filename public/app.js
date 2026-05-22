@@ -1602,7 +1602,7 @@ function scrollChatToBottom() {
 
 async function updatePlayer(data, autoplay) {
   const track = data.track || {};
-  document.querySelector('#track-title').textContent = track.name || 'myMusic';
+  document.querySelector('#track-title').textContent = track.name || '灿灿校园电台';
   document.querySelector('#track-artist').textContent = (track.artists || []).join(' / ') || '等待启动';
   updateAiMusicDownload(track);
   buildLyricDOM(data.track?.lyric || '', { syncMode: data.track?.lyricSync || 'timed' });
