@@ -543,7 +543,7 @@ button.danger:hover {
 
 .ai-music-toggle-copy {
   display: grid;
-  gap: 3px;
+  gap: 2px;
   min-width: 0;
 }
 
@@ -568,10 +568,11 @@ button.danger:hover {
 }
 
 .ai-music-hint {
-  margin-top: 2px;
+  display: inline;
+  margin-left: 10px;
   color: rgba(0, 255, 65, 0.78);
   font-size: 11px;
-  line-height: 1.35;
+  line-height: inherit;
   letter-spacing: 0.02em;
 }
 
