@@ -63,8 +63,27 @@ let avatarRestoreTimer = null;
 let avatarFrameTimer = null;
 let avatarFrameSequenceToken = 0;
 let preferencesLoadPromise = null;
-const FALLBACK_BAR_COUNT = 44;
 const VISUALIZER_DEBUG = false;
+const visualizerReducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)');
+const visualizerPalette = ['#00f0ff', '#ff00ff', '#ffd700', '#7f5bff'];
+const visualizerState = {
+  mode: 'off',
+  particles: [],
+  sparks: [],
+  data: null,
+  lastTime: 0,
+  dpr: 1,
+  cssWidth: 0,
+  cssHeight: 0,
+  intensity: { low: 0, mid: 0, high: 0, overall: 0 }
+};
+let audioCtx = null;
+let analyser = null;
+let visualizerAnimId = null;
+let visualizerBuilt = false;
+let _drawFrameCount = 0;
+let _drawLogged = false;
+const sourceCache = new Map();
 
 function makeAvatarFrameSequence(stateName, durations) {
   return {
@@ -196,30 +215,18 @@ async function render() {
 // One persistent AudioContext. Sources created once per audio element and
 // cached. Switching disconnects old connections and reconnects the desired
 // source to a fresh analyser. No gain nodes.
-let audioCtx = null;
-let analyser = null;
-let visualizerAnimId = null;
-let visualizerBuilt = false;
-const sourceCache = new Map();
 
 function visualizerLog(...args) {
   if (VISUALIZER_DEBUG) console.log('[viz]', ...args);
 }
 
 function initVisualizer() {
-  const fallback = document.querySelector('#equalizer-fallback');
-  if (!fallback) return;
-  if (fallback.dataset.visualizerReady === 'true') return;
-  fallback.replaceChildren();
-  for (let i = 0; i < FALLBACK_BAR_COUNT; i++) {
-    const bar = document.createElement('span');
-    bar.className = 'bar';
-    bar.style.animationDelay = (i * 0.035) + 's';
-    bar.style.animationDuration = (0.55 + (i % 7) * 0.08) + 's';
-    bar.style.setProperty('--fallback-height', `${18 + ((i * 13) % 34)}px`);
-    fallback.appendChild(bar);
-  }
-  fallback.dataset.visualizerReady = 'true';
+  const canvas = document.querySelector('#visualizer-canvas');
+  if (!canvas) return;
+  canvas.hidden = false;
+  canvas.style.display = 'block';
+  setupVisualizerCanvas(canvas);
+  startDrawLoop(canvas, 'idle');
 }
 
 function getOrCreateMediaSource(audioEl) {
@@ -267,20 +274,25 @@ function disconnectVisualizerGraph() {
 function switchVisualizerTo(kind) {
   visualizerLog('switchVisualizerTo(' + kind + ') built:', visualizerBuilt);
   const canvas = document.querySelector('#visualizer-canvas');
-  const fb = document.querySelector('#equalizer-fallback');
 
   const hideAll = () => {
     stopDrawLoop();
     disconnectVisualizerGraph();
-    if (canvas) { canvas.style.display = 'none'; canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height); }
-    if (fb) fb.style.display = 'none';
+    setVisualizerMode('off');
+    if (canvas) {
+      const ctx = canvas.getContext('2d');
+      if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
+      canvas.style.display = 'none';
+    }
   };
-  const showFallback = () => {
-    initVisualizer();
+  const showIdle = () => {
     stopDrawLoop();
     disconnectVisualizerGraph();
-    if (canvas) { canvas.style.display = 'none'; canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height); }
-    if (fb) fb.style.display = 'flex';
+    if (canvas) {
+      canvas.style.display = 'block';
+      setupVisualizerCanvas(canvas);
+      startDrawLoop(canvas, 'idle');
+    }
   };
 
   if (kind === 'off') {
@@ -295,7 +307,7 @@ function switchVisualizerTo(kind) {
     ? Boolean(audioEl?.currentSrc || audioEl?.src)
     : Boolean(state.current?.track?.playUrl && (audioEl?.currentSrc || audioEl?.src));
   if (!hasBrowserAudio || !buildAudioGraph()) {
-    showFallback();
+    showIdle();
     return;
   }
 
@@ -306,7 +318,7 @@ function switchVisualizerTo(kind) {
   const source = getOrCreateMediaSource(audioEl);
   visualizerLog('source for ' + kind + ':', !!source, 'el src:', (audioEl?.src || '').slice(-40));
   if (!source) {
-    showFallback();
+    showIdle();
     return;
   }
 
@@ -316,56 +328,253 @@ function switchVisualizerTo(kind) {
   source.connect(analyser);
   analyser.connect(audioCtx.destination);
 
-  if (canvas) canvas.style.display = 'block';
-  if (fb) fb.style.display = 'none';
+  if (canvas) {
+    canvas.style.display = 'block';
+    setupVisualizerCanvas(canvas);
+  }
 
   stopDrawLoop();
-  startDrawLoop(canvas);
+  startDrawLoop(canvas, kind === 'host' ? 'host' : 'song');
 }
 
-let _drawFrameCount = 0;
-let _drawLogged = false;
-
-function startDrawLoop(canvas) {
+function startDrawLoop(canvas, mode = 'idle') {
   if (visualizerAnimId || !canvas) return;
-  visualizerLog('startDrawLoop, analyser:', !!analyser, 'built:', visualizerBuilt);
+  visualizerLog('startDrawLoop, mode:', mode, 'analyser:', !!analyser, 'built:', visualizerBuilt);
+  setVisualizerMode(mode);
+  setupVisualizerCanvas(canvas);
   _drawFrameCount = 0;
   _drawLogged = false;
-  function frame() {
+  visualizerState.lastTime = performance.now();
+  function frame(now) {
     visualizerAnimId = requestAnimationFrame(frame);
-    if (!visualizerBuilt || !analyser) return;
+    const dt = Math.min(33, Math.max(12, now - visualizerState.lastTime || 16));
+    visualizerState.lastTime = now;
     _drawFrameCount++;
     const ctx = canvas.getContext('2d');
-    const W = canvas.width;
-    const H = canvas.height;
-    const bufferLength = analyser.frequencyBinCount;
-    const dataArray = new Uint8Array(bufferLength);
-    analyser.getByteFrequencyData(dataArray);
-    if (VISUALIZER_DEBUG && !_drawLogged && _drawFrameCount % 30 === 0) {
+    if (!ctx) return;
+    setupVisualizerCanvas(canvas);
+    const dataArray = readVisualizerData();
+    if (VISUALIZER_DEBUG && dataArray && !_drawLogged && _drawFrameCount % 30 === 0) {
       const maxVal = Math.max(...dataArray);
       console.log('[viz] frame #' + _drawFrameCount, 'max freq:', maxVal, 'first 5:', [...dataArray.slice(0, 5)]);
       if (_drawFrameCount >= 120) _drawLogged = true;
     }
-    ctx.clearRect(0, 0, W, H);
-
-    const barCount = Math.min(bufferLength, 18);
-    const barWidth = (W / barCount) - 2;
-    let x = 1;
-    for (let i = 0; i < barCount; i++) {
-      const barHeight = Math.max(2, (dataArray[i] / 255) * (H - 4));
-      const gradient = ctx.createLinearGradient(0, H, 0, H - barHeight);
-      gradient.addColorStop(0, '#00f0ff');
-      gradient.addColorStop(1, '#ff00ff');
-      ctx.fillStyle = gradient;
-      ctx.fillRect(x, H - barHeight - 1, barWidth, barHeight);
-      x += barWidth + 2;
-    }
+    drawParticleVisualizer(ctx, canvas, dataArray, dt);
   }
   visualizerAnimId = requestAnimationFrame(frame);
 }
 
 function stopDrawLoop() {
   if (visualizerAnimId) { cancelAnimationFrame(visualizerAnimId); visualizerAnimId = null; }
+}
+
+function setVisualizerMode(mode = 'idle') {
+  visualizerState.mode = mode;
+  const canvas = document.querySelector('#visualizer-canvas');
+  if (canvas) canvas.dataset.visualizerMode = mode;
+  seedVisualizerParticles(canvas);
+}
+
+function setupVisualizerCanvas(canvas) {
+  const rect = canvas.getBoundingClientRect();
+  const dpr = Math.min(globalThis.devicePixelRatio || 1, 2);
+  const width = Math.max(1, Math.round(rect.width || canvas.clientWidth || 600));
+  const height = Math.max(1, Math.round(rect.height || canvas.clientHeight || 72));
+  if (visualizerState.cssWidth === width && visualizerState.cssHeight === height && visualizerState.dpr === dpr) return;
+  visualizerState.cssWidth = width;
+  visualizerState.cssHeight = height;
+  visualizerState.dpr = dpr;
+  canvas.width = Math.round(width * dpr);
+  canvas.height = Math.round(height * dpr);
+  seedVisualizerParticles(canvas, true);
+}
+
+function seedVisualizerParticles(canvas, force = false) {
+  if (!canvas || visualizerState.mode === 'off') {
+    visualizerState.particles = [];
+    visualizerState.sparks = [];
+    return;
+  }
+  const target = targetVisualizerParticleCount();
+  if (!force && Math.abs(visualizerState.particles.length - target) < 8) return;
+  visualizerState.particles = Array.from({ length: target }, (_, i) => createVisualizerParticle(i));
+  visualizerState.sparks = [];
+}
+
+function targetVisualizerParticleCount() {
+  const reduceMotion = Boolean(visualizerReducedMotion?.matches);
+  const mobile = globalThis.matchMedia?.('(max-width: 760px)')?.matches;
+  if (reduceMotion) return mobile ? 24 : 36;
+  return mobile ? 54 : 104;
+}
+
+function createVisualizerParticle(index = 0) {
+  const width = visualizerState.cssWidth || 600;
+  const height = visualizerState.cssHeight || 72;
+  return {
+    x: Math.random() * width,
+    y: height * (0.22 + Math.random() * 0.56),
+    vx: 0.18 + Math.random() * 0.72,
+    vy: -0.22 + Math.random() * 0.44,
+    size: 1 + (index % 4),
+    phase: Math.random() * Math.PI * 2,
+    depth: 0.35 + Math.random() * 0.75,
+    color: visualizerPalette[index % visualizerPalette.length]
+  };
+}
+
+function readVisualizerData() {
+  if (!visualizerBuilt || !analyser) return null;
+  const bufferLength = analyser.frequencyBinCount;
+  const dataArray = visualizerState.data?.length === bufferLength
+    ? visualizerState.data
+    : new Uint8Array(bufferLength);
+  analyser.getByteFrequencyData(dataArray);
+  visualizerState.data = dataArray;
+  return dataArray;
+}
+
+function drawParticleVisualizer(ctx, canvas, dataArray, dt) {
+  const width = visualizerState.cssWidth || canvas.width;
+  const height = visualizerState.cssHeight || canvas.height;
+  const dpr = visualizerState.dpr || 1;
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const intensity = computeVisualizerIntensity(dataArray);
+  visualizerState.intensity = intensity;
+  const mode = visualizerState.mode;
+  const reduceMotion = Boolean(visualizerReducedMotion?.matches);
+  const low = mode === 'idle' ? Math.max(0.08, intensity.low) : intensity.low;
+  const mid = mode === 'idle' ? Math.max(0.05, intensity.mid) : intensity.mid;
+  const high = mode === 'idle' ? Math.max(0.04, intensity.high) : intensity.high;
+
+  drawVisualizerField(ctx, width, height, low, mid, mode);
+  updateVisualizerParticles(ctx, width, height, { low, mid, high, dt, mode, reduceMotion });
+  if (!reduceMotion) emitVisualizerSparks(width, height, high, mode);
+  drawVisualizerSparks(ctx, dt);
+}
+
+function computeVisualizerIntensity(dataArray) {
+  if (!dataArray?.length) {
+    const idle = 0.08 + Math.sin(performance.now() / 900) * 0.025;
+    return { low: idle, mid: idle * 0.7, high: idle * 0.45, overall: idle };
+  }
+  const segment = (from, to) => {
+    let sum = 0;
+    let count = 0;
+    for (let i = from; i < to && i < dataArray.length; i += 1) {
+      sum += dataArray[i];
+      count += 1;
+    }
+    return count ? sum / (count * 255) : 0;
+  };
+  const low = segment(0, 7);
+  const mid = segment(7, 19);
+  const high = segment(19, dataArray.length);
+  return {
+    low,
+    mid,
+    high,
+    overall: low * 0.46 + mid * 0.34 + high * 0.2
+  };
+}
+
+function drawVisualizerField(ctx, width, height, low, mid, mode) {
+  const centerY = height * 0.52;
+  const glow = mode === 'host' ? '#ff00ff' : '#00f0ff';
+  const sweep = ctx.createLinearGradient(0, 0, width, 0);
+  sweep.addColorStop(0, 'rgba(0, 240, 255, 0)');
+  sweep.addColorStop(0.5, `rgba(${mode === 'host' ? '255, 0, 255' : '0, 240, 255'}, ${0.08 + low * 0.18})`);
+  sweep.addColorStop(1, 'rgba(255, 0, 255, 0)');
+  ctx.fillStyle = sweep;
+  ctx.fillRect(0, 0, width, height);
+
+  ctx.globalAlpha = 0.22 + low * 0.38;
+  ctx.strokeStyle = glow;
+  ctx.lineWidth = 1;
+  ctx.setLineDash([2, 8]);
+  for (let i = 0; i < 3; i += 1) {
+    const y = centerY + (i - 1) * (10 + mid * 16);
+    ctx.beginPath();
+    ctx.moveTo(8, y);
+    ctx.quadraticCurveTo(width * 0.5, y - (low * 18) + (i - 1) * 5, width - 8, y);
+    ctx.stroke();
+  }
+  ctx.setLineDash([]);
+  ctx.globalAlpha = 1;
+}
+
+function updateVisualizerParticles(ctx, width, height, values) {
+  const { low, mid, high, dt, mode, reduceMotion } = values;
+  const speed = (reduceMotion ? 0.22 : mode === 'song' ? 0.9 : 0.52) + mid * 1.25;
+  const pulse = (mode === 'host' ? low * 16 : low * 9) + high * 5;
+  for (const particle of visualizerState.particles) {
+    particle.phase += 0.02 * dt * particle.depth;
+    const driftY = Math.sin(particle.phase) * (0.16 + low * 0.38);
+    particle.x += particle.vx * speed * dt * 0.08 * particle.depth;
+    particle.y += (particle.vy + driftY) * dt * 0.05;
+    if (mode === 'host') {
+      const centerX = width * 0.22;
+      const centerY = height * 0.5;
+      particle.x += (centerX - particle.x) * 0.0025 * dt * particle.depth;
+      particle.y += (centerY - particle.y) * 0.003 * dt * particle.depth;
+    }
+    if (particle.x > width + 8) particle.x = -8;
+    if (particle.y < 8) particle.y = height - 8;
+    if (particle.y > height - 8) particle.y = 8;
+
+    const size = Math.max(1, Math.round(particle.size + pulse * particle.depth * 0.16));
+    const alpha = Math.min(0.9, 0.25 + low * 0.32 + high * 0.38 + particle.depth * 0.18);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = particle.color;
+    ctx.shadowColor = particle.color;
+    ctx.shadowBlur = reduceMotion ? 0 : 4 + low * 12;
+    ctx.fillRect(Math.round(particle.x), Math.round(particle.y), size, size);
+  }
+  ctx.shadowBlur = 0;
+  ctx.globalAlpha = 1;
+}
+
+function emitVisualizerSparks(width, height, high, mode) {
+  if (mode === 'idle' || high < 0.22) return;
+  const maxSparks = mode === 'song' ? 20 : 12;
+  const chance = mode === 'song' ? high * 0.38 : high * 0.18;
+  if (visualizerState.sparks.length >= maxSparks || Math.random() > chance) return;
+  const count = Math.min(3, 1 + Math.floor(high * 4));
+  for (let i = 0; i < count; i += 1) {
+    visualizerState.sparks.push({
+      x: mode === 'host' ? width * (0.16 + Math.random() * 0.18) : Math.random() * width,
+      y: height * (0.28 + Math.random() * 0.48),
+      vx: -0.5 + Math.random(),
+      vy: -0.9 - Math.random() * 0.8,
+      life: 280 + Math.random() * 220,
+      maxLife: 500,
+      size: 2 + Math.floor(Math.random() * 3),
+      color: visualizerPalette[Math.floor(Math.random() * visualizerPalette.length)]
+    });
+  }
+}
+
+function drawVisualizerSparks(ctx, dt) {
+  for (let i = visualizerState.sparks.length - 1; i >= 0; i -= 1) {
+    const spark = visualizerState.sparks[i];
+    spark.life -= dt;
+    if (spark.life <= 0) {
+      visualizerState.sparks.splice(i, 1);
+      continue;
+    }
+    spark.x += spark.vx * dt * 0.08;
+    spark.y += spark.vy * dt * 0.08;
+    const alpha = Math.max(0, spark.life / spark.maxLife);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = spark.color;
+    ctx.shadowColor = spark.color;
+    ctx.shadowBlur = 10 * alpha;
+    ctx.fillRect(Math.round(spark.x), Math.round(spark.y), spark.size, spark.size);
+  }
+  ctx.shadowBlur = 0;
+  ctx.globalAlpha = 1;
 }
 
 function stopVisualizer() {
@@ -614,7 +823,7 @@ function renderPlayer() {
   // Move persistent audio elements into the player layout
   const leftCol = document.querySelector('.left-col');
   const audioLayer = document.querySelector('#audio-layer');
-  const audioEls = ['#host-audio', '#song-audio', '#visualizer-canvas', '#equalizer-fallback'];
+  const audioEls = ['#host-audio', '#song-audio', '#visualizer-canvas'];
   const savedDisplay = [];
   audioEls.forEach((sel, i) => {
     const el = audioLayer.querySelector(sel);

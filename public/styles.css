@@ -78,11 +78,6 @@
   75%      { clip-path: inset(10% 0 40% 0); }
 }
 
-@keyframes eq-bar {
-  0%, 100% { transform: scaleY(0.32); opacity: 0.68; }
-  50%      { transform: scaleY(1); opacity: 1; }
-}
-
 @keyframes msg-slide-in {
   0%   { opacity: 0; transform: translateY(8px); }
   100% { opacity: 1; transform: translateY(0); }
@@ -1472,39 +1467,36 @@ audio {
   z-index: -2;
 }
 
-/* ----- Equalizer Fallback ----- */
-.equalizer-fallback {
-  display: none;
-  align-items: flex-end;
-  justify-content: stretch;
-  gap: 2px;
-  width: 100%;
-  height: 52px;
-  padding: 8px 12px;
-  border: 1px solid var(--line);
-  border-radius: 4px;
-  background: var(--panel);
-  box-sizing: border-box;
-  overflow: hidden;
-}
-.equalizer-fallback .bar {
-  flex: 1 1 0;
-  height: var(--fallback-height, 24px);
-  min-height: 3px;
-  background: var(--cyan);
-  border-radius: 1px;
-  transform-origin: bottom;
-  animation: eq-bar 0.8s ease-in-out infinite;
-}
-
-/* ----- Visualizer Canvas ----- */
+/* ----- Particle Rhythm Canvas ----- */
 #visualizer-canvas {
   width: 100%;
-  height: 52px;
+  height: 72px;
   border: 1px solid var(--line);
   border-radius: 4px;
-  background: var(--panel);
+  background:
+    radial-gradient(circle at 18% 48%, rgba(255, 0, 255, 0.14), transparent 0 28%),
+    radial-gradient(circle at 74% 42%, rgba(0, 240, 255, 0.12), transparent 0 30%),
+    linear-gradient(180deg, rgba(18, 18, 42, 0.9), rgba(6, 6, 14, 0.96)),
+    var(--panel);
   display: block;
+  pointer-events: none;
+  image-rendering: pixelated;
+  box-shadow: inset 0 0 18px rgba(0, 240, 255, 0.07);
+  transition: border-color 0.2s ease, box-shadow 0.2s ease, opacity 0.2s ease;
+}
+
+#visualizer-canvas[data-visualizer-mode="host"] {
+  border-color: rgba(255, 0, 255, 0.28);
+  box-shadow: inset 0 0 20px rgba(255, 0, 255, 0.1), 0 0 16px rgba(255, 0, 255, 0.08);
+}
+
+#visualizer-canvas[data-visualizer-mode="song"] {
+  border-color: rgba(0, 240, 255, 0.32);
+  box-shadow: inset 0 0 20px rgba(0, 240, 255, 0.1), 0 0 18px rgba(0, 240, 255, 0.09);
+}
+
+#visualizer-canvas[data-visualizer-mode="idle"] {
+  opacity: 0.74;
 }
 
 /* ----- Lyrics ----- */
@@ -3111,11 +3103,13 @@ button.small {
 
   #visualizer-canvas {
     max-width: 100%;
-    height: 42px;
+    height: 58px;
   }
+}
 
-  .equalizer-fallback {
-    height: 42px;
-    padding: 6px 8px;
+@media (prefers-reduced-motion: reduce) {
+  #visualizer-canvas {
+    opacity: 0.72;
+    box-shadow: inset 0 0 12px rgba(0, 240, 255, 0.05);
   }
 }
