@@ -69,9 +69,8 @@ const visualizerPalette = ['#00f0ff', '#ff00ff', '#ffd700', '#7f5bff'];
 const visualizerState = {
   mode: 'off',
   particles: [],
-  sparks: [],
-  data: null,
   lastTime: 0,
+  lastRender: 0,
   dpr: 1,
   cssWidth: 0,
   cssHeight: 0,
@@ -79,13 +78,9 @@ const visualizerState = {
   smoothedOverall: 0,
   lastOverall: 0
 };
-let audioCtx = null;
-let analyser = null;
 let visualizerAnimId = null;
-let visualizerBuilt = false;
 let _drawFrameCount = 0;
 let _drawLogged = false;
-const sourceCache = new Map();
 
 function makeAvatarFrameSequence(stateName, durations) {
   return {
@@ -214,9 +209,8 @@ async function render() {
 
 
 // --- Audio visualizer ---
-// One persistent AudioContext. Sources created once per audio element and
-// cached. Switching disconnects old connections and reconnects the desired
-// source to a fresh analyser. No gain nodes.
+// Keep the visual layer decoupled from the actual audio output. The public demo
+// should never route TTS or music through a Web Audio graph just to animate pixels.
 
 function visualizerLog(...args) {
   if (VISUALIZER_DEBUG) console.log('[viz]', ...args);
@@ -231,55 +225,12 @@ function initVisualizer() {
   startDrawLoop(canvas, 'idle');
 }
 
-function getOrCreateMediaSource(audioEl) {
-  if (!audioCtx || !audioEl) return null;
-  const cached = sourceCache.get(audioEl);
-  if (cached?.ctx === audioCtx && cached.source) return cached.source;
-  const source = audioCtx.createMediaElementSource(audioEl);
-  sourceCache.set(audioEl, { ctx: audioCtx, source });
-  return source;
-}
-
-function buildAudioGraph() {
-  if (visualizerBuilt) return true;
-  const hostAudio = document.querySelector('#host-audio');
-  const songAudio = document.querySelector('#song-audio');
-  if (!hostAudio || !songAudio) return false;
-  try {
-    hostAudio.crossOrigin = 'anonymous';
-    songAudio.crossOrigin = 'anonymous';
-    const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
-    if (!AudioContextCtor) return false;
-    if (!audioCtx) audioCtx = new AudioContextCtor();
-    const hostSource = getOrCreateMediaSource(hostAudio);
-    const songSource = getOrCreateMediaSource(songAudio);
-    visualizerBuilt = Boolean(hostSource && songSource);
-    visualizerLog('graph ready, sources cached:', sourceCache.size);
-    return visualizerBuilt;
-  } catch(e) {
-    console.warn('[viz] Web Audio not available:', e.message);
-    visualizerBuilt = false;
-    return false;
-  }
-}
-
-function disconnectVisualizerGraph() {
-  for (const entry of sourceCache.values()) {
-    try { entry.source.disconnect(); } catch {}
-  }
-  if (analyser) {
-    try { analyser.disconnect(); } catch {}
-    analyser = null;
-  }
-}
-
 function switchVisualizerTo(kind) {
-  visualizerLog('switchVisualizerTo(' + kind + ') built:', visualizerBuilt);
+  visualizerLog('switchVisualizerTo(' + kind + ')');
   const canvas = document.querySelector('#visualizer-canvas');
 
   const hideAll = () => {
     stopDrawLoop();
-    disconnectVisualizerGraph();
     setVisualizerMode('off');
     if (canvas) {
       const ctx = canvas.getContext('2d');
@@ -289,7 +240,6 @@ function switchVisualizerTo(kind) {
   };
   const showIdle = () => {
     stopDrawLoop();
-    disconnectVisualizerGraph();
     if (canvas) {
       canvas.style.display = 'block';
       setupVisualizerCanvas(canvas);
@@ -302,34 +252,6 @@ function switchVisualizerTo(kind) {
     return;
   }
 
-  const audioEl = kind === 'host'
-    ? document.querySelector('#host-audio')
-    : document.querySelector('#song-audio');
-  const hasBrowserAudio = kind === 'host'
-    ? Boolean(audioEl?.currentSrc || audioEl?.src)
-    : Boolean(state.current?.track?.playUrl && (audioEl?.currentSrc || audioEl?.src));
-  if (!hasBrowserAudio || !buildAudioGraph()) {
-    showIdle();
-    return;
-  }
-
-  if (audioCtx?.state === 'suspended') audioCtx.resume().catch(() => {});
-
-  disconnectVisualizerGraph();
-
-  const source = getOrCreateMediaSource(audioEl);
-  visualizerLog('source for ' + kind + ':', !!source, 'el src:', (audioEl?.src || '').slice(-40));
-  if (!source) {
-    showIdle();
-    return;
-  }
-
-  analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 64;
-  analyser.smoothingTimeConstant = 0.7;
-  source.connect(analyser);
-  analyser.connect(audioCtx.destination);
-
   if (canvas) {
     canvas.style.display = 'block';
     setupVisualizerCanvas(canvas);
@@ -341,27 +263,28 @@ function switchVisualizerTo(kind) {
 
 function startDrawLoop(canvas, mode = 'idle') {
   if (visualizerAnimId || !canvas) return;
-  visualizerLog('startDrawLoop, mode:', mode, 'analyser:', !!analyser, 'built:', visualizerBuilt);
+  visualizerLog('startDrawLoop, mode:', mode);
   setVisualizerMode(mode);
   setupVisualizerCanvas(canvas);
   _drawFrameCount = 0;
   _drawLogged = false;
   visualizerState.lastTime = performance.now();
+  visualizerState.lastRender = 0;
   function frame(now) {
     visualizerAnimId = requestAnimationFrame(frame);
+    if (now - visualizerState.lastRender < 33) return;
     const dt = Math.min(33, Math.max(12, now - visualizerState.lastTime || 16));
     visualizerState.lastTime = now;
+    visualizerState.lastRender = now;
     _drawFrameCount++;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
     setupVisualizerCanvas(canvas);
-    const dataArray = readVisualizerData();
-    if (VISUALIZER_DEBUG && dataArray && !_drawLogged && _drawFrameCount % 30 === 0) {
-      const maxVal = Math.max(...dataArray);
-      console.log('[viz] frame #' + _drawFrameCount, 'max freq:', maxVal, 'first 5:', [...dataArray.slice(0, 5)]);
+    if (VISUALIZER_DEBUG && !_drawLogged && _drawFrameCount % 30 === 0) {
+      console.log('[viz] frame #' + _drawFrameCount, 'mode:', visualizerState.mode, 'intensity:', visualizerState.intensity);
       if (_drawFrameCount >= 120) _drawLogged = true;
     }
-    drawParticleVisualizer(ctx, canvas, dataArray, dt);
+    drawParticleVisualizer(ctx, canvas, dt);
   }
   visualizerAnimId = requestAnimationFrame(frame);
 }
@@ -379,7 +302,7 @@ function setVisualizerMode(mode = 'idle') {
 
 function setupVisualizerCanvas(canvas) {
   const rect = canvas.getBoundingClientRect();
-  const dpr = Math.min(globalThis.devicePixelRatio || 1, 2);
+  const dpr = Math.min(globalThis.devicePixelRatio || 1, 1.25);
   const width = Math.max(1, Math.round(rect.width || canvas.clientWidth || 600));
   const height = Math.max(1, Math.round(rect.height || canvas.clientHeight || 72));
   if (visualizerState.cssWidth === width && visualizerState.cssHeight === height && visualizerState.dpr === dpr) return;
@@ -394,20 +317,18 @@ function setupVisualizerCanvas(canvas) {
 function seedVisualizerParticles(canvas, force = false) {
   if (!canvas || visualizerState.mode === 'off') {
     visualizerState.particles = [];
-    visualizerState.sparks = [];
     return;
   }
   const target = targetVisualizerParticleCount();
   if (!force && Math.abs(visualizerState.particles.length - target) < 8) return;
   visualizerState.particles = Array.from({ length: target }, (_, i) => createVisualizerParticle(i));
-  visualizerState.sparks = [];
 }
 
 function targetVisualizerParticleCount() {
   const reduceMotion = Boolean(visualizerReducedMotion?.matches);
   const mobile = globalThis.matchMedia?.('(max-width: 760px)')?.matches;
-  if (reduceMotion) return mobile ? 24 : 36;
-  return mobile ? 54 : 104;
+  if (reduceMotion) return mobile ? 14 : 22;
+  return mobile ? 34 : 64;
 }
 
 function createVisualizerParticle(index = 0) {
@@ -456,70 +377,36 @@ function getVisualizerRails() {
   ];
 }
 
-function readVisualizerData() {
-  if (!visualizerBuilt || !analyser) return null;
-  const bufferLength = analyser.frequencyBinCount;
-  const dataArray = visualizerState.data?.length === bufferLength
-    ? visualizerState.data
-    : new Uint8Array(bufferLength);
-  analyser.getByteFrequencyData(dataArray);
-  visualizerState.data = dataArray;
-  return dataArray;
-}
-
-function drawParticleVisualizer(ctx, canvas, dataArray, dt) {
+function drawParticleVisualizer(ctx, canvas, dt) {
   const width = visualizerState.cssWidth || canvas.width;
   const height = visualizerState.cssHeight || canvas.height;
   const dpr = visualizerState.dpr || 1;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, width, height);
 
-  const intensity = computeVisualizerIntensity(dataArray);
+  const intensity = computeVisualizerIntensity();
   visualizerState.intensity = intensity;
   const mode = visualizerState.mode;
   const reduceMotion = Boolean(visualizerReducedMotion?.matches);
   const low = mode === 'idle' ? Math.max(0.08, intensity.low) : intensity.low;
   const mid = mode === 'idle' ? Math.max(0.05, intensity.mid) : intensity.mid;
   const high = mode === 'idle' ? Math.max(0.04, intensity.high) : intensity.high;
-  const beat = intensity.beat || 0;
 
-  drawVisualizerField(ctx, width, height, low, mid, beat, mode);
-  updateVisualizerParticles(ctx, width, height, { low, mid, high, beat, dt, mode, reduceMotion });
-  if (!reduceMotion) emitVisualizerSparks(width, height, high, beat, mode);
-  drawVisualizerSparks(ctx, dt);
+  updateVisualizerParticles(ctx, width, height, { low, mid, high, dt, mode, reduceMotion });
 }
 
-function computeVisualizerIntensity(dataArray) {
-  if (!dataArray?.length) {
-    const idle = 0.08 + Math.sin(performance.now() / 900) * 0.025;
-    const fallback = currentAudioPulse();
-    const overall = Math.max(idle, fallback);
-    return { low: overall, mid: overall * 0.7, high: overall * 0.45, overall, beat: fallback * 0.7 };
-  }
-  const segment = (from, to) => {
-    let sum = 0;
-    let count = 0;
-    for (let i = from; i < to && i < dataArray.length; i += 1) {
-      sum += dataArray[i];
-      count += 1;
-    }
-    return count ? sum / (count * 255) : 0;
-  };
-  const low = segment(0, 7);
-  const mid = segment(7, 19);
-  const high = segment(19, dataArray.length);
-  const rawOverall = low * 0.52 + mid * 0.34 + high * 0.14;
-  const fallback = currentAudioPulse();
-  const overall = Math.max(rawOverall, fallback * 0.72);
-  visualizerState.smoothedOverall = visualizerState.smoothedOverall * 0.78 + overall * 0.22;
-  const beat = Math.max(0, overall - visualizerState.lastOverall) * 5.8 + Math.max(0, overall - visualizerState.smoothedOverall) * 3.2;
-  visualizerState.lastOverall = overall;
+function computeVisualizerIntensity() {
+  const idle = 0.055 + Math.sin(performance.now() / 1400) * 0.012;
+  const pulse = currentAudioPulse();
+  const overall = Math.max(idle, pulse);
+  visualizerState.smoothedOverall = visualizerState.smoothedOverall * 0.9 + overall * 0.1;
+  visualizerState.lastOverall = visualizerState.smoothedOverall;
   return {
-    low: Math.max(low, fallback * 0.55),
-    mid: Math.max(mid, fallback * 0.42),
-    high: Math.max(high, fallback * 0.28),
-    overall,
-    beat: Math.min(1, beat)
+    low: Math.max(0.04, visualizerState.smoothedOverall),
+    mid: Math.max(0.035, visualizerState.smoothedOverall * 0.74),
+    high: Math.max(0.025, visualizerState.smoothedOverall * 0.48),
+    overall: visualizerState.smoothedOverall,
+    beat: 0
   };
 }
 
@@ -529,57 +416,24 @@ function currentAudioPulse() {
     : document.querySelector('#song-audio');
   if (!audio || audio.paused || audio.ended) return 0;
   const t = audio.currentTime || performance.now() / 1000;
-  const pulse = Math.max(0, Math.sin(t * Math.PI * 2.05));
-  const offbeat = Math.max(0, Math.sin(t * Math.PI * 4.1 + 0.8));
-  return Math.min(0.55, 0.12 + pulse * 0.32 + offbeat * 0.11);
-}
-
-function drawVisualizerField(ctx, width, height, low, mid, beat, mode) {
-  const glow = mode === 'host' ? '#ff00ff' : '#00f0ff';
-  const rails = getVisualizerRails();
-  for (const rail of rails) {
-    const sideGlow = rail.side === 'left' ? '0, 240, 255' : '255, 0, 255';
-    const gradient = ctx.createLinearGradient(rail.x, 0, rail.x + rail.width, 0);
-    if (rail.side === 'left') {
-      gradient.addColorStop(0, `rgba(${sideGlow}, ${0.12 + low * 0.2 + beat * 0.18})`);
-      gradient.addColorStop(1, 'rgba(0, 240, 255, 0)');
-    } else {
-      gradient.addColorStop(0, 'rgba(255, 0, 255, 0)');
-      gradient.addColorStop(1, `rgba(${sideGlow}, ${0.12 + low * 0.2 + beat * 0.18})`);
-    }
-    ctx.fillStyle = gradient;
-    ctx.fillRect(rail.x, rail.y, rail.width, rail.height);
-
-    ctx.globalAlpha = 0.18 + low * 0.28 + beat * 0.32;
-    ctx.strokeStyle = glow;
-    ctx.lineWidth = 1;
-    ctx.setLineDash([2, 10]);
-    const originX = rail.side === 'left' ? rail.x + rail.width * 0.18 : rail.x + rail.width * 0.82;
-    const targetX = rail.side === 'left' ? rail.x + rail.width * 0.9 : rail.x + rail.width * 0.1;
-    for (let i = 0; i < 6; i += 1) {
-      const y = height * (0.16 + i * 0.14) + Math.sin(performance.now() / 700 + i) * (4 + mid * 18);
-      ctx.beginPath();
-      ctx.moveTo(originX, y);
-      ctx.quadraticCurveTo((originX + targetX) / 2, y - (low * 24 + beat * 42), targetX, y);
-      ctx.stroke();
-    }
-  }
-  ctx.setLineDash([]);
-  ctx.globalAlpha = 1;
+  const primary = (Math.sin(t * Math.PI * 1.7) + 1) * 0.5;
+  const secondary = (Math.sin(t * Math.PI * 0.73 + 1.8) + 1) * 0.5;
+  const base = visualizerState.mode === 'host' ? 0.09 : 0.11;
+  return Math.min(0.28, base + primary * 0.08 + secondary * 0.04);
 }
 
 function updateVisualizerParticles(ctx, width, height, values) {
-  const { low, mid, high, beat, dt, mode, reduceMotion } = values;
-  const speed = (reduceMotion ? 0.22 : mode === 'song' ? 1.25 : 0.72) + mid * 2.4 + beat * 3.8;
-  const pulse = (mode === 'host' ? low * 24 : low * 16) + high * 10 + beat * 30;
+  const { low, mid, high, dt, mode, reduceMotion } = values;
+  const speed = (reduceMotion ? 0.18 : mode === 'song' ? 0.82 : 0.52) + mid * 1.35;
+  const pulse = (mode === 'host' ? low * 10 : low * 8) + high * 4;
   const rails = getVisualizerRails();
   for (const [index, particle] of visualizerState.particles.entries()) {
     const rail = rails.find((item) => item.side === particle.side) || rails[index % rails.length];
     if (!rail) continue;
     particle.phase += 0.02 * dt * particle.depth;
-    const driftY = Math.sin(particle.phase) * (0.16 + low * 0.52 + beat * 0.88);
+    const driftY = Math.sin(particle.phase) * (0.12 + low * 0.34);
     particle.x += particle.vx * speed * dt * 0.08 * particle.depth;
-    particle.y += (particle.vy + driftY - beat * 0.8) * dt * 0.08;
+    particle.y += (particle.vy + driftY) * dt * 0.08;
     if (mode === 'host') {
       const centerX = particle.side === 'left' ? rail.x + rail.width * 0.58 : rail.x + rail.width * 0.42;
       const centerY = height * 0.5;
@@ -593,59 +447,15 @@ function updateVisualizerParticles(ctx, width, height, values) {
       particle.y > height + 18
     ) {
       resetVisualizerParticle(particle, index);
-      if (beat > 0.2) particle.y = height + Math.random() * 30;
     }
 
     const size = Math.max(1, Math.round(particle.size + pulse * particle.depth * 0.16));
-    const alpha = Math.min(0.96, 0.2 + low * 0.36 + high * 0.46 + beat * 0.52 + particle.depth * 0.16);
+    const alpha = Math.min(0.58, 0.14 + low * 0.22 + high * 0.16 + particle.depth * 0.1);
     ctx.globalAlpha = alpha;
     ctx.fillStyle = particle.color;
     ctx.shadowColor = particle.color;
-    ctx.shadowBlur = reduceMotion ? 0 : 4 + low * 14 + beat * 20;
+    ctx.shadowBlur = reduceMotion ? 0 : 1.5 + low * 4;
     ctx.fillRect(Math.round(particle.x), Math.round(particle.y), size, size);
-  }
-  ctx.shadowBlur = 0;
-  ctx.globalAlpha = 1;
-}
-
-function emitVisualizerSparks(width, height, high, beat, mode) {
-  if (mode === 'idle' || Math.max(high, beat) < 0.2) return;
-  const maxSparks = mode === 'song' ? 20 : 12;
-  const chance = mode === 'song' ? high * 0.42 + beat * 0.72 : high * 0.18 + beat * 0.38;
-  if (visualizerState.sparks.length >= maxSparks || Math.random() > chance) return;
-  const rails = getVisualizerRails();
-  const count = Math.min(5, 1 + Math.floor(high * 4 + beat * 5));
-  for (let i = 0; i < count; i += 1) {
-    const rail = rails[Math.floor(Math.random() * rails.length)] || { x: 0, width, height, side: 'left' };
-    visualizerState.sparks.push({
-      x: rail.x + Math.random() * rail.width,
-      y: height * (0.18 + Math.random() * 0.68),
-      vx: (rail.side === 'left' ? 1 : -1) * (0.4 + Math.random() * 0.8),
-      vy: -1.1 - Math.random() * 1.4 - beat,
-      life: 280 + Math.random() * 220,
-      maxLife: 500,
-      size: 2 + Math.floor(Math.random() * 3),
-      color: visualizerPalette[Math.floor(Math.random() * visualizerPalette.length)]
-    });
-  }
-}
-
-function drawVisualizerSparks(ctx, dt) {
-  for (let i = visualizerState.sparks.length - 1; i >= 0; i -= 1) {
-    const spark = visualizerState.sparks[i];
-    spark.life -= dt;
-    if (spark.life <= 0) {
-      visualizerState.sparks.splice(i, 1);
-      continue;
-    }
-    spark.x += spark.vx * dt * 0.08;
-    spark.y += spark.vy * dt * 0.08;
-    const alpha = Math.max(0, spark.life / spark.maxLife);
-    ctx.globalAlpha = alpha;
-    ctx.fillStyle = spark.color;
-    ctx.shadowColor = spark.color;
-    ctx.shadowBlur = 10 * alpha;
-    ctx.fillRect(Math.round(spark.x), Math.round(spark.y), spark.size, spark.size);
   }
   ctx.shadowBlur = 0;
   ctx.globalAlpha = 1;

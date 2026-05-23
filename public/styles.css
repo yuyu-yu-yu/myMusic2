@@ -1485,20 +1485,20 @@ audio {
   display: block;
   pointer-events: none;
   image-rendering: pixelated;
-  opacity: 0.95;
+  opacity: 0.62;
   transition: opacity 0.2s ease;
 }
 
 #visualizer-canvas[data-visualizer-mode="host"] {
-  opacity: 0.9;
+  opacity: 0.58;
 }
 
 #visualizer-canvas[data-visualizer-mode="song"] {
-  opacity: 1;
+  opacity: 0.66;
 }
 
 #visualizer-canvas[data-visualizer-mode="idle"] {
-  opacity: 0.58;
+  opacity: 0.36;
 }
 
 /* ----- Lyrics ----- */
@@ -3111,6 +3111,6 @@ button.small {
 
 @media (prefers-reduced-motion: reduce) {
   #visualizer-canvas {
-    opacity: 0.72;
+    opacity: 0.28;
   }
 }

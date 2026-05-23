@@ -572,7 +572,37 @@ function serveTts(req, res) {
     res.end('not found');
     return;
   }
-  res.writeHead(200, { 'content-type': 'audio/mpeg', 'cache-control': 'public, max-age=31536000' });
+  const stat = fs.statSync(filePath);
+  const baseHeaders = {
+    'content-type': 'audio/mpeg',
+    'cache-control': 'public, max-age=31536000',
+    'accept-ranges': 'bytes'
+  };
+  const range = req.headers.range;
+  if (range) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range);
+    if (!match) {
+      res.writeHead(416, { ...baseHeaders, 'content-range': `bytes */${stat.size}` });
+      res.end();
+      return;
+    }
+    const start = match[1] ? Number(match[1]) : 0;
+    const end = match[2] ? Number(match[2]) : stat.size - 1;
+    if (!Number.isFinite(start) || !Number.isFinite(end) || start > end || start >= stat.size) {
+      res.writeHead(416, { ...baseHeaders, 'content-range': `bytes */${stat.size}` });
+      res.end();
+      return;
+    }
+    const safeEnd = Math.min(end, stat.size - 1);
+    res.writeHead(206, {
+      ...baseHeaders,
+      'content-length': String(safeEnd - start + 1),
+      'content-range': `bytes ${start}-${safeEnd}/${stat.size}`
+    });
+    fs.createReadStream(filePath, { start, end: safeEnd }).pipe(res);
+    return;
+  }
+  res.writeHead(200, { ...baseHeaders, 'content-length': String(stat.size) });
   fs.createReadStream(filePath).pipe(res);
 }
 
