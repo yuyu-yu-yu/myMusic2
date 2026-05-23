@@ -642,6 +642,7 @@ function renderPlayer() {
   const nextBtn = document.querySelector('#next-btn');
   const playToggleBtn = document.querySelector('#play-toggle-btn');
   const chatForm = document.querySelector('#chat-form');
+  const scenePrompts = document.querySelector('#scene-prompts');
   const modeResetBtn = document.querySelector('#mode-reset-btn');
   const aiMusicToggle = document.querySelector('#ai-music-toggle');
   const aiMusicDownload = document.querySelector('#ai-music-download');
@@ -676,6 +677,14 @@ function renderPlayer() {
     if (!msg) return;
     input.value = '';
     sendChat(msg);
+  });
+
+  scenePrompts?.addEventListener('click', (event) => {
+    const button = closestButtonFromEvent(event);
+    if (!button?.matches('[data-scene-prompt]')) return;
+    const scene = button.dataset.scenePrompt?.trim();
+    if (!scene) return;
+    sendChat(`我正在${scene}，请帮我推荐适合${scene}的歌`);
   });
 
   // Restore saved chat messages

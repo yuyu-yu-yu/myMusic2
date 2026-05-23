@@ -1093,6 +1093,55 @@ button.danger:hover {
   border-top: 1px solid var(--line);
 }
 
+.scene-prompts {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 8px 12px 0;
+  border-top: 1px solid rgba(0, 240, 255, 0.14);
+  background:
+    linear-gradient(90deg, rgba(0, 240, 255, 0.05), rgba(255, 0, 255, 0.06)),
+    rgba(10, 12, 30, 0.62);
+}
+
+.scene-prompts-label {
+  color: var(--muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.2;
+}
+
+.scene-prompt-chip {
+  min-height: 24px;
+  border: 1px solid rgba(0, 240, 255, 0.34);
+  border-radius: 3px;
+  padding: 0 9px;
+  color: var(--cyan);
+  background: rgba(0, 240, 255, 0.06);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  transition: border-color 0.18s, color 0.18s, background 0.18s, box-shadow 0.18s, transform 0.14s;
+}
+
+.scene-prompt-chip:hover,
+.scene-prompt-chip:focus-visible {
+  outline: none;
+  border-color: var(--neon-green);
+  color: var(--neon-green);
+  background: rgba(0, 255, 106, 0.1);
+  box-shadow: 0 0 12px rgba(0, 255, 106, 0.24);
+}
+
+.scene-prompt-chip:active {
+  transform: translateY(1px);
+  border-color: var(--magenta);
+  color: var(--text);
+  background: rgba(255, 0, 255, 0.16);
+}
+
 .chat-form-inline input {
   flex: 1;
   min-width: 0;
