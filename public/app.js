@@ -75,7 +75,9 @@ const visualizerState = {
   dpr: 1,
   cssWidth: 0,
   cssHeight: 0,
-  intensity: { low: 0, mid: 0, high: 0, overall: 0 }
+  intensity: { low: 0, mid: 0, high: 0, overall: 0, beat: 0 },
+  smoothedOverall: 0,
+  lastOverall: 0
 };
 let audioCtx = null;
 let analyser = null;
@@ -409,18 +411,49 @@ function targetVisualizerParticleCount() {
 }
 
 function createVisualizerParticle(index = 0) {
-  const width = visualizerState.cssWidth || 600;
-  const height = visualizerState.cssHeight || 72;
+  const rails = getVisualizerRails();
+  const rail = rails[index % rails.length] || { x: 0, y: 0, width: visualizerState.cssWidth || 1200, height: visualizerState.cssHeight || 800, side: 'left' };
   return {
-    x: Math.random() * width,
-    y: height * (0.22 + Math.random() * 0.56),
-    vx: 0.18 + Math.random() * 0.72,
-    vy: -0.22 + Math.random() * 0.44,
+    side: rail.side,
+    x: rail.x + Math.random() * rail.width,
+    y: rail.y + Math.random() * rail.height,
+    vx: (rail.side === 'left' ? 1 : -1) * (0.08 + Math.random() * 0.34),
+    vy: -0.38 + Math.random() * 0.76,
     size: 1 + (index % 4),
     phase: Math.random() * Math.PI * 2,
     depth: 0.35 + Math.random() * 0.75,
     color: visualizerPalette[index % visualizerPalette.length]
   };
+}
+
+function resetVisualizerParticle(particle, index = 0) {
+  const rails = getVisualizerRails();
+  const fallbackRail = rails[index % rails.length] || { x: 0, y: 0, width: visualizerState.cssWidth || 1200, height: visualizerState.cssHeight || 800, side: 'left' };
+  const rail = rails.find((item) => item.side === particle.side) || fallbackRail;
+  particle.side = rail.side;
+  particle.x = rail.x + Math.random() * rail.width;
+  particle.y = rail.y + Math.random() * rail.height;
+  particle.vx = (rail.side === 'left' ? 1 : -1) * (0.08 + Math.random() * 0.34);
+  particle.vy = -0.38 + Math.random() * 0.76;
+  particle.depth = 0.35 + Math.random() * 0.75;
+  particle.phase = Math.random() * Math.PI * 2;
+  particle.color = visualizerPalette[index % visualizerPalette.length];
+}
+
+function getVisualizerRails() {
+  const width = visualizerState.cssWidth || window.innerWidth || 1200;
+  const height = visualizerState.cssHeight || window.innerHeight || 800;
+  const shell = document.querySelector('.player-shell') || document.querySelector('.view');
+  const rect = shell?.getBoundingClientRect();
+  const minRail = width <= 760 ? 26 : 72;
+  const sideGap = width <= 760 ? 8 : 24;
+  const leftWidth = rect ? Math.max(minRail, Math.min(280, rect.left - sideGap)) : Math.max(minRail, width * 0.16);
+  const rightStart = rect ? Math.min(width - minRail, rect.right + sideGap) : width * 0.84;
+  const rightWidth = Math.max(minRail, width - rightStart);
+  return [
+    { side: 'left', x: 0, y: 0, width: leftWidth, height },
+    { side: 'right', x: rightStart, y: 0, width: rightWidth, height }
+  ];
 }
 
 function readVisualizerData() {
@@ -448,17 +481,20 @@ function drawParticleVisualizer(ctx, canvas, dataArray, dt) {
   const low = mode === 'idle' ? Math.max(0.08, intensity.low) : intensity.low;
   const mid = mode === 'idle' ? Math.max(0.05, intensity.mid) : intensity.mid;
   const high = mode === 'idle' ? Math.max(0.04, intensity.high) : intensity.high;
+  const beat = intensity.beat || 0;
 
-  drawVisualizerField(ctx, width, height, low, mid, mode);
-  updateVisualizerParticles(ctx, width, height, { low, mid, high, dt, mode, reduceMotion });
-  if (!reduceMotion) emitVisualizerSparks(width, height, high, mode);
+  drawVisualizerField(ctx, width, height, low, mid, beat, mode);
+  updateVisualizerParticles(ctx, width, height, { low, mid, high, beat, dt, mode, reduceMotion });
+  if (!reduceMotion) emitVisualizerSparks(width, height, high, beat, mode);
   drawVisualizerSparks(ctx, dt);
 }
 
 function computeVisualizerIntensity(dataArray) {
   if (!dataArray?.length) {
     const idle = 0.08 + Math.sin(performance.now() / 900) * 0.025;
-    return { low: idle, mid: idle * 0.7, high: idle * 0.45, overall: idle };
+    const fallback = currentAudioPulse();
+    const overall = Math.max(idle, fallback);
+    return { low: overall, mid: overall * 0.7, high: overall * 0.45, overall, beat: fallback * 0.7 };
   }
   const segment = (from, to) => {
     let sum = 0;
@@ -472,82 +508,120 @@ function computeVisualizerIntensity(dataArray) {
   const low = segment(0, 7);
   const mid = segment(7, 19);
   const high = segment(19, dataArray.length);
+  const rawOverall = low * 0.52 + mid * 0.34 + high * 0.14;
+  const fallback = currentAudioPulse();
+  const overall = Math.max(rawOverall, fallback * 0.72);
+  visualizerState.smoothedOverall = visualizerState.smoothedOverall * 0.78 + overall * 0.22;
+  const beat = Math.max(0, overall - visualizerState.lastOverall) * 5.8 + Math.max(0, overall - visualizerState.smoothedOverall) * 3.2;
+  visualizerState.lastOverall = overall;
   return {
-    low,
-    mid,
-    high,
-    overall: low * 0.46 + mid * 0.34 + high * 0.2
+    low: Math.max(low, fallback * 0.55),
+    mid: Math.max(mid, fallback * 0.42),
+    high: Math.max(high, fallback * 0.28),
+    overall,
+    beat: Math.min(1, beat)
   };
 }
 
-function drawVisualizerField(ctx, width, height, low, mid, mode) {
-  const centerY = height * 0.52;
-  const glow = mode === 'host' ? '#ff00ff' : '#00f0ff';
-  const sweep = ctx.createLinearGradient(0, 0, width, 0);
-  sweep.addColorStop(0, 'rgba(0, 240, 255, 0)');
-  sweep.addColorStop(0.5, `rgba(${mode === 'host' ? '255, 0, 255' : '0, 240, 255'}, ${0.08 + low * 0.18})`);
-  sweep.addColorStop(1, 'rgba(255, 0, 255, 0)');
-  ctx.fillStyle = sweep;
-  ctx.fillRect(0, 0, width, height);
+function currentAudioPulse() {
+  const audio = visualizerState.mode === 'host'
+    ? document.querySelector('#host-audio')
+    : document.querySelector('#song-audio');
+  if (!audio || audio.paused || audio.ended) return 0;
+  const t = audio.currentTime || performance.now() / 1000;
+  const pulse = Math.max(0, Math.sin(t * Math.PI * 2.05));
+  const offbeat = Math.max(0, Math.sin(t * Math.PI * 4.1 + 0.8));
+  return Math.min(0.55, 0.12 + pulse * 0.32 + offbeat * 0.11);
+}
 
-  ctx.globalAlpha = 0.22 + low * 0.38;
-  ctx.strokeStyle = glow;
-  ctx.lineWidth = 1;
-  ctx.setLineDash([2, 8]);
-  for (let i = 0; i < 3; i += 1) {
-    const y = centerY + (i - 1) * (10 + mid * 16);
-    ctx.beginPath();
-    ctx.moveTo(8, y);
-    ctx.quadraticCurveTo(width * 0.5, y - (low * 18) + (i - 1) * 5, width - 8, y);
-    ctx.stroke();
+function drawVisualizerField(ctx, width, height, low, mid, beat, mode) {
+  const glow = mode === 'host' ? '#ff00ff' : '#00f0ff';
+  const rails = getVisualizerRails();
+  for (const rail of rails) {
+    const sideGlow = rail.side === 'left' ? '0, 240, 255' : '255, 0, 255';
+    const gradient = ctx.createLinearGradient(rail.x, 0, rail.x + rail.width, 0);
+    if (rail.side === 'left') {
+      gradient.addColorStop(0, `rgba(${sideGlow}, ${0.12 + low * 0.2 + beat * 0.18})`);
+      gradient.addColorStop(1, 'rgba(0, 240, 255, 0)');
+    } else {
+      gradient.addColorStop(0, 'rgba(255, 0, 255, 0)');
+      gradient.addColorStop(1, `rgba(${sideGlow}, ${0.12 + low * 0.2 + beat * 0.18})`);
+    }
+    ctx.fillStyle = gradient;
+    ctx.fillRect(rail.x, rail.y, rail.width, rail.height);
+
+    ctx.globalAlpha = 0.18 + low * 0.28 + beat * 0.32;
+    ctx.strokeStyle = glow;
+    ctx.lineWidth = 1;
+    ctx.setLineDash([2, 10]);
+    const originX = rail.side === 'left' ? rail.x + rail.width * 0.18 : rail.x + rail.width * 0.82;
+    const targetX = rail.side === 'left' ? rail.x + rail.width * 0.9 : rail.x + rail.width * 0.1;
+    for (let i = 0; i < 6; i += 1) {
+      const y = height * (0.16 + i * 0.14) + Math.sin(performance.now() / 700 + i) * (4 + mid * 18);
+      ctx.beginPath();
+      ctx.moveTo(originX, y);
+      ctx.quadraticCurveTo((originX + targetX) / 2, y - (low * 24 + beat * 42), targetX, y);
+      ctx.stroke();
+    }
   }
   ctx.setLineDash([]);
   ctx.globalAlpha = 1;
 }
 
 function updateVisualizerParticles(ctx, width, height, values) {
-  const { low, mid, high, dt, mode, reduceMotion } = values;
-  const speed = (reduceMotion ? 0.22 : mode === 'song' ? 0.9 : 0.52) + mid * 1.25;
-  const pulse = (mode === 'host' ? low * 16 : low * 9) + high * 5;
-  for (const particle of visualizerState.particles) {
+  const { low, mid, high, beat, dt, mode, reduceMotion } = values;
+  const speed = (reduceMotion ? 0.22 : mode === 'song' ? 1.25 : 0.72) + mid * 2.4 + beat * 3.8;
+  const pulse = (mode === 'host' ? low * 24 : low * 16) + high * 10 + beat * 30;
+  const rails = getVisualizerRails();
+  for (const [index, particle] of visualizerState.particles.entries()) {
+    const rail = rails.find((item) => item.side === particle.side) || rails[index % rails.length];
+    if (!rail) continue;
     particle.phase += 0.02 * dt * particle.depth;
-    const driftY = Math.sin(particle.phase) * (0.16 + low * 0.38);
+    const driftY = Math.sin(particle.phase) * (0.16 + low * 0.52 + beat * 0.88);
     particle.x += particle.vx * speed * dt * 0.08 * particle.depth;
-    particle.y += (particle.vy + driftY) * dt * 0.05;
+    particle.y += (particle.vy + driftY - beat * 0.8) * dt * 0.08;
     if (mode === 'host') {
-      const centerX = width * 0.22;
+      const centerX = particle.side === 'left' ? rail.x + rail.width * 0.58 : rail.x + rail.width * 0.42;
       const centerY = height * 0.5;
       particle.x += (centerX - particle.x) * 0.0025 * dt * particle.depth;
       particle.y += (centerY - particle.y) * 0.003 * dt * particle.depth;
     }
-    if (particle.x > width + 8) particle.x = -8;
-    if (particle.y < 8) particle.y = height - 8;
-    if (particle.y > height - 8) particle.y = 8;
+    if (
+      particle.x < rail.x - 18 ||
+      particle.x > rail.x + rail.width + 18 ||
+      particle.y < -18 ||
+      particle.y > height + 18
+    ) {
+      resetVisualizerParticle(particle, index);
+      if (beat > 0.2) particle.y = height + Math.random() * 30;
+    }
 
     const size = Math.max(1, Math.round(particle.size + pulse * particle.depth * 0.16));
-    const alpha = Math.min(0.9, 0.25 + low * 0.32 + high * 0.38 + particle.depth * 0.18);
+    const alpha = Math.min(0.96, 0.2 + low * 0.36 + high * 0.46 + beat * 0.52 + particle.depth * 0.16);
     ctx.globalAlpha = alpha;
     ctx.fillStyle = particle.color;
     ctx.shadowColor = particle.color;
-    ctx.shadowBlur = reduceMotion ? 0 : 4 + low * 12;
+    ctx.shadowBlur = reduceMotion ? 0 : 4 + low * 14 + beat * 20;
     ctx.fillRect(Math.round(particle.x), Math.round(particle.y), size, size);
   }
   ctx.shadowBlur = 0;
   ctx.globalAlpha = 1;
 }
 
-function emitVisualizerSparks(width, height, high, mode) {
-  if (mode === 'idle' || high < 0.22) return;
+function emitVisualizerSparks(width, height, high, beat, mode) {
+  if (mode === 'idle' || Math.max(high, beat) < 0.2) return;
   const maxSparks = mode === 'song' ? 20 : 12;
-  const chance = mode === 'song' ? high * 0.38 : high * 0.18;
+  const chance = mode === 'song' ? high * 0.42 + beat * 0.72 : high * 0.18 + beat * 0.38;
   if (visualizerState.sparks.length >= maxSparks || Math.random() > chance) return;
-  const count = Math.min(3, 1 + Math.floor(high * 4));
+  const rails = getVisualizerRails();
+  const count = Math.min(5, 1 + Math.floor(high * 4 + beat * 5));
   for (let i = 0; i < count; i += 1) {
+    const rail = rails[Math.floor(Math.random() * rails.length)] || { x: 0, width, height, side: 'left' };
     visualizerState.sparks.push({
-      x: mode === 'host' ? width * (0.16 + Math.random() * 0.18) : Math.random() * width,
-      y: height * (0.28 + Math.random() * 0.48),
-      vx: -0.5 + Math.random(),
-      vy: -0.9 - Math.random() * 0.8,
+      x: rail.x + Math.random() * rail.width,
+      y: height * (0.18 + Math.random() * 0.68),
+      vx: (rail.side === 'left' ? 1 : -1) * (0.4 + Math.random() * 0.8),
+      vy: -1.1 - Math.random() * 1.4 - beat,
       life: 280 + Math.random() * 220,
       maxLife: 500,
       size: 2 + Math.floor(Math.random() * 3),
@@ -823,7 +897,7 @@ function renderPlayer() {
   // Move persistent audio elements into the player layout
   const leftCol = document.querySelector('.left-col');
   const audioLayer = document.querySelector('#audio-layer');
-  const audioEls = ['#host-audio', '#song-audio', '#visualizer-canvas'];
+  const audioEls = ['#host-audio', '#song-audio'];
   const savedDisplay = [];
   audioEls.forEach((sel, i) => {
     const el = audioLayer.querySelector(sel);
@@ -1998,6 +2072,7 @@ async function startSongPlayback(radioTurn = null) {
     songAudio.onplay = () => {
       if (!isCurrentPlaybackTurn(radioTurn, track)) return;
       setAvatarState('listening');
+      if (visualizerState.mode !== 'song') switchVisualizerTo('song');
       api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
     };
     songAudio.ontimeupdate = () => {
