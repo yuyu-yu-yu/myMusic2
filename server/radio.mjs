@@ -38,9 +38,9 @@ export async function nextRadioItem({ db, config, netease, sessionId, userMessag
   return attachAccount(result, account);
 }
 
-export async function startPlaylistRadio({ db, config, netease, sessionId, accountContext }) {
+export async function startPlaylistRadio({ db, config, netease, sessionId, message, accountContext }) {
   const account = getRequestAccount(db, accountContext);
-  const result = await playlistStartTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), accountContext: account });
+  const result = await playlistStartTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), userMessage: message || '', accountContext: account });
   return attachAccount(result, account);
 }
 

@@ -1013,7 +1013,7 @@ function renderPlayer() {
     if (!button?.matches('[data-scene-prompt]')) return;
     const scene = button.dataset.scenePrompt?.trim();
     if (!scene) return;
-    sendChat(`我正在${scene}，请帮我推荐适合${scene}的歌`);
+    handleScenePrompt(scene);
   });
   document.querySelector('#playlist-queue-panel')?.addEventListener('click', (event) => {
     const button = closestButtonFromEvent(event);
@@ -1514,17 +1514,21 @@ async function startRadio() {
   }
 }
 
-async function startPlaylistRadio() {
+async function startPlaylistRadio({ message = '' } = {}) {
   const radioTurn = beginRadioTurn();
   primeVoicePlayback();
   const sessionId = ensureSessionId();
+  const userMessage = String(message || '').trim();
   state.radioMode = 'playlist';
   state.playlistStatus = 'loading';
   renderPlaylistQueue();
   setAvatarState('searching');
   setRadioButtonState('loading');
   if (state.aiMusicMode) setAiMusicMode(false, { announce: false });
-  appendChat({ role: 'user', text: '一键推荐 5 首歌单' });
+  if (userMessage) appendChat({ role: 'user', text: userMessage });
+  if (!userMessage) {
+    appendChat({ role: 'user', text: '一键推荐 5 首歌单' });
+  }
   const loading = startLoadingMessages('playlist');
   attachRadioTurnLoading(radioTurn, loading);
   try {
@@ -1532,7 +1536,7 @@ async function startPlaylistRadio() {
     if (!isActiveRadioTurn(radioTurn)) return;
     const data = await api('/api/radio/playlist/start', {
       method: 'POST',
-      body: { sessionId },
+      body: { sessionId, message: userMessage },
       signal: radioTurnSignal(radioTurn)
     });
     state.radioMode = 'playlist';
@@ -1673,6 +1677,21 @@ function withAiMusicFallbackNotice(data = {}, error = {}) {
       error: error?.message || String(error || '')
     }
   };
+}
+
+function buildScenePromptMessage(scene) {
+  return `\u6211\u6b63\u5728${scene}\uff0c\u8bf7\u5e2e\u6211\u63a8\u8350\u9002\u5408${scene}\u7684\u6b4c`;
+}
+
+function handleScenePrompt(scene) {
+  const message = buildScenePromptMessage(scene);
+  if (state.radioMode === 'playlist') {
+    api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
+    startPlaylistRadio({ message });
+    return;
+  }
+  setRadioMode('single');
+  sendChat(message);
 }
 
 async function sendChat(msg) {

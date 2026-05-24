@@ -2282,11 +2282,13 @@ test('playlist mode starts with one intro and continues without per-song speech'
 
   const netease = { isConfigured: () => false };
   const config = { llm: {}, tts: {}, weather: {} };
+  const playlistSceneMessage = '\u6211\u6b63\u5728\u5065\u8eab\u623f\uff0c\u8bf7\u5e2e\u6211\u63a8\u8350\u9002\u5408\u5065\u8eab\u623f\u7684\u6b4c';
   const start = await playlistStartTurn({
     db,
     config,
     netease,
-    sessionId: 'playlist-mode-session'
+    sessionId: 'playlist-mode-session',
+    userMessage: playlistSceneMessage
   });
 
   assert.equal(start.playlistMode, true);
@@ -2295,6 +2297,9 @@ test('playlist mode starts with one intro and continues without per-song speech'
   assert.equal(start.playlist.currentIndex, 0);
   assert.match(start.chatText, /5 首歌|歌单/);
   assert.equal(start.speech.shouldSpeak, false);
+  const savedSceneMessage = db.prepare('SELECT content FROM messages WHERE session_id = ? AND role = ? ORDER BY id LIMIT 1')
+    .get('playlist-mode-session', 'user');
+  assert.equal(savedSceneMessage.content, playlistSceneMessage);
 
   const next = await playlistNextTurn({
     db,

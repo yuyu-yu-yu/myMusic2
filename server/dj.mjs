@@ -220,11 +220,19 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   return { ...response, queueHit: false };
 }
 
-export async function playlistStartTurn({ db, config, netease, sessionId, accountContext = null }) {
+export async function playlistStartTurn({ db, config, netease, sessionId, userMessage = null, accountContext = null }) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
+  const normalizedUserMessage = String(userMessage || '').trim();
   clearRadioQueue(db, sessionId);
-  const built = await buildPlaylistRecommendation({ db, config, netease, sessionId, accountContext: account });
+  const built = await buildPlaylistRecommendation({
+    db,
+    config,
+    netease,
+    sessionId,
+    userMessage: normalizedUserMessage || null,
+    accountContext: account
+  });
   if (!built.playlist) return built.response;
   return commitPlaylistPlayback({
     db,
@@ -233,6 +241,7 @@ export async function playlistStartTurn({ db, config, netease, sessionId, accoun
     playlist: built.playlist,
     index: 0,
     hostPolicy: 'playlist_intro',
+    userMessage: normalizedUserMessage || null,
     accountContext: account
   });
 }
@@ -403,9 +412,10 @@ async function buildRadioRecommendation({
   };
 }
 
-async function buildPlaylistRecommendation({ db, config, netease, sessionId, accountContext = null }) {
+async function buildPlaylistRecommendation({ db, config, netease, sessionId, userMessage = null, accountContext = null }) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
+  const normalizedUserMessage = String(userMessage || '').trim();
   const profile = getProfile(db, account);
   const environmentContext = await getEnvironmentContext({ db, sessionId, config });
   const { hour, timeOfDay, weather } = environmentContext;
@@ -414,25 +424,25 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, acc
   const context = getSessionContext(db, sessionId);
   const sessionConstraints = getSessionConstraintsFromContext(context);
   const conversationState = normalizeConversationState(context.conversationState);
-  const effectiveMusicContext = getEffectiveMusicContextForRecommendation(context, { userMessage: null });
+  const effectiveMusicContext = getEffectiveMusicContextForRecommendation(context, { userMessage: normalizedUserMessage || null });
   const contextMood = context.musicContext ? moodFromMusicContext(effectiveMusicContext) : null;
   const conversationMood = mergeSessionConstraintsIntoMood(
     contextMood || moodFromConversationState(conversationState, prefs, mode),
     sessionConstraints
   );
-  const hostContext = buildRadioHostContext(db, sessionId, context, null, account);
+  const hostContext = buildRadioHostContext(db, sessionId, context, normalizedUserMessage || null, account);
   const history = loadHistory(db, sessionId, account);
   const sessionSummary = await updateSessionSummary(db, config, sessionId, account);
   const longTermMemories = retrieveRelevantMemories(db, {
     accountId: account.accountId,
-    text: conversationMood?.reason || '',
+    text: normalizedUserMessage || conversationMood?.reason || '',
     mood: conversationMood,
     mode,
     limit: LONG_MEMORY_LIMIT,
     maxChars: LONG_MEMORY_MAX_CHARS
   });
   const memoryContext = buildMemoryContext({ sessionSummary, longTermMemories });
-  const request = getMusicRequestConstraints(db, null, mode, sessionConstraints);
+  const request = getMusicRequestConstraints(db, normalizedUserMessage || null, mode, sessionConstraints);
   const playedHistory = getPlayedTrackHistory(db, sessionId, 80, account);
   const playedIds = new Set(playedHistory.map(track => String(track.id || '')).filter(Boolean));
   const playedSignatures = buildPlayedSignatureSet(playedHistory);
@@ -452,6 +462,7 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, acc
       history,
       conversationMood,
       memoryContext,
+      userMessage: normalizedUserMessage || null,
       request,
       playedHistory,
       hostContext,
@@ -472,6 +483,7 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, acc
       history,
       conversationMood,
       memoryContext,
+      userMessage: normalizedUserMessage || null,
       request,
       playedHistory: [...playedHistory, ...selected.map(item => item.track)],
       hostContext,
@@ -632,7 +644,7 @@ async function fillPlaylistFromProfile({ db, config, netease, profile, conversat
   return { diagnostics: [trimSearchDiagnostic(diagnostics[0])] };
 }
 
-async function commitPlaylistPlayback({ db, config, sessionId, playlist, index = 0, hostPolicy = 'none', accountContext = null }) {
+async function commitPlaylistPlayback({ db, config, sessionId, playlist, index = 0, hostPolicy = 'none', userMessage = null, accountContext = null }) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
   const normalized = normalizeActivePlaylist({
@@ -662,6 +674,10 @@ async function commitPlaylistPlayback({ db, config, sessionId, playlist, index =
     : { shouldSpeak: false, mode: 'off' };
   let tts = { url: null, status: hostPolicy === 'playlist_intro' ? 'disabled' : 'disabled', ms: 0, error: null };
   const chatText = hostPolicy === 'playlist_intro' ? String(nextPlaylist.hostText || '').trim() : '';
+  if (hostPolicy === 'playlist_intro') {
+    if (userMessage) saveMessage(db, sessionId, 'user', userMessage, account);
+    if (chatText) saveMessage(db, sessionId, 'assistant', chatText, account);
+  }
   if (hostPolicy === 'playlist_intro' && speech.shouldSpeak && chatText) {
     tts = await synthesizeSpeechWithDiagnostics(config.tts, chatText);
     if (tts.status === 'failed') updateQueueMetrics(db, sessionId, { ttsFailedCount: 1 });
@@ -687,7 +703,7 @@ async function commitPlaylistPlayback({ db, config, sessionId, playlist, index =
   };
 }
 
-async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, conversationMood, memoryContext, request, playedHistory = [], hostContext = {}, environmentContext = {}, failedPicks = [] }) {
+async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, conversationMood, memoryContext, userMessage = null, request, playedHistory = [], hostContext = {}, environmentContext = {}, failedPicks = [] }) {
   const fallbackPlan = { title: '', summary: '', picks: [], hostDraft: '', mode: null };
   if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return fallbackPlan;
   const modeText = mode?.genre
@@ -721,6 +737,7 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
         `听众画像：${profile?.summary || '无'}`,
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
         modeText,
+        userMessage ? `SCENE_REQUEST: ${userMessage}` : 'SCENE_REQUEST: none',
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
         formatSessionConstraintsForPrompt(request?.sessionConstraints),
         formatRecentHostPlays(hostContext.recentPlays),

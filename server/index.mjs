@@ -298,7 +298,7 @@ const routes = {
   },
   'POST /api/radio/playlist/start': async (req) => {
     const body = await readJson(req);
-    return startPlaylistRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), accountContext: getRequestAccount(req) });
+    return startPlaylistRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), message: body.message || '', accountContext: getRequestAccount(req) });
   },
   'POST /api/radio/playlist/next': async (req) => {
     const body = await readJson(req);
