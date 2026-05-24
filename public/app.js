@@ -75,9 +75,12 @@ const visualizerState = {
   lastTime: 0,
   lastRender: 0,
   lastAnalysisTry: 0,
+  lastCanvasMeasure: 0,
+  lastRailMeasure: 0,
   dpr: 1,
   cssWidth: 0,
   cssHeight: 0,
+  rails: null,
   intensity: { low: 0, mid: 0, high: 0, overall: 0, beat: 0 },
   smoothedOverall: 0,
   lastOverall: 0
@@ -89,8 +92,14 @@ let visualizerActiveAnalyser = null;
 let visualizerFrequencyData = null;
 let visualizerCaptureWarningShown = false;
 const visualizerCaptureCache = new WeakMap();
+const visualizerCaptureEntries = new Set();
 let _drawFrameCount = 0;
 let _drawLogged = false;
+
+visualizerReducedMotion?.addEventListener?.('change', () => {
+  const canvas = document.querySelector('#visualizer-canvas');
+  seedVisualizerParticles(canvas, true);
+});
 
 function makeAvatarFrameSequence(stateName, durations) {
   return {
@@ -231,7 +240,7 @@ function initVisualizer() {
   if (!canvas) return;
   canvas.hidden = false;
   canvas.style.display = 'block';
-  setupVisualizerCanvas(canvas);
+  setupVisualizerCanvas(canvas, true);
   startDrawLoop(canvas, 'idle');
 }
 
@@ -249,16 +258,6 @@ function switchVisualizerTo(kind) {
       canvas.style.display = 'none';
     }
   };
-  const showIdle = () => {
-    stopDrawLoop();
-    clearVisualizerAnalysis();
-    if (canvas) {
-      canvas.style.display = 'block';
-      setupVisualizerCanvas(canvas);
-      startDrawLoop(canvas, 'idle');
-    }
-  };
-
   if (kind === 'off') {
     hideAll();
     return;
@@ -266,19 +265,25 @@ function switchVisualizerTo(kind) {
 
   if (canvas) {
     canvas.style.display = 'block';
-    setupVisualizerCanvas(canvas);
+    setupVisualizerCanvas(canvas, true);
   }
 
   stopDrawLoop();
-  ensureVisualizerAnalysis(kind);
-  startDrawLoop(canvas, kind === 'host' ? 'host' : 'song');
+  if (kind === 'idle') {
+    clearVisualizerAnalysis();
+    startDrawLoop(canvas, 'idle');
+    return;
+  }
+  const mode = kind === 'host' ? 'host' : 'song';
+  ensureVisualizerAnalysis(mode);
+  startDrawLoop(canvas, mode);
 }
 
 function startDrawLoop(canvas, mode = 'idle') {
   if (visualizerAnimId || !canvas) return;
   visualizerLog('startDrawLoop, mode:', mode);
   setVisualizerMode(mode);
-  setupVisualizerCanvas(canvas);
+  setupVisualizerCanvas(canvas, true);
   _drawFrameCount = 0;
   _drawLogged = false;
   visualizerState.lastTime = performance.now();
@@ -292,7 +297,7 @@ function startDrawLoop(canvas, mode = 'idle') {
     _drawFrameCount++;
     const ctx = canvas.getContext('2d');
     if (!ctx) return;
-    setupVisualizerCanvas(canvas);
+    if (now - visualizerState.lastCanvasMeasure > 500) setupVisualizerCanvas(canvas);
     if (VISUALIZER_DEBUG && !_drawLogged && _drawFrameCount % 30 === 0) {
       console.log('[viz] frame #' + _drawFrameCount, 'mode:', visualizerState.mode, 'intensity:', visualizerState.intensity);
       if (_drawFrameCount >= 120) _drawLogged = true;
@@ -320,9 +325,29 @@ function getVisualizerAudioElement(kind = visualizerState.mode) {
 }
 
 function clearVisualizerAnalysis() {
+  releaseVisualizerCapture(visualizerActiveAudio);
+  releaseInactiveVisualizerCaptures(null);
   visualizerActiveAudio = null;
   visualizerActiveAnalyser = null;
   visualizerFrequencyData = null;
+}
+
+function releaseVisualizerCapture(audio) {
+  if (!audio) return;
+  const cached = visualizerCaptureCache.get(audio);
+  if (!cached) return;
+  try { cached.source?.disconnect?.(); } catch {}
+  try {
+    for (const track of cached.stream?.getTracks?.() || []) track.stop?.();
+  } catch {}
+  visualizerCaptureCache.delete(audio);
+  visualizerCaptureEntries.delete(cached);
+}
+
+function releaseInactiveVisualizerCaptures(activeAudio = null) {
+  for (const entry of [...visualizerCaptureEntries]) {
+    if (entry.audio && entry.audio !== activeAudio) releaseVisualizerCapture(entry.audio);
+  }
 }
 
 function ensureVisualizerAudioContext() {
@@ -350,7 +375,9 @@ function getOrCreateCaptureAnalyser(audio) {
     analyser.fftSize = 128;
     analyser.smoothingTimeConstant = 0.58;
     source.connect(analyser);
-    visualizerCaptureCache.set(audio, { ctx, stream, source, analyser });
+    const entry = { audio, ctx, stream, source, analyser };
+    visualizerCaptureCache.set(audio, entry);
+    visualizerCaptureEntries.add(entry);
     return analyser;
   } catch (error) {
     if (!visualizerCaptureWarningShown) {
@@ -372,23 +399,26 @@ function ensureVisualizerAnalysis(kind = visualizerState.mode) {
 
   const analyser = getOrCreateCaptureAnalyser(audio);
   if (!analyser) return false;
+  releaseInactiveVisualizerCaptures(audio);
   visualizerActiveAudio = audio;
   visualizerActiveAnalyser = analyser;
   visualizerFrequencyData = null;
   return true;
 }
 
-function setupVisualizerCanvas(canvas) {
+function setupVisualizerCanvas(canvas, force = false) {
+  visualizerState.lastCanvasMeasure = performance.now();
   const rect = canvas.getBoundingClientRect();
   const dpr = Math.min(globalThis.devicePixelRatio || 1, 1.25);
   const width = Math.max(1, Math.round(rect.width || canvas.clientWidth || 600));
   const height = Math.max(1, Math.round(rect.height || canvas.clientHeight || 72));
-  if (visualizerState.cssWidth === width && visualizerState.cssHeight === height && visualizerState.dpr === dpr) return;
+  if (!force && visualizerState.cssWidth === width && visualizerState.cssHeight === height && visualizerState.dpr === dpr) return;
   visualizerState.cssWidth = width;
   visualizerState.cssHeight = height;
   visualizerState.dpr = dpr;
   canvas.width = Math.round(width * dpr);
   canvas.height = Math.round(height * dpr);
+  visualizerState.rails = null;
   seedVisualizerParticles(canvas, true);
 }
 
@@ -439,7 +469,9 @@ function resetVisualizerParticle(particle, index = 0) {
   particle.color = visualizerPalette[index % visualizerPalette.length];
 }
 
-function getVisualizerRails() {
+function getVisualizerRails({ force = false } = {}) {
+  const now = performance.now();
+  if (!force && visualizerState.rails && now - visualizerState.lastRailMeasure < 500) return visualizerState.rails;
   const width = visualizerState.cssWidth || window.innerWidth || 1200;
   const height = visualizerState.cssHeight || window.innerHeight || 800;
   const shell = document.querySelector('.player-shell') || document.querySelector('.view');
@@ -449,10 +481,12 @@ function getVisualizerRails() {
   const leftWidth = rect ? Math.max(minRail, Math.min(280, rect.left - sideGap)) : Math.max(minRail, width * 0.16);
   const rightStart = rect ? Math.min(width - minRail, rect.right + sideGap) : width * 0.84;
   const rightWidth = Math.max(minRail, width - rightStart);
-  return [
+  visualizerState.lastRailMeasure = now;
+  visualizerState.rails = [
     { side: 'left', x: 0, y: 0, width: leftWidth, height },
     { side: 'right', x: rightStart, y: 0, width: rightWidth, height }
   ];
+  return visualizerState.rails;
 }
 
 function drawParticleVisualizer(ctx, canvas, dt) {
