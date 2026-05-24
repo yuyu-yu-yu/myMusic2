@@ -539,10 +539,10 @@ function computeVisualizerIntensity() {
   const fallbackPulse = currentAudioPulse();
   const boost = (value, factor, cap) => Math.min(cap, value * factor);
   const raw = analysed ? {
-    low: boost(analysed.low, 1.72, 0.95),
-    mid: boost(analysed.mid, 1.48, 0.86),
-    high: boost(analysed.high, 1.62, 0.82),
-    overall: boost(analysed.overall, 1.62, 0.88)
+    low: boost(analysed.low, 1.86, 0.98),
+    mid: boost(analysed.mid, 1.58, 0.9),
+    high: boost(analysed.high, 1.76, 0.88),
+    overall: boost(analysed.overall, 1.74, 0.92)
   } : {
     low: fallbackPulse,
     mid: fallbackPulse * 0.74,
@@ -553,15 +553,15 @@ function computeVisualizerIntensity() {
   visualizerState.smoothedOverall = visualizerState.smoothedOverall * 0.78 + overall * 0.22;
   const lift = Math.max(0, overall - visualizerState.lastOverall);
   const beat = analysed
-    ? lift * 7.2 + Math.max(0, overall - visualizerState.smoothedOverall) * 3.4
-    : fallbackPulse * 0.28;
+    ? lift * 7.8 + Math.max(0, overall - visualizerState.smoothedOverall) * 3.8
+    : fallbackPulse * 0.32;
   visualizerState.lastOverall = overall;
   return {
     low: Math.max(0.04, raw.low, visualizerState.smoothedOverall * 0.62),
     mid: Math.max(0.035, raw.mid, visualizerState.smoothedOverall * 0.44),
     high: Math.max(0.025, raw.high, visualizerState.smoothedOverall * 0.3),
     overall: visualizerState.smoothedOverall,
-    beat: Math.min(0.75, beat)
+    beat: Math.min(0.82, beat)
   };
 }
 
@@ -605,8 +605,8 @@ function currentAudioPulse() {
   const primary = (Math.sin(t * Math.PI * 1.7) + 1) * 0.5;
   const secondary = (Math.sin(t * Math.PI * 0.73 + 1.8) + 1) * 0.5;
   const isHost = visualizerState.mode === 'host';
-  const base = isHost ? 0.13 : 0.16;
-  return Math.min(isHost ? 0.34 : 0.38, base + primary * 0.14 + secondary * 0.08);
+  const base = isHost ? 0.14 : 0.18;
+  return Math.min(isHost ? 0.36 : 0.42, base + primary * 0.15 + secondary * 0.09);
 }
 
 function updateVisualizerParticles(ctx, width, height, values) {
@@ -618,13 +618,13 @@ function updateVisualizerParticles(ctx, width, height, values) {
     : (mode === 'song' ? 0.86 : 0.58) + mid * 2.6 + beat * 1.7;
   const pulse = reduceMotion
     ? low * 5 + high * 2
-    : (mode === 'host' ? low * 14 : low * 13) + high * 9 + beat * 8;
+    : (mode === 'host' ? low * 15 : low * 15) + high * 10.5 + beat * 9.5;
   const rails = getVisualizerRails();
   for (const [index, particle] of visualizerState.particles.entries()) {
     const rail = rails.find((item) => item.side === particle.side) || rails[index % rails.length];
     if (!rail) continue;
     particle.phase += 0.02 * dt * particle.depth;
-    const driftY = Math.sin(particle.phase) * (0.14 + low * 0.65 + beat * 0.48);
+    const driftY = Math.sin(particle.phase) * (0.14 + low * 0.72 + beat * 0.54);
     particle.x += particle.vx * speed * dt * motionStep * particle.depth;
     particle.y += (particle.vy + driftY - beat * 0.18) * dt * motionStep;
     if (mode === 'host' || hostRelease.pull > 0) {
@@ -647,12 +647,12 @@ function updateVisualizerParticles(ctx, width, height, values) {
       resetVisualizerParticle(particle, index);
     }
 
-    const size = Math.max(1, Math.round(particle.size + pulse * particle.depth * 0.24 + hostRelease.bloom * 1.2));
-    const alpha = Math.min(0.84, 0.16 + low * 0.38 + high * 0.28 + beat * 0.24 + particle.depth * 0.12 + hostRelease.bloom * 0.08);
+    const size = Math.max(1, Math.round(particle.size + pulse * particle.depth * 0.3 + hostRelease.bloom * 1.2));
+    const alpha = Math.min(0.9, 0.18 + low * 0.44 + high * 0.34 + beat * 0.28 + particle.depth * 0.12 + hostRelease.bloom * 0.08);
     ctx.globalAlpha = alpha;
     ctx.fillStyle = particle.color;
     ctx.shadowColor = particle.color;
-    ctx.shadowBlur = reduceMotion ? 0 : 2 + low * 7 + beat * 4 + hostRelease.bloom * 3;
+    ctx.shadowBlur = reduceMotion ? 0 : 2.4 + low * 8.5 + beat * 5 + hostRelease.bloom * 3;
     ctx.fillRect(Math.round(particle.x), Math.round(particle.y), size, size);
   }
   ctx.shadowBlur = 0;
