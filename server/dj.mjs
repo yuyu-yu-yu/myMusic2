@@ -45,6 +45,8 @@ const DEFAULT_PREFS = Object.freeze({
   note: ''
 });
 const RADIO_QUEUE_LIMIT = 2;
+const PLAYLIST_SIZE = 5;
+const PLAYLIST_PLAN_LIMIT = 10;
 const RADIO_QUEUE_DIAGNOSTIC_LIMIT = 4;
 const RADIO_QUEUE_DIAGNOSTIC_TTL_MS = 10 * 60 * 1000;
 const QUEUE_ITEM_STATUSES = new Set(['pending', 'ready', 'failed', 'stale']);
@@ -218,6 +220,87 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   return { ...response, queueHit: false };
 }
 
+export async function playlistStartTurn({ db, config, netease, sessionId, accountContext = null }) {
+  const account = normalizeAccountContext(accountContext);
+  sessionId = ensureSession(db, sessionId, account);
+  clearRadioQueue(db, sessionId);
+  const built = await buildPlaylistRecommendation({ db, config, netease, sessionId, accountContext: account });
+  if (!built.playlist) return built.response;
+  return commitPlaylistPlayback({
+    db,
+    config,
+    sessionId,
+    playlist: built.playlist,
+    index: 0,
+    hostPolicy: 'playlist_intro',
+    accountContext: account
+  });
+}
+
+export async function playlistNextTurn({ db, config, netease, sessionId, accountContext = null }) {
+  const account = normalizeAccountContext(accountContext);
+  sessionId = ensureSession(db, sessionId, account);
+  const context = getSessionContext(db, sessionId);
+  const current = normalizeActivePlaylist(context.activePlaylist);
+  if (!current || current.currentIndex >= PLAYLIST_SIZE - 1) {
+    if (current) {
+      setSessionContext(db, sessionId, {
+        ...context,
+        activePlaylist: markPlaylistItemStatus(current, current.currentIndex, 'played')
+      });
+    }
+    return playlistStartTurn({ db, config, netease, sessionId, accountContext: account });
+  }
+  const playlist = movePlaylistToIndex(current, current.currentIndex + 1, { previousStatus: 'played' });
+  return commitPlaylistPlayback({
+    db,
+    config,
+    sessionId,
+    playlist,
+    index: playlist.currentIndex,
+    hostPolicy: 'none',
+    accountContext: account
+  });
+}
+
+export async function playlistJumpTurn({ db, config, netease, sessionId, index, accountContext = null }) {
+  const account = normalizeAccountContext(accountContext);
+  sessionId = ensureSession(db, sessionId, account);
+  const context = getSessionContext(db, sessionId);
+  const current = normalizeActivePlaylist(context.activePlaylist);
+  const targetIndex = Number(index);
+  if (!current) {
+    return { __error: true, ok: false, status: 400, error: 'No active playlist.' };
+  }
+  if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= current.items.length) {
+    return { __error: true, ok: false, status: 400, error: 'Invalid playlist index.' };
+  }
+  const target = current.items[targetIndex];
+  if (!target?.track?.id || target.status !== 'pending') {
+    return { __error: true, ok: false, status: 400, error: 'Playlist item is not jumpable.' };
+  }
+  const playlist = movePlaylistToIndex(current, targetIndex, { previousStatus: 'skipped' });
+  return commitPlaylistPlayback({
+    db,
+    config,
+    sessionId,
+    playlist,
+    index: playlist.currentIndex,
+    hostPolicy: 'none',
+    accountContext: account
+  });
+}
+
+export function clearActivePlaylistSession(db, sessionId, accountContext = null) {
+  const account = normalizeAccountContext(accountContext);
+  const id = ensureSession(db, sessionId, account);
+  updateSessionContext(db, id, (context) => {
+    const { activePlaylist, ...rest } = context;
+    return rest;
+  });
+  return { ok: true, sessionId: id };
+}
+
 async function buildRadioRecommendation({
   db,
   config,
@@ -318,6 +401,519 @@ async function buildRadioRecommendation({
     accountContext: account,
     hostDeferred: deferHostAndSpeech
   };
+}
+
+async function buildPlaylistRecommendation({ db, config, netease, sessionId, accountContext = null }) {
+  const account = normalizeAccountContext(accountContext);
+  sessionId = ensureSession(db, sessionId, account);
+  const profile = getProfile(db, account);
+  const environmentContext = await getEnvironmentContext({ db, sessionId, config });
+  const { hour, timeOfDay, weather } = environmentContext;
+  const mode = getSessionMode(db, sessionId);
+  const prefs = normalizeRuntimePrefs(getUserPrefs(db, account));
+  const context = getSessionContext(db, sessionId);
+  const sessionConstraints = getSessionConstraintsFromContext(context);
+  const conversationState = normalizeConversationState(context.conversationState);
+  const effectiveMusicContext = getEffectiveMusicContextForRecommendation(context, { userMessage: null });
+  const contextMood = context.musicContext ? moodFromMusicContext(effectiveMusicContext) : null;
+  const conversationMood = mergeSessionConstraintsIntoMood(
+    contextMood || moodFromConversationState(conversationState, prefs, mode),
+    sessionConstraints
+  );
+  const hostContext = buildRadioHostContext(db, sessionId, context, null, account);
+  const history = loadHistory(db, sessionId, account);
+  const sessionSummary = await updateSessionSummary(db, config, sessionId, account);
+  const longTermMemories = retrieveRelevantMemories(db, {
+    accountId: account.accountId,
+    text: conversationMood?.reason || '',
+    mood: conversationMood,
+    mode,
+    limit: LONG_MEMORY_LIMIT,
+    maxChars: LONG_MEMORY_MAX_CHARS
+  });
+  const memoryContext = buildMemoryContext({ sessionSummary, longTermMemories });
+  const request = getMusicRequestConstraints(db, null, mode, sessionConstraints);
+  const playedHistory = getPlayedTrackHistory(db, sessionId, 80, account);
+  const playedIds = new Set(playedHistory.map(track => String(track.id || '')).filter(Boolean));
+  const playedSignatures = buildPlayedSignatureSet(playedHistory);
+  const selected = [];
+  const diagnostics = [];
+  const failedPicks = [];
+
+  const plans = [
+    await generatePlaylistPlan({
+      config,
+      profile,
+      weather,
+      timeOfDay,
+      hour,
+      mode,
+      prefs,
+      history,
+      conversationMood,
+      memoryContext,
+      request,
+      playedHistory,
+      hostContext,
+      environmentContext,
+      failedPicks
+    })
+  ];
+
+  for (let attempt = 0; attempt < 2 && selected.length < PLAYLIST_SIZE; attempt += 1) {
+    const plan = plans[attempt] || await generatePlaylistPlan({
+      config,
+      profile,
+      weather,
+      timeOfDay,
+      hour,
+      mode,
+      prefs,
+      history,
+      conversationMood,
+      memoryContext,
+      request,
+      playedHistory: [...playedHistory, ...selected.map(item => item.track)],
+      hostContext,
+      environmentContext,
+      failedPicks
+    });
+    if (!plans[attempt]) plans[attempt] = plan;
+    setRadioDebugInfo(db, sessionId, { lastPlaylistPlan: sanitizePlaylistPlan(plan, attempt) });
+    for (const pick of uniquePlaylistPicks(plan.picks)) {
+      if (selected.length >= PLAYLIST_SIZE) break;
+      const resolved = await resolveSongPlanTrack({
+        db,
+        config,
+        netease,
+        sessionId,
+        plan: { picks: [pick], hostDraft: plan.hostDraft, mode: null },
+        playedIds,
+        playedSignatures,
+        request
+      });
+      diagnostics.push(...(resolved.diagnostics || []));
+      if (!resolved.track) {
+        failedPicks.push(...(resolved.failedPicks || [pick]));
+        continue;
+      }
+      addPlaylistSelection(selected, resolved.track, resolved.pick || pick, playedIds, playedSignatures);
+    }
+  }
+
+  if (selected.length < PLAYLIST_SIZE) {
+    const fallback = await fillPlaylistFromProfile({
+      db,
+      config,
+      netease,
+      profile,
+      conversationMood,
+      request,
+      selected,
+      playedIds,
+      playedSignatures,
+      accountContext: account
+    });
+    diagnostics.push(...fallback.diagnostics);
+  }
+
+  setRadioDebugInfo(db, sessionId, { lastPlaylistSearchDiagnostics: diagnostics.slice(0, 12) });
+  if (selected.length < PLAYLIST_SIZE) {
+    const chatText = '这次没凑齐稳定可播的 5 首，我先不硬播。';
+    return {
+      playlist: null,
+      response: {
+        sessionId,
+        chatText,
+        track: null,
+        reason: 'playlist_not_enough_playable_tracks',
+        playlistMode: true,
+        hostPolicy: 'none',
+        playlist: null,
+        ttsUrl: null,
+        ttsStatus: 'disabled',
+        speech: { shouldSpeak: false, mode: 'off' },
+        profile,
+        weather
+      }
+    };
+  }
+
+  const title = buildPlaylistTitle({ timeOfDay, conversationMood });
+  const summary = buildPlaylistSummary({ selected, conversationMood, weather, timeOfDay });
+  const playlist = normalizeActivePlaylist({
+    id: `playlist-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    title,
+    summary,
+    createdAt: nowIso(),
+    contextVersion: effectiveMusicContext.version,
+    contextSnapshot: effectiveMusicContext,
+    currentIndex: 0,
+    items: selected.slice(0, PLAYLIST_SIZE).map((item, index) => ({
+      index,
+      track: item.track,
+      reason: item.reason,
+      status: index === 0 ? 'current' : 'pending'
+    })),
+    conversationMood,
+    weather,
+    environmentContext,
+    profile
+  });
+  playlist.hostText = await generatePlaylistIntroText({
+    config,
+    playlist,
+    profile,
+    prefs,
+    history,
+    timeOfDay,
+    hour,
+    weather,
+    conversationMood,
+    memoryContext,
+    hostContext,
+    environmentContext
+  });
+  return { playlist, response: null };
+}
+
+function addPlaylistSelection(selected, track, pick, playedIds, playedSignatures) {
+  const key = playedSongKey(track?.name);
+  if (!track?.id || !key || playedSignatures.has(key)) return false;
+  selected.push({
+    track,
+    reason: pick?.reason || '符合当前状态、音乐画像和上下文',
+    pick
+  });
+  playedIds.add(String(track.id));
+  playedSignatures.add(key);
+  return true;
+}
+
+async function fillPlaylistFromProfile({ db, config, netease, profile, conversationMood, request, selected, playedIds, playedSignatures, accountContext }) {
+  const diagnostics = [{
+    pick: { name: 'playlist_profile_fallback', artists: [], reason: 'profile_fallback' },
+    queries: ['current account profile playlists'],
+    hits: [],
+    fallbackSource: 'playlist_profile'
+  }];
+  const fallbackTracks = listProfileFallbackTracks(db, 260, accountContext)
+    .filter(track => !shouldSkipFallbackTrack(track, { playedIds, playedSignatures, request }))
+    .filter(track => !trackViolatesSessionConstraints(track, request.sessionConstraints))
+    .map((track, index) => ({ track, score: scoreFallbackTrack(track, { profile, conversationMood }) - index * 0.01 }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, 48);
+
+  for (const item of fallbackTracks) {
+    if (selected.length >= PLAYLIST_SIZE) break;
+    const hit = {
+      track: sanitizeTrackForDebug(item.track),
+      score: Math.round(item.score * 100) / 100,
+      accepted: true,
+      filterReason: null,
+      playable: null
+    };
+    diagnostics[0].hits.push(hit);
+    const playable = await resolvePlayableTrack(db, netease, item.track, playableResolveOptions(config, { includeLyric: false }));
+    hit.playable = Boolean(playable?.playable);
+    if (!playable?.playable) {
+      hit.accepted = false;
+      hit.filterReason = 'not_playable';
+      continue;
+    }
+    const withLyric = await resolvePlayableTrack(db, netease, playable, playableResolveOptions(config, { includeLyric: true }));
+    const selectedTrack = withLyric?.playable ? withLyric : playable;
+    addPlaylistSelection(selected, selectedTrack, {
+      name: selectedTrack.name,
+      artists: selectedTrack.artists || [],
+      reason: item.track.playlistName ? `来自你的《${item.track.playlistName}》歌单画像` : '来自你的音乐画像'
+    }, playedIds, playedSignatures);
+  }
+  return { diagnostics: [trimSearchDiagnostic(diagnostics[0])] };
+}
+
+async function commitPlaylistPlayback({ db, config, sessionId, playlist, index = 0, hostPolicy = 'none', accountContext = null }) {
+  const account = normalizeAccountContext(accountContext);
+  sessionId = ensureSession(db, sessionId, account);
+  const normalized = normalizeActivePlaylist({
+    ...playlist,
+    currentIndex: index
+  });
+  const item = normalized.items[index];
+  if (!item?.track?.id) {
+    return { __error: true, ok: false, status: 500, error: 'Playlist item missing track.' };
+  }
+  const context = getSessionContext(db, sessionId);
+  const nextPlaylist = movePlaylistToIndex(normalized, index, { previousStatus: null });
+  saveTrack(db, item.track);
+  db.prepare('INSERT INTO plays (account_id, track_id, played_at, source, reason, host_text, report_status) VALUES (?,?,?,?,?,?,?)')
+    .run(account.accountId, item.track.id, nowIso(), 'playlist', item.reason || normalized.summary || '', hostPolicy === 'playlist_intro' ? normalized.hostText || '' : '', 'pending');
+  setSessionContext(db, sessionId, {
+    ...context,
+    activePlaylist: nextPlaylist,
+    radioIntroDone: true,
+    radioIntroAt: context.radioIntroAt || nowIso(),
+    radioTurnCount: Number(context.radioTurnCount || 0) + 1,
+    radioPlayedSongs: mergePlayedSongContext(context.radioPlayedSongs, item.track)
+  });
+  const prefs = normalizeRuntimePrefs(getUserPrefs(db, account));
+  const speech = hostPolicy === 'playlist_intro'
+    ? speechDecisionForRecommendation(prefs)
+    : { shouldSpeak: false, mode: 'off' };
+  let tts = { url: null, status: hostPolicy === 'playlist_intro' ? 'disabled' : 'disabled', ms: 0, error: null };
+  const chatText = hostPolicy === 'playlist_intro' ? String(nextPlaylist.hostText || '').trim() : '';
+  if (hostPolicy === 'playlist_intro' && speech.shouldSpeak && chatText) {
+    tts = await synthesizeSpeechWithDiagnostics(config.tts, chatText);
+    if (tts.status === 'failed') updateQueueMetrics(db, sessionId, { ttsFailedCount: 1 });
+    setRadioDebugInfo(db, sessionId, { lastTtsDiagnostics: sanitizeTtsDiagnostics(tts) });
+  }
+  return {
+    sessionId,
+    chatText,
+    track: item.track,
+    reason: item.reason || nextPlaylist.summary || '',
+    explanation: buildPlaylistItemExplanation(nextPlaylist, item, hostPolicy),
+    ttsUrl: tts.url,
+    ttsStatus: tts.status,
+    ttsMs: tts.ms,
+    ttsError: tts.error,
+    speech,
+    mode: getSessionMode(db, sessionId),
+    profile: nextPlaylist.profile || getProfile(db, account),
+    weather: nextPlaylist.weather || context.weather || '',
+    playlistMode: true,
+    hostPolicy,
+    playlist: playlistForClient(nextPlaylist)
+  };
+}
+
+async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, conversationMood, memoryContext, request, playedHistory = [], hostContext = {}, environmentContext = {}, failedPicks = [] }) {
+  const fallbackPlan = { title: '', summary: '', picks: [], hostDraft: '', mode: null };
+  if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return fallbackPlan;
+  const modeText = mode?.genre
+    ? `当前模式：${mode.genre}（${mode.note || '用户指定'}）`
+    : '当前模式：无特殊模式';
+  const failedText = failedPicks.length
+    ? `上一批未命中可播放源，请避开：${failedPicks.map(pick => `${pick.name}${pick.artists?.length ? ' - ' + pick.artists.join('/') : ''}`).join('；')}`
+    : '暂无失败候选。';
+  const playedText = formatPlayedSongExclusions(playedHistory, request);
+  const raw = await generateChatCompletion(config.llm, [
+    {
+      role: 'system',
+      content: [
+        '你是灿灿校园电台的歌单策划。请一次设计一张 5 首歌的真实可搜索歌单，但为了后续校验，需要给出 8-10 首候选。',
+        buildCanCanBackgroundPrompt('一键推荐歌单'),
+        '必须结合当前时间、天气或场景、听众音乐画像、长期记忆、最近对话和禁听约束。',
+        '候选必须是真实存在、主要音乐平台容易搜到的具体歌曲；每首必须有明确歌名和主要艺人。',
+        '整体要像一张有顺序感的校园电台歌单，不要五首完全同质，也不要跨度过大。',
+        '不要推荐已经播放过的同名歌曲；若有禁听歌手或歌名，必须避开。',
+        'queries 只写短搜索词，优先“歌名 艺人”和“艺人 歌名”。',
+        'hostDraft 是整张歌单的开场导播方向，只描述整体氛围，不逐首长篇介绍。',
+        '只输出严格 JSON，不要 Markdown。',
+        'JSON 格式：{"title":"歌单名","summary":"一句话歌单氛围","picks":[{"name":"歌名","artists":["艺人"],"reason":"一句话理由","queries":["歌名 艺人","艺人 歌名"]}],"hostDraft":"50-110字整张歌单开场导播词"}'
+      ].join('\n')
+    },
+    {
+      role: 'user',
+      content: [
+        `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
+        `此刻：${timeOfDay} ${hour}点，${weather}`,
+        `听众画像：${profile?.summary || '无'}`,
+        `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
+        modeText,
+        conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
+        formatSessionConstraintsForPrompt(request?.sessionConstraints),
+        formatRecentHostPlays(hostContext.recentPlays),
+        playedText,
+        memoryContext?.promptText || '相关长期记忆：无',
+        memoryContext?.sessionSummary ? `本轮会话摘要：${memoryContext.sessionSummary}` : '本轮会话摘要：无',
+        `最近对话：${history.length ? '\n' + history.map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`,
+        failedText
+      ].join('\n')
+    }
+  ], () => JSON.stringify(fallbackPlan));
+  return parsePlaylistPlanResponse(raw, fallbackPlan);
+}
+
+function parsePlaylistPlanResponse(raw, fallbackPlan = { title: '', summary: '', picks: [], hostDraft: '', mode: null }) {
+  const text = stripCodeFence(String(raw || '')).trim();
+  let parsed = null;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    const objectMatch = text.match(/\{[\s\S]*\}/);
+    if (objectMatch) {
+      try { parsed = JSON.parse(objectMatch[0]); } catch {}
+    }
+  }
+  if (!parsed) return fallbackPlan;
+  const rawPicks = Array.isArray(parsed) ? parsed : (parsed.picks || parsed.songs || parsed.recommendations || []);
+  return {
+    title: String(parsed.title || parsed.name || '').trim().slice(0, 40),
+    summary: String(parsed.summary || parsed.reason || '').trim().slice(0, 120),
+    picks: rawPicks.map(normalizeSongPick).filter(pick => pick.name && pick.artists.length).slice(0, PLAYLIST_PLAN_LIMIT),
+    hostDraft: String(parsed.hostDraft || parsed.hostText || parsed.chatText || '').trim(),
+    mode: parsed.mode ?? null
+  };
+}
+
+function uniquePlaylistPicks(picks = []) {
+  const seen = new Set();
+  const unique = [];
+  for (const pick of picks) {
+    const key = `${playedSongKey(pick?.name)}:${normalizeArtistList(pick?.artists || []).join('|').toLowerCase()}`;
+    if (!key || seen.has(key)) continue;
+    seen.add(key);
+    unique.push(pick);
+  }
+  return unique;
+}
+
+function sanitizePlaylistPlan(plan = {}, attempt = 0) {
+  return {
+    attempt,
+    title: String(plan.title || '').slice(0, 40),
+    summary: String(plan.summary || '').slice(0, 120),
+    picks: (plan.picks || []).map(sanitizeSongPick).slice(0, PLAYLIST_PLAN_LIMIT),
+    hostDraft: String(plan.hostDraft || '').slice(0, 180),
+    updatedAt: nowIso()
+  };
+}
+
+function normalizeActivePlaylist(raw = null) {
+  if (!raw || typeof raw !== 'object') return null;
+  const items = Array.isArray(raw.items)
+    ? raw.items.map((item, index) => ({
+        index: Number.isInteger(Number(item?.index)) ? Number(item.index) : index,
+        track: item?.track || null,
+        reason: String(item?.reason || '').trim(),
+        status: ['pending', 'current', 'played', 'skipped'].includes(item?.status) ? item.status : 'pending'
+      })).filter(item => item.track?.id)
+    : [];
+  if (!items.length) return null;
+  const currentIndexRaw = Number(raw.currentIndex || 0);
+  const currentIndex = Math.min(Math.max(Number.isInteger(currentIndexRaw) ? currentIndexRaw : 0, 0), items.length - 1);
+  return {
+    id: String(raw.id || `playlist-${Date.now()}`),
+    title: String(raw.title || '灿灿推荐歌单').slice(0, 40),
+    summary: String(raw.summary || '').slice(0, 180),
+    createdAt: raw.createdAt || nowIso(),
+    contextVersion: Number(raw.contextVersion || raw.contextSnapshot?.version || 0),
+    contextSnapshot: normalizeMusicContext(raw.contextSnapshot || {}),
+    currentIndex,
+    items: items.map((item, index) => ({
+      ...item,
+      index,
+      status: index === currentIndex ? 'current' : item.status
+    })),
+    hostText: String(raw.hostText || '').trim(),
+    conversationMood: raw.conversationMood ? normalizeMoodDecision(raw.conversationMood) : null,
+    weather: raw.weather || '',
+    environmentContext: raw.environmentContext || {},
+    profile: raw.profile || null
+  };
+}
+
+function markPlaylistItemStatus(playlist, index, status) {
+  const normalized = normalizeActivePlaylist(playlist);
+  if (!normalized) return null;
+  return {
+    ...normalized,
+    items: normalized.items.map((item) => item.index === index ? { ...item, status } : item)
+  };
+}
+
+function movePlaylistToIndex(playlist, index, { previousStatus = 'played' } = {}) {
+  const normalized = normalizeActivePlaylist(playlist);
+  if (!normalized) return null;
+  const targetIndex = Math.min(Math.max(Number(index) || 0, 0), normalized.items.length - 1);
+  const previousIndex = normalized.currentIndex;
+  return {
+    ...normalized,
+    currentIndex: targetIndex,
+    items: normalized.items.map((item) => {
+      if (item.index === targetIndex) return { ...item, status: 'current' };
+      if (previousStatus && item.index === previousIndex && item.status === 'current') return { ...item, status: previousStatus };
+      return item.status === 'current' ? { ...item, status: item.index < targetIndex ? 'played' : 'pending' } : item;
+    })
+  };
+}
+
+function playlistForClient(playlist) {
+  const normalized = normalizeActivePlaylist(playlist);
+  if (!normalized) return null;
+  return {
+    id: normalized.id,
+    title: normalized.title,
+    summary: normalized.summary,
+    currentIndex: normalized.currentIndex,
+    items: normalized.items.map((item) => ({
+      index: item.index,
+      track: item.track,
+      reason: item.reason,
+      status: item.status
+    }))
+  };
+}
+
+function buildPlaylistTitle({ timeOfDay, conversationMood } = {}) {
+  const mood = String(conversationMood?.mood || conversationMood?.energy || '').trim();
+  if (mood) return `灿灿的${mood}五首`;
+  return `${timeOfDay || '此刻'}校园五首`;
+}
+
+function buildPlaylistSummary({ selected = [], conversationMood, weather, timeOfDay } = {}) {
+  const names = selected.slice(0, 3).map(item => `《${item.track.name}》`).join('、');
+  const mood = conversationMood?.reason || conversationMood?.mood || '';
+  return [timeOfDay, weather, mood, names ? `从${names}开始` : ''].filter(Boolean).join(' · ').slice(0, 160);
+}
+
+async function generatePlaylistIntroText({ config, playlist, profile, prefs, history, timeOfDay, hour, weather, conversationMood, memoryContext, hostContext, environmentContext }) {
+  const fallback = playlist.hostText || `我给你整理了一张 5 首歌的小歌单，会顺着现在的状态慢慢播放。`;
+  if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return fallback;
+  const songList = playlist.items.map(item => `${item.index + 1}. ${item.track.name} - ${(item.track.artists || []).join('/')}${item.reason ? `：${item.reason}` : ''}`).join('\n');
+  const raw = await generateChatCompletion(config.llm, [
+    {
+      role: 'system',
+      content: [
+        '你是灿灿校园电台的 AI DJ。请为一张已经确认可播放的 5 首歌歌单写一段开场导播词。',
+        buildCanCanBackgroundPrompt('歌单开场导播'),
+        '只写整张歌单的整体氛围和使用场景，不要逐首详细介绍，不要说后面每首还会继续导播。',
+        '语气自然、亲近、像电台开场，长度 50-110 字。',
+        '只输出纯文本。'
+      ].join('\n')
+    },
+    {
+      role: 'user',
+      content: [
+        `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
+        `此刻：${timeOfDay} ${hour}点，${weather}`,
+        `听众画像：${profile?.summary || '无'}`,
+        `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
+        conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
+        memoryContext?.promptText || '相关长期记忆：无',
+        formatRecentHostPlays(hostContext.recentPlays),
+        `歌单名：${playlist.title}`,
+        `歌单摘要：${playlist.summary}`,
+        `五首歌：\n${songList}`,
+        `最近对话：${history.length ? '\n' + history.slice(-8).map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`
+      ].join('\n')
+    }
+  ], () => fallback);
+  return sanitizeSpokenChatText(String(raw || fallback)).slice(0, 180) || fallback;
+}
+
+function buildPlaylistItemExplanation(playlist, item, hostPolicy) {
+  return normalizeRecommendationExplanation({
+    summary: hostPolicy === 'playlist_intro'
+      ? `歌单开场：${playlist.summary || item.reason || '5 首连续推荐'}`
+      : `歌单第 ${item.index + 1} 首：${item.reason || playlist.summary || '延续当前歌单氛围'}`,
+    factors: [
+      { type: 'playlist', text: playlist.title || '歌单模式' },
+      item.reason ? { type: 'reason', text: item.reason } : null
+    ].filter(Boolean),
+    source: 'playlist'
+  });
 }
 
 async function commitRadioRecommendation({ db, config, sessionId, payload, userMessage = null, conversationMood = null, source = 'sync', accountContext = null }) {

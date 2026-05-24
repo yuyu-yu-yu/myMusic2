@@ -74,7 +74,11 @@
             </div>
             <span id="progress-duration" class="progress-time">00:00</span>
           </div>
-          <button id="start-btn" class="primary start-wide">启动电台</button>
+          <div class="radio-mode-launcher" role="group" aria-label="电台启动模式">
+            <button id="start-btn" class="primary start-wide radio-mode-btn is-selected" type="button" data-radio-mode="single">单曲模式</button>
+            <button id="playlist-start-btn" class="primary start-wide radio-mode-btn" type="button" data-radio-mode="playlist">歌单模式</button>
+          </div>
+          <aside id="playlist-queue-panel" class="playlist-queue-panel" hidden></aside>
           <div class="ai-music-mode">
             <button id="ai-music-toggle" class="ai-music-toggle" type="button" aria-pressed="false">
               <span class="ai-music-toggle-led" aria-hidden="true"></span>

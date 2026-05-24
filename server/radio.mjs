@@ -1,6 +1,6 @@
 // Radio routes — thin wrappers over the conversational DJ engine
 import crypto from 'node:crypto';
-import { chatTurn, djTurn, getRadioDebugStatus, prefetchRadioQueue } from './dj.mjs';
+import { chatTurn, clearActivePlaylistSession, djTurn, getRadioDebugStatus, playlistJumpTurn, playlistNextTurn, playlistStartTurn, prefetchRadioQueue } from './dj.mjs';
 import {
   clearUserMemories,
   deleteUserMemory,
@@ -16,19 +16,43 @@ import { normalizeAccountContext, publicAccountContext, resolveAccountContext } 
 
 export async function startRadio({ db, config, netease, sessionId, accountContext }) {
   const account = getRequestAccount(db, accountContext);
-  const result = await djTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), userMessage: null, accountContext: account });
+  const id = sessionId || crypto.randomUUID();
+  clearActivePlaylistSession(db, id, account);
+  const result = await djTurn({ db, config, netease, sessionId: id, userMessage: null, accountContext: account });
   return attachAccount(result, account);
 }
 
 export async function chatRadio({ db, config, netease, sessionId, message, accountContext }) {
   const account = getRequestAccount(db, accountContext);
-  const result = await chatTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), message: message || '', accountContext: account });
+  const id = sessionId || crypto.randomUUID();
+  const result = await chatTurn({ db, config, netease, sessionId: id, message: message || '', accountContext: account });
+  if (result?.track) clearActivePlaylistSession(db, id, account);
   return attachAccount(result, account);
 }
 
 export async function nextRadioItem({ db, config, netease, sessionId, userMessage, accountContext }) {
   const account = getRequestAccount(db, accountContext);
-  const result = await djTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), userMessage: userMessage || null, accountContext: account });
+  const id = sessionId || crypto.randomUUID();
+  clearActivePlaylistSession(db, id, account);
+  const result = await djTurn({ db, config, netease, sessionId: id, userMessage: userMessage || null, accountContext: account });
+  return attachAccount(result, account);
+}
+
+export async function startPlaylistRadio({ db, config, netease, sessionId, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  const result = await playlistStartTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), accountContext: account });
+  return attachAccount(result, account);
+}
+
+export async function nextPlaylistRadio({ db, config, netease, sessionId, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  const result = await playlistNextTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), accountContext: account });
+  return attachAccount(result, account);
+}
+
+export async function jumpPlaylistRadio({ db, config, netease, sessionId, index, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  const result = await playlistJumpTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), index, accountContext: account });
   return attachAccount(result, account);
 }
 

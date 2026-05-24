@@ -45,6 +45,9 @@ import {
   parseDjModelResponse,
   parseFinalHostText,
   parseSongPlanResponse,
+  playlistJumpTurn,
+  playlistNextTurn,
+  playlistStartTurn,
   queueItemMatchesMusicContext,
   recommendationTextMentionsDifferentTrack,
   rankAndSelectCandidates,
@@ -2260,4 +2263,86 @@ test('DJ recommendation falls back to current profile playlists when LLM has no 
   assert.equal(result.track?.name, 'Fallback Song');
   assert.equal(result.explanation?.source, 'fallback');
   assert.doesNotMatch(result.chatText, /没能生成|可靠歌名|no playable/i);
+});
+
+test('playlist mode starts with one intro and continues without per-song speech', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  const playlist = savePlaylist(db, { id: 'five-song-profile', name: 'Five Song Profile', trackCount: 5 }, 'created');
+  for (let index = 0; index < 5; index += 1) {
+    const track = saveTrack(db, {
+      id: `playlist-track-${index}`,
+      originalId: `playlist-original-${index}`,
+      name: `Playlist Song ${index + 1}`,
+      artists: [`Artist ${index + 1}`],
+      album: 'Playlist Album'
+    });
+    linkPlaylistTrack(db, playlist.id, track.id, index);
+  }
+
+  const netease = { isConfigured: () => false };
+  const config = { llm: {}, tts: {}, weather: {} };
+  const start = await playlistStartTurn({
+    db,
+    config,
+    netease,
+    sessionId: 'playlist-mode-session'
+  });
+
+  assert.equal(start.playlistMode, true);
+  assert.equal(start.hostPolicy, 'playlist_intro');
+  assert.equal(start.playlist.items.length, 5);
+  assert.equal(start.playlist.currentIndex, 0);
+  assert.match(start.chatText, /5 首歌|歌单/);
+  assert.equal(start.speech.shouldSpeak, false);
+
+  const next = await playlistNextTurn({
+    db,
+    config,
+    netease,
+    sessionId: 'playlist-mode-session'
+  });
+
+  assert.equal(next.playlistMode, true);
+  assert.equal(next.hostPolicy, 'none');
+  assert.equal(next.chatText, '');
+  assert.equal(next.ttsUrl, null);
+  assert.equal(next.speech.shouldSpeak, false);
+  assert.equal(next.playlist.currentIndex, 1);
+  assert.equal(next.playlist.items[0].status, 'played');
+  assert.equal(next.playlist.items[1].status, 'current');
+});
+
+test('playlist jump skips the current item and does not generate host speech', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'all' } });
+  const playlist = savePlaylist(db, { id: 'jump-profile', name: 'Jump Profile', trackCount: 5 }, 'created');
+  for (let index = 0; index < 5; index += 1) {
+    const track = saveTrack(db, {
+      id: `jump-track-${index}`,
+      originalId: `jump-original-${index}`,
+      name: `Jump Song ${index + 1}`,
+      artists: [`Jump Artist ${index + 1}`],
+      album: 'Jump Album'
+    });
+    linkPlaylistTrack(db, playlist.id, track.id, index);
+  }
+
+  const netease = { isConfigured: () => false };
+  const config = { llm: {}, tts: {}, weather: {} };
+  await playlistStartTurn({ db, config, netease, sessionId: 'playlist-jump-session' });
+  const jumped = await playlistJumpTurn({
+    db,
+    config,
+    netease,
+    sessionId: 'playlist-jump-session',
+    index: 3
+  });
+
+  assert.equal(jumped.hostPolicy, 'none');
+  assert.equal(jumped.chatText, '');
+  assert.equal(jumped.speech.shouldSpeak, false);
+  assert.equal(jumped.playlist.currentIndex, 3);
+  assert.equal(jumped.playlist.items[0].status, 'skipped');
+  assert.equal(jumped.playlist.items[3].status, 'current');
 });

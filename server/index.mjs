@@ -9,7 +9,7 @@ import { openDatabase, getSetting, saveTrack, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { extractOpenApiTokenPayload, getNeteaseLoginStatus, resolveQrOpenApiLogin, saveNeteaseUserProfile, saveOpenApiToken } from './netease-auth.mjs';
 import { clearLibraryAccountSnapshot, getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
-import { chatRadio, getMemories, getPreferences, getRadioDebug, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
+import { chatRadio, getMemories, getPreferences, getRadioDebug, jumpPlaylistRadio, nextPlaylistRadio, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startPlaylistRadio, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
 import { checkCookieQrLogin, clearCookie, createCookieQrLogin, getCookieStatus, getCookieUserProfile, loadCookie, resolveCommunityApiFile } from './community.mjs';
@@ -295,6 +295,18 @@ const routes = {
   'POST /api/radio/next': async (req) => {
     const body = await readJson(req);
     return nextRadioItem({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), userMessage: body.message || '', accountContext: getRequestAccount(req) });
+  },
+  'POST /api/radio/playlist/start': async (req) => {
+    const body = await readJson(req);
+    return startPlaylistRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), accountContext: getRequestAccount(req) });
+  },
+  'POST /api/radio/playlist/next': async (req) => {
+    const body = await readJson(req);
+    return nextPlaylistRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), accountContext: getRequestAccount(req) });
+  },
+  'POST /api/radio/playlist/jump': async (req) => {
+    const body = await readJson(req);
+    return jumpPlaylistRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), index: body.index, accountContext: getRequestAccount(req) });
   },
   'POST /api/ai-music/generate': async (req) => {
     const body = await readJson(req);

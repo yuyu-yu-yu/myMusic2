@@ -29,6 +29,9 @@ const state = {
   demoSelfCheckRunning: false,
   radioTurnSeq: 0,
   activeRadioTurn: null,
+  radioMode: 'single',
+  activePlaylist: null,
+  playlistStatus: 'idle',
   aiMusicMode: readStoredAiMusicMode()
 };
 
@@ -772,11 +775,22 @@ function getContextualAvatarState() {
 
 function setRadioButtonState(mode = 'idle') {
   const startBtn = document.querySelector('#start-btn');
-  if (!startBtn) return;
-  startBtn.dataset.radioState = mode;
-  if (mode === 'loading') startBtn.textContent = '电台启动中';
-  else if (mode === 'active') startBtn.textContent = '电台已启动';
-  else startBtn.textContent = '启动电台';
+  const playlistStartBtn = document.querySelector('#playlist-start-btn');
+  const activeMode = state.radioMode === 'playlist' ? 'playlist' : 'single';
+  const buttons = [
+    { el: startBtn, mode: 'single', idleText: '单曲模式', loadingText: '单曲搜索中', activeText: '单曲电台中' },
+    { el: playlistStartBtn, mode: 'playlist', idleText: '歌单模式', loadingText: '整理歌单中', activeText: '歌单播放中' }
+  ];
+  buttons.forEach(({ el, mode: buttonMode, idleText, loadingText, activeText }) => {
+    if (!el) return;
+    const isActiveMode = activeMode === buttonMode;
+    el.dataset.radioState = isActiveMode ? mode : 'idle';
+    el.classList.toggle('is-selected', isActiveMode);
+    el.setAttribute('aria-pressed', String(isActiveMode));
+    if (isActiveMode && mode === 'loading') el.textContent = loadingText;
+    else if (isActiveMode && mode === 'active') el.textContent = activeText;
+    else el.textContent = idleText;
+  });
 }
 // --- Button press feedback ---
 
@@ -817,6 +831,18 @@ function closestButtonFromEvent(event) {
   return parent instanceof Element ? parent.closest('button') : null;
 }
 
+function setRadioMode(mode = 'single') {
+  state.radioMode = mode === 'playlist' ? 'playlist' : 'single';
+  if (state.radioMode === 'single') {
+    state.activePlaylist = null;
+    state.playlistStatus = 'idle';
+  } else if (!state.activePlaylist) {
+    state.playlistStatus = 'loading';
+  }
+  setRadioButtonState(state.current?.track || state.sessionId ? 'active' : 'idle');
+  renderPlaylistQueue();
+}
+
 function renderPlayer() {
   view.innerHTML = '';
   view.append(template.content.cloneNode(true));
@@ -849,6 +875,7 @@ function renderPlayer() {
   };
 
   const startBtn = document.querySelector('#start-btn');
+  const playlistStartBtn = document.querySelector('#playlist-start-btn');
   const previousBtn = document.querySelector('#previous-btn');
   const nextBtn = document.querySelector('#next-btn');
   const playToggleBtn = document.querySelector('#play-toggle-btn');
@@ -860,8 +887,14 @@ function renderPlayer() {
   const { likeBtn, dislikeBtn } = ensureFeedbackButtons();
 
   startBtn.addEventListener('click', () => {
+    setRadioMode('single');
     api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
     startRadio();
+  });
+  playlistStartBtn?.addEventListener('click', () => {
+    setRadioMode('playlist');
+    api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
+    startPlaylistRadio();
   });
   previousBtn?.addEventListener('click', () => previousTrack());
   nextBtn.addEventListener('click', () => nextTrack({ skipCurrent: true }));
@@ -897,6 +930,12 @@ function renderPlayer() {
     if (!scene) return;
     sendChat(`我正在${scene}，请帮我推荐适合${scene}的歌`);
   });
+  document.querySelector('#playlist-queue-panel')?.addEventListener('click', (event) => {
+    const button = closestButtonFromEvent(event);
+    if (!button?.matches('[data-playlist-index]')) return;
+    const index = Number(button.dataset.playlistIndex);
+    if (Number.isInteger(index)) jumpPlaylistTo(index);
+  });
 
   // Restore saved chat messages
   if (savedChatHTML) {
@@ -915,6 +954,7 @@ function renderPlayer() {
   initProgressBar();
   updateAiMusicToggle();
   updateAiMusicDownload(state.current?.track || null);
+  renderPlaylistQueue();
   scheduleRadioPrefetch();
 }
 
@@ -961,12 +1001,19 @@ function readStoredAiMusicMode() {
 
 function setAiMusicMode(enabled, { announce = true } = {}) {
   state.aiMusicMode = Boolean(enabled);
+  if (state.aiMusicMode) {
+    state.radioMode = 'single';
+    state.activePlaylist = null;
+    state.playlistStatus = 'idle';
+  }
   try {
     localStorage.setItem(AI_MUSIC_MODE_STORAGE_KEY, state.aiMusicMode ? 'on' : 'off');
   } catch {
     // Storage failures should not block the local playback mode switch.
   }
   updateAiMusicToggle();
+  setRadioButtonState(state.current?.track || state.sessionId ? 'active' : 'idle');
+  renderPlaylistQueue();
   if (announce) {
     appendChat({
       role: 'dj',
@@ -1128,6 +1175,18 @@ const aiMusicLoadingMessages = [
   '灿灿正在把最近对话做成旋律...',
 ];
 
+const playlistLoadingMessages = [
+  '灿灿正在整理 5 首歌单...',
+  '灿灿正在校验每首歌能不能稳定播放...',
+  '灿灿正在给这张歌单排顺序...',
+  '灿灿正在写整张歌单的开场导播...',
+];
+
+const playlistNextLoadingMessages = [
+  '灿灿正在切到歌单下一首...',
+  '灿灿正在保持这张歌单的播放节奏...',
+];
+
 const chatLoadingMessages = [
   '灿灿正在回复...',
   '灿灿正在读你的消息...',
@@ -1139,6 +1198,10 @@ function startLoadingMessages(kind = 'music') {
     ? chatLoadingMessages
     : kind === 'aiMusic'
     ? aiMusicLoadingMessages
+    : kind === 'playlist'
+    ? playlistLoadingMessages
+    : kind === 'playlistNext'
+    ? playlistNextLoadingMessages
     : loadingMessages;
   statusLocked = true;
   setAvatarState(kind === 'chat' ? 'reading' : 'searching');
@@ -1300,6 +1363,7 @@ function suppressCurrentSongAutoAdvance() {
 
 function scheduleRadioPrefetch({ force = false } = {}) {
   if (state.aiMusicMode) return Promise.resolve(null);
+  if (state.radioMode === 'playlist') return Promise.resolve(null);
   if (state.radioPrefetchPromise && !force) return state.radioPrefetchPromise;
   const sessionId = ensureSessionId();
   state.radioPrefetchPromise = api('/api/radio/prefetch', {
@@ -1365,6 +1429,44 @@ async function startRadio() {
   }
 }
 
+async function startPlaylistRadio() {
+  const radioTurn = beginRadioTurn();
+  primeVoicePlayback();
+  const sessionId = ensureSessionId();
+  state.radioMode = 'playlist';
+  state.playlistStatus = 'loading';
+  renderPlaylistQueue();
+  setAvatarState('searching');
+  setRadioButtonState('loading');
+  if (state.aiMusicMode) setAiMusicMode(false, { announce: false });
+  appendChat({ role: 'user', text: '一键推荐 5 首歌单' });
+  const loading = startLoadingMessages('playlist');
+  attachRadioTurnLoading(radioTurn, loading);
+  try {
+    await loadPreferences().catch(() => null);
+    if (!isActiveRadioTurn(radioTurn)) return;
+    const data = await api('/api/radio/playlist/start', {
+      method: 'POST',
+      body: { sessionId },
+      signal: radioTurnSignal(radioTurn)
+    });
+    state.radioMode = 'playlist';
+    handleRadioResponse(data, { loading, radioTurn });
+  } catch (e) {
+    if (isInterruptedRadioTurn(radioTurn, e)) {
+      stopLoadingMessages({ remove: true, loading });
+      clearRadioTurnLoading(radioTurn, loading);
+      return;
+    }
+    clearRadioTurnLoading(radioTurn, loading);
+    stopLoadingMessages({ loading });
+    replaceLoadingMessage({ text: '整理 5 首歌单时出了一点问题：' + e.message, loading });
+    setAvatarState(getContextualAvatarState());
+    setRadioButtonState(state.current?.track ? 'active' : 'idle');
+    setPlayerStatus(e.message, 'error');
+  }
+}
+
 async function nextTrack({ skipCurrent = true, silent = false } = {}) {
   const radioTurn = beginRadioTurn();
   primeVoicePlayback();
@@ -1374,15 +1476,17 @@ async function nextTrack({ skipCurrent = true, silent = false } = {}) {
   if (skipCurrent) await reportFeedback('skip');
   if (!isActiveRadioTurn(radioTurn)) return;
   if (!silent) {
-    appendChat({ role: 'user', text: state.aiMusicMode ? '生成此刻歌曲' : '下一首' });
+    appendChat({ role: 'user', text: state.aiMusicMode ? '生成此刻歌曲' : state.radioMode === 'playlist' ? '歌单下一首' : '下一首' });
   }
-  const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : 'music');
+  const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : state.radioMode === 'playlist' ? 'playlistNext' : 'music');
   attachRadioTurnLoading(radioTurn, loading);
   try {
     await loadPreferences().catch(() => null);
     if (!isActiveRadioTurn(radioTurn)) return;
     const data = state.aiMusicMode
       ? await requestAiMusicTrack({ sessionId, trigger: 'next', signal: radioTurnSignal(radioTurn) })
+      : state.radioMode === 'playlist'
+      ? await api('/api/radio/playlist/next', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) })
       : await api('/api/radio/next', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
     handleRadioResponse(data, { loading, radioTurn });
   } catch (e) {
@@ -1408,6 +1512,42 @@ async function nextTrack({ skipCurrent = true, silent = false } = {}) {
     clearRadioTurnLoading(radioTurn, loading);
     stopLoadingMessages({ loading });
     replaceLoadingMessage({ text: '抱歉，刚才找歌时出了一点问题：' + e.message, loading });
+    setAvatarState(getContextualAvatarState());
+    setPlayerStatus(e.message, 'error');
+  }
+}
+
+async function jumpPlaylistTo(index) {
+  if (state.radioMode !== 'playlist' || !state.activePlaylist) return;
+  const item = state.activePlaylist.items?.[index];
+  if (!item || item.status !== 'pending') return;
+  const radioTurn = beginRadioTurn();
+  primeVoicePlayback();
+  const sessionId = ensureSessionId();
+  setAvatarState('searching');
+  setPlaybackToggleState(false);
+  await reportFeedback('skip');
+  if (!isActiveRadioTurn(radioTurn)) return;
+  appendChat({ role: 'user', text: `跳到歌单第 ${index + 1} 首` });
+  const loading = startLoadingMessages('playlistNext');
+  attachRadioTurnLoading(radioTurn, loading);
+  try {
+    const data = await api('/api/radio/playlist/jump', {
+      method: 'POST',
+      body: { sessionId, index },
+      signal: radioTurnSignal(radioTurn)
+    });
+    state.radioMode = 'playlist';
+    handleRadioResponse(data, { loading, radioTurn });
+  } catch (e) {
+    if (isInterruptedRadioTurn(radioTurn, e)) {
+      stopLoadingMessages({ remove: true, loading });
+      clearRadioTurnLoading(radioTurn, loading);
+      return;
+    }
+    clearRadioTurnLoading(radioTurn, loading);
+    stopLoadingMessages({ loading });
+    replaceLoadingMessage({ text: '跳转歌单歌曲时出了一点问题：' + e.message, loading });
     setAvatarState(getContextualAvatarState());
     setPlayerStatus(e.message, 'error');
   }
@@ -1478,10 +1618,21 @@ function handleRadioResponse(data, { loading = null, radioTurn = null } = {}) {
     clearRadioTurnLoading(radioTurn, loading);
     return false;
   }
-  stopLoadingMessages({ loading });
+  const suppressPlaylistHostBubble = Boolean(data.playlistMode && data.hostPolicy === 'none' && data.track && !data.chatText);
+  stopLoadingMessages({ loading, remove: suppressPlaylistHostBubble });
   clearRadioTurnLoading(radioTurn, loading);
   state.sessionId = data.sessionId || state.sessionId;
+  if (data.playlistMode) {
+    state.radioMode = 'playlist';
+    state.activePlaylist = data.playlist || null;
+    state.playlistStatus = data.playlist ? 'ready' : 'empty';
+  } else if (data.track) {
+    state.radioMode = state.aiMusicMode ? 'single' : state.radioMode === 'playlist' ? 'single' : state.radioMode;
+    state.activePlaylist = null;
+    state.playlistStatus = 'idle';
+  }
   setRadioButtonState(state.sessionId || data.track || state.current?.track ? 'active' : 'idle');
+  renderPlaylistQueue();
   if (data.track) {
     stopVisualizer();
     rememberCurrentForHistory(data);
@@ -1489,12 +1640,14 @@ function handleRadioResponse(data, { loading = null, radioTurn = null } = {}) {
     updatePlayer(data, false);
   }
 
-  replaceLoadingMessage({
-    text: data.chatText || data.hostText || '',
-    track: data.track,
-    explanation: data.explanation,
-    loading
-  });
+  if (!suppressPlaylistHostBubble) {
+    replaceLoadingMessage({
+      text: data.chatText || data.hostText || '',
+      track: data.track,
+      explanation: data.explanation,
+      loading
+    });
+  }
   scheduleUsageInsightsRefresh(data.track ? 800 : 3200);
 
   // Show/hide mode reset button
@@ -1739,6 +1892,94 @@ function buildTrackCardHTML(track, explanation = null) {
       ${reasonHtml}
     </div>
   </div>`;
+}
+
+function renderPlaylistQueue() {
+  const panel = document.querySelector('#playlist-queue-panel');
+  if (!panel) return;
+  const isPlaylistMode = state.radioMode === 'playlist';
+  panel.hidden = !isPlaylistMode;
+  panel.classList.toggle('is-active', isPlaylistMode);
+  if (!isPlaylistMode) {
+    panel.innerHTML = '';
+    return;
+  }
+
+  const playlist = state.activePlaylist;
+  const items = Array.isArray(playlist?.items) ? playlist.items : [];
+  if (!playlist || !items.length) {
+    const isEmpty = state.playlistStatus === 'empty';
+    panel.innerHTML = `
+      <div class="playlist-queue-head">
+        <span>5 TRACK SET</span>
+        <strong>${isEmpty ? '暂未成单' : '灿灿歌单'}</strong>
+        <small>${isEmpty ? '这次没凑齐稳定可播的 5 首' : '正在整理可播放歌曲'}</small>
+      </div>
+      <div class="playlist-queue-list" aria-label="歌单准备中">
+        ${Array.from({ length: 5 }, (_, index) => `
+          <div class="playlist-queue-item is-waiting${isEmpty ? ' is-empty' : ''}">
+            <span class="playlist-queue-index">${index + 1}</span>
+            <span class="playlist-queue-copy">
+              <strong>${isEmpty ? '未锁定曲目' : '待确认曲目'}</strong>
+              <small>${isEmpty ? 'NO SIGNAL' : 'STANDBY'}</small>
+            </span>
+          </div>
+        `).join('')}
+      </div>
+    `;
+    return;
+  }
+
+  const current = Number(playlist.currentIndex || 0) + 1;
+  const total = items.length;
+  panel.innerHTML = `
+    <div class="playlist-queue-head">
+      <span>5 TRACK SET</span>
+      <strong>${escapeHtml(playlist.title || '灿灿歌单')}</strong>
+      <small>${escapeHtml(playlist.summary || `第 ${current} / ${total} 首`)}</small>
+    </div>
+    <div class="playlist-queue-progress" aria-hidden="true">
+      <span style="width:${Math.min(100, Math.max(0, (current / Math.max(1, total)) * 100))}%"></span>
+    </div>
+    <div class="playlist-queue-list" aria-label="当前推荐歌单">
+      ${items.map((item) => buildPlaylistQueueItemHTML(item)).join('')}
+    </div>
+  `;
+}
+
+function buildPlaylistQueueItemHTML(item = {}) {
+  const track = item.track || {};
+  const status = ['current', 'played', 'skipped', 'pending'].includes(item.status) ? item.status : 'pending';
+  const index = Number(item.index || 0);
+  const artists = Array.isArray(track.artists) ? track.artists.join(' / ') : '';
+  const statusText = {
+    current: 'ON AIR',
+    pending: '可跳播',
+    played: '已播',
+    skipped: '已跳过'
+  }[status] || '待播';
+  const disabled = status !== 'pending';
+  const title = track.name || '待确认曲目';
+  return `
+    <button
+      type="button"
+      class="playlist-queue-item is-${escapeAttr(status)}"
+      data-playlist-index="${index}"
+      ${disabled ? 'disabled' : ''}
+      title="${disabled ? escapeAttr(statusText) : `跳到第 ${index + 1} 首`}"
+    >
+      <span class="playlist-queue-index">${index + 1}</span>
+      <span class="playlist-queue-cover">
+        <img src="${escapeAttr(track.coverUrl || '/assets/cover-1.svg')}" alt="" />
+      </span>
+      <span class="playlist-queue-copy">
+        <strong>${escapeHtml(title)}</strong>
+        <small>${escapeHtml(artists || item.reason || '灿灿推荐')}</small>
+        ${item.reason ? `<em>${escapeHtml(item.reason)}</em>` : ''}
+      </span>
+      <span class="playlist-queue-status">${escapeHtml(statusText)}</span>
+    </button>
+  `;
 }
 
 function buildExplanationHTML(explanation = null) {
