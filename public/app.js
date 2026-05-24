@@ -230,8 +230,8 @@ async function render() {
 
 
 // --- Audio visualizer ---
-// Keep the visual layer decoupled from the actual audio output. The public demo
-// should never route TTS or music through a Web Audio graph just to animate pixels.
+// Prefer a real analyser on the existing audio elements; fall back gracefully when
+// the browser or media source blocks Web Audio inspection.
 
 function visualizerLog(...args) {
   if (VISUALIZER_DEBUG) console.log('[viz]', ...args);
@@ -362,6 +362,9 @@ function releaseVisualizerCapture(audio) {
   const cached = visualizerCaptureCache.get(audio);
   if (!cached) return;
   try { cached.source?.disconnect?.(); } catch {}
+  try { cached.analyser?.disconnect?.(); } catch {}
+  cached.connected = false;
+  if (cached.kind === 'media') return;
   try {
     for (const track of cached.stream?.getTracks?.() || []) track.stop?.();
   } catch {}
@@ -385,22 +388,67 @@ function ensureVisualizerAudioContext() {
   return visualizerAudioCtx;
 }
 
+function configureVisualizerAnalyser(analyser) {
+  analyser.fftSize = 128;
+  analyser.smoothingTimeConstant = 0.58;
+  return analyser;
+}
+
+function connectVisualizerMediaEntry(entry) {
+  if (entry.connected) return;
+  entry.source.connect(entry.analyser);
+  entry.analyser.connect(entry.ctx.destination);
+  entry.connected = true;
+}
+
+function getOrCreateMediaElementAnalyser(audio, ctx) {
+  if (!ctx?.createMediaElementSource || !audio) return null;
+  const cached = visualizerCaptureCache.get(audio);
+  if (cached?.kind === 'media' && cached.ctx === ctx && cached.analyser) {
+    connectVisualizerMediaEntry(cached);
+    return cached.analyser;
+  }
+  if (cached?.kind === 'capture') releaseVisualizerCapture(audio);
+
+  try {
+    const source = ctx.createMediaElementSource(audio);
+    const analyser = configureVisualizerAnalyser(ctx.createAnalyser());
+    const entry = { kind: 'media', audio, ctx, source, analyser, connected: false };
+    connectVisualizerMediaEntry(entry);
+    visualizerCaptureCache.set(audio, entry);
+    visualizerCaptureEntries.add(entry);
+    return analyser;
+  } catch (error) {
+    if (!visualizerCaptureWarningShown) {
+      console.warn('[viz] media element analysis unavailable:', error?.message || error);
+      visualizerCaptureWarningShown = true;
+    }
+    return null;
+  }
+}
+
 function getOrCreateCaptureAnalyser(audio) {
   const ctx = ensureVisualizerAudioContext();
-  const capture = audio?.captureStream || audio?.mozCaptureStream;
-  if (!ctx || !audio || !capture) return null;
+  if (!ctx || !audio) return null;
 
   const cached = visualizerCaptureCache.get(audio);
-  if (cached?.ctx === ctx && cached.analyser) return cached.analyser;
+  if (cached?.ctx === ctx && cached.analyser) {
+    if (cached.kind === 'media') connectVisualizerMediaEntry(cached);
+    return cached.analyser;
+  }
+
+  const mediaAnalyser = getOrCreateMediaElementAnalyser(audio, ctx);
+  if (mediaAnalyser) return mediaAnalyser;
+
+  const capture = audio.captureStream || audio.mozCaptureStream;
+  if (!capture) return null;
 
   try {
     const stream = capture.call(audio);
     const source = ctx.createMediaStreamSource(stream);
-    const analyser = ctx.createAnalyser();
-    analyser.fftSize = 128;
-    analyser.smoothingTimeConstant = 0.58;
+    const analyser = configureVisualizerAnalyser(ctx.createAnalyser());
     source.connect(analyser);
-    const entry = { audio, ctx, stream, source, analyser };
+    const entry = { kind: 'capture', audio, ctx, stream, source, analyser, connected: true };
     visualizerCaptureCache.set(audio, entry);
     visualizerCaptureEntries.add(entry);
     return analyser;
