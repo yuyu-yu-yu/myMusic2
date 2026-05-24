@@ -83,7 +83,9 @@ const visualizerState = {
   rails: null,
   intensity: { low: 0, mid: 0, high: 0, overall: 0, beat: 0 },
   smoothedOverall: 0,
-  lastOverall: 0
+  lastOverall: 0,
+  hostReleaseStartedAt: 0,
+  hostReleaseDurationMs: 720
 };
 let visualizerAnimId = null;
 let visualizerAudioCtx = null;
@@ -265,7 +267,7 @@ function switchVisualizerTo(kind) {
 
   if (canvas) {
     canvas.style.display = 'block';
-    setupVisualizerCanvas(canvas, true);
+    setupVisualizerCanvas(canvas);
   }
 
   stopDrawLoop();
@@ -283,7 +285,7 @@ function startDrawLoop(canvas, mode = 'idle') {
   if (visualizerAnimId || !canvas) return;
   visualizerLog('startDrawLoop, mode:', mode);
   setVisualizerMode(mode);
-  setupVisualizerCanvas(canvas, true);
+  setupVisualizerCanvas(canvas);
   _drawFrameCount = 0;
   _drawLogged = false;
   visualizerState.lastTime = performance.now();
@@ -312,10 +314,33 @@ function stopDrawLoop() {
 }
 
 function setVisualizerMode(mode = 'idle') {
+  const previousMode = visualizerState.mode;
   visualizerState.mode = mode;
+  if (previousMode === 'host' && mode === 'song' && !visualizerReducedMotion?.matches) {
+    visualizerState.hostReleaseStartedAt = performance.now();
+  } else if (mode !== 'song') {
+    visualizerState.hostReleaseStartedAt = 0;
+  }
   const canvas = document.querySelector('#visualizer-canvas');
   if (canvas) canvas.dataset.visualizerMode = mode;
   seedVisualizerParticles(canvas);
+}
+
+function getHostReleaseTransition() {
+  if (visualizerState.mode !== 'song' || !visualizerState.hostReleaseStartedAt) {
+    return { pull: 0, bloom: 0 };
+  }
+  const elapsed = performance.now() - visualizerState.hostReleaseStartedAt;
+  const rawProgress = Math.min(1, elapsed / visualizerState.hostReleaseDurationMs);
+  if (rawProgress >= 1) {
+    visualizerState.hostReleaseStartedAt = 0;
+    return { pull: 0, bloom: 0 };
+  }
+  const easedProgress = 1 - Math.pow(1 - rawProgress, 3);
+  return {
+    pull: 1 - easedProgress,
+    bloom: Math.sin(rawProgress * Math.PI)
+  };
 }
 
 function getVisualizerAudioElement(kind = visualizerState.mode) {
@@ -586,6 +611,8 @@ function currentAudioPulse() {
 
 function updateVisualizerParticles(ctx, width, height, values) {
   const { low, mid, high, beat, dt, mode, reduceMotion } = values;
+  const motionStep = 0.04;
+  const hostRelease = reduceMotion ? { pull: 0, bloom: 0 } : getHostReleaseTransition();
   const speed = reduceMotion
     ? 0.16 + mid * 0.6
     : (mode === 'song' ? 0.86 : 0.58) + mid * 2.6 + beat * 1.7;
@@ -598,13 +625,18 @@ function updateVisualizerParticles(ctx, width, height, values) {
     if (!rail) continue;
     particle.phase += 0.02 * dt * particle.depth;
     const driftY = Math.sin(particle.phase) * (0.14 + low * 0.65 + beat * 0.48);
-    particle.x += particle.vx * speed * dt * 0.08 * particle.depth;
-    particle.y += (particle.vy + driftY - beat * 0.18) * dt * 0.08;
-    if (mode === 'host') {
+    particle.x += particle.vx * speed * dt * motionStep * particle.depth;
+    particle.y += (particle.vy + driftY - beat * 0.18) * dt * motionStep;
+    if (mode === 'host' || hostRelease.pull > 0) {
       const centerX = particle.side === 'left' ? rail.x + rail.width * 0.58 : rail.x + rail.width * 0.42;
       const centerY = height * 0.5;
-      particle.x += (centerX - particle.x) * 0.0025 * dt * particle.depth;
-      particle.y += (centerY - particle.y) * 0.003 * dt * particle.depth;
+      const pull = mode === 'host' ? 1 : hostRelease.pull;
+      particle.x += (centerX - particle.x) * 0.00125 * dt * particle.depth * pull;
+      particle.y += (centerY - particle.y) * 0.0015 * dt * particle.depth * pull;
+      if (mode === 'song' && hostRelease.bloom > 0) {
+        particle.x += (particle.x - centerX) * 0.0012 * dt * particle.depth * hostRelease.bloom;
+        particle.y += (particle.y - centerY) * 0.0009 * dt * particle.depth * hostRelease.bloom;
+      }
     }
     if (
       particle.x < rail.x - 18 ||
@@ -615,12 +647,12 @@ function updateVisualizerParticles(ctx, width, height, values) {
       resetVisualizerParticle(particle, index);
     }
 
-    const size = Math.max(1, Math.round(particle.size + pulse * particle.depth * 0.24));
-    const alpha = Math.min(0.84, 0.16 + low * 0.38 + high * 0.28 + beat * 0.24 + particle.depth * 0.12);
+    const size = Math.max(1, Math.round(particle.size + pulse * particle.depth * 0.24 + hostRelease.bloom * 1.2));
+    const alpha = Math.min(0.84, 0.16 + low * 0.38 + high * 0.28 + beat * 0.24 + particle.depth * 0.12 + hostRelease.bloom * 0.08);
     ctx.globalAlpha = alpha;
     ctx.fillStyle = particle.color;
     ctx.shadowColor = particle.color;
-    ctx.shadowBlur = reduceMotion ? 0 : 2 + low * 7 + beat * 4;
+    ctx.shadowBlur = reduceMotion ? 0 : 2 + low * 7 + beat * 4 + hostRelease.bloom * 3;
     ctx.fillRect(Math.round(particle.x), Math.round(particle.y), size, size);
   }
   ctx.shadowBlur = 0;
