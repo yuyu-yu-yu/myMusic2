@@ -512,25 +512,31 @@ function computeVisualizerIntensity() {
   const analysed = readVisualizerAnalysis();
   const idle = 0.055 + Math.sin(performance.now() / 1400) * 0.012;
   const fallbackPulse = currentAudioPulse();
-  const raw = analysed || {
+  const boost = (value, factor, cap) => Math.min(cap, value * factor);
+  const raw = analysed ? {
+    low: boost(analysed.low, 1.72, 0.95),
+    mid: boost(analysed.mid, 1.48, 0.86),
+    high: boost(analysed.high, 1.62, 0.82),
+    overall: boost(analysed.overall, 1.62, 0.88)
+  } : {
     low: fallbackPulse,
     mid: fallbackPulse * 0.74,
     high: fallbackPulse * 0.48,
     overall: fallbackPulse
   };
   const overall = Math.max(idle, raw.overall, fallbackPulse * 0.42);
-  visualizerState.smoothedOverall = visualizerState.smoothedOverall * 0.84 + overall * 0.16;
+  visualizerState.smoothedOverall = visualizerState.smoothedOverall * 0.78 + overall * 0.22;
   const lift = Math.max(0, overall - visualizerState.lastOverall);
   const beat = analysed
-    ? lift * 5.6 + Math.max(0, overall - visualizerState.smoothedOverall) * 2.4
-    : fallbackPulse * 0.18;
+    ? lift * 7.2 + Math.max(0, overall - visualizerState.smoothedOverall) * 3.4
+    : fallbackPulse * 0.28;
   visualizerState.lastOverall = overall;
   return {
     low: Math.max(0.04, raw.low, visualizerState.smoothedOverall * 0.62),
     mid: Math.max(0.035, raw.mid, visualizerState.smoothedOverall * 0.44),
     high: Math.max(0.025, raw.high, visualizerState.smoothedOverall * 0.3),
     overall: visualizerState.smoothedOverall,
-    beat: Math.min(0.55, beat)
+    beat: Math.min(0.75, beat)
   };
 }
 
@@ -573,20 +579,25 @@ function currentAudioPulse() {
   const t = audio.currentTime || performance.now() / 1000;
   const primary = (Math.sin(t * Math.PI * 1.7) + 1) * 0.5;
   const secondary = (Math.sin(t * Math.PI * 0.73 + 1.8) + 1) * 0.5;
-  const base = visualizerState.mode === 'host' ? 0.09 : 0.11;
-  return Math.min(0.28, base + primary * 0.08 + secondary * 0.04);
+  const isHost = visualizerState.mode === 'host';
+  const base = isHost ? 0.13 : 0.16;
+  return Math.min(isHost ? 0.34 : 0.38, base + primary * 0.14 + secondary * 0.08);
 }
 
 function updateVisualizerParticles(ctx, width, height, values) {
   const { low, mid, high, beat, dt, mode, reduceMotion } = values;
-  const speed = (reduceMotion ? 0.18 : mode === 'song' ? 0.78 : 0.5) + mid * 1.8 + beat * 1.1;
-  const pulse = (mode === 'host' ? low * 11 : low * 9) + high * 6 + beat * 5;
+  const speed = reduceMotion
+    ? 0.16 + mid * 0.6
+    : (mode === 'song' ? 0.86 : 0.58) + mid * 2.6 + beat * 1.7;
+  const pulse = reduceMotion
+    ? low * 5 + high * 2
+    : (mode === 'host' ? low * 14 : low * 13) + high * 9 + beat * 8;
   const rails = getVisualizerRails();
   for (const [index, particle] of visualizerState.particles.entries()) {
     const rail = rails.find((item) => item.side === particle.side) || rails[index % rails.length];
     if (!rail) continue;
     particle.phase += 0.02 * dt * particle.depth;
-    const driftY = Math.sin(particle.phase) * (0.12 + low * 0.36 + beat * 0.28);
+    const driftY = Math.sin(particle.phase) * (0.14 + low * 0.65 + beat * 0.48);
     particle.x += particle.vx * speed * dt * 0.08 * particle.depth;
     particle.y += (particle.vy + driftY - beat * 0.18) * dt * 0.08;
     if (mode === 'host') {
@@ -604,12 +615,12 @@ function updateVisualizerParticles(ctx, width, height, values) {
       resetVisualizerParticle(particle, index);
     }
 
-    const size = Math.max(1, Math.round(particle.size + pulse * particle.depth * 0.16));
-    const alpha = Math.min(0.72, 0.14 + low * 0.26 + high * 0.18 + beat * 0.16 + particle.depth * 0.1);
+    const size = Math.max(1, Math.round(particle.size + pulse * particle.depth * 0.24));
+    const alpha = Math.min(0.84, 0.16 + low * 0.38 + high * 0.28 + beat * 0.24 + particle.depth * 0.12);
     ctx.globalAlpha = alpha;
     ctx.fillStyle = particle.color;
     ctx.shadowColor = particle.color;
-    ctx.shadowBlur = reduceMotion ? 0 : 1.5 + low * 4 + beat * 2.5;
+    ctx.shadowBlur = reduceMotion ? 0 : 2 + low * 7 + beat * 4;
     ctx.fillRect(Math.round(particle.x), Math.round(particle.y), size, size);
   }
   ctx.shadowBlur = 0;
@@ -877,6 +888,17 @@ function setRadioMode(mode = 'single') {
   renderPlaylistQueue();
 }
 
+function hasCurrentPlaybackCandidate() {
+  const songAudio = document.querySelector('#song-audio');
+  return Boolean(songAudio?.currentSrc || songAudio?.src || state.current?.track);
+}
+
+function startSingleRadioFromControls() {
+  setRadioMode('single');
+  api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
+  startRadio();
+}
+
 function renderPlayer() {
   view.innerHTML = '';
   view.append(template.content.cloneNode(true));
@@ -920,11 +942,7 @@ function renderPlayer() {
   const aiMusicDownload = document.querySelector('#ai-music-download');
   const { likeBtn, dislikeBtn } = ensureFeedbackButtons();
 
-  startBtn.addEventListener('click', () => {
-    setRadioMode('single');
-    api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
-    startRadio();
-  });
+  startBtn.addEventListener('click', () => startSingleRadioFromControls());
   playlistStartBtn?.addEventListener('click', () => {
     setRadioMode('playlist');
     api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
@@ -934,6 +952,7 @@ function renderPlayer() {
   nextBtn.addEventListener('click', () => nextTrack({ skipCurrent: true }));
   playToggleBtn?.addEventListener('click', () => {
     if (playToggleBtn.classList.contains('is-playing')) pausePlayback();
+    else if (!hasCurrentPlaybackCandidate()) startSingleRadioFromControls();
     else resumePlayback();
   });
   modeResetBtn.addEventListener('click', () => resetMode());
