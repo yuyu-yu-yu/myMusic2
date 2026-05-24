@@ -9,7 +9,7 @@ import { openDatabase, getSetting, saveTrack, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { extractOpenApiTokenPayload, getNeteaseLoginStatus, resolveQrOpenApiLogin, saveNeteaseUserProfile, saveOpenApiToken } from './netease-auth.mjs';
 import { clearLibraryAccountSnapshot, getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
-import { chatRadio, getMemories, getPreferences, getRadioDebug, jumpPlaylistRadio, nextPlaylistRadio, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startPlaylistRadio, startRadio, submitFeedback, updatePreferences } from './radio.mjs';
+import { chatRadio, getMemories, getMoodStatsSummary, getPreferences, getRadioDebug, jumpPlaylistRadio, nextPlaylistRadio, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startPlaylistRadio, startRadio, submitFeedback, updateMemory, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
 import { checkCookieQrLogin, clearCookie, createCookieQrLogin, getCookieStatus, getCookieUserProfile, loadCookie, resolveCommunityApiFile } from './community.mjs';
@@ -346,6 +346,7 @@ const routes = {
   },
   'GET /api/memories': async (req) => getMemories({ db, accountContext: getRequestAccount(req) }),
   'DELETE /api/memories': async (req) => removeAllMemories({ db, accountContext: getRequestAccount(req) }),
+  'GET /api/mood-stats': async (req) => getMoodStatsSummary({ db, accountContext: getRequestAccount(req) }),
   'GET /api/preferences': async (req) => getPreferences({ db, accountContext: getRequestAccount(req) }),
   'PUT /api/preferences': async (req) => {
     const body = await readJson(req);
@@ -532,6 +533,15 @@ const server = http.createServer(async (req, res) => {
   try {
     if (req.url.startsWith('/api/tts/')) return serveTts(req, res);
     const pathname = new URL(req.url, 'http://local').pathname;
+    if (req.method === 'PUT' && /^\/api\/memories\/\d+$/.test(pathname)) {
+      const result = await updateMemory({
+        db,
+        id: pathname.split('/').pop(),
+        payload: await readJson(req),
+        accountContext: getRequestAccount(req)
+      });
+      return sendJson(res, result, result?.status || 200);
+    }
     if (req.method === 'DELETE' && /^\/api\/memories\/\d+$/.test(pathname)) {
       return sendJson(res, removeMemory({ db, id: pathname.split('/').pop(), accountContext: getRequestAccount(req) }));
     }

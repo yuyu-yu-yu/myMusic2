@@ -9,12 +9,15 @@ import {
   listUserMemories,
   linkPlaylistTrack,
   openDatabase,
+  getMoodStats,
   recordOrMergeUserMemory,
+  recordMoodEvent,
   recordTrackFeedback,
   retrieveRelevantMemories,
   savePlaylist,
   saveTrack,
-  setSetting
+  setSetting,
+  updateUserMemoryContent
 } from '../server/db.mjs';
 import {
   analyzeConversationMood,
@@ -60,7 +63,7 @@ import {
   TURN_ACTIONS
 } from '../server/dj.mjs';
 import { resolvePlayableTrack } from '../server/library.mjs';
-import { getMemories, getPreferences, nextRadioItem, removeAllMemories, removeMemory, startRadio, submitFeedback, updatePreferences } from '../server/radio.mjs';
+import { getMemories, getMoodStatsSummary, getPreferences, nextRadioItem, removeAllMemories, removeMemory, startRadio, submitFeedback, updateMemory, updatePreferences } from '../server/radio.mjs';
 import { resolveAccountContext } from '../server/account-scope.mjs';
 import { generateDiary, getDiary } from '../server/diary.mjs';
 import { buildCanCanBackgroundPrompt, buildCanCanPersonaPrompt, shouldUseCanCanCreatorContext } from '../server/cancan-persona.mjs';
@@ -713,6 +716,7 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
     recommendationFrequency: 'medium',
     voiceMode: 'recommendations',
     moodMode: 'auto',
+    lowDistractionMode: false,
     note: ''
   });
 
@@ -723,6 +727,7 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
       recommendationFrequency: 'low',
       voiceMode: 'all',
       moodMode: 'focus',
+      lowDistractionMode: true,
       note: '多一点像朋友一样聊天。'
     }
   });
@@ -730,6 +735,7 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
   assert.equal(saved.preferences.recommendationFrequency, 'low');
   assert.equal(saved.preferences.voiceMode, 'all');
   assert.equal(saved.preferences.moodMode, 'focus');
+  assert.equal(saved.preferences.lowDistractionMode, true);
 
   const loaded = getPreferences({ db });
   assert.equal(loaded.preferences.note, '多一点像朋友一样聊天。');
@@ -755,6 +761,7 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
       recommendationFrequency: 'always',
       voiceMode: 'robot',
       moodMode: 'chaos',
+      lowDistractionMode: 'yes',
       note: 'x'.repeat(600)
     }
   });
@@ -762,7 +769,35 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
   assert.equal(sanitized.preferences.recommendationFrequency, 'medium');
   assert.equal(sanitized.preferences.voiceMode, 'recommendations');
   assert.equal(sanitized.preferences.moodMode, 'auto');
+  assert.equal(sanitized.preferences.lowDistractionMode, false);
   assert.equal(sanitized.preferences.note.length, 500);
+});
+
+test('low distraction mode disables speech and slows proactive handoff', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { lowDistractionMode: true, voiceMode: 'all' } });
+  const quietChat = await chatTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'quiet-chat',
+    message: '今天有点累'
+  });
+  assert.deepEqual(quietChat.speech, { mode: 'off', shouldSpeak: false });
+  assert.equal(quietChat.ttsUrl, null);
+
+  assert.equal(canProactivelyRecommend({
+    userMessageCount: 3,
+    currentTrack: { id: 'now' },
+    mood: { shouldRecommend: true, musicIntent: 'mood_signal' },
+    prefs: { lowDistractionMode: true, chatMusicBalance: 'friend', recommendationFrequency: 'medium' }
+  }), false);
+  assert.equal(canProactivelyRecommend({
+    userMessageCount: 5,
+    currentTrack: { id: 'now' },
+    mood: { shouldRecommend: true, musicIntent: 'mood_signal' },
+    prefs: { lowDistractionMode: true, chatMusicBalance: 'friend', recommendationFrequency: 'medium' }
+  }), true);
 });
 
 test('voice mode is returned as an explicit speech decision for chat replies', async (t) => {
@@ -846,12 +881,33 @@ test('memory API helpers expose list, delete one, and clear all', (t) => {
   });
 
   assert.equal(getMemories({ db }).memories.length, 1);
+  const edited = updateMemory({ db, id: memory.id, payload: { content: '用户低落时希望先被轻轻接住，不要被催着开心。' } });
+  assert.equal(edited.ok, true);
+  assert.equal(edited.memory.content, '用户低落时希望先被轻轻接住，不要被催着开心。');
+  assert.equal(updateUserMemoryContent(db, 9999, '不存在的记忆').status, 404);
   assert.equal(removeMemory({ db, id: memory.id }).deleted, 1);
   assert.equal(getMemories({ db }).memories.length, 0);
 
   recordOrMergeUserMemory(db, { kind: 'preference', content: '用户喜欢温柔的聊天方式。', tags: ['温柔'] });
   assert.equal(removeAllMemories({ db }).ok, true);
   assert.equal(getMemories({ db }).memories.length, 0);
+});
+
+test('mood stats aggregate recent atmosphere records by account', (t) => {
+  const db = testDb(t);
+  recordMoodEvent(db, { accountId: 'account:a', sessionId: 's1', mood: 'focus', energy: 'low', musicIntent: 'chat' });
+  recordMoodEvent(db, { accountId: 'account:a', sessionId: 's1', mood: 'comfort', energy: 'low', musicIntent: 'mood_signal' });
+  recordMoodEvent(db, { accountId: 'account:a', sessionId: 's1', mood: 'healing', energy: 'low', musicIntent: 'mood_signal' });
+  recordMoodEvent(db, { accountId: 'account:b', sessionId: 's2', mood: 'energy', energy: 'high', musicIntent: 'chat' });
+
+  const stats = getMoodStats(db, { accountId: 'account:a' });
+  assert.equal(stats.total, 3);
+  assert.equal(stats.buckets.find(bucket => bucket.id === 'focus').count, 1);
+  assert.equal(stats.buckets.find(bucket => bucket.id === 'comfort').count, 2);
+  assert.equal(stats.buckets.find(bucket => bucket.id === 'energy').count, 0);
+
+  const apiStats = getMoodStatsSummary({ db, accountContext: { provider: 'test', source: 'a', accountId: 'account:a' } });
+  assert.equal(apiStats.total, 3);
 });
 
 test('memory API surfaces recently updated memories first', (t) => {

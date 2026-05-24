@@ -145,6 +145,17 @@ function migrate(db) {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS mood_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT NOT NULL DEFAULT 'local:default',
+      session_id TEXT,
+      mood TEXT NOT NULL,
+      energy TEXT NOT NULL DEFAULT 'medium',
+      music_intent TEXT NOT NULL DEFAULT 'chat',
+      source TEXT,
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS account_settings (
       account_id TEXT NOT NULL,
       key TEXT NOT NULL,
@@ -173,6 +184,7 @@ function migrateAccountScope(db) {
   addAccountIdColumn(db, 'messages', bootstrapAccountId);
   addAccountIdColumn(db, 'plays', bootstrapAccountId);
   addAccountIdColumn(db, 'track_feedback_events', bootstrapAccountId);
+  addAccountIdColumn(db, 'mood_events', bootstrapAccountId);
   migrateFeedbackSummaryTable(db, bootstrapAccountId);
   migrateDiaryEntriesTable(db, bootstrapAccountId);
   seedAccountScopedSettings(db, bootstrapAccountId);
@@ -182,6 +194,7 @@ function migrateAccountScope(db) {
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_messages_account_session ON messages(account_id, session_id, id)'); } catch {}
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_plays_account_played ON plays(account_id, played_at DESC)'); } catch {}
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_feedback_events_account_created ON track_feedback_events(account_id, created_at DESC)'); } catch {}
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_mood_events_account_created ON mood_events(account_id, created_at DESC)'); } catch {}
 }
 
 function addAccountIdColumn(db, table, accountId) {
@@ -551,9 +564,114 @@ export function deleteUserMemory(db, id, accountId = DEFAULT_ACCOUNT_ID) {
   return { ok: true, deleted: result.changes || 0 };
 }
 
+export function updateUserMemoryContent(db, id, content, accountId = DEFAULT_ACCOUNT_ID) {
+  const normalizedContent = String(content || '').trim().slice(0, 180);
+  const scopedAccountId = normalizeAccountId(accountId);
+  if (!normalizedContent) {
+    return { ok: false, status: 400, error: 'memory content is required' };
+  }
+  const result = db.prepare(`
+    UPDATE user_memories
+    SET content = ?, updated_at = ?
+    WHERE id = ? AND account_id = ?
+  `).run(normalizedContent, nowIso(), Number(id), scopedAccountId);
+  if (!result.changes) {
+    return { ok: false, status: 404, error: 'memory not found' };
+  }
+  return { ok: true, memory: getUserMemory(db, id, scopedAccountId) };
+}
+
 export function clearUserMemories(db, accountId = DEFAULT_ACCOUNT_ID) {
   const result = db.prepare('DELETE FROM user_memories WHERE account_id = ?').run(normalizeAccountId(accountId));
   return { ok: true, deleted: result.changes || 0 };
+}
+
+const moodLabels = {
+  focus: '专注',
+  comfort: '疲惫/陪伴',
+  melancholy: '疲惫/陪伴',
+  healing: '疲惫/陪伴',
+  calm: '放松',
+  energy: '开心/提神',
+  night: '深夜',
+  random: '随机探索',
+  romantic: '放松',
+  nostalgic: '随机探索'
+};
+
+const moodBuckets = [
+  { id: 'focus', label: '专注', moods: ['focus'] },
+  { id: 'comfort', label: '疲惫/陪伴', moods: ['comfort', 'melancholy', 'healing'] },
+  { id: 'calm', label: '放松', moods: ['calm', 'romantic'] },
+  { id: 'energy', label: '开心/提神', moods: ['energy'] },
+  { id: 'night', label: '深夜', moods: ['night'] },
+  { id: 'random', label: '随机探索', moods: ['random', 'nostalgic'] }
+];
+
+export function recordMoodEvent(db, {
+  accountId = DEFAULT_ACCOUNT_ID,
+  sessionId = null,
+  mood = 'random',
+  energy = 'medium',
+  musicIntent = 'chat',
+  source = null,
+  createdAt = nowIso()
+} = {}) {
+  const normalizedMood = Object.hasOwn(moodLabels, mood) ? mood : 'random';
+  const normalizedEnergy = ['low', 'medium', 'high'].includes(energy) ? energy : 'medium';
+  db.prepare(`
+    INSERT INTO mood_events (account_id, session_id, mood, energy, music_intent, source, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `).run(
+    normalizeAccountId(accountId),
+    sessionId ? String(sessionId) : null,
+    normalizedMood,
+    normalizedEnergy,
+    String(musicIntent || 'chat').slice(0, 40),
+    source ? String(source).slice(0, 40) : null,
+    createdAt
+  );
+  return { ok: true };
+}
+
+export function getMoodStats(db, { accountId = DEFAULT_ACCOUNT_ID, windowDays = 30 } = {}) {
+  const days = Math.max(1, Math.min(90, Number(windowDays) || 30));
+  const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+  const rows = db.prepare(`
+    SELECT mood,
+           COUNT(*) AS count,
+           MAX(created_at) AS updatedAt
+    FROM mood_events
+    WHERE account_id = ? AND created_at >= ?
+    GROUP BY mood
+  `).all(normalizeAccountId(accountId), cutoff);
+  const total = rows.reduce((sum, row) => sum + Number(row.count || 0), 0);
+  const latest = rows.reduce((value, row) => {
+    const updatedAt = row.updatedAt || '';
+    return updatedAt > value ? updatedAt : value;
+  }, '');
+  const buckets = moodBuckets.map((bucket) => {
+    const matching = rows.filter(item => bucket.moods.includes(item.mood));
+    const count = matching.reduce((sum, row) => sum + Number(row.count || 0), 0);
+    const updatedAt = matching.reduce((value, row) => {
+      const rowUpdatedAt = row.updatedAt || '';
+      return rowUpdatedAt > value ? rowUpdatedAt : value;
+    }, '');
+    return {
+      id: bucket.id,
+      label: bucket.label,
+      count,
+      ratio: total ? Math.round((count / total) * 1000) / 1000 : 0,
+      updatedAt: updatedAt || null
+    };
+  });
+  return {
+    ok: true,
+    windowDays: days,
+    total,
+    updatedAt: latest || null,
+    buckets
+  };
 }
 
 export function retrieveRelevantMemories(db, {

@@ -9,6 +9,7 @@ import {
   saveTrack,
   getSessionMode,
   setSessionMode,
+  recordMoodEvent,
   recordOrMergeUserMemory,
   retrieveRelevantMemories,
   memoryKinds
@@ -42,6 +43,7 @@ const DEFAULT_PREFS = Object.freeze({
   recommendationFrequency: 'medium',
   voiceMode: 'recommendations',
   moodMode: 'auto',
+  lowDistractionMode: false,
   note: ''
 });
 const RADIO_QUEUE_LIMIT = 2;
@@ -974,6 +976,7 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
   if (userMessage) {
     scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: chatText, conversationMood, accountContext: account });
   }
+  rememberMoodEvent({ db, sessionId, conversationMood, accountContext: account, source: track ? 'recommendation' : 'chat' });
 
   let mode = payload?.mode || getSessionMode(db, sessionId);
   if (payload?.newMode) {
@@ -1127,6 +1130,7 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       if (userMessage) {
         scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: chatText, conversationMood, accountContext: account });
       }
+      rememberMoodEvent({ db, sessionId, conversationMood, accountContext: account, source: 'queued_chat' });
       setSessionContext(db, sessionId, {
         ...getSessionContext(db, sessionId),
         conversationState: nextConversationState,
@@ -1230,6 +1234,7 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
   if (userMessage) {
     scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText: chatDecision.chatText, conversationMood, accountContext: account });
   }
+  rememberMoodEvent({ db, sessionId, conversationMood, accountContext: account, source: 'chat' });
   const newModeDecision = chatDecision.newMode ?? turnAction.newMode ?? null;
   if (newModeDecision) {
     const newMode = { ...newModeDecision, updatedAt: nowIso() };
@@ -2199,18 +2204,20 @@ function normalizeRuntimePrefs(raw = {}) {
     recommendationFrequency: pick(raw.recommendationFrequency, ['low', 'medium', 'high'], DEFAULT_PREFS.recommendationFrequency),
     voiceMode: pick(raw.voiceMode, ['off', 'recommendations', 'all'], DEFAULT_PREFS.voiceMode),
     moodMode: pick(raw.moodMode, ['auto', 'comfort', 'focus', 'calm', 'night', 'random'], DEFAULT_PREFS.moodMode),
+    lowDistractionMode: raw.lowDistractionMode === true,
     note: String(raw.note || '').slice(0, 500)
   };
 }
 
 function shouldSynthesizeForRecommendation(prefs = {}) {
-  return normalizeRuntimePrefs(prefs).voiceMode !== 'off';
+  const normalized = normalizeRuntimePrefs(prefs);
+  return !normalized.lowDistractionMode && normalized.voiceMode !== 'off';
 }
 
 function speechDecisionForRecommendation(prefs = {}) {
   const normalized = normalizeRuntimePrefs(prefs);
   return {
-    mode: normalized.voiceMode,
+    mode: normalized.lowDistractionMode ? 'off' : normalized.voiceMode,
     shouldSpeak: shouldSynthesizeForRecommendation(normalized)
   };
 }
@@ -2218,8 +2225,8 @@ function speechDecisionForRecommendation(prefs = {}) {
 function speechDecisionForChat(prefs = {}) {
   const normalized = normalizeRuntimePrefs(prefs);
   return {
-    mode: normalized.voiceMode,
-    shouldSpeak: normalized.voiceMode === 'all'
+    mode: normalized.lowDistractionMode ? 'off' : normalized.voiceMode,
+    shouldSpeak: !normalized.lowDistractionMode && normalized.voiceMode === 'all'
   };
 }
 
@@ -2866,11 +2873,15 @@ export function decideTurnAction({
 export function canProactivelyRecommend({ userMessageCount = 0, lastSuggestedAtUserCount = 0, noMusicUntilUserCount = 0, currentTrack = null, mood = {}, prefs = {} } = {}) {
   const normalizedPrefs = normalizeRuntimePrefs(prefs);
   if (noMusicUntilUserCount && userMessageCount <= Number(noMusicUntilUserCount)) return false;
-  if (!currentTrack) return Boolean(mood?.shouldRecommend);
+  const explicitMusic = ['explicit_music', 'explicit_song', 'artist', 'genre', 'music'].includes(mood?.musicIntent || mood?.intent);
+  if (!currentTrack) {
+    return Boolean(mood?.shouldRecommend) && (!normalizedPrefs.lowDistractionMode || explicitMusic || Number(mood?.confidence || 0) >= 0.75);
+  }
   const minMessages = BALANCE_MIN_USER_MESSAGES[normalizedPrefs.chatMusicBalance] ?? 3;
   const minGap = FREQUENCY_MIN_GAP[normalizedPrefs.recommendationFrequency] ?? 3;
-  if (userMessageCount < minMessages) return false;
-  if (lastSuggestedAtUserCount && userMessageCount - Number(lastSuggestedAtUserCount) < minGap) return false;
+  const lowDistractionGap = normalizedPrefs.lowDistractionMode ? 2 : 0;
+  if (userMessageCount < minMessages + lowDistractionGap) return false;
+  if (lastSuggestedAtUserCount && userMessageCount - Number(lastSuggestedAtUserCount) < minGap + lowDistractionGap) return false;
   return Boolean(mood?.shouldRecommend);
 }
 
@@ -3206,7 +3217,22 @@ export function analyzeConversationMood({ history = [], userMessage = '', profil
 }
 
 function applyMoodPreferenceOverride(mood, prefs) {
-  if (!prefs?.moodMode || prefs.moodMode === 'auto') return mood;
+  const normalizedPrefs = normalizeRuntimePrefs(prefs);
+  const baseMood = !normalizedPrefs.moodMode || normalizedPrefs.moodMode === 'auto'
+    ? mood
+    : applyExplicitMoodMode(mood, normalizedPrefs);
+  if (!normalizedPrefs.lowDistractionMode) return baseMood;
+  const explicitMusic = ['explicit_music', 'explicit_song', 'artist', 'genre', 'music'].includes(baseMood.musicIntent || baseMood.intent);
+  return {
+    ...baseMood,
+    mood: explicitMusic ? baseMood.mood : (baseMood.mood === 'night' ? 'night' : 'focus'),
+    energy: explicitMusic ? baseMood.energy : 'low',
+    searchHints: uniqueStrings(['低干扰', '安静', '专注', '轻柔', ...(baseMood.searchHints || [])], 5),
+    reason: baseMood.reason || 'low distraction mode'
+  };
+}
+
+function applyExplicitMoodMode(mood, prefs) {
   const moodHints = {
     comfort: ['治愈', '安慰', '温柔', '陪伴'],
     focus: ['专注', '低干扰', '工作', '学习'],
@@ -4085,6 +4111,21 @@ function safeJsonObject(value) {
 function scheduleMemoryExtraction({ db, config, sessionId, userMessage, assistantText, conversationMood, accountContext = null }) {
   if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return;
   void extractAndStoreMemories({ db, config, sessionId, userMessage, assistantText, conversationMood, accountContext }).catch(() => {});
+}
+
+function rememberMoodEvent({ db, sessionId, conversationMood, accountContext = null, source = 'chat' } = {}) {
+  if (!conversationMood?.mood) return;
+  try {
+    const account = normalizeAccountContext(accountContext);
+    recordMoodEvent(db, {
+      accountId: account.accountId,
+      sessionId,
+      mood: conversationMood.mood,
+      energy: conversationMood.energy,
+      musicIntent: conversationMood.musicIntent || conversationMood.intent,
+      source
+    });
+  } catch {}
 }
 
 export async function extractAndStoreMemories({ db, config, sessionId, userMessage, assistantText = '', conversationMood = null, accountContext = null }) {

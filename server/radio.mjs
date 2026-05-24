@@ -5,12 +5,14 @@ import {
   clearUserMemories,
   deleteUserMemory,
   getAccountSetting,
+  getMoodStats,
   getSetting,
   getTrackById,
   listUserMemories,
   recordOrMergeUserMemory,
   recordTrackFeedback,
-  setAccountSetting
+  setAccountSetting,
+  updateUserMemoryContent
 } from './db.mjs';
 import { normalizeAccountContext, publicAccountContext, resolveAccountContext } from './account-scope.mjs';
 
@@ -123,6 +125,13 @@ export function removeMemory({ db, id, accountContext }) {
   return attachAccount(deleteUserMemory(db, id, account.accountId), account);
 }
 
+export function updateMemory({ db, id, payload, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  const result = updateUserMemoryContent(db, id, payload?.content, account.accountId);
+  if (!result.ok) return { __error: true, ...result };
+  return attachAccount(result, account);
+}
+
 export function removeAllMemories({ db, accountContext }) {
   const account = getRequestAccount(db, accountContext);
   return attachAccount(clearUserMemories(db, account.accountId), account);
@@ -152,6 +161,11 @@ export function getPreferences({ db, accountContext }) {
   };
 }
 
+export function getMoodStatsSummary({ db, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(getMoodStats(db, { accountId: account.accountId, windowDays: 30 }), account);
+}
+
 export function updatePreferences({ db, payload, accountContext }) {
   const account = getRequestAccount(db, accountContext);
   const next = normalizePreferences({ ...getUserPrefs(db, account), ...(payload || {}) });
@@ -171,6 +185,7 @@ function normalizePreferences(raw = {}) {
     recommendationFrequency: pick(raw.recommendationFrequency, ['low', 'medium', 'high'], 'medium'),
     voiceMode: pick(raw.voiceMode, ['off', 'recommendations', 'all'], 'recommendations'),
     moodMode: pick(raw.moodMode, ['auto', 'comfort', 'focus', 'calm', 'night', 'random'], 'auto'),
+    lowDistractionMode: raw.lowDistractionMode === true,
     note: String(raw.note || '').slice(0, 500)
   };
 }

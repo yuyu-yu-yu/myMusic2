@@ -106,6 +106,7 @@ function deleteGuestAccountData(db, accountId) {
     'messages',
     'radio_sessions',
     'plays',
+    'mood_events',
     'track_feedback_events',
     'track_feedback_summary',
     'user_memories',

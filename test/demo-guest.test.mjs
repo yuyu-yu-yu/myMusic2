@@ -5,10 +5,12 @@ import path from 'node:path';
 import test from 'node:test';
 import {
   getAccountSetting,
+  getMoodStats,
   linkPlaylistTrack,
   listUserMemories,
   openDatabase,
   recordOrMergeUserMemory,
+  recordMoodEvent,
   recordTrackFeedback,
   savePlaylist,
   saveTrack,
@@ -93,6 +95,7 @@ test('demo guest accounts isolate preferences, memories, and feedback while shar
 
   updatePreferences({ db, accountContext: guestA, payload: { note: 'A note', moodMode: 'focus' } });
   submitFeedback({ db, accountContext: guestA, payload: { trackId: seeded.trackId, eventType: 'like', sessionId: 'a-session' } });
+  recordMoodEvent(db, { accountId: guestA.accountId, sessionId: 'a-session', mood: 'focus', energy: 'low' });
   recordOrMergeUserMemory(db, {
     accountId: guestA.accountId,
     kind: 'music_preference',
@@ -103,6 +106,8 @@ test('demo guest accounts isolate preferences, memories, and feedback while shar
   assert.equal(getPreferences({ db, accountContext: guestB }).preferences.note, 'base note');
   assert.equal(getPreferences({ db, accountContext: guestA }).feedbackSummary.totals.likes, 1);
   assert.equal(getPreferences({ db, accountContext: guestB }).feedbackSummary.totals.likes, 0);
+  assert.equal(getMoodStats(db, { accountId: guestA.accountId }).total, 1);
+  assert.equal(getMoodStats(db, { accountId: guestB.accountId }).total, 0);
   assert.equal(listUserMemories(db, { accountId: guestA.accountId }).length, 1);
   assert.equal(listUserMemories(db, { accountId: guestB.accountId }).length, 0);
 
@@ -111,6 +116,7 @@ test('demo guest accounts isolate preferences, memories, and feedback while shar
 
   const cleanup = cleanupDemoGuest(db, 'visitor-a-1234');
   assert.equal(cleanup.ok, true);
+  assert.equal(getMoodStats(db, { accountId: guestA.accountId }).total, 0);
   assert.equal(getAccountSetting(db, seeded.baseAccountId, 'library_synced_user_id'), 'base-user');
   assert.equal(getPreferences({ db, accountContext: guestB }).preferences.note, 'base note');
 });

@@ -18,6 +18,7 @@ const state = {
   preferences: null,
   feedbackSummary: null,
   memories: [],
+  moodStats: null,
   mixerRefreshTimer: null,
   librarySyncTimer: null,
   librarySyncStatus: null,
@@ -2493,19 +2494,23 @@ function maybeReportInferredComplete() {
 function applyUsageInsights(data = {}) {
   if (data.feedbackSummary) state.feedbackSummary = data.feedbackSummary;
   if (Array.isArray(data.memories)) state.memories = data.memories;
+  if (data.preferences) applyLowDistractionVisualMode(data.preferences);
   refreshMixerUsagePanels();
 }
 
 async function refreshUsageInsights() {
   if (location.pathname !== '/mixer') return;
   try {
-    const [prefData, memoryData] = await Promise.all([
+    const [prefData, memoryData, moodStatsData] = await Promise.all([
       api('/api/preferences'),
-      api('/api/memories').catch(() => ({ memories: state.memories || [] }))
+      api('/api/memories').catch(() => ({ memories: state.memories || [] })),
+      api('/api/mood-stats').catch(() => state.moodStats || { total: 0, buckets: [] })
     ]);
     state.feedbackSummary = prefData.feedbackSummary || state.feedbackSummary || {};
     state.preferences = prefData.preferences || state.preferences;
     state.memories = memoryData.memories || state.memories || [];
+    state.moodStats = moodStatsData || state.moodStats;
+    applyLowDistractionVisualMode(state.preferences);
     refreshMixerUsagePanels();
   } catch {
     // Usage panels should not interrupt playback or chat.
@@ -2535,11 +2540,13 @@ function refreshMixerUsagePanels() {
   const feedbackMeterEl = document.querySelector('[data-feedback-meter]');
   const feedbackTracksEl = document.querySelector('[data-feedback-tracks]');
   const memoryListEl = document.querySelector('[data-memory-list]');
+  const moodPanelEl = document.querySelector('[data-mood-stats]');
 
   if (feedback && feedbackMeterEl) feedbackMeterEl.innerHTML = feedbackMeter(feedback);
   if (feedback && feedbackTracksEl) feedbackTracksEl.innerHTML = feedbackTracks(feedback);
+  if (moodPanelEl) moodPanelEl.innerHTML = moodStatsPanel(state.moodStats || {});
   if (memoryListEl) memoryListEl.innerHTML = memories.length
-    ? memories.slice(0, 8).map(memorySummaryItem).join('')
+    ? memories.slice(0, 12).map(memorySummaryItem).join('')
     : '<p class="muted memory-empty">暂时还没有长期记忆。继续和灿灿聊天后，这里会出现稳定偏好、需求和边界。</p>';
 }
 
@@ -2952,16 +2959,20 @@ function neteaseTrialLoginCard(status = {}) {
 }
 
 async function renderMixer() {
-  const [prefData, memoryData] = await Promise.all([
+  const [prefData, memoryData, moodStatsData] = await Promise.all([
     api('/api/preferences'),
-    api('/api/memories').catch(() => ({ memories: [] }))
+    api('/api/memories').catch(() => ({ memories: [] })),
+    api('/api/mood-stats').catch(() => ({ total: 0, buckets: [] }))
   ]);
   const preferences = prefData.preferences || {};
   state.preferences = preferences;
   const feedback = prefData.feedbackSummary || {};
-  const memories = (memoryData.memories || []).slice(0, 8);
+  const memories = (memoryData.memories || []).slice(0, 12);
+  const moodStats = moodStatsData || { total: 0, buckets: [] };
   state.feedbackSummary = feedback;
   state.memories = memories;
+  state.moodStats = moodStats;
+  applyLowDistractionVisualMode(preferences);
 
   view.innerHTML = `
     <section class="mixer-hero page-panel">
@@ -2974,12 +2985,13 @@ async function renderMixer() {
         <span class="mixer-led"></span>
         <div>
           <strong id="mixer-mode-summary">${escapeHtml(mixerModeSummary(preferences))}</strong>
-          <p id="mixer-save-status" class="muted">SIGNAL LOCKED</p>
+          <p id="mixer-save-status" class="muted">${preferences.lowDistractionMode ? 'LOW DISTRACTION' : 'SIGNAL LOCKED'}</p>
         </div>
       </div>
     </section>
     <section class="mixer-console">
       <div class="mixer-rack">
+        ${lowDistractionControl(preferences)}
         ${mixerControl('chatMusicBalance', '聊天 vs 推歌比例', '控制灿灿先像朋友聊，还是更积极接歌。', preferences)}
         ${mixerControl('recommendationFrequency', '主动推荐频率', '决定普通聊天中灿灿多久自然接一首歌。', preferences)}
         ${mixerControl('voiceMode', '语音播报', '控制灿灿什么时候把文字变成主持语音。', preferences)}
@@ -2996,6 +3008,18 @@ async function renderMixer() {
         </article>
       </div>
       <aside class="mixer-side">
+        <article class="mixer-mood-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Atmosphere</p>
+              <h2>电台氛围记录</h2>
+            </div>
+            <span class="mood-window">近 ${Number(moodStats.windowDays || 30)} 天</span>
+          </div>
+          <div data-mood-stats>
+            ${moodStatsPanel(moodStats)}
+          </div>
+        </article>
         <article class="mixer-meter-panel">
           <div class="panel-header">
             <div>
@@ -3014,7 +3038,7 @@ async function renderMixer() {
           <div class="panel-header">
             <div>
               <p class="eyebrow">Memory</p>
-              <h2>长期记忆摘要</h2>
+              <h2>灿灿记忆管理</h2>
             </div>
             <a class="ghost-link" href="/settings" data-link>危险操作</a>
           </div>
@@ -3027,6 +3051,7 @@ async function renderMixer() {
   `;
 
   bindMixerControls(preferences);
+  bindMemoryManagement();
   startMixerUsageAutoRefresh();
 }
 
@@ -3746,6 +3771,37 @@ function mixerControl(key, title, description, preferences = {}) {
   `;
 }
 
+function lowDistractionControl(preferences = {}) {
+  const active = Boolean(preferences.lowDistractionMode);
+  return `
+    <article class="mixer-control low-distraction-control ${active ? 'is-active' : ''}" data-pref-control="lowDistractionMode">
+      <div class="mixer-control-head">
+        <div>
+          <h2>宿舍 / 自习室低打扰</h2>
+          <p class="muted">文字优先、减少口播和主动接歌，推荐更偏安静专注。</p>
+        </div>
+        <button
+          id="low-distraction-toggle"
+          class="switch-control ${active ? 'is-on' : ''}"
+          type="button"
+          role="switch"
+          aria-checked="${active ? 'true' : 'false'}"
+          data-pref-key="lowDistractionMode"
+          data-pref-value="${active ? 'false' : 'true'}"
+        >
+          <span class="switch-track" aria-hidden="true"><span></span></span>
+          <strong>${active ? 'LOW DISTRACTION' : 'NORMAL SIGNAL'}</strong>
+        </button>
+      </div>
+      <div class="low-distraction-strip" aria-hidden="true">
+        <span>LOW VOICE</span>
+        <span>SOFT MOTION</span>
+        <span>QUIET PICKS</span>
+      </div>
+    </article>
+  `;
+}
+
 function bindMixerControls(initialPreferences = {}) {
   let preferences = { ...initialPreferences };
   const controls = [...document.querySelectorAll('[data-pref-key]')];
@@ -3762,7 +3818,19 @@ function bindMixerControls(initialPreferences = {}) {
         button.classList.toggle('active', isMixerOptionActive(key, preferences[key], button.dataset.prefValue));
       });
     }
+    const lowToggle = document.querySelector('#low-distraction-toggle');
+    const lowPanel = document.querySelector('[data-pref-control="lowDistractionMode"]');
+    const lowActive = Boolean(preferences.lowDistractionMode);
+    if (lowToggle) {
+      lowToggle.classList.toggle('is-on', lowActive);
+      lowToggle.setAttribute('aria-checked', lowActive ? 'true' : 'false');
+      lowToggle.dataset.prefValue = lowActive ? 'false' : 'true';
+      const label = lowToggle.querySelector('strong');
+      if (label) label.textContent = lowActive ? 'LOW DISTRACTION' : 'NORMAL SIGNAL';
+    }
+    if (lowPanel) lowPanel.classList.toggle('is-active', lowActive);
     if (summaryEl) summaryEl.textContent = mixerModeSummary(preferences);
+    applyLowDistractionVisualMode(preferences);
   };
 
   const save = async (patch) => {
@@ -3776,7 +3844,7 @@ function bindMixerControls(initialPreferences = {}) {
       preferences = result.preferences || preferences;
       state.preferences = preferences;
       refresh();
-      setMixerStatus('已保存到灿灿的运行参数', 'ok');
+      setMixerStatus(preferences.lowDistractionMode ? 'LOW DISTRACTION' : '已保存到灿灿的运行参数', 'ok');
     } catch (error) {
       preferences = previous;
       if (note) note.value = previous.note || '';
@@ -3790,8 +3858,10 @@ function bindMixerControls(initialPreferences = {}) {
   controls.forEach((button) => {
     button.addEventListener('click', () => {
       const key = button.dataset.prefKey;
-      const value = button.dataset.prefValue;
-      if (!key || !value || preferences[key] === value) return;
+      const value = key === 'lowDistractionMode'
+        ? button.dataset.prefValue === 'true'
+        : button.dataset.prefValue;
+      if (!key || value === undefined || preferences[key] === value) return;
       save({ [key]: value });
     });
   });
@@ -3821,12 +3891,50 @@ function isMixerOptionActive(key, storedValue, optionValue) {
 }
 
 function mixerModeSummary(preferences = {}) {
-  return [
+  const parts = [
     activeMixerLabel('chatMusicBalance', preferences.chatMusicBalance),
     activeMixerLabel('recommendationFrequency', preferences.recommendationFrequency),
     activeMixerLabel('voiceMode', preferences.voiceMode),
     activeMixerLabel('moodMode', preferences.moodMode)
-  ].join(' / ');
+  ];
+  if (preferences.lowDistractionMode) parts.push('低打扰');
+  return parts.join(' / ');
+}
+
+function moodStatsPanel(stats = {}) {
+  const buckets = Array.isArray(stats.buckets) ? stats.buckets : [];
+  const total = Number(stats.total || 0);
+  if (!total || !buckets.some(bucket => Number(bucket.count || 0) > 0)) {
+    return `
+      <div class="mood-empty">
+        <strong>还没有足够的电台氛围记录</strong>
+        <span>和灿灿聊几轮后，这里会显示最近更常出现的专注、放松、深夜等状态。</span>
+      </div>
+    `;
+  }
+  return `
+    <div class="mood-ribbon" aria-label="电台氛围分布">
+      ${buckets.map(bucket => `
+        <span class="mood-${escapeAttr(bucket.id || 'random')}" style="width:${Math.max(2, Number(bucket.ratio || 0) * 100)}%" title="${escapeAttr(`${bucket.label} ${bucket.count} 次`)}"></span>
+      `).join('')}
+    </div>
+    <div class="mood-grid">
+      ${buckets.map(bucket => moodBucket(bucket, total)).join('')}
+    </div>
+    <p class="muted mixer-impact">这些只是电台氛围记录，用来帮助灿灿调整聊天和接歌节奏。</p>
+  `;
+}
+
+function moodBucket(bucket = {}, total = 1) {
+  const count = Number(bucket.count || 0);
+  const percent = Math.round((count / Math.max(1, total)) * 100);
+  return `
+    <article class="mood-bucket mood-${escapeAttr(bucket.id || 'random')}">
+      <span>${escapeHtml(bucket.label || '随机探索')}</span>
+      <strong>${count}</strong>
+      <small>${percent}%</small>
+    </article>
+  `;
 }
 
 function feedbackMeter(feedback = {}) {
@@ -3895,16 +4003,107 @@ function feedbackScore(track = {}) {
 function memorySummaryItem(memory) {
   const confidence = Math.round(Number(memory.confidence || 0) * 100);
   return `
-    <article class="memory-item compact">
+    <article class="memory-item compact" data-memory-id="${escapeAttr(memory.id)}">
       <div class="memory-main">
         <div class="memory-meta">
           <span class="tag">${escapeHtml(memoryKindLabel(memory.kind))}</span>
           <span class="muted">置信 ${confidence}%</span>
         </div>
-        <p>${escapeHtml(memory.content || '')}</p>
+        <p data-memory-content>${escapeHtml(memory.content || '')}</p>
+        <textarea class="memory-editor" data-memory-editor maxlength="180" hidden>${escapeHtml(memory.content || '')}</textarea>
+        <div class="memory-actions">
+          <button class="ghost tiny" type="button" data-memory-edit>编辑</button>
+          <button class="ghost tiny" type="button" data-memory-save hidden>保存</button>
+          <button class="ghost tiny" type="button" data-memory-cancel hidden>取消</button>
+          <button class="ghost tiny danger" type="button" data-memory-delete>删除</button>
+        </div>
       </div>
     </article>
   `;
+}
+
+function bindMemoryManagement() {
+  const list = document.querySelector('[data-memory-list]');
+  if (!list) return;
+  list.addEventListener('click', async (event) => {
+    const button = closestButtonFromEvent(event);
+    if (!button) return;
+    const item = button.closest('[data-memory-id]');
+    if (!item) return;
+    const id = item.dataset.memoryId;
+    const content = item.querySelector('[data-memory-content]');
+    const editor = item.querySelector('[data-memory-editor]');
+    const edit = item.querySelector('[data-memory-edit]');
+    const save = item.querySelector('[data-memory-save]');
+    const cancel = item.querySelector('[data-memory-cancel]');
+    const del = item.querySelector('[data-memory-delete]');
+    const setEditing = (editing) => {
+      if (content) content.hidden = editing;
+      if (editor) editor.hidden = !editing;
+      if (edit) edit.hidden = editing;
+      if (save) save.hidden = !editing;
+      if (cancel) cancel.hidden = !editing;
+      if (del) del.disabled = editing;
+      if (editing) editor?.focus();
+    };
+    if (button.matches('[data-memory-edit]')) {
+      setEditing(true);
+      return;
+    }
+    if (button.matches('[data-memory-cancel]')) {
+      if (editor && content) editor.value = content.textContent || '';
+      setEditing(false);
+      return;
+    }
+    if (button.matches('[data-memory-save]')) {
+      const nextContent = editor?.value?.trim() || '';
+      if (!nextContent) return;
+      setMemoryBusy(item, true);
+      try {
+        const result = await api(`/api/memories/${encodeURIComponent(id)}`, { method: 'PUT', body: { content: nextContent } });
+        const memory = result.memory;
+        if (memory) {
+          item.outerHTML = memorySummaryItem(memory);
+        } else if (content) {
+          content.textContent = nextContent;
+          setEditing(false);
+        }
+      } catch (error) {
+        setMixerInlineError(item, error.message);
+      } finally {
+        setMemoryBusy(item, false);
+      }
+      return;
+    }
+    if (button.matches('[data-memory-delete]')) {
+      setMemoryBusy(item, true);
+      try {
+        await api(`/api/memories/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        item.remove();
+        if (!list.querySelector('[data-memory-id]')) {
+          list.innerHTML = '<p class="muted memory-empty">暂时还没有长期记忆。继续和灿灿聊天后，这里会出现稳定偏好、需求和边界。</p>';
+        }
+      } catch (error) {
+        setMixerInlineError(item, error.message);
+        setMemoryBusy(item, false);
+      }
+    }
+  });
+}
+
+function setMemoryBusy(item, busy) {
+  item.querySelectorAll('button, textarea').forEach((el) => { el.disabled = busy; });
+}
+
+function setMixerInlineError(item, message) {
+  let error = item.querySelector('[data-memory-error]');
+  if (!error) {
+    error = document.createElement('p');
+    error.className = 'memory-error';
+    error.dataset.memoryError = 'true';
+    item.querySelector('.memory-main')?.appendChild(error);
+  }
+  error.textContent = message || '操作失败';
 }
 
 function trackItem(track) {
@@ -3984,11 +4183,16 @@ async function loadPreferences({ force = false } = {}) {
       .then((data) => {
         state.preferences = data.preferences || state.preferences || {};
         if (data.feedbackSummary) state.feedbackSummary = data.feedbackSummary;
+        applyLowDistractionVisualMode(state.preferences);
         return state.preferences;
       })
       .finally(() => { preferencesLoadPromise = null; });
   }
   return preferencesLoadPromise;
+}
+
+function applyLowDistractionVisualMode(preferences = state.preferences || {}) {
+  document.body.classList.toggle('low-distraction-mode', Boolean(preferences?.lowDistractionMode));
 }
 
 function escapeHtml(value) {
