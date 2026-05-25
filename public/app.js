@@ -114,9 +114,9 @@ visualizerReducedMotion?.addEventListener?.('change', () => {
   seedVisualizerParticles(canvas, true);
 });
 
-function makeAvatarFrameSequence(stateName, durations) {
+function makeAvatarFrameSequence(stateName, durations, options = {}) {
   return {
-    spriteSrc: `/avatar/sprites/${stateName}.png`,
+    spriteSrc: options.sprite === false ? '' : `/avatar/sprites/${stateName}.png`,
     loopMs: durations.reduce((total, durationMs) => total + durationMs, 0),
     frames: durations.map((durationMs, index) => ({
       src: `/avatar/frames/${stateName}/${String(index).padStart(2, '0')}.png`,
@@ -131,7 +131,8 @@ const avatarFrameSequences = {
   talking: makeAvatarFrameSequence('talking', [220, 220, 220, 240, 240, 240, 220, 100, 220, 240, 240, 400]),
   searching: makeAvatarFrameSequence('searching', [300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300]),
   reading: makeAvatarFrameSequence('reading', [240, 240, 250, 260, 260, 250, 240, 240, 250, 260, 260, 250]),
-  happy: makeAvatarFrameSequence('happy', [160, 160, 170, 180, 180, 170, 160, 220]),
+  // The happy strip can expose adjacent cells in the square avatar viewport; frame PNGs stay single-frame.
+  happy: makeAvatarFrameSequence('happy', [160, 160, 170, 180, 180, 170, 160, 220], { sprite: false }),
   on_air: makeAvatarFrameSequence('on_air', [233, 233, 233, 233, 233, 233, 233, 233, 233, 233, 233, 237])
 };
 
@@ -804,6 +805,12 @@ function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
   stopAvatarFrameSequence();
   const token = avatarFrameSequenceToken;
   let index = 0;
+
+  if (!sequence.spriteSrc) {
+    playAvatarImageFrameSequence(root, video, image, sequence, fallbackSrc, token);
+    return;
+  }
+
   const { sprite, strip } = ensureAvatarSprite(root);
 
   const showSpriteFrame = () => {
@@ -848,6 +855,20 @@ function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
 }
 
 function playAvatarImageFrameSequence(root, video, image, sequence, fallbackSrc, token) {
+  root.classList.remove('is-fallback');
+  root.classList.remove('is-sprite-sequence');
+  root.classList.add('is-frame-sequence');
+
+  const sprite = root.querySelector('#avatar-sprite');
+  if (sprite) sprite.hidden = true;
+  if (video) {
+    video.pause();
+    video.hidden = true;
+    video.onerror = null;
+    video.onloadeddata = null;
+  }
+  image.hidden = false;
+
   let index = 0;
   image.onerror = () => {
     if (token !== avatarFrameSequenceToken) return;
