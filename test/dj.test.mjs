@@ -51,6 +51,7 @@ import {
   playlistJumpTurn,
   playlistNextTurn,
   playlistStartTurn,
+  prefetchRadioQueue,
   queueItemMatchesMusicContext,
   recommendationTextMentionsDifferentTrack,
   rankAndSelectCandidates,
@@ -1861,6 +1862,44 @@ test('radio queue skips stale head and records miss diagnostics', (t) => {
   assert.equal(status.queueMetrics.lastMissReason, 'stale_queue_head');
 });
 
+test('instrumental-only context does not consume stale quiet vocal queue item', (t) => {
+  const db = testDb(t);
+  const musicContext = normalizeMusicContext({
+    version: 2,
+    mood: 'calm',
+    energy: 'low',
+    searchHints: ['\u5b89\u9759', '\u7eaf\u97f3\u4e50'],
+    musicIntent: 'explicit_music',
+    vocalPolicy: 'instrumental_only',
+    confidence: 0.9
+  });
+  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
+    .run('queue-instrumental-stale', new Date().toISOString(), JSON.stringify({ musicContext }), JSON.stringify(normalizeRadioQueue([
+      {
+        id: 'ready-quiet-vocal',
+        status: 'ready',
+        contextVersion: 1,
+        contextSnapshot: normalizeMusicContext({
+          version: 1,
+          mood: 'calm',
+          energy: 'low',
+          searchHints: ['\u5b89\u9759'],
+          musicIntent: 'mood_signal'
+        }),
+        track: { id: 'quiet-vocal-1', name: 'Quiet Vocal Song', artists: ['Singer A'] },
+        chatText: 'old quiet host'
+      }
+    ])));
+
+  const consumed = consumeReadyRadioQueue(db, 'queue-instrumental-stale');
+  assert.equal(consumed, null);
+
+  const status = getRadioQueueStatus(db, 'queue-instrumental-stale');
+  assert.equal(status.readyCount, 0);
+  assert.equal(status.staleCount, 1);
+  assert.equal(status.queue[0].staleReason, 'context_mismatch');
+});
+
 test('radio queue skips songs already played by song name before consuming', (t) => {
   const db = testDb(t);
   db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
@@ -2319,6 +2358,73 @@ test('DJ recommendation falls back to current profile playlists when LLM has no 
   assert.equal(result.track?.name, 'Fallback Song');
   assert.equal(result.explanation?.source, 'fallback');
   assert.doesNotMatch(result.chatText, /没能生成|可靠歌名|no playable/i);
+});
+
+test('instrumental-only request refuses ordinary vocal profile fallback', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  const playlist = savePlaylist(db, { id: 'vocal-fallback-playlist', name: 'Vocal Fallback Playlist', trackCount: 1 }, 'created');
+  const track = saveTrack(db, {
+    id: 'ordinary-vocal-fallback',
+    originalId: 'ordinary-vocal-original-id',
+    name: 'Ordinary Vocal Song',
+    artists: ['Vocal Artist'],
+    album: 'Vocal Album'
+  });
+  linkPlaylistTrack(db, playlist.id, track.id, 0);
+
+  const result = await djTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'instrumental-no-vocal-fallback',
+    userMessage: '\u653e\u4e00\u9996\u5b89\u9759\u7684\u7eaf\u97f3\u4e50',
+    useQueue: false
+  });
+
+  assert.equal(result.track, null);
+  const debug = getRadioDebugStatus(db, 'instrumental-no-vocal-fallback');
+  assert.equal(debug.lastRecommendationFailure?.stage, 'profile_fallback');
+});
+
+test('removed pending radio prefetch does not reinsert after async completion', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  const playlist = savePlaylist(db, { id: 'instrumental-prefetch-playlist', name: 'Instrumental Playlist', trackCount: 1 }, 'created');
+  const track = saveTrack(db, {
+    id: 'instrumental-prefetch-track',
+    originalId: 'instrumental-prefetch-original-id',
+    name: 'Instrumental BGM',
+    artists: ['Piano Artist'],
+    album: 'Pure Music Album'
+  });
+  linkPlaylistTrack(db, playlist.id, track.id, 0);
+  const musicContext = normalizeMusicContext({
+    version: 1,
+    mood: 'calm',
+    energy: 'low',
+    searchHints: ['\u7eaf\u97f3\u4e50'],
+    musicIntent: 'explicit_music',
+    vocalPolicy: 'instrumental_only'
+  });
+  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
+    .run('prefetch-removed-pending', new Date().toISOString(), JSON.stringify({ musicContext }), '[]');
+
+  prefetchRadioQueue({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'prefetch-removed-pending',
+    force: true
+  });
+  const pending = getRadioQueueStatus(db, 'prefetch-removed-pending');
+  assert.equal(pending.pendingCount, 1);
+
+  db.prepare('UPDATE radio_sessions SET queue_json = ? WHERE id = ?').run('[]', 'prefetch-removed-pending');
+  await new Promise(resolve => setTimeout(resolve, 80));
+
+  const status = getRadioQueueStatus(db, 'prefetch-removed-pending');
+  assert.equal(status.queueSize, 0);
 });
 
 test('playlist mode starts with one intro and continues without per-song speech', async (t) => {

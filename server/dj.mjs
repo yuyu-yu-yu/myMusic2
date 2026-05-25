@@ -63,6 +63,9 @@ const RADIO_QUEUE_POLICIES = Object.freeze({
   SOFT_PREEMPT: 'soft_preempt',
   CLEAR: 'clear'
 });
+const VOCAL_POLICIES = Object.freeze({
+  INSTRUMENTAL_ONLY: 'instrumental_only'
+});
 const radioQueueJobs = new Set();
 const BALANCE_MIN_USER_MESSAGES = Object.freeze({ friend: 3, balanced: 2, dj: 1 });
 const FREQUENCY_MIN_GAP = Object.freeze({ low: 5, medium: 3, high: 2 });
@@ -445,6 +448,9 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, use
   });
   const memoryContext = buildMemoryContext({ sessionSummary, longTermMemories });
   const request = getMusicRequestConstraints(db, normalizedUserMessage || null, mode, sessionConstraints);
+  if (!request.vocalPolicy && conversationMood?.vocalPolicy) {
+    request.vocalPolicy = normalizeVocalPolicy(conversationMood.vocalPolicy);
+  }
   const playedHistory = getPlayedTrackHistory(db, sessionId, 80, account);
   const playedIds = new Set(playedHistory.map(track => String(track.id || '')).filter(Boolean));
   const playedSignatures = buildPlayedSignatureSet(playedHistory);
@@ -614,6 +620,7 @@ async function fillPlaylistFromProfile({ db, config, netease, profile, conversat
   const fallbackTracks = listProfileFallbackTracks(db, 260, accountContext)
     .filter(track => !shouldSkipFallbackTrack(track, { playedIds, playedSignatures, request }))
     .filter(track => !trackViolatesSessionConstraints(track, request.sessionConstraints))
+    .filter(track => !trackViolatesVocalPolicy(track, request))
     .map((track, index) => ({ track, score: scoreFallbackTrack(track, { profile, conversationMood }) - index * 0.01 }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 48);
@@ -715,6 +722,7 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
     ? `上一批未命中可播放源，请避开：${failedPicks.map(pick => `${pick.name}${pick.artists?.length ? ' - ' + pick.artists.join('/') : ''}`).join('；')}`
     : '暂无失败候选。';
   const playedText = formatPlayedSongExclusions(playedHistory, request);
+  const vocalPolicyText = formatVocalPolicyForPrompt(request);
   const raw = await generateChatCompletion(config.llm, [
     {
       role: 'system',
@@ -725,6 +733,7 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
         '候选必须是真实存在、主要音乐平台容易搜到的具体歌曲；每首必须有明确歌名和主要艺人。',
         '整体要像一张有顺序感的校园电台歌单，不要五首完全同质，也不要跨度过大。',
         '不要推荐已经播放过的同名歌曲；若有禁听歌手或歌名，必须避开。',
+        vocalPolicyText,
         'queries 只写短搜索词，优先“歌名 艺人”和“艺人 歌名”。',
         'hostDraft 是整张歌单的开场导播方向，只描述整体氛围，不逐首长篇介绍。',
         '只输出严格 JSON，不要 Markdown。',
@@ -741,6 +750,7 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
         modeText,
         userMessage ? `SCENE_REQUEST: ${userMessage}` : 'SCENE_REQUEST: none',
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
+        vocalPolicyText,
         formatSessionConstraintsForPrompt(request?.sessionConstraints),
         formatRecentHostPlays(hostContext.recentPlays),
         playedText,
@@ -1517,8 +1527,9 @@ export function consumeReadyRadioQueue(db, sessionId, options = {}) {
       });
       continue;
     }
-    const staleByContext = item.contextVersion < musicContext.version &&
-      !queueItemMatchesMusicContext(item, musicContext);
+    const contextMismatch = !queueItemMatchesMusicContext(item, musicContext);
+    const staleByContext = (item.contextVersion < musicContext.version && contextMismatch) ||
+      (musicContext.vocalPolicy === VOCAL_POLICIES.INSTRUMENTAL_ONLY && contextMismatch);
     if (staleByContext) {
       queue[index] = {
         ...item,
@@ -2034,6 +2045,9 @@ function markQueueItemStale(db, sessionId, itemId, staleReason = 'stale') {
 
 function replacePendingQueueItem(db, sessionId, pendingId, readyItem, accountContext = null) {
   const account = normalizeAccountContext(accountContext);
+  const queue = getSessionQueue(db, sessionId);
+  const pendingInQueue = queue.some(item => item.id === pendingId && item.status === 'pending');
+  if (!pendingInQueue) return;
   if (!readyItem?.track?.id) {
     markPendingQueueItemFailed(db, sessionId, pendingId, {
       failedStage: 'recommendation',
@@ -2055,8 +2069,14 @@ function replacePendingQueueItem(db, sessionId, pendingId, readyItem, accountCon
     });
     return;
   }
+  const currentContext = normalizeMusicContext(getSessionContext(db, sessionId).musicContext || {});
+  const contextMismatch = !queueItemMatchesMusicContext(readyItem, currentContext);
+  if ((readyItem.contextVersion < currentContext.version && contextMismatch) ||
+      (currentContext.vocalPolicy === VOCAL_POLICIES.INSTRUMENTAL_ONLY && contextMismatch)) {
+    markQueueItemStale(db, sessionId, pendingId, 'context_changed_before_ready');
+    return;
+  }
   const readyKey = playedSongKey(readyItem.track.name);
-  const queue = getSessionQueue(db, sessionId);
   const isPreempt = readyItem.policy === RADIO_QUEUE_POLICIES.HARD_PREEMPT ||
     readyItem.policy === RADIO_QUEUE_POLICIES.SOFT_PREEMPT;
   const keepNonDuplicate = (item) => {
@@ -2459,6 +2479,56 @@ export function normalizeMusicText(value) {
     .replace(/[\s·・.．,，、\-_/\\（）()《》<>[\]【】"'“”‘’!！?？:：;；~～]/g, '');
 }
 
+function normalizeVocalPolicy(value = '') {
+  return value === VOCAL_POLICIES.INSTRUMENTAL_ONLY ? VOCAL_POLICIES.INSTRUMENTAL_ONLY : '';
+}
+
+function detectVocalPolicyUpdate(text = '') {
+  const value = String(text || '').trim();
+  if (!value) return null;
+  if (/(?:\u6062\u590d\u6b63\u5e38|\u6b63\u5e38\u63a8\u8350|\u4e0d\u7528\u7eaf\u97f3\u4e50|\u53ef\u4ee5\u6709\u4eba\u58f0|\u6709\u4eba\u58f0|\u6709\u6b4c\u8bcd)/i.test(value)) {
+    return '';
+  }
+  if (/(?:\u7eaf\u97f3\u4e50|\u4f34\u594f|\u65e0\u4eba\u58f0|\u6ca1\u6709\u4eba\u58f0|\u4e0d\u8981\u4eba\u58f0|\u65e0\u6b4c\u8bcd|\u6ca1\u6709\u6b4c\u8bcd|\u4e0d\u8981\u6b4c\u8bcd|instrumental|no\s+vocal|no\s+lyrics)/i.test(value)) {
+    return VOCAL_POLICIES.INSTRUMENTAL_ONLY;
+  }
+  return null;
+}
+
+function requestRequiresInstrumental(request = {}) {
+  return normalizeVocalPolicy(request?.vocalPolicy) === VOCAL_POLICIES.INSTRUMENTAL_ONLY;
+}
+
+function hasInstrumentalEvidence(...values) {
+  const text = values.map(value => {
+    if (!value) return '';
+    if (Array.isArray(value)) return value.join(' ');
+    if (typeof value === 'object') {
+      return [
+        value.name,
+        value.title,
+        value.song,
+        value.album,
+        value.reason,
+        value.hostLine,
+        value.playlistName,
+        ...(Array.isArray(value.artists) ? value.artists : []),
+        ...(Array.isArray(value.queries) ? value.queries : [])
+      ].filter(Boolean).join(' ');
+    }
+    return String(value);
+  }).join(' ');
+  return /(?:\u7eaf\u97f3\u4e50|\u4f34\u594f|\u8f7b\u97f3\u4e50|\u5668\u4e50|\u65e0\u4eba\u58f0|\u65e0\u6b4c\u8bcd|\u94a2\u7434|\u53e4\u5178|\u914d\u4e50|\u7535\u5f71\u539f\u58f0|\u539f\u58f0|instrumental|piano|ambient|soundtrack|ost|bgm|lofi)/i.test(text);
+}
+
+function songPickViolatesVocalPolicy(pick = {}, request = {}) {
+  return requestRequiresInstrumental(request) && !hasInstrumentalEvidence(pick);
+}
+
+function trackViolatesVocalPolicy(track = {}, request = {}, pick = null) {
+  return requestRequiresInstrumental(request) && !hasInstrumentalEvidence(track, pick);
+}
+
 function trackDisplayName(track = {}) {
   const artists = (track.artists || []).filter(Boolean).join('、');
   return artists ? `《${track.name}》 - ${artists}` : `《${track.name || '这首歌'}》`;
@@ -2717,10 +2787,12 @@ function getMusicRequestConstraints(db, userMessage = '', mode = {}, sessionCons
   const tracks = safeListTracks(db);
   const artistConstraint = extractRequestedArtistConstraint(text, tracks, mode);
   const songTitle = extractRequestedSongTitle(text, artistConstraint);
+  const messageVocalPolicy = detectVocalPolicyUpdate(text);
   return {
     text,
     artistConstraint,
     songTitle,
+    vocalPolicy: messageVocalPolicy || '',
     sessionConstraints: normalizeSessionConstraints(sessionConstraints),
     allowRequestedSongReplay: Boolean(songTitle),
     allowPlayedSongReplay: Boolean(songTitle && isExplicitReplayRequest(text))
@@ -3358,6 +3430,11 @@ function formatSessionConstraintsForPrompt(sessionConstraints = {}) {
     : '本场禁听：无。';
 }
 
+function formatVocalPolicyForPrompt(request = {}) {
+  if (!requestRequiresInstrumental(request)) return '人声约束：无';
+  return '人声约束：只能推荐纯音乐/伴奏/无人声/无歌词作品。这是硬约束；候选 reason 或 queries 应明确写出“纯音乐、伴奏、无人声、钢琴、器乐、OST、BGM、instrumental”等证据；找不到时不要用普通人声歌曲兜底。';
+}
+
 export function trackViolatesSessionConstraints(track = {}, sessionConstraints = {}) {
   const terms = normalizeSessionConstraints(sessionConstraints).avoidTerms
     .map(normalizeMusicText)
@@ -3576,6 +3653,7 @@ function normalizeMoodDecision(input = {}) {
     preferenceHints: Array.isArray(input.preferenceHints) ? uniqueStrings(input.preferenceHints, 8) : [],
     avoidHints: Array.isArray(input.avoidHints) ? uniqueStrings(input.avoidHints, 8) : [],
     musicIntent: input.musicIntent || input.intent || 'chat',
+    vocalPolicy: normalizeVocalPolicy(input.vocalPolicy),
     confidence: Number.isFinite(Number(input.confidence)) ? Number(input.confidence) : undefined
   };
 }
@@ -3590,6 +3668,7 @@ export function normalizeMusicContext(input = {}) {
     preferenceHints: uniqueStrings(input.preferenceHints || mood.preferenceHints || [], 8),
     avoidHints: uniqueStrings(input.avoidHints || mood.avoidHints || [], 8),
     musicIntent: input.musicIntent || mood.musicIntent || 'chat',
+    vocalPolicy: normalizeVocalPolicy(input.vocalPolicy || mood.vocalPolicy),
     confidence: Number.isFinite(Number(input.confidence)) ? Number(input.confidence) : (mood.confidence ?? 0.45),
     reason: input.reason || mood.reason || '',
     lastUserMessage: String(input.lastUserMessage || '').slice(0, 180),
@@ -3600,6 +3679,7 @@ export function normalizeMusicContext(input = {}) {
 function nextMusicContext(previous = {}, analysis = {}, userMessage = '') {
   const normalizedPrevious = normalizeMusicContext(previous);
   const normalizedAnalysis = normalizeMoodDecision(analysis);
+  const messageVocalPolicy = detectVocalPolicyUpdate(userMessage);
   return normalizeMusicContext({
     ...normalizedPrevious,
     ...normalizedAnalysis,
@@ -3617,6 +3697,9 @@ function nextMusicContext(previous = {}, analysis = {}, userMessage = '') {
       ...(normalizedPrevious.avoidHints || [])
     ], 8),
     musicIntent: normalizedAnalysis.musicIntent || normalizedPrevious.musicIntent || 'chat',
+    vocalPolicy: messageVocalPolicy !== null
+      ? messageVocalPolicy
+      : (normalizedAnalysis.vocalPolicy || normalizedPrevious.vocalPolicy || ''),
     confidence: normalizedAnalysis.confidence ?? normalizedPrevious.confidence,
     reason: normalizedAnalysis.reason || normalizedPrevious.reason || '',
     lastUserMessage: userMessage || normalizedPrevious.lastUserMessage || '',
@@ -3662,6 +3745,7 @@ function moodFromMusicContext(context = {}) {
     preferenceHints: musicContext.preferenceHints,
     avoidHints: musicContext.avoidHints,
     musicIntent: musicContext.musicIntent,
+    vocalPolicy: musicContext.vocalPolicy,
     confidence: musicContext.confidence,
     reason: musicContext.reason
   });
@@ -3693,6 +3777,8 @@ export function queueItemMatchesMusicContext(item = {}, musicContext = {}) {
   const itemContext = normalizeMusicContext(item.contextSnapshot || {});
   const target = normalizeMusicContext(musicContext || {});
   if (target.musicIntent === 'explicit_music') return false;
+  if (target.vocalPolicy === VOCAL_POLICIES.INSTRUMENTAL_ONLY &&
+      itemContext.vocalPolicy !== VOCAL_POLICIES.INSTRUMENTAL_ONLY) return false;
   if (queueItemConflictsWithAvoidHints(item, target)) return false;
   if (itemContext.energy === 'high' && target.energy === 'low') return false;
   if (itemContext.energy === 'low' && target.energy === 'high') return false;
@@ -4429,6 +4515,9 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
   const playedIds = new Set(playedHistory.map(track => String(track.id || '')).filter(Boolean));
   const playedSignatures = buildPlayedSignatureSet(playedHistory);
   const request = getMusicRequestConstraints(db, userMessage, mode, sessionConstraints);
+  if (!request.vocalPolicy && conversationMood?.vocalPolicy) {
+    request.vocalPolicy = normalizeVocalPolicy(conversationMood.vocalPolicy);
+  }
   const failedPicks = [];
   let lastPlan = null;
   let newMode = null;
@@ -4701,6 +4790,11 @@ async function resolveSameArtistFallback({ db, config, netease, failedPicks = []
         hit.filterReason = 'session_constraint';
         continue;
       }
+      if (trackViolatesVocalPolicy(track, request)) {
+        hit.accepted = false;
+        hit.filterReason = 'vocal_policy';
+        continue;
+      }
       if (shouldSkipFallbackTrack(track, { playedIds, playedSignatures, failedNameKeys, request })) {
         hit.accepted = false;
         hit.filterReason = 'played_or_failed_song';
@@ -4755,6 +4849,7 @@ async function resolveProfileLibraryFallback({ db, config, netease, profile = {}
   const ranked = tracks
     .filter(track => !shouldSkipFallbackTrack(track, { playedIds, playedSignatures, failedNameKeys, request }))
     .filter(track => !trackViolatesSessionConstraints(track, request.sessionConstraints))
+    .filter(track => !trackViolatesVocalPolicy(track, request))
     .map((track, index) => ({ track, score: scoreFallbackTrack(track, { profile, conversationMood }) - index * 0.01 }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 32);
@@ -4874,6 +4969,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
     request?.songTitle ? `指定歌名：${request.songTitle}` : ''
   ].filter(Boolean).join('；') || '无明确歌名/艺人约束';
   const sessionConstraintText = formatSessionConstraintsForPrompt(request?.sessionConstraints);
+  const vocalPolicyText = formatVocalPolicyForPrompt(request);
   const failedText = failedPicks.length
     ? `上一批没有确认到可播放源，请避开这些歌：${failedPicks.map(pick => `${pick.name}${pick.artists?.length ? ' - ' + pick.artists.join('、') : ''}`).join('；')}`
     : '没有失败歌单。';
@@ -4895,6 +4991,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         '搜索 queries 必须像音乐软件里会输入的短词，优先“歌名 艺人”和“艺人 歌名”。不要输出长句。',
         '如果用户明确指定艺人、歌名或风格，必须优先满足；不确定时选更常见、更好搜的歌曲。',
         '如果存在本场禁听，禁听优先级高于听众画像、历史偏好和兜底推荐；不要推荐禁听歌手，也不要推荐歌名命中禁听词的歌曲。',
+        vocalPolicyText,
         '如果用户说“他的另一首/她的另一首/这个歌手的另一首/换这位歌手”，优先参考最近播放歌曲的艺人，把它理解成当前或上一首歌的主艺人。',
         replayRule,
         'hostLine 只是备用素材，不是最终导播词。不要写成“刚才……现在……”“上一首……接下来……”或“接下来放……”。可以只写一个自然的导播方向。',
@@ -4912,6 +5009,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         modeText,
         `明确请求：${requestText}`,
         sessionConstraintText,
+        vocalPolicyText,
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
         formatRecentHostPlays(hostContext.recentPlays),
         playedText,
@@ -5013,6 +5111,12 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
       failedPicks.push(effectivePick);
       continue;
     }
+    if (songPickViolatesVocalPolicy(effectivePick, request)) {
+      pickDiagnostic.failedReason = 'vocal_policy';
+      diagnostics.push(pickDiagnostic);
+      failedPicks.push(effectivePick);
+      continue;
+    }
     const search = await searchTracksForSongPick(effectivePick, { request });
     pickDiagnostic.queries = search.queries;
     pickDiagnostic.queryDiagnostics = search.queryDiagnostics;
@@ -5040,6 +5144,11 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
       if (trackViolatesSessionConstraints(track, request.sessionConstraints)) {
         item.diagnostic.accepted = false;
         item.diagnostic.filterReason = 'session_constraint';
+        continue;
+      }
+      if (trackViolatesVocalPolicy(track, request, effectivePick)) {
+        item.diagnostic.accepted = false;
+        item.diagnostic.filterReason = 'vocal_policy';
         continue;
       }
       if (playedIds.has(String(track.id)) && !replayRequestAllowsPlayedSong(track, request)) {

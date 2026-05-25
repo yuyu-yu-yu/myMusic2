@@ -1,4 +1,11 @@
 import { animate } from '/vendor/anime.esm.min.js';
+import {
+  addPlaybackItem,
+  canMovePlaybackPrevious,
+  getNextPlaybackItem,
+  getPreviousPlaybackItem,
+  movePlaybackCursor
+} from './playback-sequence.js';
 
 const AI_MUSIC_MODE_STORAGE_KEY = 'mymusic:aiMusicMode';
 const DEMO_VISITOR_STORAGE_KEY = 'mymusic:demoVisitorId';
@@ -25,11 +32,14 @@ const state = {
   profileSelectionDirty: false,
   librarySyncNotice: '',
   radioPrefetchPromise: null,
-  playbackHistory: [],
+  playbackSequence: [],
+  playbackCursor: -1,
   demoSelfCheck: null,
   demoSelfCheckRunning: false,
   radioTurnSeq: 0,
   activeRadioTurn: null,
+  playbackTokenSeq: 0,
+  activePlaybackToken: 0,
   radioMode: 'single',
   activePlaylist: null,
   playlistStatus: 'idle',
@@ -1429,7 +1439,7 @@ function ensureSessionId() {
   return state.sessionId;
 }
 
-function beginRadioTurn() {
+function beginRadioTurn({ interruptPlayback = true } = {}) {
   if (state.activeRadioTurn?.controller && !state.activeRadioTurn.controller.signal.aborted) {
     state.activeRadioTurn.controller.abort();
   }
@@ -1437,7 +1447,10 @@ function beginRadioTurn() {
     stopLoadingMessages({ remove: true, loading: state.activeRadioTurn.loading });
   }
   interruptPendingHostSpeech();
-  suppressCurrentSongAutoAdvance();
+  if (interruptPlayback) {
+    invalidateActivePlaybackEvents();
+    clearSongAudioHandlers();
+  }
 
   const controller = typeof AbortController === 'function' ? new AbortController() : null;
   const turn = {
@@ -1475,8 +1488,10 @@ function radioTurnSignal(radioTurn) {
   return radioTurn?.controller?.signal;
 }
 
-function isCurrentPlaybackTurn(radioTurn, track) {
-  return isActiveRadioTurn(radioTurn) && (!track?.id || state.current?.track?.id === track.id);
+function isCurrentPlaybackTurn(radioTurn, track, playbackToken = null) {
+  return isActiveRadioTurn(radioTurn) &&
+    (!playbackToken || state.activePlaybackToken === playbackToken) &&
+    (!track?.id || state.current?.track?.id === track.id);
 }
 
 function interruptPendingHostSpeech() {
@@ -1489,10 +1504,21 @@ function interruptPendingHostSpeech() {
   window.speechSynthesis?.cancel?.();
 }
 
-function suppressCurrentSongAutoAdvance() {
+function invalidateActivePlaybackEvents() {
+  state.activePlaybackToken = ++state.playbackTokenSeq;
+}
+
+function clearSongAudioHandlers({ reset = false } = {}) {
   const songAudio = document.querySelector('#song-audio');
   if (!songAudio) return;
   songAudio.onended = null;
+  songAudio.onerror = null;
+  songAudio.onplay = null;
+  songAudio.ontimeupdate = null;
+  if (reset) {
+    songAudio.pause();
+    try { songAudio.currentTime = 0; } catch {}
+  }
 }
 
 function scheduleRadioPrefetch({ force = false } = {}) {
@@ -1605,7 +1631,14 @@ async function startPlaylistRadio({ message = '' } = {}) {
   }
 }
 
-async function nextTrack({ skipCurrent = true, silent = false } = {}) {
+async function nextTrack({ skipCurrent = true, silent = false, forceFresh = false } = {}) {
+  const storedNext = forceFresh ? null : getNextPlaybackItem(playbackSequenceState());
+  if (storedNext?.track) {
+    applyPlaybackSequence(movePlaybackCursor(playbackSequenceState(), 1));
+    await playPlaybackSequenceItem(storedNext, { direction: 'next', skipCurrent, silent });
+    return;
+  }
+
   const radioTurn = beginRadioTurn();
   primeVoicePlayback();
   const sessionId = ensureSessionId();
@@ -1744,15 +1777,28 @@ function handleScenePrompt(scene) {
 }
 
 async function sendChat(msg) {
+  const radioTurn = beginRadioTurn({ interruptPlayback: false });
   primeVoicePlayback();
   const sessionId = ensureSessionId();
   appendChat({ role: 'user', text: msg });
   const loading = startLoadingMessages('chat');
+  attachRadioTurnLoading(radioTurn, loading);
   try {
     await loadPreferences().catch(() => null);
-    const data = await api('/api/radio/chat', { method: 'POST', body: { sessionId, message: msg } });
-    handleRadioResponse(data, { loading });
+    if (!isActiveRadioTurn(radioTurn)) return;
+    const data = await api('/api/radio/chat', {
+      method: 'POST',
+      body: { sessionId, message: msg },
+      signal: radioTurnSignal(radioTurn)
+    });
+    handleRadioResponse(data, { loading, radioTurn });
   } catch (e) {
+    if (isInterruptedRadioTurn(radioTurn, e)) {
+      stopLoadingMessages({ remove: true, loading });
+      clearRadioTurnLoading(radioTurn, loading);
+      return;
+    }
+    clearRadioTurnLoading(radioTurn, loading);
     stopLoadingMessages({ loading });
     setAvatarState(getContextualAvatarState());
     replaceLoadingMessage({ text: '抱歉，出了一点问题：' + e.message, loading });
@@ -1788,7 +1834,7 @@ function handleRadioResponse(data, { loading = null, radioTurn = null } = {}) {
   renderPlaylistQueue();
   if (data.track) {
     stopVisualizer();
-    rememberCurrentForHistory(data);
+    rememberPlaybackRecommendation(data, { truncateFuture: true });
     state.current = data;
     updatePlayer(data, false);
   }
@@ -1828,18 +1874,26 @@ function handleRadioResponse(data, { loading = null, radioTurn = null } = {}) {
   return true;
 }
 
-function rememberCurrentForHistory(nextData = {}) {
-  const current = state.current;
-  const currentTrackId = current?.track?.id;
-  const nextTrackId = nextData?.track?.id;
-  if (!currentTrackId || !nextTrackId || currentTrackId === nextTrackId) return;
+function playbackSequenceState() {
+  return {
+    sequence: state.playbackSequence,
+    cursor: state.playbackCursor
+  };
+}
 
-  const last = state.playbackHistory.at(-1);
-  if (last?.track?.id !== currentTrackId) {
-    state.playbackHistory.push(clonePlaybackItem(current));
-    if (state.playbackHistory.length > 20) state.playbackHistory.shift();
-  }
+function applyPlaybackSequence(nextState = {}) {
+  state.playbackSequence = Array.isArray(nextState.sequence) ? nextState.sequence : [];
+  state.playbackCursor = Number.isInteger(nextState.cursor) ? nextState.cursor : -1;
   updatePreviousButtonState();
+}
+
+function rememberPlaybackRecommendation(data = {}, { truncateFuture = true } = {}) {
+  if (!data?.track?.id) return;
+  applyPlaybackSequence(addPlaybackItem(
+    playbackSequenceState(),
+    clonePlaybackItem(data),
+    { truncateFuture }
+  ));
 }
 
 function clonePlaybackItem(item) {
@@ -1853,49 +1907,61 @@ function clonePlaybackItem(item) {
 function updatePreviousButtonState() {
   const button = document.querySelector('#previous-btn');
   if (!button) return;
-  const hasPrevious = state.playbackHistory.length > 0;
+  const hasPrevious = canMovePlaybackPrevious(playbackSequenceState());
   button.disabled = !hasPrevious;
   const label = hasPrevious ? '上一首' : '没有上一首';
   button.title = label;
   button.setAttribute('aria-label', label);
 }
 
-async function previousTrack() {
-  const previous = state.playbackHistory.pop();
-  updatePreviousButtonState();
-  if (!previous?.track) {
-    setPlayerStatus('没有上一首', '');
-    return;
-  }
-
+async function playPlaybackSequenceItem(item, { direction = 'previous', skipCurrent = false, silent = false } = {}) {
+  if (!item?.track) return false;
   const radioTurn = beginRadioTurn();
   primeVoicePlayback();
+  if (skipCurrent) await reportFeedback('skip');
+  if (!isActiveRadioTurn(radioTurn)) return false;
   stopVisualizer();
   setAvatarState('searching');
   setPlaybackToggleState(false);
   document.querySelector('#host-audio')?.pause();
-  const songAudio = document.querySelector('#song-audio');
-  if (songAudio) {
-    songAudio.pause();
-    songAudio.currentTime = 0;
-  }
+  clearSongAudioHandlers({ reset: true });
   try {
     await api('/api/player/stop', { method: 'POST', body: {} });
   } catch {
     // Browser playback can still continue even if the external player was not running.
   }
 
-  state.current = previous;
-  updatePlayer(previous, false);
-  appendChat({ role: 'user', text: '上一首' });
-  appendChat({
-    role: 'dj',
-    text: `回到上一首：《${previous.track.name || '这首歌'}》。`,
-    track: previous.track,
-    explanation: previous.explanation
-  });
-  setPlayerStatus('回到上一首', 'playing');
+  if (!isActiveRadioTurn(radioTurn)) return false;
+  const replayItem = clonePlaybackItem(item);
+  state.current = replayItem;
+  updatePlayer(replayItem, false);
+  if (!silent) {
+    const isPrevious = direction === 'previous';
+    appendChat({ role: 'user', text: isPrevious ? '上一首' : '下一首' });
+    appendChat({
+      role: 'dj',
+      text: isPrevious
+        ? `回到上一首：《${replayItem.track.name || '这首歌'}》。`
+        : `继续播放顺序：《${replayItem.track.name || '这首歌'}》。`,
+      track: replayItem.track,
+      explanation: replayItem.explanation
+    });
+  }
+  setPlayerStatus(direction === 'previous' ? '回到上一首' : '继续播放顺序', 'playing');
   startSongPlayback(radioTurn);
+  return true;
+}
+
+async function previousTrack() {
+  const previous = getPreviousPlaybackItem(playbackSequenceState());
+  if (!previous?.track) {
+    setPlayerStatus('没有上一首', '');
+    updatePreviousButtonState();
+    return;
+  }
+
+  applyPlaybackSequence(movePlaybackCursor(playbackSequenceState(), -1));
+  await playPlaybackSequenceItem(previous, { direction: 'previous' });
 }
 
 function responseShouldSpeak(data = {}) {
@@ -2225,12 +2291,16 @@ async function updatePlayer(data, autoplay) {
   const songAudio = document.querySelector('#song-audio');
   if (track.playUrl) {
     // Don't reset src if already playing this URL (e.g. navigating back to player page)
-    if (songAudio.src !== track.playUrl) {
+    if (songAudio.getAttribute('src') !== track.playUrl) {
+      clearSongAudioHandlers();
       songAudio.crossOrigin = 'anonymous';
       songAudio.src = track.playUrl;
     }
     songAudio.style.display = '';
   } else {
+    clearSongAudioHandlers();
+    songAudio.removeAttribute('src');
+    songAudio.load?.();
     songAudio.style.display = 'none';
   }
   // Reset progress bar for new track
@@ -2370,6 +2440,9 @@ async function startSongPlayback(radioTurn = null) {
   if (!isActiveRadioTurn(radioTurn)) return;
   const track = state.current?.track;
   const songAudio = document.querySelector('#song-audio');
+  const playbackToken = ++state.playbackTokenSeq;
+  state.activePlaybackToken = playbackToken;
+  clearSongAudioHandlers();
 
   // If we have a direct URL, play it in browser
   if (track?.playUrl) {
@@ -2378,29 +2451,29 @@ async function startSongPlayback(radioTurn = null) {
     setAvatarState('listening');
     setPlaybackToggleState(true);
     switchVisualizerTo('song');
-    songAudio.play().catch(() => handleBrowserPlaybackIssue(radioTurn, track));
+    songAudio.play().catch(() => handleBrowserPlaybackIssue(radioTurn, track, playbackToken));
     songAudio.onerror = () => {
-      if (!isCurrentPlaybackTurn(radioTurn, track)) return;
-      handleBrowserPlaybackIssue(radioTurn, track);
+      if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
+      handleBrowserPlaybackIssue(radioTurn, track, playbackToken);
     };
     songAudio.onended = async () => {
-      if (!isCurrentPlaybackTurn(radioTurn, track)) return;
+      if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
       stopVisualizer();
       setAvatarState('searching');
       setPlaybackToggleState(false);
       await reportFeedback('complete');
-      if (!isCurrentPlaybackTurn(radioTurn, track)) return;
+      if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
       nextTrack({ skipCurrent: false });
     };
     songAudio.onplay = () => {
-      if (!isCurrentPlaybackTurn(radioTurn, track)) return;
+      if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
       setAvatarState('listening');
       ensureVisualizerAnalysis('song');
       if (visualizerState.mode !== 'song') switchVisualizerTo('song');
       api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
     };
     songAudio.ontimeupdate = () => {
-      if (!isCurrentPlaybackTurn(radioTurn, track)) return;
+      if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
       syncLyricTime(songAudio.currentTime);
       updateProgressBar();
     };
@@ -2408,7 +2481,7 @@ async function startSongPlayback(radioTurn = null) {
   }
 
   if (!shouldUseServerPlayerFallback()) {
-    handleBrowserPlaybackIssue(radioTurn, track);
+    handleBrowserPlaybackIssue(radioTurn, track, playbackToken);
     return;
   }
 
@@ -2416,7 +2489,7 @@ async function startSongPlayback(radioTurn = null) {
   setAvatarState('listening');
   setPlaybackToggleState(true);
   switchVisualizerTo('song');
-  playCurrentTrack(radioTurn);
+  playCurrentTrack(radioTurn, playbackToken);
 }
 
 function shouldUseServerPlayerFallback() {
@@ -2424,10 +2497,10 @@ function shouldUseServerPlayerFallback() {
   return !host || host === 'localhost' || host === '127.0.0.1' || host === '::1';
 }
 
-function handleBrowserPlaybackIssue(radioTurn, track) {
-  if (!isCurrentPlaybackTurn(radioTurn, track)) return;
+function handleBrowserPlaybackIssue(radioTurn, track, playbackToken = null) {
+  if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
   if (shouldUseServerPlayerFallback()) {
-    playCurrentTrack(radioTurn);
+    playCurrentTrack(radioTurn, playbackToken);
     return;
   }
   stopVisualizer();
@@ -2435,7 +2508,7 @@ function handleBrowserPlaybackIssue(radioTurn, track) {
   setAvatarState('searching');
   setPlayerStatus('这首暂时无法在网页播放，正在换下一首', '');
   setTimeout(() => {
-    if (!isCurrentPlaybackTurn(radioTurn, track)) return;
+    if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
     nextTrack({ skipCurrent: true, silent: true });
   }, 420);
 }
@@ -2627,9 +2700,9 @@ function initProgressBar() {
   });
 }
 
-async function playCurrentTrack(radioTurn = null) {
+async function playCurrentTrack(radioTurn = null, playbackToken = null) {
   const track = state.current?.track;
-  if (!isCurrentPlaybackTurn(radioTurn, track)) return;
+  if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
   if (!track?.id) {
     setPlayerStatus('没有可播放的歌曲', 'error');
     return;
@@ -2637,7 +2710,7 @@ async function playCurrentTrack(radioTurn = null) {
   setPlayerStatus(`正在调用 ncm-cli 播放：${track.name || track.id}`, 'playing');
   try {
     const result = await api('/api/player/play', { method: 'POST', body: { trackId: track.id, maxSkips: 0 }, signal: radioTurnSignal(radioTurn) });
-    if (!isCurrentPlaybackTurn(radioTurn, track)) return;
+    if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
     if (result.track && result.track.id !== track.id) {
       throw new Error(`播放器返回了另一首歌：${result.track.name || result.track.id}`);
     }
@@ -2647,7 +2720,7 @@ async function playCurrentTrack(radioTurn = null) {
     setPlayerStatus(`正在播放：${track.name}`, 'playing');
     api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
   } catch (error) {
-    if (isInterruptedRadioTurn(radioTurn, error) || !isCurrentPlaybackTurn(radioTurn, track)) return;
+    if (isInterruptedRadioTurn(radioTurn, error) || !isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
     setPlaybackToggleState(false);
     setPlayerStatus(formatPlaybackErrorMessage(error), 'error');
   }
@@ -2687,12 +2760,13 @@ async function resumePlayback() {
 }
 
 async function stopPlayback() {
+  invalidateActivePlaybackEvents();
   stopVisualizer();
   setAvatarState('idle');
   setPlaybackToggleState(false);
   document.querySelector('#host-audio')?.pause();
   const songAudio = document.querySelector('#song-audio');
-  songAudio?.pause();
+  clearSongAudioHandlers({ reset: true });
   if (songAudio) songAudio.src = '';
   window.speechSynthesis?.cancel?.();
   try {
