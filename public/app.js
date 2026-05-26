@@ -2434,17 +2434,15 @@ function renderLyricStandby() {
   state.lyricLines = [];
   state.activeLyricIndex = -1;
   container.innerHTML = `
-    <div class="lyric-standby" aria-label="CanCan radio standby signal">
-      <div class="lyric-standby-scope" aria-hidden="true">
-        <span class="lyric-standby-scan"></span>
-        <div class="lyric-standby-bars">
-          ${Array.from({ length: 8 }, () => '<span></span>').join('')}
-        </div>
+    <div class="lyric-standby" aria-label="CanCan radio standby">
+      <div class="lyric-standby-signal" aria-hidden="true">
+        <span class="lyric-standby-line"></span>
+        <span class="lyric-standby-pulse"></span>
       </div>
       <div class="lyric-standby-copy">
-        <span class="lyric-standby-kicker">CANCAN RADIO ARRAY</span>
-        <strong>SIGNAL STANDBY</strong>
-        <p>Waiting for your private frequency</p>
+        <span class="lyric-standby-kicker">PRIVATE FREQUENCY</span>
+        <strong>READY</strong>
+        <p>CanCan is waiting on this channel</p>
       </div>
     </div>
   `;
