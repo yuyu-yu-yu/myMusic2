@@ -1669,7 +1669,7 @@ audio {
   border-radius: 3px;
   background: var(--cyan);
   box-shadow: 0 0 8px rgba(0, 240, 255, 0.3);
-  transition: width 0.1s linear;
+  transition: none;
   pointer-events: none;
   position: relative;
   z-index: 1;
@@ -1684,26 +1684,31 @@ audio {
   left: var(--progress-pct, 0%);
   top: 50%;
   z-index: 2;
-  width: 22px;
-  height: 22px;
+  width: 18px;
+  height: 18px;
   padding: 0;
   border: 0;
   background: transparent;
   cursor: grab;
-  transform: translate(-50%, -50%);
+  transform: translate3d(-50%, -50%, 0);
   touch-action: none;
+  box-sizing: border-box;
 }
 
 .progress-thumb::before {
   content: '';
   position: absolute;
-  inset: 5px;
+  left: 50%;
+  top: 50%;
+  width: 8px;
+  height: 8px;
   border-radius: 2px;
   background: var(--cyan);
   border: 1px solid rgba(255,255,255,0.78);
+  transform: translate3d(-50%, -50%, 0);
   box-shadow:
-    0 0 0 3px rgba(0, 240, 255, 0.12),
-    0 0 14px rgba(0, 240, 255, 0.65);
+    0 0 0 2px rgba(0, 240, 255, 0.12),
+    0 0 10px rgba(0, 240, 255, 0.58);
 }
 
 .progress-thumb:hover::before,
@@ -1711,8 +1716,8 @@ audio {
 .progress-bar.is-dragging .progress-thumb::before {
   background: var(--yellow);
   box-shadow:
-    0 0 0 4px rgba(255, 215, 0, 0.14),
-    0 0 18px rgba(255, 215, 0, 0.72);
+    0 0 0 3px rgba(255, 215, 0, 0.14),
+    0 0 12px rgba(255, 215, 0, 0.68);
 }
 
 .progress-thumb:focus-visible {

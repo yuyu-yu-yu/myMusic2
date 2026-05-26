@@ -48,8 +48,13 @@ const state = {
 
 const progressSeekState = {
   dragging: false,
-  suppressClick: false
+  suppressClick: false,
+  pointerId: null,
+  previewTime: null,
+  documentListenersReady: false
 };
+
+let progressAnimationFrame = null;
 
 function ensureDemoVisitorId() {
   try {
@@ -1540,6 +1545,7 @@ function invalidateActivePlaybackEvents() {
 function clearSongAudioHandlers({ reset = false } = {}) {
   const songAudio = document.querySelector('#song-audio');
   if (!songAudio) return;
+  stopProgressAnimation();
   songAudio.onended = null;
   songAudio.onerror = null;
   songAudio.onplay = null;
@@ -2519,6 +2525,7 @@ async function startSongPlayback(radioTurn = null) {
     };
     songAudio.onended = async () => {
       if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
+      stopProgressAnimation();
       stopVisualizer();
       setAvatarState('searching');
       setPlaybackToggleState(false);
@@ -2528,6 +2535,7 @@ async function startSongPlayback(radioTurn = null) {
     };
     songAudio.onplay = () => {
       if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
+      startProgressAnimation();
       setAvatarState('listening');
       ensureVisualizerAnalysis('song');
       if (visualizerState.mode !== 'song') switchVisualizerTo('song');
@@ -2535,7 +2543,7 @@ async function startSongPlayback(radioTurn = null) {
     };
     songAudio.ontimeupdate = () => {
       if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
-      syncLyricTime(songAudio.currentTime);
+      if (!progressSeekState.dragging) syncLyricTime(songAudio.currentTime);
       updateProgressBar();
     };
     return;
@@ -2770,52 +2778,97 @@ function setProgressThumbA11y(currentTimeSec, durationSec) {
   thumb.setAttribute('aria-valuetext', duration ? `${formatTime(current)} / ${formatTime(duration)}` : '00:00');
 }
 
-function seekProgressToTime(targetTimeSec) {
-  const songAudio = document.querySelector('#song-audio');
-  if (!songAudio?.duration || isNaN(songAudio.duration)) return false;
-  const duration = songAudio.duration;
-  const targetTime = Math.max(0, Math.min(duration, Number(targetTimeSec) || 0));
-  songAudio.currentTime = targetTime;
+function previewProgressSeek(targetTime, duration) {
   setProgressBarVisual((targetTime / duration) * 100);
   setProgressThumbA11y(targetTime, duration);
   const current = document.querySelector('#progress-current');
   const total = document.querySelector('#progress-duration');
   if (current) current.textContent = formatTime(targetTime);
   if (total) total.textContent = formatTime(duration);
-  syncLyricTime(targetTime, { forceCenter: true });
+}
+
+function seekProgressToTime(targetTimeSec, { commit = true, syncLyrics = true } = {}) {
+  const songAudio = document.querySelector('#song-audio');
+  if (!songAudio?.duration || isNaN(songAudio.duration)) return false;
+  const duration = songAudio.duration;
+  const targetTime = Math.max(0, Math.min(duration, Number(targetTimeSec) || 0));
+  progressSeekState.previewTime = targetTime;
+  previewProgressSeek(targetTime, duration);
+  if (commit) {
+    songAudio.currentTime = targetTime;
+    if (syncLyrics) syncLyricTime(targetTime, { forceCenter: true });
+  }
   return true;
 }
 
-function seekProgressFromClientX(clientX) {
+function seekProgressFromClientX(clientX, options = {}) {
   const songAudio = document.querySelector('#song-audio');
   const bar = document.querySelector('#progress-bar');
   if (!songAudio?.duration || isNaN(songAudio.duration) || !bar) return false;
   const rect = bar.getBoundingClientRect();
   if (!rect.width) return false;
   const pct = clampProgressPercent(((clientX - rect.left) / rect.width) * 100);
-  return seekProgressToTime((pct / 100) * songAudio.duration);
+  return seekProgressToTime((pct / 100) * songAudio.duration, options);
+}
+
+function finishProgressDrag(event = null) {
+  if (!progressSeekState.dragging) return;
+  const thumb = document.querySelector('#progress-thumb');
+  const bar = document.querySelector('#progress-bar');
+  progressSeekState.dragging = false;
+  bar?.classList.remove('is-dragging');
+  if (typeof event?.clientX === 'number') {
+    seekProgressFromClientX(event.clientX, { commit: true, syncLyrics: true });
+  } else if (progressSeekState.previewTime !== null) {
+    seekProgressToTime(progressSeekState.previewTime, { commit: true, syncLyrics: true });
+  }
+  try { thumb?.releasePointerCapture?.(progressSeekState.pointerId); } catch {}
+  progressSeekState.pointerId = null;
+  progressSeekState.previewTime = null;
+  setTimeout(() => {
+    progressSeekState.suppressClick = false;
+  }, 0);
+}
+
+function ensureProgressDragDocumentListeners() {
+  if (progressSeekState.documentListenersReady) return;
+  progressSeekState.documentListenersReady = true;
+  document.addEventListener('pointerup', finishProgressDrag);
+  document.addEventListener('pointercancel', finishProgressDrag);
+  window.addEventListener('blur', () => finishProgressDrag());
+}
+
+function startProgressAnimation() {
+  if (progressAnimationFrame) return;
+  const tick = () => {
+    progressAnimationFrame = null;
+    updateProgressBar();
+    const songAudio = document.querySelector('#song-audio');
+    if (songAudio && !songAudio.paused && !songAudio.ended) {
+      progressAnimationFrame = requestAnimationFrame(tick);
+    }
+  };
+  progressAnimationFrame = requestAnimationFrame(tick);
+}
+
+function stopProgressAnimation() {
+  if (progressAnimationFrame) {
+    cancelAnimationFrame(progressAnimationFrame);
+    progressAnimationFrame = null;
+  }
+  updateProgressBar();
 }
 
 function initProgressBar() {
   const bar = document.querySelector('#progress-bar');
   const thumb = document.querySelector('#progress-thumb');
   if (!bar) return;
+  ensureProgressDragDocumentListeners();
   bar.addEventListener('click', (e) => {
     if (progressSeekState.suppressClick || e.target === thumb) return;
-    seekProgressFromClientX(e.clientX);
+    seekProgressFromClientX(e.clientX, { commit: true, syncLyrics: true });
   });
   if (!thumb) return;
-
-  const finishDrag = (event) => {
-    if (!progressSeekState.dragging) return;
-    if (typeof event?.clientX === 'number') seekProgressFromClientX(event.clientX);
-    progressSeekState.dragging = false;
-    bar.classList.remove('is-dragging');
-    try { thumb.releasePointerCapture?.(event.pointerId); } catch {}
-    setTimeout(() => {
-      progressSeekState.suppressClick = false;
-    }, 0);
-  };
 
   thumb.addEventListener('pointerdown', (event) => {
     const songAudio = document.querySelector('#song-audio');
@@ -2823,17 +2876,18 @@ function initProgressBar() {
     event.preventDefault();
     progressSeekState.dragging = true;
     progressSeekState.suppressClick = true;
+    progressSeekState.pointerId = event.pointerId;
     bar.classList.add('is-dragging');
     try { thumb.setPointerCapture?.(event.pointerId); } catch {}
-    seekProgressFromClientX(event.clientX);
+    seekProgressFromClientX(event.clientX, { commit: false, syncLyrics: false });
   });
   thumb.addEventListener('pointermove', (event) => {
     if (!progressSeekState.dragging) return;
     event.preventDefault();
-    seekProgressFromClientX(event.clientX);
+    seekProgressFromClientX(event.clientX, { commit: false, syncLyrics: false });
   });
-  thumb.addEventListener('pointerup', finishDrag);
-  thumb.addEventListener('pointercancel', finishDrag);
+  thumb.addEventListener('pointerup', finishProgressDrag);
+  thumb.addEventListener('pointercancel', finishProgressDrag);
   thumb.addEventListener('click', (event) => {
     event.preventDefault();
     event.stopPropagation();
@@ -2849,9 +2903,11 @@ function initProgressBar() {
     else if (event.key === 'End') target = songAudio.duration;
     if (target === null) return;
     event.preventDefault();
-    seekProgressToTime(target);
+    seekProgressToTime(target, { commit: true, syncLyrics: true });
   });
   updateProgressBar();
+  const songAudio = document.querySelector('#song-audio');
+  if (songAudio && !songAudio.paused && !songAudio.ended) startProgressAnimation();
 }
 
 async function playCurrentTrack(radioTurn = null, playbackToken = null) {
