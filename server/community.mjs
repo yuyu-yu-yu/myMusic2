@@ -313,6 +313,67 @@ export async function getLyric(songId) {
   }
 }
 
+export async function getSongComments(songId, { limit = 40, offset = 0 } = {}) {
+  const id = String(songId || '').trim();
+  if (!/^\d+$/.test(id)) return [];
+  const pageLimit = Math.min(40, Math.max(1, Number(limit) || 40));
+  try {
+    const result = await api.comment_music({
+      id,
+      limit: pageLimit,
+      offset: Math.max(0, Number(offset) || 0),
+      cookie: _cookie || undefined,
+      timestamp: Date.now()
+    });
+    return normalizeSongComments(result, pageLimit);
+  } catch (e) {
+    console.warn('[community] comment_music failed:', e.message || e.body?.message || e.body?.msg || e.status);
+    return [];
+  }
+}
+
+export function normalizeSongComments(result, limit = 40) {
+  const body = result?.body || result?.data || result || {};
+  const candidates = [
+    ...(Array.isArray(body.hotComments) ? body.hotComments : []),
+    ...(Array.isArray(body.comments) ? body.comments : []),
+    ...(Array.isArray(body.data?.hotComments) ? body.data.hotComments : []),
+    ...(Array.isArray(body.data?.comments) ? body.data.comments : [])
+  ];
+  const seen = new Set();
+  const normalized = [];
+  const max = Math.min(40, Math.max(1, Number(limit) || 40));
+
+  for (const item of candidates) {
+    const content = normalizeCommentContent(item?.content);
+    if (!content) continue;
+    const id = item?.commentId ?? item?.commentID ?? item?.id ?? '';
+    const key = id ? `id:${id}` : `content:${content}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    normalized.push({
+      id: String(id || key),
+      content,
+      nickname: normalizeCommentNickname(item?.user),
+      likedCount: Math.max(0, Number(item?.likedCount ?? item?.likeCount ?? 0) || 0)
+    });
+    if (normalized.length >= max) break;
+  }
+  return normalized;
+}
+
+function normalizeCommentContent(value) {
+  const text = String(value || '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  if (text.length > 96) return '';
+  if (/该评论已删除|comment deleted|deleted/i.test(text)) return '';
+  return text;
+}
+
+function normalizeCommentNickname(user = {}) {
+  return String(user?.nickname || user?.nickName || user?.name || '').replace(/\s+/g, ' ').trim().slice(0, 24);
+}
+
 function assertCookie() {
   if (!_cookie) throw new Error('NetEase MUSIC_U cookie is not available');
 }

@@ -56,6 +56,19 @@ const progressSeekState = {
 
 let progressAnimationFrame = null;
 
+const DANMAKU_MIN_DELAY_MS = 8000;
+const DANMAKU_MAX_DELAY_MS = 18000;
+const DANMAKU_INITIAL_DELAY_MS = 3200;
+const DANMAKU_MAX_VISIBLE = 3;
+const danmakuState = {
+  timer: null,
+  token: 0,
+  activeTrackId: null,
+  activeSongId: null,
+  comments: [],
+  cache: new Map()
+};
+
 function ensureDemoVisitorId() {
   try {
     let id = sessionStorage.getItem(DEMO_VISITOR_STORAGE_KEY);
@@ -1546,6 +1559,7 @@ function invalidateActivePlaybackEvents() {
 function clearSongAudioHandlers({ reset = false } = {}) {
   const songAudio = document.querySelector('#song-audio');
   if (!songAudio) return;
+  stopCommentDanmaku({ clearLayer: true });
   stopProgressAnimation();
   songAudio.onended = null;
   songAudio.onerror = null;
@@ -1559,6 +1573,7 @@ function clearSongAudioHandlers({ reset = false } = {}) {
 
 function pauseCurrentPlaybackForTransition() {
   invalidateActivePlaybackEvents();
+  stopCommentDanmaku({ clearLayer: true, invalidate: true });
   stopVisualizer();
   setPlaybackToggleState(false);
   interruptPendingHostSpeech();
@@ -2340,6 +2355,7 @@ async function updatePlayer(data, autoplay) {
   document.querySelector('#track-artist').textContent = (track.artists || []).join(' / ') || '等待启动';
   updateAiMusicDownload(track);
   buildLyricDOM(data.track?.lyric || '', { syncMode: data.track?.lyricSync || 'timed' });
+  prepareCommentDanmakuForTrack(track);
 
   const songAudio = document.querySelector('#song-audio');
   if (track.playUrl) {
@@ -2363,6 +2379,117 @@ async function updatePlayer(data, autoplay) {
   if (fill) setProgressBarVisual(0);
   if (current) current.textContent = '00:00';
   if (duration) duration.textContent = '00:00';
+}
+
+function prepareCommentDanmakuForTrack(track = {}) {
+  const songId = getTrackNeteaseSongId(track);
+  stopCommentDanmaku({ clearLayer: true, invalidate: true });
+  danmakuState.activeTrackId = track?.id || null;
+  danmakuState.activeSongId = songId || null;
+  danmakuState.comments = [];
+  if (!songId) return;
+
+  const cached = danmakuState.cache.get(songId);
+  if (cached) {
+    danmakuState.comments = cached;
+    maybeStartCommentDanmaku({ initial: true });
+    return;
+  }
+
+  const token = danmakuState.token;
+  api(`/api/track-comments?songId=${encodeURIComponent(songId)}`)
+    .then((data) => {
+      if (token !== danmakuState.token || danmakuState.activeSongId !== songId) return;
+      const comments = Array.isArray(data.comments) ? data.comments : [];
+      danmakuState.cache.set(songId, comments);
+      danmakuState.comments = comments;
+      maybeStartCommentDanmaku({ initial: true });
+    })
+    .catch(() => {
+      if (token !== danmakuState.token || danmakuState.activeSongId !== songId) return;
+      danmakuState.cache.set(songId, []);
+      danmakuState.comments = [];
+    });
+}
+
+function getTrackNeteaseSongId(track = {}) {
+  const value = track?.originalId || (!track?.aiGenerated ? track?.id : '');
+  const id = String(value || '').trim();
+  return /^\d+$/.test(id) ? id : '';
+}
+
+function stopCommentDanmaku({ clearLayer = false, invalidate = false } = {}) {
+  if (danmakuState.timer) {
+    clearTimeout(danmakuState.timer);
+    danmakuState.timer = null;
+  }
+  if (invalidate) danmakuState.token += 1;
+  if (clearLayer) {
+    const layer = document.querySelector('.player-danmaku-layer');
+    if (layer) layer.innerHTML = '';
+  }
+}
+
+function maybeStartCommentDanmaku({ initial = false } = {}) {
+  if (!danmakuState.comments.length || !isCurrentTrackPlaying()) return;
+  if (danmakuState.timer) return;
+  const delay = initial
+    ? DANMAKU_INITIAL_DELAY_MS
+    : randomBetween(DANMAKU_MIN_DELAY_MS, DANMAKU_MAX_DELAY_MS);
+  danmakuState.timer = setTimeout(() => {
+    danmakuState.timer = null;
+    if (!danmakuState.comments.length || !isCurrentTrackPlaying()) return;
+    spawnCommentDanmaku();
+    maybeStartCommentDanmaku();
+  }, delay);
+}
+
+function isCurrentTrackPlaying() {
+  const track = state.current?.track;
+  if (!track?.id) return false;
+  const songAudio = document.querySelector('#song-audio');
+  if (track.playUrl && songAudio?.src) return !songAudio.paused && !songAudio.ended;
+  return state.activePlayback?.trackId === track.id &&
+    document.querySelector('#play-toggle-btn')?.classList.contains('is-playing');
+}
+
+function spawnCommentDanmaku() {
+  const layer = ensureCommentDanmakuLayer();
+  if (!layer) return;
+  const comments = danmakuState.comments;
+  if (!comments.length) return;
+  while (layer.children.length >= DANMAKU_MAX_VISIBLE) {
+    layer.firstElementChild?.remove();
+  }
+
+  const comment = comments[Math.floor(Math.random() * comments.length)];
+  const bullet = document.createElement('div');
+  bullet.className = 'player-danmaku-bullet';
+  bullet.style.setProperty('--danmaku-y', `${Math.round(randomBetween(8, 76))}%`);
+  bullet.style.setProperty('--danmaku-duration', `${randomBetween(11, 16).toFixed(1)}s`);
+  bullet.style.setProperty('--danmaku-distance', `-${Math.max(560, layer.clientWidth + 420)}px`);
+  const nickname = comment.nickname ? `<em>${escapeHtml(comment.nickname)}</em>` : '';
+  bullet.innerHTML = `<span>${escapeHtml(comment.content || '')}</span>${nickname}`;
+  layer.appendChild(bullet);
+  bullet.addEventListener('animationend', () => bullet.remove(), { once: true });
+  setTimeout(() => bullet.remove(), 18000);
+}
+
+function ensureCommentDanmakuLayer() {
+  const panel = document.querySelector('.now-panel');
+  if (!panel) return null;
+  let layer = panel.querySelector('.player-danmaku-layer');
+  if (!layer) {
+    layer = document.createElement('div');
+    layer.className = 'player-danmaku-layer';
+    layer.setAttribute('aria-hidden', 'true');
+    panel.appendChild(layer);
+  }
+  return layer;
+}
+
+function randomBetween(min, max) {
+  return min + Math.random() * (max - min);
 }
 
 function buildLyricDOM(lrcText, { syncMode = 'timed' } = {}) {
@@ -2558,6 +2685,7 @@ async function startSongPlayback(radioTurn = null) {
     };
     songAudio.onended = async () => {
       if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
+      stopCommentDanmaku({ clearLayer: true });
       stopProgressAnimation();
       stopVisualizer();
       setAvatarState('searching');
@@ -2568,6 +2696,7 @@ async function startSongPlayback(radioTurn = null) {
     };
     songAudio.onplay = () => {
       if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
+      maybeStartCommentDanmaku({ initial: true });
       startProgressAnimation();
       setAvatarState('listening');
       ensureVisualizerAnalysis('song');
@@ -2605,6 +2734,7 @@ function handleBrowserPlaybackIssue(radioTurn, track, playbackToken = null) {
     playCurrentTrack(radioTurn, playbackToken);
     return;
   }
+  stopCommentDanmaku({ clearLayer: true });
   stopVisualizer();
   setPlaybackToggleState(false);
   setAvatarState('searching');
@@ -2960,6 +3090,7 @@ async function playCurrentTrack(radioTurn = null, playbackToken = null) {
     markPlaybackStarted(track, 'ncm-cli');
     setAvatarState('listening');
     setPlaybackToggleState(true);
+    maybeStartCommentDanmaku({ initial: true });
     setPlayerStatus(`正在播放：${track.name}`, 'playing');
     api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
   } catch (error) {
@@ -2970,6 +3101,7 @@ async function playCurrentTrack(radioTurn = null, playbackToken = null) {
 }
 
 async function pausePlayback() {
+  stopCommentDanmaku({ clearLayer: true });
   stopVisualizer();
   setAvatarState('idle');
   setPlaybackToggleState(false);
@@ -2992,6 +3124,7 @@ async function resumePlayback() {
     setAvatarState('listening');
     setPlaybackToggleState(true);
     switchVisualizerTo('song');
+    maybeStartCommentDanmaku({ initial: true });
     songAudio.play().catch(() => {});
     setPlayerStatus('继续播放', 'playing');
     return;
@@ -3000,6 +3133,7 @@ async function resumePlayback() {
     await api('/api/player/resume', { method: 'POST', body: {} });
     setAvatarState('listening');
     setPlaybackToggleState(true);
+    maybeStartCommentDanmaku({ initial: true });
     setPlayerStatus('继续播放', 'playing');
   } catch (error) {
     setPlayerStatus(formatPlaybackErrorMessage(error), 'error');
@@ -3008,6 +3142,7 @@ async function resumePlayback() {
 
 async function stopPlayback() {
   invalidateActivePlaybackEvents();
+  stopCommentDanmaku({ clearLayer: true, invalidate: true });
   stopVisualizer();
   setAvatarState('idle');
   setPlaybackToggleState(false);
@@ -3034,6 +3169,7 @@ async function pollPlayerState() {
     const data = await api('/api/player/state');
     const status = data.state?.status || data.state?.playerState || 'unknown';
     if (status === 'playing') maybeReportInferredComplete();
+    else if (state.activePlayback?.source === 'ncm-cli') stopCommentDanmaku({ clearLayer: true });
   } catch {
     // State polling should not interrupt the radio UI.
   }

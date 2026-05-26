@@ -483,6 +483,70 @@ button.danger:hover {
 .now-panel::before { top: -1px; left: -1px; border-right: none; border-bottom: none; }
 .now-panel::after  { bottom: -1px; right: -1px; border-left: none; border-top: none; }
 
+.player-danmaku-layer {
+  position: absolute;
+  inset: 10px 12px 78px;
+  z-index: 3;
+  overflow: hidden;
+  pointer-events: none;
+  contain: layout paint;
+}
+
+.player-danmaku-bullet {
+  position: absolute;
+  top: var(--danmaku-y, 28%);
+  right: -420px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(440px, 80%);
+  padding: 6px 9px;
+  border: 1px solid rgba(0, 240, 255, 0.28);
+  border-radius: 4px;
+  color: rgba(245, 251, 255, 0.92);
+  background:
+    linear-gradient(90deg, rgba(4, 8, 22, 0.14), rgba(4, 8, 22, 0.74)),
+    repeating-linear-gradient(0deg, rgba(0, 240, 255, 0.08) 0 1px, transparent 1px 4px);
+  box-shadow:
+    0 0 12px rgba(0, 240, 255, 0.14),
+    inset 0 0 14px rgba(255, 0, 255, 0.06);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.45;
+  text-shadow: 0 0 8px rgba(0, 240, 255, 0.32);
+  white-space: nowrap;
+  transform: translate3d(0, -50%, 0);
+  animation: player-danmaku-fly var(--danmaku-duration, 13s) linear forwards;
+  will-change: transform, opacity;
+}
+
+.player-danmaku-bullet span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.player-danmaku-bullet em {
+  flex: 0 0 auto;
+  color: var(--yellow);
+  font-style: normal;
+  opacity: 0.78;
+}
+
+@keyframes player-danmaku-fly {
+  0% {
+    opacity: 0;
+    transform: translate3d(0, -50%, 0);
+  }
+  8%, 86% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translate3d(var(--danmaku-distance, -900px), -50%, 0);
+  }
+}
+
 .start-wide {
   width: 100%;
   padding: 14px;
@@ -3750,6 +3814,15 @@ button.small {
     width: min(100%, 258px);
   }
 
+  .player-danmaku-layer {
+    inset: 8px 10px 58px;
+  }
+
+  .player-danmaku-bullet {
+    max-width: min(360px, 86%);
+    font-size: 10px;
+  }
+
   .playback-controls {
     grid-template-columns: 40px 58px 40px;
     justify-content: center;
@@ -3824,5 +3897,11 @@ button.small {
 @media (prefers-reduced-motion: reduce) {
   #visualizer-canvas {
     opacity: 0.28;
+  }
+
+  .player-danmaku-bullet {
+    animation-duration: 0.01ms;
+    opacity: 0;
+    will-change: auto;
   }
 }

@@ -12,7 +12,7 @@ import { clearLibraryAccountSnapshot, getLibrary, getProfile, syncLibrary, updat
 import { chatRadio, getMemories, getMoodStatsSummary, getPreferences, getRadioDebug, jumpPlaylistRadio, nextPlaylistRadio, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startPlaylistRadio, startRadio, submitFeedback, updateMemory, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { createNcmPlayer } from './player.mjs';
-import { checkCookieQrLogin, clearCookie, createCookieQrLogin, getCookieStatus, getCookieUserProfile, loadCookie, resolveCommunityApiFile } from './community.mjs';
+import { checkCookieQrLogin, clearCookie, createCookieQrLogin, getCookieStatus, getCookieUserProfile, getSongComments, loadCookie, resolveCommunityApiFile } from './community.mjs';
 import { runDemoSelfCheck } from './diagnostics.mjs';
 import { publicAccountContext, resolveAccountContext } from './account-scope.mjs';
 import { generateAiMusic } from './ai-music.mjs';
@@ -265,6 +265,13 @@ const routes = {
   'GET /api/library/sync/status': async () => getLibrarySyncStatus(),
   'GET /api/library': async (req) => getLibrary(db, getRequestAccount(req)),
   'GET /api/library/profile': async (req) => getProfile(db, getRequestAccount(req)),
+  'GET /api/track-comments': async (req) => {
+    const url = new URL(req.url, 'http://local');
+    const songId = url.searchParams.get('songId') || '';
+    if (!/^\d+$/.test(songId)) return { ok: true, comments: [] };
+    const comments = await getSongComments(songId, { limit: 40 });
+    return { ok: true, songId, comments };
+  },
   'PUT /api/library/profile-playlists': async (req) => {
     const body = await readJson(req);
     if (!Array.isArray(body.selectedPlaylistIds)) return jsonError('selectedPlaylistIds must be an array', 400);
