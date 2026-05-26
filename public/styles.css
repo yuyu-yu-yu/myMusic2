@@ -1686,13 +1686,32 @@ audio {
   z-index: 2;
   width: 18px;
   height: 18px;
+  min-width: 0;
+  min-height: 0;
   padding: 0;
   border: 0;
+  border-radius: 0;
   background: transparent;
+  box-shadow: none;
+  color: transparent;
   cursor: grab;
+  font-size: 0;
+  letter-spacing: 0;
   transform: translate3d(-50%, -50%, 0);
+  transition: none;
   touch-action: none;
   box-sizing: border-box;
+}
+
+.progress-thumb:hover,
+.progress-thumb:active,
+.progress-thumb.btn-pressed {
+  animation: none;
+  border: 0;
+  background: transparent;
+  box-shadow: none;
+  color: transparent;
+  transform: translate3d(-50%, -50%, 0);
 }
 
 .progress-thumb::before {
@@ -1892,6 +1911,10 @@ audio {
   border-radius: 4px;
 }
 
+.lyric-viewport.is-seeking {
+  scroll-behavior: auto;
+}
+
 .lyric-line {
   text-align: center;
   padding: 10px 16px;
@@ -1904,6 +1927,10 @@ audio {
   transition: all 0.45s cubic-bezier(0.25, 0.1, 0.25, 1);
   cursor: default;
   user-select: none;
+}
+
+.lyric-viewport.is-seeking .lyric-line {
+  transition: none;
 }
 
 .lyric-line.near {

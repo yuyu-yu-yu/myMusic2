@@ -2444,6 +2444,7 @@ function syncLyricTime(currentTimeSec, { forceCenter = false } = {}) {
 
   const viewport = document.querySelector('.lyric-viewport');
   if (!viewport) return;
+  if (forceCenter) viewport.classList.add('is-seeking');
 
   viewport.querySelectorAll('.lyric-line').forEach((el, i) => {
     const dist = Math.abs(i - activeIndex);
@@ -2456,30 +2457,40 @@ function syncLyricTime(currentTimeSec, { forceCenter = false } = {}) {
   if (activeIndex >= 0) {
     const activeEl = viewport.querySelector(`.lyric-line[data-index="${activeIndex}"]`);
     if (activeEl) {
-      centerLyricLine(viewport, activeEl, { stabilize: forceCenter });
+      centerLyricLine(viewport, activeEl, { stabilize: forceCenter, immediate: forceCenter });
     }
+  }
+
+  if (forceCenter) {
+    setTimeout(() => {
+      if (viewport.isConnected) viewport.classList.remove('is-seeking');
+    }, 180);
   }
 }
 
-function centerLyricLine(viewport, lineEl, { stabilize = false } = {}) {
-  const center = () => requestAnimationFrame(() => {
-    if (!viewport?.isConnected || !lineEl?.isConnected) return;
-    updateLyricCenterPadding(viewport, lineEl);
-    const viewportRect = viewport.getBoundingClientRect();
-    const lineRect = lineEl.getBoundingClientRect();
-    const targetTop = viewport.scrollTop
-      + (lineRect.top + lineRect.height / 2)
-      - (viewportRect.top + viewportRect.height / 2);
-    const maxTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
-    viewport.scrollTo({
-      top: Math.min(maxTop, Math.max(0, targetTop)),
-      behavior: 'auto'
-    });
+function applyLyricCenter(viewport, lineEl) {
+  if (!viewport?.isConnected || !lineEl?.isConnected) return;
+  updateLyricCenterPadding(viewport, lineEl);
+  const viewportRect = viewport.getBoundingClientRect();
+  const lineRect = lineEl.getBoundingClientRect();
+  const targetTop = viewport.scrollTop
+    + (lineRect.top + lineRect.height / 2)
+    - (viewportRect.top + viewportRect.height / 2);
+  const maxTop = Math.max(0, viewport.scrollHeight - viewport.clientHeight);
+  viewport.scrollTo({
+    top: Math.min(maxTop, Math.max(0, targetTop)),
+    behavior: 'auto'
   });
+}
+
+function centerLyricLine(viewport, lineEl, { stabilize = false, immediate = false } = {}) {
+  const center = () => requestAnimationFrame(() => applyLyricCenter(viewport, lineEl));
+  if (immediate) applyLyricCenter(viewport, lineEl);
   center();
   if (stabilize) {
-    setTimeout(center, 80);
-    setTimeout(center, 240);
+    setTimeout(center, 48);
+    setTimeout(center, 140);
+    setTimeout(center, 320);
   }
 }
 
