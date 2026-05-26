@@ -1120,6 +1120,7 @@ function renderPlayer() {
   }
 
   if (state.current) updatePlayer(state.current, false);
+  else renderLyricStandby();
   scheduleLyricResyncToCurrentPlayback();
   updatePreviousButtonState();
   setAvatarState(state.avatarState || getContextualAvatarState());
@@ -2424,6 +2425,29 @@ function buildLyricDOM(lrcText, { syncMode = 'timed' } = {}) {
 
   container.appendChild(viewport);
   updateLyricCenterPadding(viewport);
+}
+
+function renderLyricStandby() {
+  const container = document.querySelector('#lyric');
+  if (!container) return;
+
+  state.lyricLines = [];
+  state.activeLyricIndex = -1;
+  container.innerHTML = `
+    <div class="lyric-standby" aria-label="CanCan radio standby signal">
+      <div class="lyric-standby-scope" aria-hidden="true">
+        <span class="lyric-standby-scan"></span>
+        <div class="lyric-standby-bars">
+          ${Array.from({ length: 8 }, () => '<span></span>').join('')}
+        </div>
+      </div>
+      <div class="lyric-standby-copy">
+        <span class="lyric-standby-kicker">CANCAN RADIO ARRAY</span>
+        <strong>SIGNAL STANDBY</strong>
+        <p>Waiting for your private frequency</p>
+      </div>
+    </div>
+  `;
 }
 
 function syncLyricTime(currentTimeSec, { forceCenter = false } = {}) {
