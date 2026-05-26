@@ -66,6 +66,7 @@ const danmakuState = {
   activeTrackId: null,
   activeSongId: null,
   comments: [],
+  remainingComments: [],
   cache: new Map()
 };
 
@@ -2387,11 +2388,12 @@ function prepareCommentDanmakuForTrack(track = {}) {
   danmakuState.activeTrackId = track?.id || null;
   danmakuState.activeSongId = songId || null;
   danmakuState.comments = [];
+  danmakuState.remainingComments = [];
   if (!songId) return;
 
   const cached = danmakuState.cache.get(songId);
   if (cached) {
-    danmakuState.comments = cached;
+    setCommentDanmakuComments(cached);
     maybeStartCommentDanmaku({ initial: true });
     return;
   }
@@ -2402,14 +2404,21 @@ function prepareCommentDanmakuForTrack(track = {}) {
       if (token !== danmakuState.token || danmakuState.activeSongId !== songId || String(data.songId || '') !== songId) return;
       const comments = Array.isArray(data.comments) ? data.comments : [];
       danmakuState.cache.set(songId, comments);
-      danmakuState.comments = comments;
+      setCommentDanmakuComments(comments);
       maybeStartCommentDanmaku({ initial: true });
     })
     .catch(() => {
       if (token !== danmakuState.token || danmakuState.activeSongId !== songId) return;
       danmakuState.cache.set(songId, []);
       danmakuState.comments = [];
+      danmakuState.remainingComments = [];
     });
+}
+
+function setCommentDanmakuComments(comments = []) {
+  const safeComments = Array.isArray(comments) ? comments.filter(comment => comment?.content) : [];
+  danmakuState.comments = safeComments;
+  danmakuState.remainingComments = shuffledComments(safeComments);
 }
 
 function getTrackNeteaseSongId(track = {}) {
@@ -2431,14 +2440,14 @@ function stopCommentDanmaku({ clearLayer = false, invalidate = false } = {}) {
 }
 
 function maybeStartCommentDanmaku({ initial = false } = {}) {
-  if (!danmakuState.comments.length || !isCurrentTrackPlaying()) return;
+  if (!danmakuState.remainingComments.length || !isCurrentTrackPlaying()) return;
   if (danmakuState.timer) return;
   const delay = initial
     ? DANMAKU_INITIAL_DELAY_MS
     : randomBetween(DANMAKU_MIN_DELAY_MS, DANMAKU_MAX_DELAY_MS);
   danmakuState.timer = setTimeout(() => {
     danmakuState.timer = null;
-    if (!danmakuState.comments.length || !isCurrentTrackPlaying()) return;
+    if (!danmakuState.remainingComments.length || !isCurrentTrackPlaying()) return;
     spawnCommentDanmaku();
     maybeStartCommentDanmaku();
   }, delay);
@@ -2456,13 +2465,12 @@ function isCurrentTrackPlaying() {
 function spawnCommentDanmaku() {
   const layer = ensureCommentDanmakuLayer();
   if (!layer) return;
-  const comments = danmakuState.comments;
-  if (!comments.length) return;
+  const comment = danmakuState.remainingComments.shift();
+  if (!comment) return;
   while (layer.children.length >= DANMAKU_MAX_VISIBLE) {
     layer.firstElementChild?.remove();
   }
 
-  const comment = comments[Math.floor(Math.random() * comments.length)];
   const bullet = document.createElement('div');
   bullet.className = 'player-danmaku-bullet';
   bullet.style.setProperty('--danmaku-y', `${Math.round(randomBetween(8, 76))}%`);
@@ -2493,6 +2501,15 @@ function ensureCommentDanmakuLayer() {
 
 function randomBetween(min, max) {
   return min + Math.random() * (max - min);
+}
+
+function shuffledComments(comments = []) {
+  const items = [...comments];
+  for (let i = items.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [items[i], items[j]] = [items[j], items[i]];
+  }
+  return items;
 }
 
 function buildLyricDOM(lrcText, { syncMode = 'timed' } = {}) {
