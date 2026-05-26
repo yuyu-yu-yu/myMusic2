@@ -17,12 +17,17 @@ test('song comments normalize safe hot comments for danmaku', () => {
 
   assert.deepEqual(comments, [
     { id: '1', content: '第一条 评论 很短', nickname: 'Alice', likedCount: 12 },
+    { id: '3', content: 'x'.repeat(120), nickname: 'Long', likedCount: 9 },
     { id: '4', content: '适合飘过的一句', nickname: 'Carol', likedCount: 0 }
   ]);
 });
 
-test('song comments fall back to normal comments and respect limit', () => {
+test('song comments use only hot comments and respect limit', () => {
   const comments = normalizeSongComments({
+    hotComments: [
+      { commentId: 'hot-a', content: '热门评论 A', user: { nickname: 'Hot A' } },
+      { commentId: 'hot-b', content: '热门评论 B', user: { nickname: 'Hot B' } }
+    ],
     comments: [
       { commentId: 'a', content: '普通评论 A', user: { nickname: 'A' } },
       { commentId: 'b', content: '普通评论 B', user: { nickname: 'B' } }
@@ -30,7 +35,7 @@ test('song comments fall back to normal comments and respect limit', () => {
   }, 1);
 
   assert.deepEqual(comments, [
-    { id: 'a', content: '普通评论 A', nickname: 'A', likedCount: 0 }
+    { id: 'hot-a', content: '热门评论 A', nickname: 'Hot A', likedCount: 0 }
   ]);
 });
 

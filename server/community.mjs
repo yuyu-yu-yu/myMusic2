@@ -336,9 +336,7 @@ export function normalizeSongComments(result, limit = 40) {
   const body = result?.body || result?.data || result || {};
   const candidates = [
     ...(Array.isArray(body.hotComments) ? body.hotComments : []),
-    ...(Array.isArray(body.comments) ? body.comments : []),
-    ...(Array.isArray(body.data?.hotComments) ? body.data.hotComments : []),
-    ...(Array.isArray(body.data?.comments) ? body.data.comments : [])
+    ...(Array.isArray(body.data?.hotComments) ? body.data.hotComments : [])
   ];
   const seen = new Set();
   const normalized = [];
@@ -365,7 +363,6 @@ export function normalizeSongComments(result, limit = 40) {
 function normalizeCommentContent(value) {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
   if (!text) return '';
-  if (text.length > 96) return '';
   if (/该评论已删除|comment deleted|deleted/i.test(text)) return '';
   return text;
 }

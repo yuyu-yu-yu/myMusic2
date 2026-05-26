@@ -495,11 +495,10 @@ button.danger:hover {
 .player-danmaku-bullet {
   position: absolute;
   top: var(--danmaku-y, 28%);
-  right: -420px;
+  left: 100%;
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  max-width: min(440px, 80%);
   padding: 6px 9px;
   border: 1px solid rgba(0, 240, 255, 0.28);
   border-radius: 4px;
@@ -521,9 +520,9 @@ button.danger:hover {
 }
 
 .player-danmaku-bullet span {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  flex: 0 0 auto;
+  overflow: visible;
+  text-overflow: clip;
 }
 
 .player-danmaku-bullet em {
@@ -3819,7 +3818,6 @@ button.small {
   }
 
   .player-danmaku-bullet {
-    max-width: min(360px, 86%);
     font-size: 10px;
   }
 

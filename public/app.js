@@ -56,10 +56,10 @@ const progressSeekState = {
 
 let progressAnimationFrame = null;
 
-const DANMAKU_MIN_DELAY_MS = 8000;
-const DANMAKU_MAX_DELAY_MS = 18000;
-const DANMAKU_INITIAL_DELAY_MS = 3200;
-const DANMAKU_MAX_VISIBLE = 3;
+const DANMAKU_MIN_DELAY_MS = 4500;
+const DANMAKU_MAX_DELAY_MS = 9500;
+const DANMAKU_INITIAL_DELAY_MS = 1800;
+const DANMAKU_MAX_VISIBLE = 4;
 const danmakuState = {
   timer: null,
   token: 0,
@@ -2399,7 +2399,7 @@ function prepareCommentDanmakuForTrack(track = {}) {
   const token = danmakuState.token;
   api(`/api/track-comments?songId=${encodeURIComponent(songId)}`)
     .then((data) => {
-      if (token !== danmakuState.token || danmakuState.activeSongId !== songId) return;
+      if (token !== danmakuState.token || danmakuState.activeSongId !== songId || String(data.songId || '') !== songId) return;
       const comments = Array.isArray(data.comments) ? data.comments : [];
       danmakuState.cache.set(songId, comments);
       danmakuState.comments = comments;
@@ -2413,7 +2413,7 @@ function prepareCommentDanmakuForTrack(track = {}) {
 }
 
 function getTrackNeteaseSongId(track = {}) {
-  const value = track?.originalId || (!track?.aiGenerated ? track?.id : '');
+  const value = track?.originalId || '';
   const id = String(value || '').trim();
   return /^\d+$/.test(id) ? id : '';
 }
@@ -2466,13 +2466,16 @@ function spawnCommentDanmaku() {
   const bullet = document.createElement('div');
   bullet.className = 'player-danmaku-bullet';
   bullet.style.setProperty('--danmaku-y', `${Math.round(randomBetween(8, 76))}%`);
-  bullet.style.setProperty('--danmaku-duration', `${randomBetween(11, 16).toFixed(1)}s`);
-  bullet.style.setProperty('--danmaku-distance', `-${Math.max(560, layer.clientWidth + 420)}px`);
   const nickname = comment.nickname ? `<em>${escapeHtml(comment.nickname)}</em>` : '';
   bullet.innerHTML = `<span>${escapeHtml(comment.content || '')}</span>${nickname}`;
   layer.appendChild(bullet);
+  const width = Math.max(120, bullet.scrollWidth || bullet.getBoundingClientRect().width || 240);
+  const distance = Math.ceil(layer.clientWidth + width + 48);
+  const duration = Math.min(30, Math.max(13, distance / 58));
+  bullet.style.setProperty('--danmaku-duration', `${duration.toFixed(1)}s`);
+  bullet.style.setProperty('--danmaku-distance', `-${distance}px`);
   bullet.addEventListener('animationend', () => bullet.remove(), { once: true });
-  setTimeout(() => bullet.remove(), 18000);
+  setTimeout(() => bullet.remove(), Math.ceil(duration * 1000) + 1000);
 }
 
 function ensureCommentDanmakuLayer() {
