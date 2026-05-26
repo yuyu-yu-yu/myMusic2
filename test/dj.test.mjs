@@ -24,6 +24,7 @@ import {
   analyzeTurnContext,
   buildConfirmedTrackHostFallback,
   formatEnvironmentContext,
+  buildRecommendationExplanation,
   buildMemoryContext,
   buildFinalHostMessages,
   buildSongSearchQueries,
@@ -36,6 +37,7 @@ import {
   decideTurnAction,
   djTurn,
   extractAndStoreMemories,
+  extractRequestedSongTitle,
   ensureRecommendationTextMatchesTrack,
   getRadioDebugStatus,
   getRadioQueueStatus,
@@ -158,6 +160,30 @@ test('candidate ranking deduplicates tracks and keeps highest scoring source', (
 
   assert.equal(selected.filter(item => item.track.id === 'same-track').length, 1);
   assert.equal(selected.find(item => item.track.id === 'same-track').source, 'community_search');
+});
+
+test('scene recommendation requests are not parsed as song titles', () => {
+  assert.equal(extractRequestedSongTitle('\u6211\u6b63\u5728\u6559\u5ba4\uff0c\u8bf7\u5e2e\u6211\u63a8\u8350\u9002\u5408\u6559\u5ba4\u7684\u6b4c'), '');
+  assert.equal(extractRequestedSongTitle('\u6211\u6b63\u5728\u5065\u8eab\u623f\uff0c\u8bf7\u5e2e\u6211\u63a8\u8350\u9002\u5408\u5065\u8eab\u623f\u7684\u97f3\u4e50'), '');
+  assert.equal(extractRequestedSongTitle('\u6211\u60f3\u542c\u300a\u6674\u5929\u300b'), '\u6674\u5929');
+  assert.equal(extractRequestedSongTitle('\u653e\u4e00\u9996\u5bcc\u58eb\u5c71\u4e0b'), '\u5bcc\u58eb\u5c71\u4e0b');
+});
+
+test('recommendation explanation hides internal fallback reasons', () => {
+  const explanation = buildRecommendationExplanation({
+    selectedPick: {
+      reason: '\u539f\u6765\u60f3\u627e\u7684\u300a\u9002\u5408\u6559\u5ba4\u300b\u6ca1\u6709\u786e\u8ba4\u5230\u7a33\u5b9a\u64ad\u653e\u6e90\uff0c\u5148\u6362\u540c\u6b4c\u624b\u91cc\u66f4\u7a33\u7684\u4e00\u9996\u3002'
+    },
+    selectedTrack: { name: 'River Flows in You', artists: ['Yiruma'] },
+    userMessage: '\u6211\u6b63\u5728\u6559\u5ba4\uff0c\u8bf7\u5e2e\u6211\u63a8\u8350\u9002\u5408\u6559\u5ba4\u7684\u6b4c',
+    conversationMood: { searchHints: ['\u6559\u5ba4', '\u5b89\u9759', '\u8f7b\u97f3\u4e50'] },
+    timeOfDay: '\u4e0b\u5348',
+    profile: { structured: { artists: [{ name: '\u738b\u83f2' }], genres: [{ name: '\u534e\u8bed\u6d41\u884c' }] } },
+    source: 'fallback'
+  });
+  const text = JSON.stringify(explanation);
+  assert.doesNotMatch(text, /\u539f\u6765\u60f3\u627e|\u6ca1\u6709\u786e\u8ba4\u5230|\u7a33\u5b9a\u64ad\u653e\u6e90|\u66f4\u7a33\u7684\u4e00\u9996|LLM|\u515c\u5e95/);
+  assert.match(text, /\u6559\u5ba4|\u5b89\u9759|\u8f7b\u97f3\u4e50|\u4e0b\u5348/);
 });
 
 test('song plan parser creates concrete song-search queries', () => {

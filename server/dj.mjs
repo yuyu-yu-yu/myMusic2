@@ -2289,10 +2289,11 @@ function normalizeRecommendationExplanation(explanation = null) {
         type: String(factor?.type || 'fallback').trim(),
         text: String(factor?.text || factor?.value || '').trim().slice(0, 80)
       }))
-      .filter(factor => factor.text)
+      .filter(factor => factor.text && !isInternalRecommendationExplanationText(factor.text))
       .slice(0, 6)
     : [];
-  const summary = String(explanation.summary || factors.map(factor => factor.text).join(' + ')).trim().slice(0, 180);
+  const rawSummary = String(explanation.summary || factors.map(factor => factor.text).join(' + ')).trim();
+  const summary = isInternalRecommendationExplanationText(rawSummary) ? '' : rawSummary.slice(0, 180);
   if (!summary && !factors.length) return null;
   return {
     summary,
@@ -2301,7 +2302,7 @@ function normalizeRecommendationExplanation(explanation = null) {
   };
 }
 
-function buildRecommendationExplanation({
+export function buildRecommendationExplanation({
   selectedPick = {},
   selectedTrack = {},
   userMessage = '',
@@ -2323,7 +2324,8 @@ function buildRecommendationExplanation({
   if (String(userMessage || '').trim()) {
     add(hasExplicitMusicIntent(userMessage) ? 'explicit_request' : 'chat', `你刚刚说：${String(userMessage).trim().slice(0, 34)}`);
   }
-  if (selectedPick?.reason) add('chat', selectedPick.reason);
+  const pickReason = sanitizeRecommendationReasonForExplanation(selectedPick?.reason);
+  if (pickReason) add('chat', pickReason);
   if (conversationMood?.searchHints?.length) add('chat', `当前氛围：${conversationMood.searchHints.slice(0, 3).join(' / ')}`);
   if (timeOfDay) add('time', `现在是${timeOfDay}`);
   const weatherHint = shortWeatherHint(weather);
@@ -2338,6 +2340,18 @@ function buildRecommendationExplanation({
     factors,
     source: source === 'llm_pick' ? 'llm_pick' : 'fallback'
   });
+}
+
+function sanitizeRecommendationReasonForExplanation(reason = '') {
+  const text = String(reason || '').replace(/\s+/g, ' ').trim();
+  return isInternalRecommendationExplanationText(text) ? '' : text;
+}
+
+function isInternalRecommendationExplanationText(text = '') {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  return /LLM|profile_fallback|same_artist_fallback|fallback|playable source|stable playback/i.test(value) ||
+    /没有确认到|未确认到|稳定播放源|可播放源|兜底|原来想找|更稳的一首|改用当前账号/.test(value);
 }
 
 function shortWeatherHint(weather = '') {
@@ -2808,10 +2822,11 @@ function safeListTracks(db) {
   }
 }
 
-function extractRequestedSongTitle(text, artistConstraint = null) {
+export function extractRequestedSongTitle(text, artistConstraint = null) {
   const value = String(text || '').trim();
   const quoted = value.match(/《([^》]{1,40})》/);
   if (quoted?.[1]) return cleanRequestedSongTitle(quoted[1], artistConstraint);
+  if (isSceneRecommendationRequest(value)) return '';
 
   if (artistConstraint?.aliases?.length) {
     for (const alias of artistConstraint.aliases) {
@@ -2834,6 +2849,13 @@ function extractRequestedSongTitle(text, artistConstraint = null) {
   return '';
 }
 
+function isSceneRecommendationRequest(value = '') {
+  const text = String(value || '').trim();
+  if (!text) return false;
+  return /(?:推荐|放|来|听|找).{0,10}适合[^，。？！,.!?]{1,18}(?:的)?(?:歌|音乐|曲子|歌曲|BGM|bgm)/.test(text) ||
+    /(?:正在|在|到了|位于|准备在).{0,18}(?:教室|自习室|健身房|宿舍|图书馆|办公室|课堂|学习|工作|通勤|路上|睡前|夜里).{0,18}(?:推荐|放|来|听|找)/.test(text);
+}
+
 function cleanRequestedSongTitle(value, artistConstraint = null) {
   let text = String(value || '')
     .replace(/^(我想|想|还想|要|我要|给我|帮我|重新|再|重听|再听|再放|再播|听|放|播放|播|来一首|来首|再来|推荐|一下|一遍|一次|一回|一首|首|点|一点|一些|几首)+/g, '')
@@ -2846,6 +2868,7 @@ function cleanRequestedSongTitle(value, artistConstraint = null) {
   const normalized = normalizeMusicText(text);
   if (normalized.length < 2 || normalized.length > 24) return '';
   if (GENERIC_ARTIST_PHRASES.has(normalized)) return '';
+  if (/^适合/.test(text) && /(?:教室|自习室|健身房|宿舍|图书馆|办公室|课堂|学习|工作|通勤|路上|睡前|夜里|场景)/.test(text)) return '';
   if (/^(他的|她的|他们的|她们的|它的|那首|一首|几首|一些|一点|歌|歌曲|音乐|作品|专辑)$/.test(text)) return '';
   return text;
 }
