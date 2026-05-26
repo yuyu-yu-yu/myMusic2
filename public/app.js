@@ -1110,6 +1110,7 @@ function renderPlayer() {
   }
 
   if (state.current) updatePlayer(state.current, false);
+  scheduleLyricResyncToCurrentPlayback();
   updatePreviousButtonState();
   setAvatarState(state.avatarState || getContextualAvatarState());
   setRadioButtonState(state.sessionId || state.current?.track ? 'active' : 'idle');
@@ -1240,7 +1241,9 @@ function sanitizeDownloadFilename(value = '') {
 async function handleDislike() {
   showDislikeBurst();
   setAvatarState('searching');
+  const stopCurrentPromise = pauseCurrentPlaybackForTransition();
   await reportFeedback('dislike');
+  await stopCurrentPromise;
   nextTrack({ skipCurrent: false });
 }
 
@@ -1542,6 +1545,17 @@ function clearSongAudioHandlers({ reset = false } = {}) {
   }
 }
 
+function pauseCurrentPlaybackForTransition() {
+  invalidateActivePlaybackEvents();
+  stopVisualizer();
+  setPlaybackToggleState(false);
+  interruptPendingHostSpeech();
+  const songAudio = document.querySelector('#song-audio');
+  if (songAudio) songAudio.pause();
+  clearSongAudioHandlers();
+  return api('/api/player/stop', { method: 'POST', body: {} }).catch(() => null);
+}
+
 function scheduleRadioPrefetch({ force = false } = {}) {
   if (state.aiMusicMode) return Promise.resolve(null);
   if (state.radioMode === 'playlist') return Promise.resolve(null);
@@ -1661,11 +1675,13 @@ async function nextTrack({ skipCurrent = true, silent = false, forceFresh = fals
   }
 
   const radioTurn = beginRadioTurn();
+  const stopCurrentPromise = skipCurrent ? pauseCurrentPlaybackForTransition() : null;
   primeVoicePlayback();
   const sessionId = ensureSessionId();
   setAvatarState('searching');
   setPlaybackToggleState(false);
   if (skipCurrent) await reportFeedback('skip');
+  if (stopCurrentPromise) await stopCurrentPromise;
   if (!isActiveRadioTurn(radioTurn)) return;
   if (!silent) {
     appendChat({ role: 'user', text: state.aiMusicMode ? '生成此刻歌曲' : state.radioMode === 'playlist' ? '歌单下一首' : '下一首' });
@@ -1714,11 +1730,13 @@ async function jumpPlaylistTo(index) {
   const item = state.activePlaylist.items?.[index];
   if (!item || item.status !== 'pending') return;
   const radioTurn = beginRadioTurn();
+  const stopCurrentPromise = pauseCurrentPlaybackForTransition();
   primeVoicePlayback();
   const sessionId = ensureSessionId();
   setAvatarState('searching');
   setPlaybackToggleState(false);
   await reportFeedback('skip');
+  await stopCurrentPromise;
   if (!isActiveRadioTurn(radioTurn)) return;
   appendChat({ role: 'user', text: `跳到歌单第 ${index + 1} 首` });
   const loading = startLoadingMessages('playlistNext');
@@ -1938,8 +1956,10 @@ function updatePreviousButtonState() {
 async function playPlaybackSequenceItem(item, { direction = 'previous', skipCurrent = false, silent = false } = {}) {
   if (!item?.track) return false;
   const radioTurn = beginRadioTurn();
+  const stopCurrentPromise = skipCurrent ? pauseCurrentPlaybackForTransition() : null;
   primeVoicePlayback();
   if (skipCurrent) await reportFeedback('skip');
+  if (stopCurrentPromise) await stopCurrentPromise;
   if (!isActiveRadioTurn(radioTurn)) return false;
   stopVisualizer();
   setAvatarState('searching');
@@ -2395,7 +2415,7 @@ function buildLyricDOM(lrcText, { syncMode = 'timed' } = {}) {
   updateLyricCenterPadding(viewport);
 }
 
-function syncLyricTime(currentTimeSec) {
+function syncLyricTime(currentTimeSec, { forceCenter = false } = {}) {
   const lines = state.lyricLines;
   if (!lines.length) return;
 
@@ -2408,7 +2428,7 @@ function syncLyricTime(currentTimeSec) {
     }
   }
 
-  if (activeIndex === state.activeLyricIndex) return;
+  if (activeIndex === state.activeLyricIndex && !forceCenter) return;
   state.activeLyricIndex = activeIndex;
 
   const viewport = document.querySelector('.lyric-viewport');
@@ -2425,13 +2445,13 @@ function syncLyricTime(currentTimeSec) {
   if (activeIndex >= 0) {
     const activeEl = viewport.querySelector(`.lyric-line[data-index="${activeIndex}"]`);
     if (activeEl) {
-      centerLyricLine(viewport, activeEl);
+      centerLyricLine(viewport, activeEl, { stabilize: forceCenter });
     }
   }
 }
 
-function centerLyricLine(viewport, lineEl) {
-  requestAnimationFrame(() => {
+function centerLyricLine(viewport, lineEl, { stabilize = false } = {}) {
+  const center = () => requestAnimationFrame(() => {
     if (!viewport?.isConnected || !lineEl?.isConnected) return;
     updateLyricCenterPadding(viewport, lineEl);
     const viewportRect = viewport.getBoundingClientRect();
@@ -2445,6 +2465,11 @@ function centerLyricLine(viewport, lineEl) {
       behavior: 'auto'
     });
   });
+  center();
+  if (stabilize) {
+    setTimeout(center, 80);
+    setTimeout(center, 240);
+  }
 }
 
 function updateLyricCenterPadding(viewport, lineEl = null) {
@@ -2455,6 +2480,16 @@ function updateLyricCenterPadding(viewport, lineEl = null) {
   const lineHeight = sampleLine?.getBoundingClientRect().height || 52;
   const centerPadding = Math.max(28, Math.round((viewportHeight - lineHeight) / 2));
   viewport.style.setProperty('--lyric-center-padding', `${centerPadding}px`);
+}
+
+function scheduleLyricResyncToCurrentPlayback() {
+  const sync = () => {
+    const songAudio = document.querySelector('#song-audio');
+    if (!songAudio) return;
+    syncLyricTime(Number(songAudio.currentTime) || 0, { forceCenter: true });
+  };
+  requestAnimationFrame(sync);
+  setTimeout(sync, 120);
 }
 
 async function startSongPlayback(radioTurn = null) {
@@ -2762,6 +2797,10 @@ async function pausePlayback() {
 
 async function resumePlayback() {
   const songAudio = document.querySelector('#song-audio');
+  if (songAudio?.src && state.current?.track?.playUrl) {
+    startSongPlayback();
+    return;
+  }
   if (songAudio?.src) {
     setAvatarState('listening');
     setPlaybackToggleState(true);
