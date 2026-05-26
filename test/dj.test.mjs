@@ -164,6 +164,7 @@ test('candidate ranking deduplicates tracks and keeps highest scoring source', (
 
 test('scene recommendation requests are not parsed as song titles', () => {
   assert.equal(extractRequestedSongTitle('\u6211\u6b63\u5728\u6559\u5ba4\uff0c\u8bf7\u5e2e\u6211\u63a8\u8350\u9002\u5408\u6559\u5ba4\u7684\u6b4c'), '');
+  assert.equal(extractRequestedSongTitle('\u6211\u6b63\u5728\u5bbf\u820d\uff0c\u8bf7\u5e2e\u6211\u63a8\u8350\u9002\u5408\u5bbf\u820d\u7684\u6b4c'), '');
   assert.equal(extractRequestedSongTitle('\u6211\u6b63\u5728\u5065\u8eab\u623f\uff0c\u8bf7\u5e2e\u6211\u63a8\u8350\u9002\u5408\u5065\u8eab\u623f\u7684\u97f3\u4e50'), '');
   assert.equal(extractRequestedSongTitle('\u6211\u60f3\u542c\u300a\u6674\u5929\u300b'), '\u6674\u5929');
   assert.equal(extractRequestedSongTitle('\u653e\u4e00\u9996\u5bcc\u58eb\u5c71\u4e0b'), '\u5bcc\u58eb\u5c71\u4e0b');

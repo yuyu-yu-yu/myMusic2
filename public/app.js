@@ -2273,6 +2273,7 @@ function buildPlaylistQueueItemHTML(item = {}) {
 function buildExplanationHTML(explanation = null) {
   const factors = Array.isArray(explanation?.factors)
     ? explanation.factors.flatMap(normalizeExplanationFactor).filter(Boolean)
+      .filter(factor => !isInternalExplanationFactor(factor))
     : [];
   if (!factors.length) return '';
   const factorHtml = `<div class="track-explanation-factors">${factors.map(text =>
@@ -2332,6 +2333,13 @@ function sanitizeExplanationValue(value = '') {
     .replace(/^[，,。；;\s]+|[，,。；;\s]+$/g, '')
     .trim()
     .slice(0, 80);
+}
+
+function isInternalExplanationFactor(factor) {
+  const text = `${factor?.label || ''} ${factor?.value || ''}`.trim();
+  if (!text) return false;
+  return /LLM|profile_fallback|same_artist_fallback|fallback|playable source|stable playback/i.test(text) ||
+    /没有确认到|未确认到|稳定播放源|可播放源|兜底|原来想找|更稳的一首|改用当前账号/.test(text);
 }
 
 function buildExplanationFactorHTML(factor) {

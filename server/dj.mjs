@@ -4835,8 +4835,8 @@ async function resolveSameArtistFallback({ db, config, netease, failedPicks = []
       diagnostic.selectedTrackId = String(selectedTrack.id || '');
       diagnostics.push(trimSearchDiagnostic(diagnostic));
       const requestedText = request?.songTitle
-        ? `原来想找的《${request.songTitle}》没有确认到稳定播放源，先换同歌手里更稳的一首。`
-        : 'LLM 候选没有确认到稳定播放源，改用同艺人高命中歌曲。';
+        ? `《${request.songTitle}》暂时没有放出来，先换同歌手另一首。`
+        : '同艺人里换一首更贴近当前氛围的歌。';
       return {
         track: selectedTrack,
         pick: {
