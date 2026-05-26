@@ -1658,7 +1658,9 @@ audio {
   background: var(--panel-2);
   cursor: pointer;
   position: relative;
-  overflow: hidden;
+  overflow: visible;
+  touch-action: none;
+  --progress-pct: 0%;
 }
 
 .progress-fill {
@@ -1668,10 +1670,62 @@ audio {
   background: var(--cyan);
   box-shadow: 0 0 8px rgba(0, 240, 255, 0.3);
   transition: width 0.1s linear;
+  pointer-events: none;
+  position: relative;
+  z-index: 1;
 }
 
 .progress-bar:hover .progress-fill {
   box-shadow: 0 0 12px rgba(0, 240, 255, 0.5);
+}
+
+.progress-thumb {
+  position: absolute;
+  left: var(--progress-pct, 0%);
+  top: 50%;
+  z-index: 2;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  cursor: grab;
+  transform: translate(-50%, -50%);
+  touch-action: none;
+}
+
+.progress-thumb::before {
+  content: '';
+  position: absolute;
+  inset: 5px;
+  border-radius: 2px;
+  background: var(--cyan);
+  border: 1px solid rgba(255,255,255,0.78);
+  box-shadow:
+    0 0 0 3px rgba(0, 240, 255, 0.12),
+    0 0 14px rgba(0, 240, 255, 0.65);
+}
+
+.progress-thumb:hover::before,
+.progress-thumb:focus-visible::before,
+.progress-bar.is-dragging .progress-thumb::before {
+  background: var(--yellow);
+  box-shadow:
+    0 0 0 4px rgba(255, 215, 0, 0.14),
+    0 0 18px rgba(255, 215, 0, 0.72);
+}
+
+.progress-thumb:focus-visible {
+  outline: 1px solid rgba(255,255,255,0.78);
+  outline-offset: 4px;
+}
+
+.progress-bar.is-dragging .progress-fill {
+  transition: none;
+}
+
+.progress-bar.is-dragging .progress-thumb {
+  cursor: grabbing;
 }
 
 /* ----- Loading Dots ----- */

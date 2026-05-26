@@ -46,6 +46,11 @@ const state = {
   aiMusicMode: readStoredAiMusicMode()
 };
 
+const progressSeekState = {
+  dragging: false,
+  suppressClick: false
+};
+
 function ensureDemoVisitorId() {
   try {
     let id = sessionStorage.getItem(DEMO_VISITOR_STORAGE_KEY);
@@ -2348,7 +2353,7 @@ async function updatePlayer(data, autoplay) {
   const fill = document.querySelector('#progress-fill');
   const current = document.querySelector('#progress-current');
   const duration = document.querySelector('#progress-duration');
-  if (fill) fill.style.width = '0%';
+  if (fill) setProgressBarVisual(0);
   if (current) current.textContent = '00:00';
   if (duration) duration.textContent = '00:00';
 }
@@ -2710,20 +2715,25 @@ function formatPlaybackErrorMessage(error) {
 // --- Progress bar ---
 function updateProgressBar() {
   const songAudio = document.querySelector('#song-audio');
-  const fill = document.querySelector('#progress-fill');
   const current = document.querySelector('#progress-current');
   const duration = document.querySelector('#progress-duration');
-  if (!songAudio || !fill || !current || !duration) return;
+  if (!songAudio || !current || !duration) return;
 
   const dur = songAudio.duration;
   const cur = songAudio.currentTime;
 
   if (dur && !isNaN(dur)) {
-    const pct = Math.min((cur / dur) * 100, 100);
-    fill.style.width = pct + '%';
+    if (progressSeekState.dragging) {
+      duration.textContent = formatTime(dur);
+      return;
+    }
+    const pct = (cur / dur) * 100;
+    setProgressBarVisual(pct);
+    setProgressThumbA11y(cur, dur);
     duration.textContent = formatTime(dur);
   } else {
-    fill.style.width = '0%';
+    setProgressBarVisual(0);
+    setProgressThumbA11y(0, 0);
     duration.textContent = '00:00';
   }
   current.textContent = formatTime(cur);
@@ -2736,24 +2746,112 @@ function formatTime(sec) {
   return String(m).padStart(2, '0') + ':' + String(s).padStart(2, '0');
 }
 
+function clampProgressPercent(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  return Math.max(0, Math.min(100, numeric));
+}
+
+function setProgressBarVisual(percent) {
+  const pct = clampProgressPercent(percent);
+  const bar = document.querySelector('#progress-bar');
+  const fill = document.querySelector('#progress-fill');
+  if (bar) bar.style.setProperty('--progress-pct', `${pct}%`);
+  if (fill) fill.style.width = `${pct}%`;
+}
+
+function setProgressThumbA11y(currentTimeSec, durationSec) {
+  const thumb = document.querySelector('#progress-thumb');
+  if (!thumb) return;
+  const duration = Number.isFinite(durationSec) ? Math.max(0, durationSec) : 0;
+  const current = Number.isFinite(currentTimeSec) ? Math.max(0, Math.min(duration || currentTimeSec, currentTimeSec)) : 0;
+  thumb.setAttribute('aria-valuemax', String(Math.round(duration)));
+  thumb.setAttribute('aria-valuenow', String(Math.round(current)));
+  thumb.setAttribute('aria-valuetext', duration ? `${formatTime(current)} / ${formatTime(duration)}` : '00:00');
+}
+
+function seekProgressToTime(targetTimeSec) {
+  const songAudio = document.querySelector('#song-audio');
+  if (!songAudio?.duration || isNaN(songAudio.duration)) return false;
+  const duration = songAudio.duration;
+  const targetTime = Math.max(0, Math.min(duration, Number(targetTimeSec) || 0));
+  songAudio.currentTime = targetTime;
+  setProgressBarVisual((targetTime / duration) * 100);
+  setProgressThumbA11y(targetTime, duration);
+  const current = document.querySelector('#progress-current');
+  const total = document.querySelector('#progress-duration');
+  if (current) current.textContent = formatTime(targetTime);
+  if (total) total.textContent = formatTime(duration);
+  syncLyricTime(targetTime, { forceCenter: true });
+  return true;
+}
+
+function seekProgressFromClientX(clientX) {
+  const songAudio = document.querySelector('#song-audio');
+  const bar = document.querySelector('#progress-bar');
+  if (!songAudio?.duration || isNaN(songAudio.duration) || !bar) return false;
+  const rect = bar.getBoundingClientRect();
+  if (!rect.width) return false;
+  const pct = clampProgressPercent(((clientX - rect.left) / rect.width) * 100);
+  return seekProgressToTime((pct / 100) * songAudio.duration);
+}
+
 function initProgressBar() {
   const bar = document.querySelector('#progress-bar');
+  const thumb = document.querySelector('#progress-thumb');
   if (!bar) return;
   bar.addEventListener('click', (e) => {
-    const songAudio = document.querySelector('#song-audio');
-    if (!songAudio?.duration) return;
-    const rect = bar.getBoundingClientRect();
-    const pct = (e.clientX - rect.left) / rect.width;
-    const targetTime = pct * songAudio.duration;
-    // Animate seek with anime.js
-    const fill = document.querySelector('#progress-fill');
-    animate(fill, {
-      width: (pct * 100) + '%',
-      duration: 150,
-      easing: 'easeOutQuad',
-    });
-    songAudio.currentTime = targetTime;
+    if (progressSeekState.suppressClick || e.target === thumb) return;
+    seekProgressFromClientX(e.clientX);
   });
+  if (!thumb) return;
+
+  const finishDrag = (event) => {
+    if (!progressSeekState.dragging) return;
+    if (typeof event?.clientX === 'number') seekProgressFromClientX(event.clientX);
+    progressSeekState.dragging = false;
+    bar.classList.remove('is-dragging');
+    try { thumb.releasePointerCapture?.(event.pointerId); } catch {}
+    setTimeout(() => {
+      progressSeekState.suppressClick = false;
+    }, 0);
+  };
+
+  thumb.addEventListener('pointerdown', (event) => {
+    const songAudio = document.querySelector('#song-audio');
+    if (!songAudio?.duration || isNaN(songAudio.duration)) return;
+    event.preventDefault();
+    progressSeekState.dragging = true;
+    progressSeekState.suppressClick = true;
+    bar.classList.add('is-dragging');
+    try { thumb.setPointerCapture?.(event.pointerId); } catch {}
+    seekProgressFromClientX(event.clientX);
+  });
+  thumb.addEventListener('pointermove', (event) => {
+    if (!progressSeekState.dragging) return;
+    event.preventDefault();
+    seekProgressFromClientX(event.clientX);
+  });
+  thumb.addEventListener('pointerup', finishDrag);
+  thumb.addEventListener('pointercancel', finishDrag);
+  thumb.addEventListener('click', (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  thumb.addEventListener('keydown', (event) => {
+    const songAudio = document.querySelector('#song-audio');
+    if (!songAudio?.duration || isNaN(songAudio.duration)) return;
+    const step = event.shiftKey ? 15 : 5;
+    let target = null;
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowDown') target = songAudio.currentTime - step;
+    else if (event.key === 'ArrowRight' || event.key === 'ArrowUp') target = songAudio.currentTime + step;
+    else if (event.key === 'Home') target = 0;
+    else if (event.key === 'End') target = songAudio.duration;
+    if (target === null) return;
+    event.preventDefault();
+    seekProgressToTime(target);
+  });
+  updateProgressBar();
 }
 
 async function playCurrentTrack(radioTurn = null, playbackToken = null) {
