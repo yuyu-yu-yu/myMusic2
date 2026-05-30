@@ -3220,7 +3220,7 @@ async function renderLibrary() {
         ${profileBlock('推荐场景', structured.scenes)}
         ${profileBlock('探索方向', structured.discoveryDirections)}
       </div>
-      <p class="muted">长期画像只基于当前网易云账号同步的歌单，不使用电台推荐、在线搜索、播放记录或最近播放。</p>
+      <p class="muted">长期画像只基于当前音乐账号同步的歌单，不使用电台推荐、在线搜索、播放记录或最近播放。</p>
       <p class="reason" style="white-space: pre-wrap; line-height: 1.85">${escapeHtml(data.profile.summary)}</p>
       <div class="tags">${(data.profile.tags || []).map((tag) => `<span class="tag">${escapeHtml(tag)}</span>`).join('')}</div>
       ${libraryAccountNotice(data)}
@@ -3230,7 +3230,7 @@ async function renderLibrary() {
         <div class="stat"><span class="muted">最近播放</span><strong>${data.recent.length}</strong></div>
       </div>
       <div class="library-actions">
-        <button id="sync-btn" class="primary" ${isDemoGuestLibrary ? 'disabled' : ''}>同步网易云音乐</button>
+        <button id="sync-btn" class="primary" ${isDemoGuestLibrary ? 'disabled' : ''}>同步音乐</button>
         <button id="profile-update-btn" class="ghost profile-update-btn">更新音乐画像</button>
       </div>
       <div id="library-sync-progress" class="library-sync-progress" hidden></div>
@@ -3248,7 +3248,7 @@ async function renderLibrary() {
     btn.textContent = '同步中...';
     btn.disabled = true;
     state.librarySyncNotice = '';
-    if (status) status.textContent = '正在同步网易云歌单...';
+    if (status) status.textContent = '正在同步音乐歌单...';
     try {
       const result = await api('/api/library/sync', { method: 'POST', body: {} });
       state.profileSelectionDirty = false;
@@ -3256,7 +3256,7 @@ async function renderLibrary() {
       renderLibrary();
     } catch (error) {
       btn.disabled = false;
-      btn.textContent = '同步网易云音乐';
+      btn.textContent = '同步音乐';
       state.librarySyncNotice = `同步失败：${error.message}`;
       if (status) status.textContent = state.librarySyncNotice;
     }
@@ -3271,7 +3271,7 @@ async function handleLibrarySyncClick(btn, status) {
     btn.disabled = true;
   }
   state.librarySyncNotice = '';
-  if (status) status.textContent = '正在启动网易云同步任务...';
+  if (status) status.textContent = '正在启动音乐同步任务...';
   try {
     const syncStatus = await api('/api/library/sync', { method: 'POST', body: {} });
     updateLibrarySyncUI(syncStatus);
@@ -3279,7 +3279,7 @@ async function handleLibrarySyncClick(btn, status) {
   } catch (error) {
     if (btn) {
       btn.disabled = false;
-      btn.textContent = '同步网易云音乐';
+      btn.textContent = '同步音乐';
     }
     state.librarySyncNotice = `同步失败：${error.message}`;
     if (status) status.textContent = state.librarySyncNotice;
@@ -3324,7 +3324,7 @@ function updateLibrarySyncUI(syncStatus = {}) {
   const progressEl = document.querySelector('#library-sync-progress');
   if (btn) {
     btn.disabled = syncStatus.status === 'running';
-    btn.textContent = syncStatus.status === 'running' ? '同步中...' : '同步网易云音乐';
+    btn.textContent = syncStatus.status === 'running' ? '同步中...' : '同步音乐';
   }
   if (statusEl) statusEl.textContent = librarySyncStatusText(syncStatus);
   updateProfilePlaylistFailureUI(syncStatus);
@@ -3347,7 +3347,7 @@ function librarySyncStatusText(syncStatus = {}) {
 
 function librarySyncRunningText(syncStatus = {}) {
   const source = librarySyncSourceLabel(syncStatus.source);
-  if (syncStatus.phase === 'checking_login') return '正在校验网易云登录状态...';
+  if (syncStatus.phase === 'checking_login') return '正在校验音乐登录状态...';
   if (syncStatus.phase === 'fetching_playlists') return `正在通过${source}读取歌单列表...`;
   if (syncStatus.phase === 'updating_profile') return '正在更新音乐画像...';
   const index = Number(syncStatus.currentPlaylistIndex || 0);
@@ -3358,14 +3358,14 @@ function librarySyncRunningText(syncStatus = {}) {
     ? `${synced} 首`
     : `${synced} / ${Number(syncStatus.currentPlaylistTotal) || 0} 首`;
   if (index && total) return `正在通过${source}同步第 ${index} / ${total} 个歌单：${name}，${count}`;
-  return `正在通过${source}同步网易云音乐...`;
+  return `正在通过${source}同步音乐...`;
 }
 
 function librarySyncSourceLabel(source) {
-  if (source === 'cookie') return '网易云扫码登录';
+  if (source === 'cookie') return '音乐扫码登录';
   if (source === 'openapi') return 'OpenAPI';
   if (source === 'demo') return 'Demo';
-  return '网易云';
+  return '音乐';
 }
 
 function librarySyncProgressHTML(syncStatus = {}) {
@@ -3403,19 +3403,19 @@ function libraryAccountNotice(data = {}) {
   if (!account.needsSync && !account.accountMismatch) return '';
   return `
     <div class="library-account-warning">
-      当前登录账号 ${escapeHtml(account.nickname || account.userId || '网易云用户')} 尚未完成歌单同步，请重新同步网易云音乐。
+      当前登录账号 ${escapeHtml(account.nickname || account.userId || '音乐用户')} 尚未完成歌单同步，请重新同步音乐。
     </div>
   `;
 }
 
-function neteaseAccountCard(status = {}, label = '网易云') {
+function neteaseAccountCard(status = {}, label = '音乐') {
   const readable = Boolean(status.profileReadable);
   const title = readable
-    ? `${label}已登录：${status.nickname || '网易云用户'}`
+    ? `${label}已登录：${status.nickname || '音乐用户'}`
     : ((status.hasCookie || status.hasToken) ? `${label}登录状态异常` : `${label}尚未登录`);
   const detail = readable
     ? `userId: ${status.userId}`
-    : (status.message || '请使用网易云音乐 App 扫码登录');
+    : (status.message || '请使用音乐 App 扫码登录');
   return `
     <div class="netease-account-card ${readable ? 'ok' : 'warn'}">
       <strong>${escapeHtml(title)}</strong>
@@ -3429,8 +3429,8 @@ function neteaseTrialLoginCard(status = {}) {
   const hasLogin = Boolean(status.hasCookie || status.hasToken);
   const stateClass = readable ? 'ok' : (hasLogin ? 'warn' : 'idle');
   const stateText = readable ? '已连接' : (hasLogin ? '需重新登录' : '待扫码');
-  const name = readable ? (status.nickname || '网易云用户') : '网易云音乐';
-  const detail = readable ? `userId ${status.userId}` : (status.message || '尚未扫码登录网易云');
+  const name = readable ? (status.nickname || '音乐用户') : '音乐';
+  const detail = readable ? `userId ${status.userId}` : (status.message || '尚未扫码登录音乐');
   return `
     <div class="trial-account-card ${stateClass}">
       <div class="trial-account-led" aria-hidden="true"></div>
@@ -3563,7 +3563,7 @@ async function renderSettings() {
           <div class="trial-login-title-row">
             <div>
               <p class="eyebrow">Trial Login</p>
-              <h2>网易云音乐账号</h2>
+              <h2>音乐账号</h2>
             </div>
             <span class="trial-login-badge">${cookieLogin.profileReadable ? 'ONLINE' : 'OFFLINE'}</span>
           </div>
@@ -3584,7 +3584,7 @@ async function renderSettings() {
             </div>
             <img id="cookie-qr-img" class="qr-img" src="" alt="试用版登录二维码" style="display:none" />
           </div>
-          <button id="cookie-qr-btn" class="trial-login-primary" ${demoGuestMode ? 'disabled' : ''}>扫码登录网易云</button>
+          <button id="cookie-qr-btn" class="trial-login-primary" ${demoGuestMode ? 'disabled' : ''}>扫码登录音乐</button>
           <button id="cookie-logout-btn" class="ghost trial-login-secondary" ${cookieLogin.hasCookie && !demoGuestMode ? '' : 'disabled'}>退出登录</button>
           <p id="cookie-qr-status" class="muted"></p>
         </div>
@@ -3600,7 +3600,7 @@ async function renderSettings() {
           ${state.demoSelfCheckRunning ? '检查中...' : '运行自检'}
         </button>
       </div>
-      <p class="muted">演示前检查 LLM、TTS、网易云登录、歌单同步和当前播放源。</p>
+      <p class="muted">演示前检查 LLM、TTS、音乐登录、歌单同步和当前播放源。</p>
       <div id="demo-self-check-content" class="self-check-content">
         ${buildDemoSelfCheckHTML(state.demoSelfCheck, state.demoSelfCheckRunning)}
       </div>
@@ -3642,7 +3642,7 @@ async function renderSettings() {
           </span>
           <small>普通用户不需要扫描这里</small>
         </summary>
-        <p class="developer-login-note">这里只给开发者调试 OpenAPI 使用。朋友试用和比赛演示请使用页面上方的“扫码登录网易云”，不要扫描这里的二维码。</p>
+        <p class="developer-login-note">这里只给开发者调试 OpenAPI 使用。朋友试用和比赛演示请使用页面上方的“扫码登录音乐”，不要扫描这里的二维码。</p>
         ${neteaseAccountCard(neteaseLogin, 'OpenAPI')}
         <table class="developer-config-grid">
           ${statusRow('OpenAPI appId', status.netease.appId)}
@@ -3661,7 +3661,7 @@ async function renderSettings() {
   document.querySelector('#cookie-qr-btn')?.addEventListener('click', () => startCookieQrLogin());
   document.querySelector('#cookie-logout-btn')?.addEventListener('click', async () => {
     const statusEl = document.querySelector('#cookie-qr-status');
-    if (statusEl) statusEl.textContent = '正在退出网易云登录...';
+    if (statusEl) statusEl.textContent = '正在退出音乐登录...';
     await api('/api/auth/netease-cookie/logout', { method: 'POST', body: {} });
     renderSettings();
   });
@@ -3727,7 +3727,7 @@ function buildDemoSelfCheckHTML(result = null, loading = false) {
     return `
       <div class="self-check-placeholder">
         <strong>正在检查演示链路...</strong>
-        <span>这会实际测试模型、语音、网易云登录和播放源。</span>
+        <span>这会实际测试模型、语音、音乐登录和播放源。</span>
       </div>
     `;
   }
@@ -3881,7 +3881,7 @@ async function startQrLogin() {
       statusEl.textContent = '二维码 key 缺失，请重试';
       return;
     }
-    statusEl.textContent = '请用网易云音乐 App 扫码';
+    statusEl.textContent = '请用音乐 App 扫码';
     pollQrStatus(key, statusEl);
   } catch (error) {
     statusEl.textContent = '获取失败: ' + error.message;
@@ -3913,7 +3913,7 @@ async function startCookieQrLogin() {
       statusEl.textContent = '二维码 key 缺失，请重试';
       return;
     }
-    statusEl.textContent = '请用网易云音乐 App 扫码';
+    statusEl.textContent = '请用音乐 App 扫码';
     pollCookieQrStatus(key, statusEl);
   } catch (error) {
     statusEl.textContent = '获取失败: ' + error.message;
@@ -3929,14 +3929,14 @@ async function pollCookieQrStatus(key, statusEl) {
       const code = Number(data.code || res.code || 0);
       if (code === 803) {
         if (res.loggedIn === true || data.loggedIn === true) {
-          const nickname = res.nickname || data.nickname || '网易云用户';
+          const nickname = res.nickname || data.nickname || '音乐用户';
           const userId = res.userId || data.userId || '';
           statusEl.textContent = (res.autoSyncStarted || data.autoSyncStarted)
             ? `扫码成功：${nickname}${userId ? ` (${userId})` : ''}，账号已切换，正在自动同步歌单...`
             : `扫码成功，已保存登录信息：${nickname}${userId ? ` (${userId})` : ''}`;
           if (res.syncStatus || data.syncStatus) {
             state.librarySyncStatus = res.syncStatus || data.syncStatus;
-            state.librarySyncNotice = '账号已切换，正在自动同步网易云歌单...';
+            state.librarySyncNotice = '账号已切换，正在自动同步音乐歌单...';
             startLibrarySyncPolling();
           }
           const img = document.querySelector('#cookie-qr-img');
@@ -3944,7 +3944,7 @@ async function pollCookieQrStatus(key, statusEl) {
           setTimeout(() => renderSettings(), 600);
           return;
         }
-        statusEl.textContent = res.loginMessage || data.loginMessage || '授权已确认，但没有拿到网易云登录 cookie，请重新扫码';
+        statusEl.textContent = res.loginMessage || data.loginMessage || '授权已确认，但没有拿到音乐登录 cookie，请重新扫码';
         return;
       }
       if (code === 802) { statusEl.textContent = '已扫码，请在手机上确认授权...'; continue; }
@@ -3967,7 +3967,7 @@ async function pollQrStatus(key, statusEl) {
       const code = data.code || data.status || 0;
       if (code === 803) {
         if (res.loggedIn === true || data.loggedIn === true) {
-          const nickname = res.nickname || data.nickname || '网易云用户';
+          const nickname = res.nickname || data.nickname || '音乐用户';
           const userId = res.userId || data.userId || '';
           statusEl.textContent = `扫码成功，已登录：${nickname}${userId ? ` (${userId})` : ''}`;
           document.querySelector('#qr-img').style.display = 'none';
@@ -3976,7 +3976,7 @@ async function pollQrStatus(key, statusEl) {
           statusEl.textContent = '扫码成功！已保存登录信息。';
           document.querySelector('#qr-img').style.display = 'none';
         } else {
-          statusEl.textContent = res.loginMessage || data.loginMessage || '授权已确认，但无法读取网易云账号信息，请重新扫码';
+          statusEl.textContent = res.loginMessage || data.loginMessage || '授权已确认，但无法读取音乐账号信息，请重新扫码';
           return;
           statusEl.textContent = '授权已确认，但没有拿到登录 token，请重新扫码';
         }
@@ -4026,7 +4026,7 @@ function profilePlaylistSelector(data = {}) {
         <div class="profile-playlist-head">
           <div>
             <h2>画像歌单</h2>
-            <p class="muted">当前网易云账号尚未同步歌单。同步完成后，可以选择哪些歌单参与长期音乐画像。</p>
+            <p class="muted">当前音乐账号尚未同步歌单。同步完成后，可以选择哪些歌单参与长期音乐画像。</p>
           </div>
           <span id="library-profile-state" class="profile-state-chip synced">等待同步</span>
         </div>
@@ -4161,11 +4161,11 @@ function formatLibrarySyncError(error) {
   if (!text) return '未知错误';
   const legacyPlaylistMatch = text.match(/^playlist\s+([^:：]+)\s*[:：]\s*(undefined|null|)$/i);
   if (legacyPlaylistMatch) {
-    return `歌单 ID ${legacyPlaylistMatch[1]} 同步失败：网易云接口没有返回明确原因，可能是歌单权限限制、歌单不可访问或接口临时失败`;
+    return `歌单 ID ${legacyPlaylistMatch[1]} 同步失败：音乐接口没有返回明确原因，可能是歌单权限限制、歌单不可访问或接口临时失败`;
   }
   return text
     .replace(/^playlist\s+([^:：]+)\s*[:：]\s*/i, '歌单 ID $1 同步失败：')
-    .replace(/[:：]\s*(undefined|null)$/i, '：网易云接口没有返回明确原因，可能是歌单权限限制、歌单不可访问或接口临时失败');
+    .replace(/[:：]\s*(undefined|null)$/i, '：音乐接口没有返回明确原因，可能是歌单权限限制、歌单不可访问或接口临时失败');
 }
 
 function playlistSyncFailureFor(playlist = {}, syncStatus = state.librarySyncStatus) {

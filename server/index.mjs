@@ -390,7 +390,7 @@ async function getRequestConfig(req) {
 }
 
 function demoAuthLocked() {
-  return demoGuestModeLocked('Demo 模式下网易云账号已锁定，访客不能退出或重扫共享账号。');
+  return demoGuestModeLocked('Demo 模式下音乐账号已锁定，访客不能退出或重扫共享账号。');
 }
 
 function demoGuestModeLocked(message) {
@@ -502,7 +502,7 @@ async function getCookieLoginStatus() {
       userId: savedUserId,
       nickname: savedNickname,
       source: 'cookie',
-      message: '尚未扫码登录网易云'
+      message: '尚未扫码登录音乐'
     };
   }
   try {

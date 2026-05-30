@@ -289,7 +289,7 @@ test('library sync requires NetEase token when OpenAPI is configured', async (t)
 
   assert.equal(result.__error, true);
   assert.equal(result.status, 401);
-  assert.match(result.error, /扫码登录网易云/);
+  assert.match(result.error, /扫码登录音乐/);
 });
 
 test('library sync verifies NetEase profile before reading playlists', async (t) => {

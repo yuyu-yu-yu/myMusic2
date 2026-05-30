@@ -21,7 +21,7 @@ export async function runDemoSelfCheck({
 
   checks.push(await timedCheck('llm', 'LLM', () => checkLlm(config?.llm || {})));
   checks.push(await timedCheck('tts', 'TTS', () => checkTts(config?.tts || {}, rootDir)));
-  checks.push(await timedCheck('netease_cookie', '网易云扫码登录', () => checkCookie()));
+  checks.push(await timedCheck('netease_cookie', '音乐扫码登录', () => checkCookie()));
   checks.push(await timedCheck('community_api', 'NeteaseCloudMusicApi', () => checkCommunityApi()));
   checks.push(await timedCheck('library', '当前账号歌单', () => checkLibrary(db, syncStatus, accountContext)));
   checks.push(await timedCheck('play_source', '当前播放源', () => checkPlaySource(db, config, netease, trackId, accountContext)));
@@ -103,11 +103,11 @@ async function checkTts(ttsConfig, rootDir) {
 async function checkCookie() {
   const status = getCookieStatus();
   if (!status.hasCookie) {
-    return { status: 'warn', detail: '尚未扫码登录网易云试用通道。', action: '在设置页扫码登录网易云。' };
+    return { status: 'warn', detail: '尚未扫码登录音乐试用通道。', action: '在设置页扫码登录音乐。' };
   }
   const profile = await withTimeout(getCookieUserProfile(), SELF_CHECK_TIMEOUT_MS, null);
   if (!profile?.userId) {
-    return { status: 'fail', detail: '已保存 cookie，但无法读取网易云账号。', action: '退出后重新扫码。' };
+    return { status: 'fail', detail: '已保存 cookie，但无法读取音乐账号。', action: '退出后重新扫码。' };
   }
   return { status: 'ok', detail: `已登录：${profile.nickname || profile.userId}（${profile.userId}）` };
 }
@@ -136,13 +136,13 @@ async function checkLibrary(db, syncStatus, accountContext) {
   const library = getLibrary(db, accountContext);
   const account = library.account || {};
   if (account.accountMismatch) {
-    return { status: 'fail', detail: '当前登录账号与已同步账号不一致。', action: '重新同步当前网易云账号歌单。' };
+    return { status: 'fail', detail: '当前登录账号与已同步账号不一致。', action: '重新同步当前音乐账号歌单。' };
   }
   if (syncStatus?.status === 'running') {
     return { status: 'warn', detail: `正在同步歌单：${syncStatus.currentPlaylistIndex || 0} / ${syncStatus.totalPlaylists || 0}`, action: '等待同步完成后再演示推荐。' };
   }
   if (account.needsSync || !library.playlists?.length) {
-    return { status: 'warn', detail: '当前账号尚未同步歌单。', action: '点击“同步网易云音乐”。' };
+    return { status: 'warn', detail: '当前账号尚未同步歌单。', action: '点击“同步音乐”。' };
   }
   if (!library.totalTracks) {
     return { status: 'warn', detail: `已同步 ${library.playlists.length} 个歌单，但没有可用歌曲。`, action: '检查歌单权限或重新同步。' };

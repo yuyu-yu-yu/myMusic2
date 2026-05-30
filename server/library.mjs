@@ -14,7 +14,7 @@ import { normalizeAccountContext, resolveAccountContext } from './account-scope.
 
 const PROFILE_EXCLUDED_PLAYLIST_IDS_KEY = 'profile_excluded_playlist_ids';
 const EMPTY_PROFILE_SUMMARY = '尚未选择用于生成音乐画像的歌单。';
-const UNSYNCED_ACCOUNT_SUMMARY = '当前网易云账号尚未同步歌单。';
+const UNSYNCED_ACCOUNT_SUMMARY = '当前音乐账号尚未同步歌单。';
 const PLAYLIST_SYNC_PAGE_SIZE = 200;
 const LIBRARY_SYNCED_USER_ID_KEY = 'library_synced_user_id';
 const LIBRARY_SYNCED_PLAYLIST_IDS_KEY = 'library_synced_playlist_ids';
@@ -122,7 +122,7 @@ export async function syncLibrary(db, netease, options = {}) {
         playlistRecords.push(...records.map(item => ({ kind, item })));
         progress({ phase: 'fetching_playlists', totalPlaylists: playlistRecords.length });
       } catch (error) {
-        result.errors.push(`${kind}: ${formatErrorMessage(error, '网易云歌单列表接口失败')}`);
+        result.errors.push(`${kind}: ${formatErrorMessage(error, '音乐歌单列表接口失败')}`);
         result.diagnostics.push(buildPlaylistDiagnostic(kind, null, [], error));
         progress({ phase: 'fetching_playlists' });
       }
@@ -213,7 +213,7 @@ export async function syncLibrary(db, netease, options = {}) {
       `).run(accountContext.accountId, track.id, item.playTime ? new Date(Number(item.playTime)).toISOString() : nowIso(), 'netease-recent', 'netease recent play', 'imported');
     });
   } catch (error) {
-    result.errors.push(`最近播放同步失败：${formatErrorMessage(error, '网易云最近播放接口失败')}`);
+    result.errors.push(`最近播放同步失败：${formatErrorMessage(error, '音乐最近播放接口失败')}`);
   }
 
   result.tracks = countLibraryTracks(db, accountContext);
@@ -258,7 +258,7 @@ async function resolveLibrarySyncSource(db, netease, result) {
         source: 'cookie',
         mode: 'cookie',
         user: null,
-        error: `网易云试用版扫码登录状态异常，请在设置页重新扫码：${error.message}`
+        error: `音乐试用版扫码登录状态异常，请在设置页重新扫码：${error.message}`
       };
     }
   }
@@ -276,7 +276,7 @@ async function resolveLibrarySyncSource(db, netease, result) {
       source: 'openapi',
       mode: 'netease',
       user: null,
-      error: '请先在设置页扫码登录网易云'
+      error: '请先在设置页扫码登录音乐'
     };
   }
 
@@ -501,7 +501,7 @@ export function getProfile(db, accountContext = null) {
   if (!hasCurrentAccountSnapshot(db, account)) return emptyProfile(UNSYNCED_ACCOUNT_SUMMARY);
   const row = db.prepare('SELECT summary, tags_json AS tagsJson, profile_json AS profileJson, updated_at AS updatedAt FROM account_music_profiles WHERE account_id = ?').get(account.accountId)
     || db.prepare('SELECT summary, tags_json AS tagsJson, profile_json AS profileJson, updated_at AS updatedAt FROM music_profile WHERE id = 1').get();
-  if (!row) return { summary: '尚未生成音乐画像，请先同步当前网易云账号歌单。', tags: [], structured: {}, updatedAt: null };
+  if (!row) return { summary: '尚未生成音乐画像，请先同步当前音乐账号歌单。', tags: [], structured: {}, updatedAt: null };
   return {
     summary: row.summary,
     tags: safeJson(row.tagsJson, []),
@@ -646,7 +646,7 @@ function getActiveLibraryPlaylistIds(db, accountContext = null) {
   return null;
 }
 
-function emptyProfile(summary = '尚未生成音乐画像，请先同步当前网易云账号歌单。') {
+function emptyProfile(summary = '尚未生成音乐画像，请先同步当前音乐账号歌单。') {
   return {
     summary,
     tags: [],
@@ -698,7 +698,7 @@ function buildPlaylistDiagnostic(kind, response, records = [], error = null) {
 function formatPlaylistSyncError(playlist = {}, error) {
   const name = String(playlist.name || '').trim();
   const label = name ? `《${name}》` : `ID ${playlist.id || '未知'}`;
-  return `歌单${label}同步失败：${formatErrorMessage(error, '网易云接口没有返回明确原因，可能是歌单权限限制或接口临时失败')}`;
+  return `歌单${label}同步失败：${formatErrorMessage(error, '音乐接口没有返回明确原因，可能是歌单权限限制或接口临时失败')}`;
 }
 
 function formatErrorMessage(error, fallback = '未知错误') {
@@ -732,7 +732,7 @@ function extractErrorMessage(error) {
     }
   }
   const code = error.code ?? error.body?.code ?? error.data?.code ?? error.response?.data?.code;
-  if (code !== undefined && code !== null && String(code).trim()) return `网易云返回 code ${code}`;
+  if (code !== undefined && code !== null && String(code).trim()) return `音乐返回 code ${code}`;
   try {
     const serialized = JSON.stringify(error);
     if (serialized && serialized !== '{}') return serialized.slice(0, 180);
@@ -769,10 +769,10 @@ async function fetchAllPlaylistSongs(netease, playlist, pageSize = PLAYLIST_SYNC
     const pageRecords = extractRecords(data);
     if (!pageRecords.length) {
       if (isFailedApiPayload(data)) {
-        throw new Error(formatErrorMessage(data, '网易云接口返回失败'));
+        throw new Error(formatErrorMessage(data, '音乐接口返回失败'));
       }
       if ((expectedCount ?? 0) > offset) {
-        throw new Error('网易云接口未返回歌曲列表，可能是歌单权限限制、歌单不可访问或接口临时失败');
+        throw new Error('音乐接口未返回歌曲列表，可能是歌单权限限制、歌单不可访问或接口临时失败');
       }
       break;
     }
@@ -1230,7 +1230,7 @@ function inferTags(tracks) {
   if (/lofi|jazz|chill|安静|治愈/.test(names)) tags.push('放松');
   if (/rock|punk|摇滚/.test(names)) tags.push('能量');
   if (/classic|piano|古典|钢琴/.test(names)) tags.push('古典/器乐');
-  if (!tags.length) tags.push('网易云歌单');
+  if (!tags.length) tags.push('音乐歌单');
   return tags.slice(0, 5);
 }
 

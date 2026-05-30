@@ -48,7 +48,7 @@ export async function getNeteaseLoginStatus({ db, netease }) {
       profileReadable: false,
       userId: saved.userId,
       nickname: saved.nickname,
-      message: '请先在设置页扫码登录网易云'
+      message: '请先在设置页扫码登录音乐'
     };
   }
   try {

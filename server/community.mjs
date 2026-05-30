@@ -132,7 +132,7 @@ export async function checkCookieQrLogin(key, rootDir) {
   if (!cookie) {
     return {
       ...payload,
-      loginMessage: '授权已确认，但没有拿到网易云登录 cookie，请重新扫码'
+      loginMessage: '授权已确认，但没有拿到音乐登录 cookie，请重新扫码'
     };
   }
 
@@ -151,7 +151,7 @@ export async function checkCookieQrLogin(key, rootDir) {
       },
       cookieSaved: true,
       hasCookie: true,
-      loginMessage: `授权已确认，但无法读取网易云账号，请重新扫码：${error.message}`
+      loginMessage: `授权已确认，但无法读取音乐账号，请重新扫码：${error.message}`
     };
   }
   return {
