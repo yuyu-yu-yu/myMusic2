@@ -723,6 +723,7 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
     : '暂无失败候选。';
   const playedText = formatPlayedSongExclusions(playedHistory, request);
   const vocalPolicyText = formatVocalPolicyForPrompt(request);
+  const profilePrompt = formatProfileSummaryForPrompt(profile);
   const raw = await generateChatCompletion(config.llm, [
     {
       role: 'system',
@@ -745,7 +746,7 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
       content: [
         `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
         `此刻：${timeOfDay} ${hour}点，${weather}`,
-        `听众画像：${profile?.summary || '无'}`,
+        `听众画像：${profilePrompt}`,
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
         modeText,
         userMessage ? `SCENE_REQUEST: ${userMessage}` : 'SCENE_REQUEST: none',
@@ -901,6 +902,7 @@ async function generatePlaylistIntroText({ config, playlist, profile, prefs, his
   const fallback = playlist.hostText || `我给你整理了一张 5 首歌的小歌单，会顺着现在的状态慢慢播放。`;
   if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return fallback;
   const songList = playlist.items.map(item => `${item.index + 1}. ${item.track.name} - ${(item.track.artists || []).join('/')}${item.reason ? `：${item.reason}` : ''}`).join('\n');
+  const profilePrompt = formatProfileSummaryForPrompt(profile);
   const raw = await generateChatCompletion(config.llm, [
     {
       role: 'system',
@@ -917,7 +919,7 @@ async function generatePlaylistIntroText({ config, playlist, profile, prefs, his
       content: [
         `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
         `此刻：${timeOfDay} ${hour}点，${weather}`,
-        `听众画像：${profile?.summary || '无'}`,
+        `听众画像：${profilePrompt}`,
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
         memoryContext?.promptText || '相关长期记忆：无',
@@ -2374,6 +2376,18 @@ function shortProfileHint(profile = {}) {
   return summary ? `参考你的音乐画像：${summary.slice(0, 34)}` : '';
 }
 
+export function formatProfileSummaryForPrompt(profile = {}) {
+  const summary = String(profile?.summary || '').replace(/\s+/g, ' ').trim();
+  if (!summary) return '无';
+  return summary
+    .replace(/《[^》]{1,40}》([、，,\s]*《[^》]{1,40}》)*/g, '相关作品')
+    .replace(/相关作品(?:[、，,\s]*相关作品)+/g, '相关作品')
+    .replace(/相关作品中/g, '相关作品里')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 420) || '无';
+}
+
 function shortFeedbackHint(events = []) {
   const items = (events || []).filter(event => event?.eventType).slice(0, 3);
   if (!items.length) return '';
@@ -3087,6 +3101,7 @@ export async function classifyTurnIntent({
     return { accepted: false, source: 'fallback', reason: 'LLM is not configured', skipFriendLlm: false };
   }
 
+  const profilePrompt = formatProfileSummaryForPrompt(profile);
   const messages = [
     {
       role: 'system',
@@ -3106,7 +3121,7 @@ export async function classifyTurnIntent({
         `听众刚说：${userMessage}`,
         `最近对话：${history.slice(-8).map(h => `${h.role}: ${h.content}`).join('\n') || '无'}`,
         `当前歌曲：${getCurrentTrackPromptContext(userMessage, currentTrack)}`,
-        `听众画像：${profile?.summary || '无'}`,
+        `听众画像：${profilePrompt}`,
         `当前模式：${mode?.genre || '无'}`,
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
         `长期记忆：${memoryContext.promptText || '无'}`,
@@ -3502,6 +3517,7 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
   });
   if (!config?.llm?.baseUrl) return fallback();
   const currentTrackContext = getCurrentTrackPromptContext(userMessage, currentTrack);
+  const profilePrompt = formatProfileSummaryForPrompt(profile);
 
   const messages = [
     {
@@ -3528,7 +3544,7 @@ async function generateFriendReply({ config, profile, mode, prefs = {}, history,
     {
       role: 'user',
       content: [
-        `听众画像：${profile.summary || ''}`,
+        `听众画像：${profilePrompt}`,
         `当前模式：${mode?.genre || '无'}`,
         `用户聊天/音乐偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
         normalizeRuntimePrefs(prefs).note ? `用户补充偏好：${normalizeRuntimePrefs(prefs).note}` : '用户补充偏好：无',
@@ -5000,6 +5016,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
   const replayRule = requestAllowsRequestedSongReplay(request)
     ? `已播放歌名通常必须避开；但本次用户明确点名《${request.songTitle}》，这一个歌名允许重复播放，其他已播放歌仍必须避开同名任何版本。`
     : '已播放歌名必须避开：只要歌名相同，就不能再推荐任何版本、翻唱、Live、Remix、Album Version 或不同艺人版本。';
+  const profilePrompt = formatProfileSummaryForPrompt(profile);
 
   const raw = await generateChatCompletion(config.llm, [
     {
@@ -5027,7 +5044,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
       content: [
         `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
         `此刻：${timeOfDay} ${hour}点，${weather}`,
-        `听众画像：${profile?.summary || '无'}`,
+        `听众画像：${profilePrompt}`,
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
         modeText,
         `明确请求：${requestText}`,
@@ -5529,6 +5546,7 @@ export function buildFinalHostMessages({
   environmentContext = {}
 } = {}) {
   const firstTurn = Boolean(hostContext.isFirstRadioTurn);
+  const profilePrompt = formatProfileSummaryForPrompt(profile);
   return [
     {
       role: 'system',
@@ -5558,7 +5576,7 @@ export function buildFinalHostMessages({
         selectedTrack?.album ? `专辑：${selectedTrack.album}` : '',
         `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
         firstTurn ? `时间天气参考：${timeOfDay} ${hour}点，${weather}` : `时间天气仅供理解氛围，不要写进导播词：${timeOfDay} ${hour}点，${weather}`,
-        `听众画像：${profile?.summary || '无'}`,
+        `听众画像：${profilePrompt}`,
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
         formatRecentHostPlays(hostContext.recentPlays),

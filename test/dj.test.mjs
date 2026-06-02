@@ -39,6 +39,7 @@ import {
   extractAndStoreMemories,
   extractRequestedSongTitle,
   ensureRecommendationTextMatchesTrack,
+  formatProfileSummaryForPrompt,
   getRadioDebugStatus,
   getRadioQueueStatus,
   getTimeContext,
@@ -185,6 +186,18 @@ test('recommendation explanation hides internal fallback reasons', () => {
   const text = JSON.stringify(explanation);
   assert.doesNotMatch(text, /\u539f\u6765\u60f3\u627e|\u6ca1\u6709\u786e\u8ba4\u5230|\u7a33\u5b9a\u64ad\u653e\u6e90|\u66f4\u7a33\u7684\u4e00\u9996|LLM|\u515c\u5e95/);
   assert.match(text, /\u6559\u5ba4|\u5b89\u9759|\u8f7b\u97f3\u4e50|\u4e0b\u5348/);
+});
+
+test('profile prompt summary removes concrete song titles but keeps preference signals', () => {
+  const prompt = formatProfileSummaryForPrompt({
+    summary: '\u4f60\u7684\u97f3\u4e50\u4e16\u754c\u5728\u6e2f\u4e50\u6df1\u60c5\u3001\u534e\u8bed\u6d41\u884c\u4e0e\u6b27\u7f8e\u8282\u594f\u95f4\u4ece\u5bb9\u7a7f\u884c\u3002\u9648\u5955\u8fc5\u548c\u738b\u83f2\u662f\u4f60\u7684\u7075\u9b42\u5e95\u8272\uff0c\u90a3\u4e9b\u5173\u4e8e\u9057\u61be\u4e0e\u91ca\u6000\u7684\u53d9\u4e8b\uff0c\u5728\u300a\u5bcc\u58eb\u5c71\u4e0b\u300b\u300a\u7ea2\u8c46\u300b\u4e2d\u88ab\u53cd\u590d\u8046\u542c\u3002\u4eceHOYO-MiX\u7684\u300a\u539f\u795e\u300b\u914d\u4e50\u5230\u4e45\u77f3\u8ba9\u7684\u52a8\u753b\u539f\u58f0\uff0c\u8425\u9020\u51fa\u5b81\u9759\u7684\u51a5\u60f3\u7a7a\u95f4\u3002'
+  });
+
+  assert.doesNotMatch(prompt, /\u300a|\u300b|\u5bcc\u58eb\u5c71\u4e0b|\u7ea2\u8c46|\u539f\u795e/);
+  assert.match(prompt, /\u9648\u5955\u8fc5/);
+  assert.match(prompt, /\u738b\u83f2/);
+  assert.match(prompt, /\u6e2f\u4e50\u6df1\u60c5/);
+  assert.match(prompt, /\u534e\u8bed\u6d41\u884c/);
 });
 
 test('song plan parser creates concrete song-search queries', () => {
