@@ -25,6 +25,7 @@ export function loadEnv(rootDir = process.cwd()) {
 
 export function getConfig() {
   const env = process.env;
+  const localDevUnlockDemo = parseBoolean(env.LOCAL_DEV_UNLOCK_DEMO);
   return {
     server: {
       port: Number(env.PORT || 3000),
@@ -34,11 +35,12 @@ export function getConfig() {
       timeZone: env.APP_TIME_ZONE || 'Asia/Shanghai'
     },
     demo: {
-      guestMode: parseBoolean(env.DEMO_GUEST_MODE),
-      guestTtlHours: Math.max(1, Number(env.DEMO_GUEST_TTL_HOURS || 24) || 24)
+      guestMode: parseBoolean(env.DEMO_GUEST_MODE) && !localDevUnlockDemo,
+      guestTtlHours: Math.max(1, Number(env.DEMO_GUEST_TTL_HOURS || 24) || 24),
+      localDevUnlock: localDevUnlockDemo
     },
     playback: {
-      requireBrowserPlayUrl: parseBoolean(env.REQUIRE_BROWSER_PLAY_URL)
+      requireBrowserPlayUrl: parseBoolean(env.REQUIRE_BROWSER_PLAY_URL) && !localDevUnlockDemo
     },
     netease: {
       baseUrl: env.NETEASE_BASE_URL || 'https://openapi.music.163.com',
@@ -146,7 +148,8 @@ export function publicConfigStatus(config) {
     },
     demo: {
       guestMode: Boolean(config.demo?.guestMode),
-      guestTtlHours: config.demo?.guestTtlHours || 24
+      guestTtlHours: config.demo?.guestTtlHours || 24,
+      localDevUnlock: Boolean(config.demo?.localDevUnlock)
     },
     playback: {
       requireBrowserPlayUrl: Boolean(config.playback?.requireBrowserPlayUrl)

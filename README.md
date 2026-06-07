@@ -20,6 +20,8 @@ npm run dev
 
 Open `http://127.0.0.1:3000`.
 
+For personal local debugging, keep `LOCAL_DEV_UNLOCK_DEMO=true` in `.env.local`. This keeps account switching, library sync, local playback fallback, and account-scoped long-term memory enabled even if a demo config was copied over from the Tencent Cloud deployment.
+
 The app uses Node built-ins for the custom server and SQLite, plus `NeteaseCloudMusicApi` for NetEase cookie login and playback URL helpers.
 
 ## Deploy
