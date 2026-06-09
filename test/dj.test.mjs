@@ -23,6 +23,7 @@ import {
   analyzeConversationMood,
   analyzeTurnContext,
   buildConfirmedTrackHostFallback,
+  buildHybridCandidateContext,
   formatEnvironmentContext,
   buildRecommendationExplanation,
   buildMemoryContext,
@@ -42,8 +43,10 @@ import {
   formatProfileSummaryForPrompt,
   getRadioDebugStatus,
   getRadioQueueStatus,
+  getRecommendationPipeline,
   getTimeContext,
   hasExplicitMusicIntent,
+  isDirectMusicRequest,
   normalizeMusicContext,
   normalizeSessionConstraints,
   normalizeRadioQueue,
@@ -61,7 +64,9 @@ import {
   replayRequestAllowsPlayedSong,
   sanitizeSpokenChatText,
   scoreSearchTrackForPick,
+  trackMatchesStyleConstraint,
   trackViolatesSessionConstraints,
+  trackViolatesStyleConstraint,
   trackMatchesPlayedSongName,
   trackMatchesSongPick,
   TURN_ACTIONS
@@ -94,6 +99,54 @@ function countBySource(candidates) {
     counts[item.source] = (counts[item.source] || 0) + 1;
     return counts;
   }, {});
+}
+
+function countByNovelty(candidates) {
+  return candidates.reduce((counts, item) => {
+    const bucket = item.noveltyBucket || 'familiar';
+    counts[bucket] = (counts[bucket] || 0) + 1;
+    return counts;
+  }, {});
+}
+
+function discoveryRecords(prefix, count, artist = 'Discovery Artist') {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `${prefix}${index}`,
+    name: `Discovery ${prefix}${index}`,
+    artists: [{ name: `${artist} ${index}` }],
+    album: { name: `Discovery Album ${index}` }
+  }));
+}
+
+function discoveryNetease(records, extra = {}) {
+  return {
+    isConfigured: () => true,
+    dailyRecommend: async () => ({ data: { songs: records } }),
+    ...extra
+  };
+}
+
+function saveLocalTracks(db, prefix, count) {
+  return Array.from({ length: count }, (_, index) => saveTrack(db, {
+    id: `${prefix}${index}`,
+    originalId: `${prefix}${index}`,
+    name: `Local ${prefix}${index}`,
+    artists: [`Local Artist ${index}`],
+    album: `Local Album ${index}`
+  }));
+}
+
+function guofengDjStyleConstraint() {
+  return {
+    strict: true,
+    requiredGroups: [
+      ['\u56fd\u98ce', '\u53e4\u98ce', '\u4e2d\u56fd\u98ce'],
+      ['DJ', 'remix', '\u7535\u97f3', 'BGM']
+    ],
+    softTerms: ['\u9006\u88ad', '\u71c3', '\u529b\u91cf', '\u77ed\u89c6\u9891'],
+    negativeTerms: ['\u666e\u901a\u6292\u60c5', '\u6000\u65e7\u6162\u6b4c'],
+    searchQueries: ['\u56fd\u98ce DJ \u9006\u88ad BGM']
+  };
 }
 
 function testDb(t) {
@@ -702,6 +755,38 @@ test('feedback and artist cooldown change candidate order', () => {
   assert.equal(selected.find(item => item.track.id === 'cooldown').score < selected[0].score, true);
 });
 
+test('stronger artist cooldown reduces repetition without hard blocking liked tracks', () => {
+  const selected = rankAndSelectCandidates([
+    {
+      ...candidate('same-artist', 'library_deep', ['Repeat Artist']),
+      track: { id: 'same-artist', name: 'Repeat Artist Song', artists: ['Repeat Artist'], album: 'Album' }
+    },
+    {
+      ...candidate('fresh-artist', 'library_deep', ['Fresh Artist']),
+      track: { id: 'fresh-artist', name: 'Fresh Calm Song', artists: ['Fresh Artist'], album: 'Album' }
+    },
+    {
+      ...candidate('liked-same-artist', 'library_deep', ['Repeat Artist']),
+      track: { id: 'liked-same-artist', name: 'Liked Repeat Song', artists: ['Repeat Artist'], album: 'Album' }
+    }
+  ], {
+    quotas: { library_deep: 3 },
+    limit: 3,
+    feedbackById: new Map([
+      ['liked-same-artist', { likes: 2, dislikes: 0, completions: 3, skips: 0 }]
+    ]),
+    artistPenaltyByName: new Map([['repeat artist', -42]]),
+    profile: {
+      structured: {
+        artists: [{ name: 'Repeat Artist', weight: 1 }]
+      }
+    }
+  });
+
+  assert.equal(selected[0].track.id, 'liked-same-artist');
+  assert.equal(selected.findIndex(item => item.track.id === 'fresh-artist') < selected.findIndex(item => item.track.id === 'same-artist'), true);
+});
+
 test('feedback API handler records valid events and rejects invalid payloads', (t) => {
   const db = testDb(t);
 
@@ -1184,6 +1269,12 @@ test('turn action gate separates self-disclosure, fatigue, music requests, and r
   }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
 
   assert.equal(decideTurnAction({
+    userMessage: '我有点消沉，放一点短视频逆袭BGM，比如国风DJ',
+    explicitIntent: hasExplicitMusicIntent('我有点消沉，放一点短视频逆袭BGM，比如国风DJ'),
+    baseMood: {}
+  }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+
+  assert.equal(decideTurnAction({
     userMessage: '恢复正常推荐，取消所有偏好模式',
     explicitIntent: true,
     baseMood: {}
@@ -1247,13 +1338,84 @@ test('intent classifier maps DeepSeek JSON into turn actions', async (t) => {
   assert.equal(chatIntent.action, TURN_ACTIONS.CHAT_ONLY);
 });
 
+test('intent classifier preserves strict style constraints for precise requests', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    choices: [{
+      message: {
+        content: JSON.stringify({
+          action: 'recommend_and_play',
+          confidence: 0.93,
+          mood: 'energy',
+          energy: 'high',
+          musicIntent: 'genre',
+          searchHints: ['\u56fd\u98ce', 'DJ', '\u9006\u88ad'],
+          styleConstraint: guofengDjStyleConstraint(),
+          searchQueries: ['\u53e4\u98ce \u7535\u97f3 \u71c3\u5411 BGM'],
+          reason: 'explicit style request'
+        })
+      }
+    }]
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  const result = await classifyTurnIntent({
+    config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-flash' } },
+    userMessage: '\u6211\u6709\u70b9\u6d88\u6c89\uff0c\u653e\u4e00\u70b9\u56fd\u98ceDJ\u9006\u88adBGM',
+    baseMood: {},
+    explicitIntent: true
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+  assert.equal(result.styleConstraint.strict, true);
+  assert.equal(result.styleConstraint.requiredGroups.length >= 2, true);
+  assert.equal(result.styleSearchQueries.includes('\u56fd\u98ce DJ \u9006\u88ad BGM'), true);
+  assert.equal(result.styleSearchQueries.includes('\u53e4\u98ce \u7535\u97f3 \u71c3\u5411 BGM'), true);
+});
+
+test('intent classifier does not invent strict style for ordinary emotional chat', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async () => new Response(JSON.stringify({
+    choices: [{
+      message: {
+        content: JSON.stringify({
+          action: 'ask_followup',
+          confidence: 0.9,
+          mood: 'melancholy',
+          energy: 'low',
+          musicIntent: 'none',
+          searchHints: [],
+          reason: 'emotion without music request'
+        })
+      }
+    }]
+  }), { status: 200, headers: { 'content-type': 'application/json' } });
+
+  const result = await classifyTurnIntent({
+    config: { llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-flash' } },
+    userMessage: '\u4eca\u5929\u6709\u70b9\u6d88\u6c89\uff0c\u60f3\u8ddf\u4f60\u804a\u804a',
+    baseMood: {},
+    explicitIntent: false
+  });
+
+  assert.equal(result.accepted, true);
+  assert.equal(result.action, TURN_ACTIONS.ASK_FOLLOWUP);
+  assert.equal(result.styleConstraint, null);
+});
+
 test('intent classifier falls back on bad JSON, low confidence, and hard rules', async (t) => {
   assert.equal(decideHardRuleTurnAction({ userMessage: '下一首' }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
   assert.equal(decideHardRuleTurnAction({ userMessage: '不想听陈奕迅的这首，换他的另一首歌，切歌' }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
   assert.equal(decideHardRuleTurnAction({ userMessage: '不想听这个版本，换一首' }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+  assert.equal(decideHardRuleTurnAction({ userMessage: '来点国风DJ' }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+  assert.equal(decideHardRuleTurnAction({ userMessage: '想听陈奕迅' }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+  assert.equal(decideHardRuleTurnAction({ userMessage: '推荐一首适合健身房的歌' }).action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
   assert.equal(decideHardRuleTurnAction({ userMessage: '暂停' }).action, TURN_ACTIONS.CONTINUE_CURRENT_SONG);
   assert.equal(decideHardRuleTurnAction({ userMessage: '别放歌，先聊聊' }).action, TURN_ACTIONS.CHAT_ONLY);
   assert.equal(decideHardRuleTurnAction({ userMessage: '不要切歌，先聊聊' }).action, TURN_ACTIONS.CHAT_ONLY);
+  assert.equal(decideHardRuleTurnAction({ userMessage: '先别切歌，后面来点国风DJ' }).action, TURN_ACTIONS.CHAT_ONLY);
 
   const originalFetch = globalThis.fetch;
   t.after(() => { globalThis.fetch = originalFetch; });
@@ -1634,6 +1796,42 @@ test('ambiguous fatigue chat does not build candidates or create plays', async (
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM plays').get().count, 0);
 });
 
+test('direct music request in chat switches immediately instead of only queueing next track', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  const currentTrack = saveTrack(db, {
+    id: 'current-playing',
+    originalId: 'current-playing-original',
+    name: 'Current Playing',
+    artists: ['Current Artist'],
+    album: 'Current Album'
+  });
+  db.prepare('INSERT INTO plays (track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?)')
+    .run(currentTrack.id, new Date(Date.now() - 1000).toISOString(), 'radio', 'current playback', 'pending');
+  const playlist = savePlaylist(db, { id: 'direct-request-playlist', name: 'Direct Request Playlist', trackCount: 1 }, 'created');
+  const targetTrack = saveTrack(db, {
+    id: 'direct-request-track',
+    originalId: 'direct-request-original',
+    name: '国风逆袭BGM',
+    artists: ['CanCan Beats'],
+    album: 'Direct Request Album'
+  });
+  linkPlaylistTrack(db, playlist.id, targetTrack.id, 0);
+
+  const result = await chatTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'direct-chat-switch',
+    message: '我有点消沉，放一点短视频逆袭BGM，比如国风DJ'
+  });
+
+  assert.equal(result.turnAction.action, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+  assert.equal(result.queuePolicy.action, 'hard_preempt');
+  assert.equal(result.track?.id, 'direct-request-track');
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM plays WHERE track_id = ?').get('direct-request-track').count, 1);
+});
+
 test('chat LLM timeout remains bounded without playing music', async (t) => {
   const db = testDb(t);
   const originalFetch = globalThis.fetch;
@@ -1757,11 +1955,20 @@ test('conversation mood detects comfort needs from recent chat', () => {
 });
 
 test('recommendation trigger policy distinguishes chat from music intent', () => {
+  assert.equal(isDirectMusicRequest('我有点消沉，放一点短视频逆袭BGM，比如国风DJ'), true);
+  assert.equal(isDirectMusicRequest('来点适合写代码的'), true);
+  assert.equal(isDirectMusicRequest('想听陈奕迅'), true);
+  assert.equal(isDirectMusicRequest('推荐一首适合健身房的歌'), true);
+  assert.equal(isDirectMusicRequest('我有点消沉'), false);
+  assert.equal(isDirectMusicRequest('先别切歌，后面来点国风DJ'), false);
+  assert.equal(isDirectMusicRequest('不想听歌，先聊聊'), false);
+
   assert.equal(hasExplicitMusicIntent('换一首，来点国风'), true);
   assert.equal(hasExplicitMusicIntent('不想听这首，换他的另一首'), true);
   assert.equal(hasExplicitMusicIntent('不想听这个版本，切歌'), true);
   assert.equal(hasExplicitMusicIntent('听陈奕迅的稳稳的幸福'), true);
   assert.equal(hasExplicitMusicIntent('放周杰伦的晴天'), true);
+  assert.equal(hasExplicitMusicIntent('我有点消沉，放一点短视频逆袭BGM，比如国风DJ'), true);
   assert.equal(hasExplicitMusicIntent('听过陈奕迅的稳稳的幸福吗'), false);
   assert.equal(hasExplicitMusicIntent('只是想和你说句话'), false);
   assert.equal(hasExplicitMusicIntent('不想听歌，先聊聊'), false);
@@ -2371,6 +2578,469 @@ test('conversation mood can override weak long-term profile signal', () => {
   });
 
   assert.equal(selected[0].track.id, 'mood');
+});
+
+test('hybrid candidate context ranks local candidates with profile, feedback, mood, and constraints', async (t) => {
+  const db = testDb(t);
+  saveTrack(db, {
+    id: 'hybrid-liked',
+    originalId: 'hybrid-liked-original',
+    name: '温柔治愈歌',
+    artists: ['Good Artist'],
+    album: '治愈 Album'
+  });
+  saveTrack(db, {
+    id: 'hybrid-skipped',
+    originalId: 'hybrid-skipped-original',
+    name: 'Metal Night',
+    artists: ['Heavy Band'],
+    album: 'Heavy Album'
+  });
+  saveTrack(db, {
+    id: 'hybrid-forbidden',
+    originalId: 'hybrid-forbidden-original',
+    name: 'Forbidden Song',
+    artists: ['Forbidden Artist'],
+    album: 'Forbidden Album'
+  });
+  recordTrackFeedback(db, { trackId: 'hybrid-liked', eventType: 'like' });
+  recordTrackFeedback(db, { trackId: 'hybrid-liked', eventType: 'complete' });
+  recordTrackFeedback(db, { trackId: 'hybrid-skipped', eventType: 'dislike' });
+  recordTrackFeedback(db, { trackId: 'hybrid-skipped', eventType: 'skip' });
+
+  const context = await buildHybridCandidateContext({
+    db,
+    config: { recommendation: { pipeline: 'hybrid' } },
+    profile: {
+      structured: {
+        artists: [{ name: 'Good Artist', weight: 1 }],
+        moods: [{ name: '治愈', weight: 1 }],
+        avoidSignals: [{ name: 'metal', weight: 1 }]
+      }
+    },
+    conversationMood: { mood: 'comfort', searchHints: ['治愈', '温柔'], energy: 'low' },
+    request: { sessionConstraints: normalizeSessionConstraints({ avoidTerms: ['Forbidden Artist'] }) },
+    playedIds: new Set(),
+    playedSignatures: new Set()
+  });
+
+  const ids = context.candidates.map(candidate => candidate.track.id);
+  assert.equal(context.enabled, true);
+  assert.equal(ids[0], 'hybrid-liked');
+  assert.equal(ids.includes('hybrid-forbidden'), false);
+  assert.equal(ids.indexOf('hybrid-skipped') > ids.indexOf('hybrid-liked'), true);
+  assert.match(context.promptText, /candidateId=hybrid-liked/);
+});
+
+test('hybrid candidate context balances familiar and discovery prompt candidates', async (t) => {
+  const db = testDb(t);
+  saveLocalTracks(db, '910', 18);
+
+  const context = await buildHybridCandidateContext({
+    db,
+    config: {
+      recommendation: {
+        pipeline: 'hybrid',
+        discoveryRatio: 0.5,
+        discoveryTimeoutMs: 20,
+        discoveryCacheTtlMs: 0
+      }
+    },
+    netease: discoveryNetease(discoveryRecords('710', 18)),
+    playedIds: new Set(),
+    playedSignatures: new Set()
+  });
+
+  assert.equal(context.enabled, true);
+  assert.deepEqual(countByNovelty(context.candidates), {
+    discovery: 12,
+    familiar: 12
+  });
+  assert.equal(context.debug.promptDiscoveryCount, 12);
+  assert.equal(context.debug.promptFamiliarCount, 12);
+  assert.equal(context.debug.discoveryUnderfilled, false);
+  assert.equal(context.debug.discoverySources.netease_daily, 18);
+  assert.match(context.promptText, /发现候选/);
+  assert.match(context.promptText, /熟悉候选/);
+});
+
+test('hybrid candidate context targets discovery or familiar by recent novelty window', async (t) => {
+  const db = testDb(t);
+  saveLocalTracks(db, '920', 18);
+  const now = Date.now();
+  for (let index = 0; index < 6; index += 1) {
+    const track = saveTrack(db, {
+      id: `window-${index}`,
+      originalId: `window-${index}`,
+      name: `Window ${index}`,
+      artists: [`Window Artist ${index}`],
+      album: 'Window'
+    });
+    const source = index === 0 ? 'radio_discovery' : 'radio_familiar';
+    db.prepare('INSERT INTO plays (track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?)')
+      .run(track.id, new Date(now - index * 1000).toISOString(), source, `[novelty:${source.includes('discovery') ? 'discovery' : 'familiar'}]`, 'imported');
+  }
+
+  const discoveryTarget = await buildHybridCandidateContext({
+    db,
+    sessionId: 'novelty-window-under',
+    config: { recommendation: { pipeline: 'hybrid', discoveryRatio: 0.5, discoveryCacheTtlMs: 0 } },
+    netease: discoveryNetease(discoveryRecords('720', 18)),
+    playedIds: new Set(),
+    playedSignatures: new Set()
+  });
+  assert.equal(discoveryTarget.debug.targetNoveltyBucket, 'discovery');
+
+  for (let index = 6; index < 12; index += 1) {
+    const track = saveTrack(db, {
+      id: `window-${index}`,
+      originalId: `window-${index}`,
+      name: `Window ${index}`,
+      artists: [`Window Artist ${index}`],
+      album: 'Window'
+    });
+    const source = index < 10 ? 'radio_discovery' : 'radio_familiar';
+    db.prepare('INSERT INTO plays (track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?)')
+      .run(track.id, new Date(now + 10000 - index * 1000).toISOString(), source, `[novelty:${source.includes('discovery') ? 'discovery' : 'familiar'}]`, 'imported');
+  }
+
+  const familiarTarget = await buildHybridCandidateContext({
+    db,
+    sessionId: 'novelty-window-over',
+    config: { recommendation: { pipeline: 'hybrid', discoveryRatio: 0.5, discoveryCacheTtlMs: 0 } },
+    netease: discoveryNetease(discoveryRecords('730', 18)),
+    playedIds: new Set(),
+    playedSignatures: new Set()
+  });
+  assert.equal(familiarTarget.debug.targetNoveltyBucket, 'familiar');
+});
+
+test('hybrid candidate context falls back to familiar candidates when discovery times out', async (t) => {
+  const db = testDb(t);
+  saveLocalTracks(db, '930', 14);
+
+  const context = await buildHybridCandidateContext({
+    db,
+    config: {
+      recommendation: {
+        pipeline: 'hybrid',
+        discoveryRatio: 0.5,
+        discoveryTimeoutMs: 5,
+        discoveryCacheTtlMs: 0
+      }
+    },
+    netease: discoveryNetease([], {
+      dailyRecommend: async () => new Promise(() => {})
+    }),
+    playedIds: new Set(),
+    playedSignatures: new Set()
+  });
+
+  assert.equal(context.enabled, true);
+  assert.equal(context.debug.promptDiscoveryCount, 0);
+  assert.equal(context.debug.promptFamiliarCount, 14);
+  assert.equal(context.debug.discoveryUnderfilled, true);
+  assert.match(context.debug.discoveryFallbackReason, /timeout/);
+});
+
+test('hybrid discovery candidates exclude played and familiar tracks', async (t) => {
+  const db = testDb(t);
+  saveLocalTracks(db, '940', 12);
+
+  const context = await buildHybridCandidateContext({
+    db,
+    config: {
+      recommendation: {
+        pipeline: 'hybrid',
+        discoveryRatio: 0.5,
+        discoveryTimeoutMs: 20,
+        discoveryCacheTtlMs: 0
+      }
+    },
+    netease: discoveryNetease([
+      { id: '9400', name: 'Local 9400', artists: [{ name: 'Local Artist 0' }], album: { name: 'Local Album 0' } },
+      { id: '7800', name: 'Already Played', artists: [{ name: 'Played Artist' }], album: { name: 'Played Album' } }
+    ]),
+    playedIds: new Set(['7800']),
+    playedSignatures: new Set()
+  });
+
+  assert.equal(context.enabled, true);
+  assert.equal(context.debug.discoveryCount, 0);
+  assert.equal(context.candidates.some(candidate => candidate.track.id === '9400' && candidate.noveltyBucket === 'discovery'), false);
+  assert.equal(context.candidates.some(candidate => candidate.track.id === '7800'), false);
+});
+
+test('strict style requests populate and prioritize style search candidates', async (t) => {
+  const db = testDb(t);
+  saveLocalTracks(db, '960', 12);
+  const queries = [];
+  const context = await buildHybridCandidateContext({
+    db,
+    config: {
+      recommendation: {
+        pipeline: 'hybrid',
+        discoveryRatio: 0.5,
+        discoveryTimeoutMs: 20,
+        discoveryCacheTtlMs: 0,
+        styleSearchTimeoutMs: 20,
+        styleSearchLimit: 6
+      }
+    },
+    netease: discoveryNetease(discoveryRecords('820', 8)),
+    request: {
+      styleConstraint: guofengDjStyleConstraint(),
+      styleSearchQueries: ['\u56fd\u98ce DJ \u9006\u88ad BGM'],
+      sessionConstraints: normalizeSessionConstraints({})
+    },
+    styleSearch: async (query) => {
+      queries.push(query);
+      return [
+        {
+          id: 'style-hit',
+          name: '\u56fd\u98ce DJ \u9006\u88ad BGM',
+          artists: ['Style Artist'],
+          album: '\u56fd\u98ce\u7535\u97f3'
+        },
+        {
+          id: 'style-plain',
+          name: '\u4e00\u751f\u6240\u7231',
+          artists: ['Plain Artist'],
+          album: 'Plain Album'
+        }
+      ];
+    },
+    playedIds: new Set(),
+    playedSignatures: new Set()
+  });
+
+  assert.equal(context.enabled, true);
+  assert.equal(queries.includes('\u56fd\u98ce DJ \u9006\u88ad BGM'), true);
+  assert.equal(context.debug.reason, 'hybrid_style_candidate_pool');
+  assert.equal(context.debug.styleSearchCount, 2);
+  assert.equal(context.debug.styleQualifiedCount, 1);
+  assert.equal(context.candidates[0].track.id, 'style-hit');
+  assert.equal(context.candidates.some(candidate => candidate.track.id === 'style-plain'), true);
+  assert.match(context.promptText, /qualified_style_search/);
+  assert.match(context.promptText, /candidateId=style-hit/);
+  assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tracks WHERE id = ?').get('style-hit').count, 0);
+});
+
+test('strict style search timeout falls back to familiar candidates', async (t) => {
+  const db = testDb(t);
+  saveLocalTracks(db, '970', 4);
+
+  const context = await buildHybridCandidateContext({
+    db,
+    config: {
+      recommendation: {
+        pipeline: 'hybrid',
+        discoveryRatio: 0.5,
+        discoveryTimeoutMs: 5,
+        discoveryCacheTtlMs: 0,
+        styleSearchTimeoutMs: 5,
+        styleSearchLimit: 6
+      }
+    },
+    netease: { isConfigured: () => false },
+    request: {
+      styleConstraint: guofengDjStyleConstraint(),
+      styleSearchQueries: ['\u56fd\u98ce DJ \u9006\u88ad BGM'],
+      sessionConstraints: normalizeSessionConstraints({})
+    },
+    styleSearch: async () => new Promise(() => {}),
+    playedIds: new Set(),
+    playedSignatures: new Set()
+  });
+
+  assert.equal(context.enabled, true);
+  assert.equal(context.debug.styleSearchCount, 0);
+  assert.match(context.debug.styleSearchFallbackReason, /timeout/);
+  assert.equal(context.debug.familiarCount, 4);
+});
+
+test('style constraint helpers reject mood-similar songs without required evidence', () => {
+  const constraint = guofengDjStyleConstraint();
+  assert.equal(trackViolatesStyleConstraint({
+    id: 'plain-love',
+    name: '\u4e00\u751f\u6240\u7231',
+    artists: ['\u5362\u51a0\u5ef7'],
+    album: 'Classic Ballad'
+  }, constraint), true);
+  assert.equal(trackMatchesStyleConstraint({
+    id: 'style-hit',
+    name: '\u56fd\u98ce DJ \u9006\u88ad BGM',
+    artists: ['Style Artist'],
+    album: '\u56fd\u98ce\u7535\u97f3'
+  }, constraint), true);
+});
+
+test('hybrid candidate context can be disabled for legacy pipeline or explicit song requests', async (t) => {
+  const db = testDb(t);
+  saveTrack(db, {
+    id: 'legacy-local-track',
+    originalId: 'legacy-local-original',
+    name: 'Legacy Local',
+    artists: ['Legacy Artist'],
+    album: 'Legacy Album'
+  });
+
+  assert.equal(getRecommendationPipeline({}), 'hybrid');
+  assert.equal(getRecommendationPipeline({ recommendation: { pipeline: 'legacy' } }), 'legacy');
+
+  const legacy = await buildHybridCandidateContext({
+    db,
+    config: { recommendation: { pipeline: 'legacy' } }
+  });
+  assert.equal(legacy.enabled, false);
+  assert.equal(legacy.reason, 'legacy_pipeline');
+
+  const explicitSong = await buildHybridCandidateContext({
+    db,
+    config: { recommendation: { pipeline: 'hybrid' } },
+    request: { songTitle: '晴天' }
+  });
+  assert.equal(explicitSong.enabled, false);
+  assert.equal(explicitSong.reason, 'explicit_song_request');
+});
+
+test('hybrid candidate id selects local track without increasing LLM calls', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  saveTrack(db, {
+    id: 'candidate-hit',
+    originalId: 'candidate-hit-original',
+    name: '温柔治愈歌',
+    artists: ['Good Artist'],
+    album: '治愈 Album'
+  });
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url, options) => {
+    const request = JSON.parse(options.body);
+    requests.push(request);
+    const promptText = JSON.stringify(request.messages || []);
+    if (promptText.includes('最终可播放歌曲已经确认')) {
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: JSON.stringify({ chatText: '接下来放《温柔治愈歌》，让声音先稳稳落下来。' })
+          }
+        }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            picks: [{
+              candidateId: 'candidate-hit',
+              name: '温柔治愈歌',
+              artists: ['Good Artist'],
+              reason: '本地候选池里最贴合当前电台氛围',
+              queries: ['温柔治愈歌 Good Artist']
+            }],
+            hostDraft: '',
+            mode: null
+          })
+        }
+      }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const result = await djTurn({
+    db,
+    config: {
+      recommendation: { pipeline: 'hybrid' },
+      llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' },
+      tts: {},
+      weather: {}
+    },
+    netease: { isConfigured: () => false },
+    sessionId: 'hybrid-candidate-id',
+    userMessage: null,
+    useQueue: false
+  });
+
+  const debug = getRadioDebugStatus(db, 'hybrid-candidate-id');
+  assert.equal(result.track?.id, 'candidate-hit');
+  assert.equal(requests.length, 2);
+  assert.match(JSON.stringify(requests[0].messages), /candidateId=candidate-hit/);
+  assert.equal(debug.lastCandidatePool?.enabled, true);
+  assert.equal(debug.lastSearchDiagnostics[0]?.fallbackSource, 'hybrid_candidate');
+});
+
+test('hybrid discovery candidate id selects discovery track without increasing LLM calls', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  saveLocalTracks(db, '950', 12);
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url, options) => {
+    const request = JSON.parse(options.body);
+    requests.push(request);
+    if (requests.length === 1) {
+      return new Response(JSON.stringify({
+        choices: [{
+          message: {
+            content: JSON.stringify({
+              picks: [{
+                candidateId: '8100',
+                name: 'Fresh Signal',
+                artists: ['Fresh Artist'],
+                reason: '来自发现候选，适合当前电台状态',
+                queries: ['Fresh Signal Fresh Artist']
+              }],
+              hostDraft: '',
+              mode: null
+            })
+          }
+        }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({ chatText: '接下来放《Fresh Signal》，让电台切到一点新的风景。' })
+        }
+      }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const result = await djTurn({
+    db,
+    config: {
+      recommendation: {
+        pipeline: 'hybrid',
+        discoveryRatio: 0.5,
+        discoveryTimeoutMs: 20,
+        discoveryCacheTtlMs: 0
+      },
+      llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' },
+      tts: {},
+      weather: {}
+    },
+    netease: discoveryNetease([
+      { id: '8100', name: 'Fresh Signal', artists: [{ name: 'Fresh Artist' }], album: { name: 'Fresh Album' } }
+    ], {
+      playUrl: async (songId) => ({ data: { url: `https://music.local/${songId}.mp3` } }),
+      lyric: async () => ({ data: { lyric: '' } })
+    }),
+    sessionId: 'hybrid-discovery-candidate-id',
+    userMessage: null,
+    useQueue: false
+  });
+
+  const debug = getRadioDebugStatus(db, 'hybrid-discovery-candidate-id');
+  const play = db.prepare('SELECT source, reason FROM plays WHERE track_id = ?').get('8100');
+  assert.equal(result.track?.id, '8100');
+  assert.equal(requests.length, 2);
+  assert.equal(debug.lastSearchDiagnostics[0]?.fallbackSource, 'hybrid_candidate');
+  assert.equal(debug.lastSearchDiagnostics[0]?.noveltyBucket, 'discovery');
+  assert.equal(play.source, 'radio_discovery');
+  assert.match(play.reason, /novelty:discovery/);
 });
 
 test('DJ recommendation falls back to current profile playlists when LLM has no picks', async (t) => {

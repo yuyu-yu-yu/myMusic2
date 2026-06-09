@@ -5,7 +5,13 @@ import { getConfig } from '../server/config.mjs';
 const ENV_KEYS = [
   'DEMO_GUEST_MODE',
   'REQUIRE_BROWSER_PLAY_URL',
-  'LOCAL_DEV_UNLOCK_DEMO'
+  'LOCAL_DEV_UNLOCK_DEMO',
+  'RECOMMENDATION_DISCOVERY_RATIO',
+  'RECOMMENDATION_DISCOVERY_TIMEOUT_MS',
+  'RECOMMENDATION_DISCOVERY_CACHE_TTL_MS',
+  'RECOMMENDATION_STYLE_SEARCH_TIMEOUT_MS',
+  'RECOMMENDATION_STYLE_SEARCH_LIMIT',
+  'RECOMMENDATION_STRICT_STYLE'
 ];
 
 function withEnv(values, fn) {
@@ -45,5 +51,24 @@ test('demo locks stay enabled without local dev unlock', () => {
     assert.equal(config.demo.guestMode, true);
     assert.equal(config.demo.localDevUnlock, false);
     assert.equal(config.playback.requireBrowserPlayUrl, true);
+  });
+});
+
+test('recommendation discovery env values are parsed', () => {
+  withEnv({
+    RECOMMENDATION_DISCOVERY_RATIO: '0.5',
+    RECOMMENDATION_DISCOVERY_TIMEOUT_MS: '900',
+    RECOMMENDATION_DISCOVERY_CACHE_TTL_MS: '60000',
+    RECOMMENDATION_STYLE_SEARCH_TIMEOUT_MS: '700',
+    RECOMMENDATION_STYLE_SEARCH_LIMIT: '12',
+    RECOMMENDATION_STRICT_STYLE: 'false'
+  }, () => {
+    const config = getConfig();
+    assert.equal(config.recommendation.discoveryRatio, 0.5);
+    assert.equal(config.recommendation.discoveryTimeoutMs, 900);
+    assert.equal(config.recommendation.discoveryCacheTtlMs, 60000);
+    assert.equal(config.recommendation.styleSearchTimeoutMs, 700);
+    assert.equal(config.recommendation.styleSearchLimit, 12);
+    assert.equal(config.recommendation.strictStyle, false);
   });
 });

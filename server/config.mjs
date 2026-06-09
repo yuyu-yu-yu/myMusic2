@@ -42,6 +42,15 @@ export function getConfig() {
     playback: {
       requireBrowserPlayUrl: parseBoolean(env.REQUIRE_BROWSER_PLAY_URL) && !localDevUnlockDemo
     },
+    recommendation: {
+      pipeline: normalizeRecommendationPipeline(env.RECOMMENDATION_PIPELINE),
+      discoveryRatio: clampNumber(env.RECOMMENDATION_DISCOVERY_RATIO, 0, 1, 0.5),
+      discoveryTimeoutMs: Math.max(1, Number(env.RECOMMENDATION_DISCOVERY_TIMEOUT_MS || 1200) || 1200),
+      discoveryCacheTtlMs: Math.max(0, Number(env.RECOMMENDATION_DISCOVERY_CACHE_TTL_MS || 1800000) || 1800000),
+      styleSearchTimeoutMs: Math.max(1, Number(env.RECOMMENDATION_STYLE_SEARCH_TIMEOUT_MS || 1500) || 1500),
+      styleSearchLimit: parseNonNegativeNumber(env.RECOMMENDATION_STYLE_SEARCH_LIMIT, 30),
+      strictStyle: env.RECOMMENDATION_STRICT_STYLE === undefined ? true : parseBoolean(env.RECOMMENDATION_STRICT_STYLE)
+    },
     netease: {
       baseUrl: env.NETEASE_BASE_URL || 'https://openapi.music.163.com',
       appId: env.NETEASE_APP_ID || '',
@@ -153,10 +162,29 @@ export function publicConfigStatus(config) {
     },
     playback: {
       requireBrowserPlayUrl: Boolean(config.playback?.requireBrowserPlayUrl)
+    },
+    recommendation: {
+      pipeline: config.recommendation?.pipeline || 'hybrid'
     }
   };
 }
 
 function parseBoolean(value) {
   return ['1', 'true', 'yes', 'on'].includes(String(value || '').trim().toLowerCase());
+}
+
+function normalizeRecommendationPipeline(value) {
+  return String(value || '').trim().toLowerCase() === 'legacy' ? 'legacy' : 'hybrid';
+}
+
+function clampNumber(value, min, max, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, number));
+}
+
+function parseNonNegativeNumber(value, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(0, number);
 }

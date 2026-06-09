@@ -1,12 +1,14 @@
 // Conversational AI DJ — unified chat + track selection
 import crypto from 'node:crypto';
 import { generateChatCompletion, getWeatherSummary, synthesizeSpeech } from './ai.mjs';
-import { getProfile, listProfileFallbackTracks, resolvePlayableTrack } from './library.mjs';
+import { extractRecords, getProfile, listProfileFallbackTracks, resolvePlayableTrack } from './library.mjs';
 import {
   listRecentPlays,
   listTracks,
   nowIso,
   saveTrack,
+  normalizeTrack,
+  getFeedbackSummaryMap,
   getSessionMode,
   setSessionMode,
   recordMoodEvent,
@@ -22,7 +24,22 @@ import { buildCanCanBackgroundPrompt, buildCanCanPersonaPrompt } from './cancan-
 const CANDIDATE_LIMIT = 60;
 const AUTO_QUOTAS = { library_recent: 18, library_deep: 22, ai_discovery: 20 };
 const SEARCH_QUOTAS = { community_search: 24, ai_discovery: 12, library_recent: 12, library_deep: 12 };
+const STYLE_SEARCH_QUOTAS = { style_search: 36, ai_discovery: 12, library_recent: 6, library_deep: 6 };
+const LOCAL_CANDIDATE_LIMIT = 120;
+const HYBRID_PROMPT_CANDIDATE_LIMIT = 24;
+const LOCAL_AUTO_QUOTAS = { library_recent: 18, library_deep: 42 };
+const LOCAL_SEARCH_QUOTAS = { library_recent: 20, library_deep: 40 };
+const HYBRID_DISCOVERY_QUOTAS = { ai_discovery: 30, library_recent: 15, library_deep: 15 };
+const HYBRID_DISCOVERY_WINDOW = 6;
+const HYBRID_DISCOVERY_DEFAULT_RATIO = 0.5;
+const HYBRID_DISCOVERY_DEFAULT_TIMEOUT_MS = 1200;
+const HYBRID_DISCOVERY_DEFAULT_CACHE_TTL_MS = 30 * 60 * 1000;
+const STYLE_SEARCH_DEFAULT_TIMEOUT_MS = 1500;
+const STYLE_SEARCH_DEFAULT_LIMIT = 30;
+const RECENT_ARTIST_COOLDOWN_PENALTY = -36;
+const HOT_ARTIST_COOLDOWN_PENALTY = -42;
 const SOURCE_BASE_SCORES = {
+  style_search: 82,
   community_search: 70,
   ai_discovery: 45,
   library_recent: 42,
@@ -67,6 +84,7 @@ const VOCAL_POLICIES = Object.freeze({
   INSTRUMENTAL_ONLY: 'instrumental_only'
 });
 const radioQueueJobs = new Set();
+const discoveryCandidateCache = new Map();
 const BALANCE_MIN_USER_MESSAGES = Object.freeze({ friend: 3, balanced: 2, dj: 1 });
 const FREQUENCY_MIN_GAP = Object.freeze({ low: 5, medium: 3, high: 2 });
 export const TURN_ACTIONS = Object.freeze({
@@ -401,6 +419,8 @@ async function buildRadioRecommendation({
     track: result.track,
     reason: result.reason,
     explanation: result.explanation,
+    noveltyBucket: result.noveltyBucket || null,
+    discoverySource: result.discoverySource || null,
     ttsUrl: tts.url,
     ttsStatus: tts.status,
     ttsMs: tts.ms,
@@ -953,6 +973,8 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
   const chatText = String(payload?.chatText || '').trim();
   const track = payload?.track || null;
   const reason = payload?.reason || '';
+  const noveltyBucket = normalizeNoveltyBucket(payload?.noveltyBucket || track?.noveltyBucket);
+  const discoverySource = payload?.discoverySource || track?.discoverySource || null;
   let explanation = normalizeRecommendationExplanation(payload?.explanation);
   if (source === 'queue' && explanation) {
     explanation = normalizeRecommendationExplanation({
@@ -966,8 +988,14 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
   saveMessage(db, sessionId, 'assistant', chatText, account);
 
   if (track) {
+    const playSource = noveltyBucket === 'discovery'
+      ? 'radio_discovery'
+      : noveltyBucket === 'familiar'
+        ? 'radio_familiar'
+        : 'radio';
+    const playReason = noveltyBucket ? `[novelty:${noveltyBucket}] ${reason}`.trim() : reason;
     db.prepare('INSERT INTO plays (account_id, track_id, played_at, source, reason, host_text, report_status) VALUES (?,?,?,?,?,?,?)')
-      .run(account.accountId, track.id, nowIso(), 'radio', reason, chatText, 'pending');
+      .run(account.accountId, track.id, nowIso(), playSource, playReason, chatText, 'pending');
     saveTrack(db, track);
     const latestContext = getSessionContext(db, sessionId);
     const payloadMusicContext = normalizeMusicContext(payload?.contextSnapshot || {});
@@ -980,7 +1008,11 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
       radioIntroDone: true,
       radioIntroAt: latestContext.radioIntroAt || nowIso(),
       radioTurnCount: Number(latestContext.radioTurnCount || 0) + 1,
-      radioPlayedSongs: mergePlayedSongContext(latestContext.radioPlayedSongs, track),
+      radioPlayedSongs: mergePlayedSongContext(latestContext.radioPlayedSongs, {
+        ...track,
+        noveltyBucket,
+        discoverySource
+      }),
       lastBoundMusicContextVersion
     });
   }
@@ -1119,7 +1151,12 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       searchHints: turnAction.searchHints?.length
         ? uniqueStrings([...(turnAction.searchHints || []), ...(baseMood.searchHints || [])], 6)
         : baseMood.searchHints,
-      reason: turnAction.reason || baseMood.reason
+      reason: turnAction.reason || baseMood.reason,
+      styleConstraint: turnAction.styleConstraint || baseMood.styleConstraint || null,
+      styleSearchQueries: uniqueStrings([
+        ...(turnAction.styleSearchQueries || []),
+        ...(baseMood.styleSearchQueries || [])
+      ], 8)
     }), sessionConstraints);
     const musicContext = nextMusicContext(getSessionContext(db, sessionId).musicContext, conversationMood, userMessage);
     let queuePolicy = decideQueuePolicy({
@@ -1132,7 +1169,8 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       currentTrack?.id &&
       userMessage &&
       queuePolicy.action === RADIO_QUEUE_POLICIES.HARD_PREEMPT &&
-      !isImmediateNextRequest(userMessage)
+      !isImmediateNextRequest(userMessage) &&
+      !isDirectMusicRequest(userMessage)
     );
 
     if (shouldQueueInsteadOfImmediate) {
@@ -1411,6 +1449,8 @@ export function normalizeRadioQueue(queue = []) {
       newMode: item?.newMode || null,
       conversationMood: item?.conversationMood ? normalizeMoodDecision(item.conversationMood) : null,
       explanation: normalizeRecommendationExplanation(item?.explanation),
+      noveltyBucket: normalizeNoveltyBucket(item?.noveltyBucket),
+      discoverySource: item?.discoverySource || null,
       failedStage: item?.failedStage || null,
       error: item?.error ? String(item.error).slice(0, 240) : null,
       staleReason: item?.staleReason || null
@@ -1896,6 +1936,7 @@ export function getRadioDebugStatus(db, sessionId, accountContext = null) {
     queueMetrics: normalizeQueueMetrics(context.queueMetrics || {}),
     recentPlayedSongs: getPlayedTrackHistory(db, id, 20, account).map(sanitizeTrackForDebug),
     recentFeedback: getRecentSessionFeedback(db, id, 10, account),
+    lastCandidatePool: debug.lastCandidatePool || null,
     lastSongPlan: debug.lastSongPlan || null,
     lastSearchDiagnostics: Array.isArray(debug.lastSearchDiagnostics) ? debug.lastSearchDiagnostics.slice(0, 6) : [],
     lastRecommendationFailure: debug.lastRecommendationFailure || null,
@@ -1918,6 +1959,8 @@ function sanitizeQueueItemForDebug(item = {}) {
     hostDeferred: Boolean(item.hostDeferred),
     track: item.track ? sanitizeTrackForDebug(item.track) : null,
     explanation: normalizeRecommendationExplanation(item.explanation),
+    noveltyBucket: item.noveltyBucket || null,
+    discoverySource: item.discoverySource || null,
     ttsStatus: item.ttsStatus,
     ttsMs: item.ttsMs,
     ttsError: item.ttsError,
@@ -2488,11 +2531,40 @@ function extractRecentTopics(text) {
 export function hasExplicitMusicIntent(text) {
   const value = String(text || '');
   if (isImmediateNextRequest(value)) return true;
+  if (isDirectMusicRequest(value)) return true;
   if (/先别放|不要放|别放|不想听歌|不想听音乐|先别切|不要切|别切|别换/.test(value)) return false;
   if (isExplicitReplayRequest(value)) return true;
   if (/^(?:我想|想|要|我要|给我|帮我)?(?:听|放|播放|播)(?!说|说话|你说|我说|着|起来|过)(?:一下|一首|首)?[\s\S]{2,40}(?:的[\s\S]{1,30})?$/.test(value.trim())) return true;
   if (/下一首|换一首|换歌|切歌|播放|放一首|来一首|来首|想听|给我.*(歌|音乐)|有没有.*(歌|音乐)|听.*(歌|音乐)|artist|song|music|play|recommend/i.test(value)) return true;
   return /(推荐|来点).*(歌|音乐|曲|国风|古风|电子|摇滚|民谣|爵士|说唱|粤语|日语|英语|中文|安静|治愈|伤感|开心|提神|专注|睡前)|推荐(一首|首|点|些)?$/.test(value);
+}
+
+export function isDirectMusicRequest(text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  if (isDeferredOrNegatedMusicRequest(value)) return false;
+  if (/听过.{0,30}(吗|么|\?|？)$/.test(value)) return false;
+  if (/(你觉得|你喜欢|你会|你知道).{0,20}(歌|音乐|歌手|曲风|风格|推荐)/.test(value)) return false;
+
+  const directAction = /(?:放|播放|播|放点|放一点|来点|来首|来一首|想听|想听点|推荐|给我|帮我|安排|整点|整一首)/;
+  if (!directAction.test(value)) return false;
+
+  const blockedObject = /(意见|想法|看法|故事|解释|回答|建议|说话|说说|聊聊|聊天)/;
+  const musicTarget = /(歌|音乐|曲|BGM|bgm|DJ|dj|歌手|风格|场景|曲风|歌单|国风|古风|电子|摇滚|民谣|爵士|说唱|粤语|日语|英语|中文|安静|治愈|伤感|开心|提神|专注|睡前|健身|健身房|写代码|短视频|逆袭|鼓点|纯音乐|ost|OST|lofi|Lo-fi|hiphop|jazz|rock|pop|music|song|playlist|artist)/;
+  if (musicTarget.test(value)) return true;
+  if (/(?:想听|听|放|播放|播)(?!说|说话|你说|我说|着|起来|过)(?:一下|一首|首|点|一点)?[^，。！？!?]{2,40}/.test(value) && !blockedObject.test(value)) return true;
+  return false;
+}
+
+function isDeferredOrNegatedMusicRequest(text) {
+  const value = String(text || '').trim();
+  if (!value) return false;
+  if (/不想听(?:歌|音乐)|不放歌|只是聊/.test(value)) return true;
+  if (/(?:先别|不要|别|不用|不必|暂时别|先不).{0,8}(?:放|播|播放|听|推荐|切歌|换歌|换一首|下一首|跳过|来点|来首|歌|音乐|BGM|bgm)/.test(value)) return true;
+  if (/(?:后面|之后|以后|稍后|待会|一会儿|下一首|下首|下一轮|后续).{0,14}(?:再|可以|帮我|给我|来|放|播|播放|听|推荐|安排|整点)?(?:放|播|播放|听|推荐|来点|来首|歌|音乐|BGM|bgm|国风|曲风|风格)/.test(value)) return true;
+  if (/(?:放|播|播放|听|推荐|来点|来首).{0,24}(?:后面|之后|以后|稍后|待会|下一首再|下首再)/.test(value)) return true;
+  if (/(?:先聊|先陪|聊聊天|先别硬切|不急着切歌)/.test(value) && /(?:放|播|播放|听|推荐|来点|来首|歌|音乐|BGM|bgm)/.test(value)) return true;
+  return false;
 }
 
 export function isExplicitReplayRequest(text) {
@@ -2816,15 +2888,260 @@ function getMusicRequestConstraints(db, userMessage = '', mode = {}, sessionCons
   const artistConstraint = extractRequestedArtistConstraint(text, tracks, mode);
   const songTitle = extractRequestedSongTitle(text, artistConstraint);
   const messageVocalPolicy = detectVocalPolicyUpdate(text);
+  const styleConstraint = inferStyleConstraintFromText(text, mode);
   return {
     text,
     artistConstraint,
     songTitle,
     vocalPolicy: messageVocalPolicy || '',
     sessionConstraints: normalizeSessionConstraints(sessionConstraints),
+    styleConstraint,
+    styleSearchQueries: styleConstraint?.searchQueries || [],
     allowRequestedSongReplay: Boolean(songTitle),
     allowPlayedSongReplay: Boolean(songTitle && isExplicitReplayRequest(text))
   };
+}
+
+function normalizeParsedStyleConstraint(input = {}, extraQueries = []) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) return null;
+  const rawGroups = input.requiredGroups || input.hardGroups || input.requiredAnyGroups || [];
+  const requiredGroups = Array.isArray(rawGroups)
+    ? rawGroups.map(group => normalizeStyleTermGroup(group)).filter(group => group.length)
+    : [];
+  const softTerms = uniqueStrings([
+    ...(Array.isArray(input.softTerms) ? input.softTerms : []),
+    ...(Array.isArray(input.preferredTerms) ? input.preferredTerms : [])
+  ].map(sanitizeStyleTerm), 12);
+  const negativeTerms = uniqueStrings([
+    ...(Array.isArray(input.negativeTerms) ? input.negativeTerms : [])
+  ].map(sanitizeStyleTerm), 10);
+  const searchQueries = normalizeStyleSearchQueries([
+    ...(Array.isArray(input.searchQueries) ? input.searchQueries : []),
+    ...extraQueries
+  ]);
+  if (!requiredGroups.length && !softTerms.length && !searchQueries.length) return null;
+  return {
+    strict: Boolean(input.strict) && requiredGroups.length > 0,
+    requiredGroups,
+    softTerms,
+    negativeTerms,
+    searchQueries
+  };
+}
+
+function normalizeStyleTermGroup(group) {
+  const values = Array.isArray(group) ? group : [group];
+  return uniqueStrings(values.map(sanitizeStyleTerm).filter(Boolean), 10);
+}
+
+function sanitizeStyleTerm(value) {
+  const text = String(value || '').trim();
+  if (!text || text.length > 24) return '';
+  return text;
+}
+
+function normalizeStyleSearchQueries(values = []) {
+  return uniqueStrings((values || [])
+    .map(value => String(value || '')
+      .replace(/[鈥溾€?']/g, '')
+      .replace(/[銆傦紒锛??锛?]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim())
+    .filter(value => value && value.length <= 48 && normalizeMusicText(value).length >= 2), 6);
+}
+
+function inferStyleConstraintFromText(text = '', mode = {}) {
+  const value = `${String(text || '')} ${String(mode?.genre || '')}`.trim();
+  if (!value) return null;
+  const hasChineseStyle = /(?:\u56fd\u98ce|\u53e4\u98ce|\u4e2d\u56fd\u98ce|\u6c11\u4e50|\u620f\u8154|\u53e4\u7b5d|\u7435\u7436|\u7b1b|\u7bab)/i.test(value);
+  const hasElectronicBgm = /(?:\bDJ\b|\bdj\b|remix|\u6df7\u97f3|\u7535\u97f3|\u7535\u5b50|BGM|bgm|\u914d\u4e50|\u9f13\u70b9|\u821e\u66f2|\u71c3\u5411)/i.test(value);
+  const hasUseCase = /(?:\u77ed\u89c6\u9891|\u89c6\u9891|\u526a\u8f91|\u9006\u88ad|\u7edd\u5883|\u70ed\u8840|\u71c3|\u529b\u91cf|\u6218\u6597|\u723d\u6587)/i.test(value);
+  if (!hasChineseStyle && !hasElectronicBgm && !hasUseCase) return null;
+
+  const requiredGroups = [];
+  if (hasChineseStyle) {
+    requiredGroups.push([
+      '\u56fd\u98ce',
+      '\u53e4\u98ce',
+      '\u4e2d\u56fd\u98ce',
+      '\u6c11\u4e50',
+      '\u620f\u8154',
+      '\u53e4\u7b5d',
+      '\u7435\u7436',
+      '\u7b1b',
+      '\u7bab'
+    ]);
+  }
+  if (hasElectronicBgm) {
+    requiredGroups.push([
+      'DJ',
+      'dj',
+      'remix',
+      'Remix',
+      '\u6df7\u97f3',
+      '\u7535\u97f3',
+      '\u7535\u5b50',
+      'BGM',
+      'bgm',
+      '\u914d\u4e50',
+      '\u9f13\u70b9'
+    ]);
+  }
+
+  const softTerms = [];
+  const softCandidates = [
+    ['\u9006\u88ad', /(?:\u9006\u88ad|\u7edd\u5883)/],
+    ['\u71c3', /(?:\u71c3|\u71c3\u5411|\u70ed\u8840)/],
+    ['\u529b\u91cf', /(?:\u529b\u91cf|\u6709\u529b)/],
+    ['\u77ed\u89c6\u9891', /(?:\u77ed\u89c6\u9891|\u89c6\u9891|\u526a\u8f91)/],
+    ['BGM', /(?:BGM|bgm|\u914d\u4e50)/i]
+  ];
+  for (const [term, pattern] of softCandidates) {
+    if (pattern.test(value)) softTerms.push(term);
+  }
+
+  const searchQueries = [];
+  if (hasChineseStyle && hasElectronicBgm) {
+    searchQueries.push('\u56fd\u98ce DJ \u9006\u88ad BGM');
+    searchQueries.push('\u53e4\u98ce \u7535\u97f3 \u71c3\u5411 BGM');
+    searchQueries.push('\u4e2d\u56fd\u98ce remix \u77ed\u89c6\u9891 BGM');
+  } else if (hasChineseStyle) {
+    searchQueries.push('\u56fd\u98ce \u71c3\u5411 BGM');
+    searchQueries.push('\u53e4\u98ce \u70ed\u8840 \u914d\u4e50');
+  } else if (hasElectronicBgm || hasUseCase) {
+    searchQueries.push('\u9006\u88ad \u71c3\u5411 BGM');
+    searchQueries.push('\u77ed\u89c6\u9891 \u70ed\u8840 DJ');
+  }
+
+  if (!requiredGroups.length) return null;
+  return {
+    strict: true,
+    requiredGroups,
+    softTerms: uniqueStrings(softTerms, 8),
+    negativeTerms: [
+      '\u666e\u901a\u6292\u60c5',
+      '\u6000\u65e7\u6162\u6b4c',
+      '\u53ea\u9760\u60c5\u7eea\u76f8\u4f3c'
+    ],
+    searchQueries: normalizeStyleSearchQueries(searchQueries)
+  };
+}
+
+function normalizeStyleConstraint(input = {}, { text = '', mode = {}, searchQueries = [] } = {}) {
+  const parsed = normalizeParsedStyleConstraint(input, searchQueries);
+  const inferred = inferStyleConstraintFromText(text, mode);
+  return mergeStyleConstraints(parsed, inferred);
+}
+
+function mergeStyleConstraints(...constraints) {
+  const valid = constraints.filter(Boolean);
+  if (!valid.length) return null;
+  const requiredGroups = [];
+  const seenGroups = new Set();
+  const addGroup = (group) => {
+    const normalized = normalizeStyleTermGroup(group);
+    if (!normalized.length) return;
+    const key = normalized.map(term => normalizeMusicText(term)).sort().join('|');
+    if (seenGroups.has(key)) return;
+    seenGroups.add(key);
+    requiredGroups.push(normalized);
+  };
+  for (const constraint of valid) {
+    for (const group of constraint.requiredGroups || []) addGroup(group);
+  }
+  const softTerms = uniqueStrings(valid.flatMap(constraint => constraint.softTerms || []).map(sanitizeStyleTerm), 12);
+  const negativeTerms = uniqueStrings(valid.flatMap(constraint => constraint.negativeTerms || []).map(sanitizeStyleTerm), 10);
+  const searchQueries = normalizeStyleSearchQueries(valid.flatMap(constraint => constraint.searchQueries || []));
+  if (!requiredGroups.length && !softTerms.length && !searchQueries.length) return null;
+  return {
+    strict: valid.some(constraint => constraint.strict) && requiredGroups.length > 0,
+    requiredGroups,
+    softTerms,
+    negativeTerms,
+    searchQueries
+  };
+}
+
+function getStyleSearchConfig(config = {}) {
+  const recommendation = config?.recommendation || {};
+  const rawTimeout = Number(recommendation.styleSearchTimeoutMs ?? process.env.RECOMMENDATION_STYLE_SEARCH_TIMEOUT_MS);
+  const rawLimit = Number(recommendation.styleSearchLimit ?? process.env.RECOMMENDATION_STYLE_SEARCH_LIMIT);
+  return {
+    timeoutMs: Math.max(1, Number.isFinite(rawTimeout) && rawTimeout > 0 ? rawTimeout : STYLE_SEARCH_DEFAULT_TIMEOUT_MS),
+    limit: Math.max(0, Number.isFinite(rawLimit) ? rawLimit : STYLE_SEARCH_DEFAULT_LIMIT),
+    strictStyle: recommendation.strictStyle ?? (process.env.RECOMMENDATION_STRICT_STYLE === undefined ? true : ['1', 'true', 'yes', 'on'].includes(String(process.env.RECOMMENDATION_STRICT_STYLE || '').trim().toLowerCase()))
+  };
+}
+
+function styleConstraintIsActive(styleConstraint = null, config = {}) {
+  if (!styleConstraint?.strict || !styleConstraint.requiredGroups?.length) return false;
+  return getStyleSearchConfig(config).strictStyle !== false;
+}
+
+function styleConstraintEvidenceText(track = {}) {
+  return [
+    track?.name,
+    track?.album,
+    track?.albumName,
+    ...(Array.isArray(track?.artists) ? track.artists : [])
+  ].filter(Boolean).join(' ');
+}
+
+function styleTermMatchesText(term, text) {
+  const wanted = normalizeMusicText(term);
+  const haystack = normalizeMusicText(text);
+  return wanted.length >= 1 && haystack.includes(wanted);
+}
+
+function getStyleConstraintResult(track = {}, styleConstraint = null, config = {}) {
+  if (!styleConstraintIsActive(styleConstraint, config)) {
+    return { active: false, accepted: true, matchedTerms: [], missingGroups: [] };
+  }
+  const text = styleConstraintEvidenceText(track);
+  const matchedTerms = [];
+  const missingGroups = [];
+  for (const group of styleConstraint.requiredGroups || []) {
+    const matched = (group || []).filter(term => styleTermMatchesText(term, text));
+    if (matched.length) matchedTerms.push(...matched);
+    else missingGroups.push(group);
+  }
+  return {
+    active: true,
+    accepted: missingGroups.length === 0,
+    matchedTerms: uniqueStrings(matchedTerms, 12),
+    missingGroups: missingGroups.map(group => uniqueStrings(group, 8))
+  };
+}
+
+export function trackMatchesStyleConstraint(track = {}, styleConstraint = null, config = {}) {
+  return getStyleConstraintResult(track, styleConstraint, config).accepted;
+}
+
+export function trackViolatesStyleConstraint(track = {}, styleConstraint = null, config = {}) {
+  return !trackMatchesStyleConstraint(track, styleConstraint, config);
+}
+
+function sanitizeStyleConstraintForDebug(styleConstraint = null) {
+  if (!styleConstraint) return null;
+  return {
+    strict: Boolean(styleConstraint.strict),
+    requiredGroups: (styleConstraint.requiredGroups || []).map(group => uniqueStrings(group, 8)).slice(0, 6),
+    softTerms: uniqueStrings(styleConstraint.softTerms || [], 12),
+    negativeTerms: uniqueStrings(styleConstraint.negativeTerms || [], 10),
+    searchQueries: normalizeStyleSearchQueries(styleConstraint.searchQueries || [])
+  };
+}
+
+function formatStyleConstraintForPrompt(styleConstraint = null) {
+  if (!styleConstraintIsActive(styleConstraint)) return '';
+  return [
+    'STRICT_STYLE_CONSTRAINT:',
+    `requiredGroups=${JSON.stringify(styleConstraint.requiredGroups || [])}`,
+    `softTerms=${JSON.stringify(styleConstraint.softTerms || [])}`,
+    `negativeTerms=${JSON.stringify(styleConstraint.negativeTerms || [])}`,
+    `searchQueries=${JSON.stringify(styleConstraint.searchQueries || [])}`,
+    'When strict style is active, do not replace it with mood similarity. A normal ballad that only feels emotional is not a valid substitute.'
+  ].join('\n');
 }
 
 function safeListTracks(db) {
@@ -3019,6 +3336,11 @@ export function decideHardRuleTurnAction({ userMessage = '', mode = {} } = {}) {
       searchHints: extractActionSearchHints(text, mode)
     });
   }
+  if (isDirectMusicRequest(text)) {
+    return result(TURN_ACTIONS.RECOMMEND_AND_PLAY, 'user directly requested music from chat', {
+      searchHints: extractActionSearchHints(text, mode)
+    });
+  }
   if (rejectsMusic(text)) return result(TURN_ACTIONS.CHAT_ONLY, 'user explicitly rejected playback or switching');
   return null;
 }
@@ -3110,6 +3432,7 @@ export async function classifyTurnIntent({
         '必须只输出 JSON，不要 Markdown，不要解释。',
         'action 只能是：chat_only、ask_followup、recommend_and_play、continue_current_song。',
         '普通聊天、问观点、问歌手喜好、问知识，不要切歌；明确点歌、换歌、要求某风格/歌手/歌曲，才 recommend_and_play。',
+        '带有“放/来点/想听/推荐/给我”这类播放动作，并且目标是歌、音乐、BGM、歌手、风格、场景或曲风时，必须 recommend_and_play。',
         '用户情绪表达但没有明确要音乐时，通常 ask_followup；只有上下文显示适合自然接歌且允许主动推荐时，才 recommend_and_play。',
         '如果只是“你喜欢陈奕迅吗/你觉得这首歌如何”，这是聊天，不是点歌。',
         '输出字段：{"action":"...","confidence":0-1,"mood":"comfort|melancholy|calm|healing|focus|energy|romantic|nostalgic|night|random","energy":"low|medium|high","musicIntent":"none|explicit_song|artist|genre|mood|skip|playback_control","searchHints":["关键词"],"reason":"简短中文理由"}'
@@ -3134,6 +3457,7 @@ export async function classifyTurnIntent({
       ].join('\n')
     }
   ];
+  messages[0].content += '\nFor explicit style/use requests, also output styleConstraint and searchQueries. styleConstraint format: {"strict":true,"requiredGroups":[["termA","termB"],["termC"]],"softTerms":["term"],"negativeTerms":["term"],"searchQueries":["short music query"]}. Example: guofeng DJ ni xi BGM => requiredGroups [["国风","古风","中国风"],["DJ","remix","电音","BGM"]], softTerms ["逆袭","燃","力量","短视频"]. For ordinary emotional chat, strict must be false or omitted.';
 
   const raw = await withTimeout(
     generateChatCompletion(config.llm, messages, () => INTENT_FALLBACK_SENTINEL),
@@ -3158,6 +3482,14 @@ export async function classifyTurnIntent({
         skipFriendLlm: false
       };
     }
+    const styleConstraint = normalizeStyleConstraint(parsed.styleConstraint, {
+      text: userMessage,
+      mode,
+      searchQueries: [
+        ...(Array.isArray(parsed.searchQueries) ? parsed.searchQueries : []),
+        ...((parsed.styleConstraint && Array.isArray(parsed.styleConstraint.searchQueries)) ? parsed.styleConstraint.searchQueries : [])
+      ]
+    });
     const normalizedMood = normalizeMoodDecision({
       mood: parsed.mood,
       energy: parsed.energy,
@@ -3165,7 +3497,9 @@ export async function classifyTurnIntent({
       musicIntent: parsed.musicIntent || 'none',
       searchHints: Array.isArray(parsed.searchHints) ? parsed.searchHints : [],
       reason: parsed.reason,
-      confidence
+      confidence,
+      styleConstraint: action === TURN_ACTIONS.RECOMMEND_AND_PLAY ? styleConstraint : null,
+      styleSearchQueries: action === TURN_ACTIONS.RECOMMEND_AND_PLAY ? (styleConstraint?.searchQueries || []) : []
     });
     return {
       ...normalizedMood,
@@ -3175,7 +3509,9 @@ export async function classifyTurnIntent({
       source: 'llm',
       reason: parsed.reason || 'LLM intent classifier',
       searchHints: normalizedMood.searchHints,
-      musicIntent: parsed.musicIntent || normalizedMood.musicIntent || 'none'
+      musicIntent: parsed.musicIntent || normalizedMood.musicIntent || 'none',
+      styleConstraint: normalizedMood.styleConstraint,
+      styleSearchQueries: normalizedMood.styleSearchQueries
     };
   } catch (error) {
     return {
@@ -3682,6 +4018,9 @@ function fallbackNoNamedSongChat(userMessage = '', mood = {}, turnAction = null)
 function normalizeMoodDecision(input = {}) {
   const mood = MOODS.has(input.mood) ? input.mood : 'random';
   const hints = Array.isArray(input.searchHints) ? input.searchHints : [];
+  const styleConstraint = normalizeStyleConstraint(input.styleConstraint, {
+    searchQueries: input.styleSearchQueries || input.searchQueries || []
+  });
   return {
     shouldRecommend: Boolean(input.shouldRecommend),
     mood,
@@ -3693,6 +4032,8 @@ function normalizeMoodDecision(input = {}) {
     avoidHints: Array.isArray(input.avoidHints) ? uniqueStrings(input.avoidHints, 8) : [],
     musicIntent: input.musicIntent || input.intent || 'chat',
     vocalPolicy: normalizeVocalPolicy(input.vocalPolicy),
+    styleConstraint,
+    styleSearchQueries: styleConstraint?.searchQueries || [],
     confidence: Number.isFinite(Number(input.confidence)) ? Number(input.confidence) : undefined
   };
 }
@@ -3708,6 +4049,8 @@ export function normalizeMusicContext(input = {}) {
     avoidHints: uniqueStrings(input.avoidHints || mood.avoidHints || [], 8),
     musicIntent: input.musicIntent || mood.musicIntent || 'chat',
     vocalPolicy: normalizeVocalPolicy(input.vocalPolicy || mood.vocalPolicy),
+    styleConstraint: mood.styleConstraint || normalizeStyleConstraint(input.styleConstraint, { searchQueries: input.styleSearchQueries || [] }),
+    styleSearchQueries: uniqueStrings(input.styleSearchQueries || mood.styleSearchQueries || mood.styleConstraint?.searchQueries || [], 8),
     confidence: Number.isFinite(Number(input.confidence)) ? Number(input.confidence) : (mood.confidence ?? 0.45),
     reason: input.reason || mood.reason || '',
     lastUserMessage: String(input.lastUserMessage || '').slice(0, 180),
@@ -3739,6 +4082,11 @@ function nextMusicContext(previous = {}, analysis = {}, userMessage = '') {
     vocalPolicy: messageVocalPolicy !== null
       ? messageVocalPolicy
       : (normalizedAnalysis.vocalPolicy || normalizedPrevious.vocalPolicy || ''),
+    styleConstraint: normalizedAnalysis.styleConstraint || normalizedPrevious.styleConstraint || null,
+    styleSearchQueries: uniqueStrings([
+      ...(normalizedAnalysis.styleSearchQueries || []),
+      ...(normalizedPrevious.styleSearchQueries || [])
+    ], 8),
     confidence: normalizedAnalysis.confidence ?? normalizedPrevious.confidence,
     reason: normalizedAnalysis.reason || normalizedPrevious.reason || '',
     lastUserMessage: userMessage || normalizedPrevious.lastUserMessage || '',
@@ -4122,6 +4470,8 @@ function mergePlayedSongContext(existing = [], track = {}) {
     name: String(track.name || ''),
     artists: Array.isArray(track.artists) ? track.artists.slice(0, 4) : [],
     album: track.album || '',
+    noveltyBucket: normalizeNoveltyBucket(track.noveltyBucket),
+    discoverySource: track.discoverySource || null,
     key,
     playedAt: nowIso()
   };
@@ -4345,6 +4695,779 @@ function parseJsonArray(text) {
   }
 }
 
+export function getRecommendationPipeline(config = {}) {
+  const value = String(config?.recommendation?.pipeline || process.env.RECOMMENDATION_PIPELINE || '').trim().toLowerCase();
+  return value === 'legacy' ? 'legacy' : 'hybrid';
+}
+
+export async function buildHybridCandidateContext({
+  db,
+  config = {},
+  netease = null,
+  sessionId = '',
+  profile = {},
+  mode = {},
+  userMessage = '',
+  conversationMood = null,
+  request = {},
+  playedIds = new Set(),
+  playedSignatures = new Set(),
+  accountContext = null,
+  styleSearch = searchOnline
+} = {}) {
+  const pipeline = getRecommendationPipeline(config);
+  const disabled = (reason, extra = {}) => ({
+    enabled: false,
+    reason,
+    pipeline,
+    candidates: [],
+    candidateById: new Map(),
+    promptText: '',
+    debug: {
+      pipeline,
+      enabled: false,
+      reason,
+      totalCandidates: 0,
+      promptCandidates: [],
+      ...extra,
+      updatedAt: nowIso()
+    }
+  });
+  if (pipeline === 'legacy') return disabled('legacy_pipeline');
+  if (request?.songTitle) return disabled('explicit_song_request');
+
+  try {
+    const account = normalizeAccountContext(accountContext);
+    const familiarCandidates = buildLocalRecommendationCandidates({
+      db,
+      request,
+      playedIds,
+      playedSignatures,
+      accountContext: account
+    });
+    const styleSearchResult = await buildStyleSearchCandidates({
+      config,
+      request,
+      playedIds,
+      playedSignatures,
+      styleSearch
+    });
+    const discoveryResult = await buildDiscoveryRecommendationCandidates({
+      db,
+      config,
+      netease,
+      request,
+      playedIds,
+      playedSignatures,
+      familiarCandidates,
+      accountContext: account
+    });
+    const candidates = [...styleSearchResult.candidates, ...familiarCandidates, ...discoveryResult.candidates];
+    if (!candidates.length) {
+      return disabled('empty_candidate_pool', {
+        familiarCount: 0,
+        styleSearchCount: 0,
+        styleQualifiedCount: 0,
+        discoveryCount: 0,
+        styleSearchFallbackReason: styleSearchResult.fallbackReason || null,
+        discoveryFallbackReason: discoveryResult.fallbackReason || null
+      });
+    }
+
+    const feedbackById = getFeedbackSummaryMap(db, candidates.map(candidate => candidate.track?.id), account.accountId);
+    const strictStyleActive = styleConstraintIsActive(request.styleConstraint, config);
+    const ranked = rankAndSelectCandidates(candidates, {
+      quotas: strictStyleActive
+        ? STYLE_SEARCH_QUOTAS
+        : (discoveryResult.candidates.length ? HYBRID_DISCOVERY_QUOTAS : (userMessage || conversationMood?.searchHints?.length ? LOCAL_SEARCH_QUOTAS : LOCAL_AUTO_QUOTAS)),
+      limit: Math.min(CANDIDATE_LIMIT, Math.max(HYBRID_PROMPT_CANDIDATE_LIMIT, candidates.length)),
+      feedbackById,
+      artistPenaltyByName: getArtistPenaltyByName(db, account),
+      profile,
+      mode,
+      userMessage,
+      conversationMood,
+      styleConstraint: request.styleConstraint,
+      seed: `${account.accountId}:${userMessage || conversationMood?.reason || nowIso().slice(0, 10)}`
+    });
+    const noveltyTarget = getNoveltyTarget({ db, sessionId, accountContext: account, config });
+    const promptSelection = strictStyleActive
+      ? selectPromptCandidatesForStyle(ranked, {
+          limit: HYBRID_PROMPT_CANDIDATE_LIMIT,
+          discoveryRatio: getDiscoveryConfig(config).ratio,
+          targetNoveltyBucket: noveltyTarget.targetNoveltyBucket,
+          styleConstraint: request.styleConstraint,
+          config
+        })
+      : selectPromptCandidatesByNovelty(ranked, {
+          limit: HYBRID_PROMPT_CANDIDATE_LIMIT,
+          discoveryRatio: getDiscoveryConfig(config).ratio,
+          targetNoveltyBucket: noveltyTarget.targetNoveltyBucket
+        });
+    const promptCandidates = promptSelection.candidates;
+    if (!promptCandidates.length) return disabled('empty_ranked_candidate_pool', { totalCandidates: candidates.length });
+
+    const candidateById = new Map(promptCandidates.map(candidate => [candidateIdForTrack(candidate.track), candidate]));
+    const debugCandidates = promptCandidates.slice(0, 12).map(sanitizeCandidateForDebug);
+    const discoverySources = summarizeDiscoverySources(discoveryResult.candidates);
+    const styleSearchSources = summarizeDiscoverySources(styleSearchResult.candidates);
+    return {
+      enabled: true,
+      reason: strictStyleActive && styleSearchResult.candidates.length
+        ? 'hybrid_style_candidate_pool'
+        : (discoveryResult.candidates.length ? 'hybrid_balanced_candidate_pool' : 'hybrid_local_candidate_pool'),
+      pipeline,
+      candidates: promptCandidates,
+      candidateById,
+      promptText: strictStyleActive
+        ? formatStyleHybridCandidatePrompt(promptCandidates, {
+            styleConstraint: request.styleConstraint,
+            targetNoveltyBucket: noveltyTarget.targetNoveltyBucket
+          })
+        : formatBalancedHybridCandidatePrompt(promptCandidates, {
+            targetNoveltyBucket: noveltyTarget.targetNoveltyBucket
+          }),
+      debug: {
+        pipeline,
+        enabled: true,
+        reason: strictStyleActive && styleSearchResult.candidates.length
+          ? 'hybrid_style_candidate_pool'
+          : (discoveryResult.candidates.length ? 'hybrid_balanced_candidate_pool' : 'hybrid_local_candidate_pool'),
+        totalCandidates: candidates.length,
+        familiarCount: familiarCandidates.length,
+        styleConstraint: sanitizeStyleConstraintForDebug(request.styleConstraint),
+        styleSearchQueries: request.styleSearchQueries || request.styleConstraint?.searchQueries || [],
+        styleSearchCount: styleSearchResult.candidates.length,
+        styleQualifiedCount: styleSearchResult.qualifiedCount || 0,
+        promptStyleSearchCount: promptSelection.styleSearchCount || 0,
+        discoveryCount: discoveryResult.candidates.length,
+        rankedCandidates: ranked.length,
+        promptLimit: HYBRID_PROMPT_CANDIDATE_LIMIT,
+        promptFamiliarCount: promptSelection.familiarCount,
+        promptDiscoveryCount: promptSelection.discoveryCount,
+        discoveryUnderfilled: promptSelection.discoveryUnderfilled,
+        familiarUnderfilled: promptSelection.familiarUnderfilled,
+        targetNoveltyBucket: noveltyTarget.targetNoveltyBucket,
+        noveltyWindow: noveltyTarget.window,
+        discoverySources,
+        styleSearchSources,
+        styleSearchFallbackReason: styleSearchResult.fallbackReason || null,
+        discoveryFallbackReason: discoveryResult.fallbackReason || null,
+        promptCandidates: debugCandidates,
+        updatedAt: nowIso()
+      }
+    };
+  } catch (error) {
+    return disabled('candidate_pool_error', { error: String(error?.message || error).slice(0, 180) });
+  }
+}
+
+function buildLocalRecommendationCandidates({ db, request = {}, playedIds = new Set(), playedSignatures = new Set(), accountContext = null } = {}) {
+  const account = normalizeAccountContext(accountContext);
+  const candidates = new Map();
+  const recentPlays = safeCall(() => listRecentPlays(db, 50, account.accountId), []);
+  const recentArtistNames = new Set(recentPlays.flatMap(play => play.artists || []).map(normalizeMusicText).filter(Boolean));
+  const explicitArtist = normalizeMusicText(request?.artistConstraint?.label || '');
+
+  const addTrack = (track, source, sourceReason = '') => {
+    if (!track?.id || !track?.name) return;
+    if (!Array.isArray(track.artists) || !track.artists.length) return;
+    if (explicitArtist && !trackArtistMatchesLabel(track, explicitArtist)) return;
+    if (trackViolatesSessionConstraints(track, request.sessionConstraints)) return;
+    if (trackViolatesVocalPolicy(track, request)) return;
+    if (playedIds.has(String(track.id)) && !replayRequestAllowsPlayedSong(track, request)) return;
+    if (trackMatchesPlayedSongName(track, playedSignatures) && !replayRequestAllowsPlayedSong(track, request)) return;
+
+    const key = String(track.id);
+    const artistRecent = (track.artists || []).some(artist => recentArtistNames.has(normalizeMusicText(artist)));
+    const effectiveSource = artistRecent ? 'library_recent' : source;
+    const reason = uniqueStrings([
+      sourceReason,
+      artistRecent ? '接近最近常听艺人' : '',
+      track.playlistName ? `来自《${track.playlistName}》` : ''
+    ], 4).join('；');
+    const candidate = {
+      track,
+      source: effectiveSource,
+      noveltyBucket: 'familiar',
+      sourceReason: reason || (effectiveSource === 'library_recent' ? '最近常听相关' : '本地曲库画像')
+    };
+    const existing = candidates.get(key);
+    if (!existing || sourcePriority(candidate.source) > sourcePriority(existing.source)) {
+      candidates.set(key, candidate);
+    }
+  };
+
+  for (const track of safeCall(() => listProfileFallbackTracks(db, LOCAL_CANDIDATE_LIMIT, account), [])) {
+    addTrack(track, 'library_deep', track.playlistName ? `画像歌单《${track.playlistName}》` : '画像歌单');
+  }
+  for (const track of safeCall(() => listTracks(db, LOCAL_CANDIDATE_LIMIT), [])) {
+    addTrack(track, 'library_deep', '本地曲库');
+  }
+  return [...candidates.values()];
+}
+
+async function buildStyleSearchCandidates({
+  config = {},
+  request = {},
+  playedIds = new Set(),
+  playedSignatures = new Set(),
+  styleSearch = searchOnline
+} = {}) {
+  const styleConfig = getStyleSearchConfig(config);
+  const empty = (fallbackReason, extra = {}) => ({
+    candidates: [],
+    fallbackReason,
+    qualifiedCount: 0,
+    ...extra
+  });
+  if (!styleConstraintIsActive(request.styleConstraint, config)) return empty('style_constraint_inactive');
+  if (!styleConfig.limit) return empty('style_search_disabled');
+  if (typeof styleSearch !== 'function') return empty('style_search_unavailable');
+
+  const queries = normalizeStyleSearchQueries([
+    ...(request.styleSearchQueries || []),
+    ...(request.styleConstraint?.searchQueries || [])
+  ]);
+  if (!queries.length) return empty('no_style_search_queries');
+
+  const perQueryLimit = Math.max(3, Math.min(10, Math.ceil(styleConfig.limit / Math.min(queries.length, 3))));
+  const jobs = queries.slice(0, 3).map(query => ({
+    source: 'style_search',
+    query,
+    run: () => styleSearch(query, perQueryLimit)
+  }));
+  const results = await Promise.all(jobs.map(job => runStyleSearchJob(job, styleConfig.timeoutMs)));
+  const errors = results
+    .filter(result => result.error || result.timedOut)
+    .map(result => `${result.query}:${result.timedOut ? 'timeout' : result.error}`);
+  const candidates = normalizeStyleSearchCandidates({
+    results,
+    request,
+    playedIds,
+    playedSignatures,
+    limit: styleConfig.limit,
+    config
+  });
+  return {
+    candidates,
+    qualifiedCount: candidates.filter(candidate => candidate.styleQualified).length,
+    fallbackReason: candidates.length ? null : (errors[0] || 'no_style_search_candidates'),
+    errors: errors.slice(0, 3)
+  };
+}
+
+async function runStyleSearchJob(job, timeoutMs) {
+  const guarded = Promise.resolve()
+    .then(job.run)
+    .then(response => ({
+      source: job.source,
+      query: job.query,
+      records: extractRecords(response?.data ?? response),
+      error: null,
+      timedOut: false
+    }))
+    .catch(error => ({
+      source: job.source,
+      query: job.query,
+      records: [],
+      error: String(error?.message || error).slice(0, 120),
+      timedOut: false
+    }));
+  return withTimeout(guarded, timeoutMs, {
+    source: job.source,
+    query: job.query,
+    records: [],
+    error: 'timeout',
+    timedOut: true
+  });
+}
+
+function normalizeStyleSearchCandidates({
+  results = [],
+  request = {},
+  playedIds = new Set(),
+  playedSignatures = new Set(),
+  limit = STYLE_SEARCH_DEFAULT_LIMIT,
+  config = {}
+} = {}) {
+  const candidates = new Map();
+  const explicitArtist = normalizeMusicText(request?.artistConstraint?.label || '');
+
+  const addTrack = (rawTrack, query) => {
+    const track = normalizeDiscoveryTrack(rawTrack);
+    if (!track?.id || !track?.name || !track.artists?.length) return;
+    if (explicitArtist && !trackArtistMatchesLabel(track, explicitArtist)) return;
+    if (trackViolatesSessionConstraints(track, request.sessionConstraints)) return;
+    if (trackViolatesVocalPolicy(track, request)) return;
+    if (playedIds.has(String(track.id)) && !replayRequestAllowsPlayedSong(track, request)) return;
+    const signature = playedSongKey(track.name);
+    if (signature && playedSignatures.has(signature) && !replayRequestAllowsPlayedSong(track, request)) return;
+    const key = String(track.id);
+    if (candidates.has(key)) return;
+    const styleResult = getStyleConstraintResult(track, request.styleConstraint, config);
+    candidates.set(key, {
+      track,
+      source: 'style_search',
+      noveltyBucket: 'discovery',
+      discoverySource: 'style_search',
+      styleQualified: styleResult.accepted,
+      styleConstraintResult: styleResult,
+      sourceReason: query ? `style_search:${query}` : 'style_search'
+    });
+  };
+
+  for (const result of results || []) {
+    for (const record of result.records || []) {
+      addTrack(record, result.query || '');
+      if (candidates.size >= limit) break;
+    }
+    if (candidates.size >= limit) break;
+  }
+
+  return [...candidates.values()];
+}
+
+async function buildDiscoveryRecommendationCandidates({
+  db,
+  config = {},
+  netease = null,
+  request = {},
+  playedIds = new Set(),
+  playedSignatures = new Set(),
+  familiarCandidates = [],
+  accountContext = null
+} = {}) {
+  const discoveryConfig = getDiscoveryConfig(config);
+  const empty = (fallbackReason, extra = {}) => ({
+    candidates: [],
+    fallbackReason,
+    ...extra
+  });
+  if (discoveryConfig.ratio <= 0) return empty('discovery_disabled');
+  if (!netease || (typeof netease.isConfigured === 'function' && !netease.isConfigured())) {
+    return empty('netease_unconfigured');
+  }
+
+  const account = normalizeAccountContext(accountContext);
+  const seedSongIds = getDiscoverySeedSongIds({ db, familiarCandidates, accountContext: account });
+  const cacheKey = buildDiscoveryCacheKey({ account, seedSongIds });
+  const cached = readDiscoveryCache(cacheKey);
+
+  const jobs = [];
+  if (typeof netease.dailyRecommend === 'function') {
+    jobs.push({ source: 'netease_daily', run: () => netease.dailyRecommend() });
+  }
+  if (seedSongIds.length && typeof netease.moreRecommend === 'function') {
+    jobs.push({ source: 'netease_more', run: () => netease.moreRecommend(seedSongIds.slice(0, 6)) });
+  }
+  if (seedSongIds.length && typeof netease.similarSongs === 'function') {
+    jobs.push({ source: 'netease_similar', run: () => netease.similarSongs(seedSongIds[0], 24) });
+  }
+  if (!jobs.length) return empty('no_discovery_api');
+
+  const results = cached?.results || await Promise.all(jobs.slice(0, 3).map(job => runDiscoveryJob(job, discoveryConfig.timeoutMs)));
+  const errors = results
+    .filter(result => result.error || result.timedOut)
+    .map(result => `${result.source}:${result.timedOut ? 'timeout' : result.error}`);
+  if (!cached && results.some(result => result.records?.length)) {
+    writeDiscoveryCache(cacheKey, { results }, discoveryConfig.cacheTtlMs);
+  }
+  const candidates = normalizeDiscoveryCandidates({
+    results,
+    request,
+    playedIds,
+    playedSignatures,
+    familiarCandidates
+  });
+  const fallbackReason = candidates.length ? null : (errors[0] || 'no_discovery_candidates');
+  const value = {
+    candidates,
+    fallbackReason,
+    errors: errors.slice(0, 3),
+    cacheHit: Boolean(cached)
+  };
+  return value;
+}
+
+async function runDiscoveryJob(job, timeoutMs) {
+  const guarded = Promise.resolve()
+    .then(job.run)
+    .then(response => ({
+      source: job.source,
+      records: extractRecords(response?.data ?? response),
+      error: null,
+      timedOut: false
+    }))
+    .catch(error => ({
+      source: job.source,
+      records: [],
+      error: String(error?.message || error).slice(0, 120),
+      timedOut: false
+    }));
+  return withTimeout(guarded, timeoutMs, {
+    source: job.source,
+    records: [],
+    error: 'timeout',
+    timedOut: true
+  });
+}
+
+function normalizeDiscoveryCandidates({
+  results = [],
+  request = {},
+  playedIds = new Set(),
+  playedSignatures = new Set(),
+  familiarCandidates = []
+} = {}) {
+  const candidates = new Map();
+  const familiarIds = new Set(familiarCandidates.map(candidate => String(candidate?.track?.id || '')).filter(Boolean));
+  const familiarSignatures = new Set(familiarCandidates.map(candidate => playedSongKey(candidate?.track?.name)).filter(Boolean));
+  const explicitArtist = normalizeMusicText(request?.artistConstraint?.label || '');
+
+  const addTrack = (rawTrack, discoverySource) => {
+    const track = normalizeDiscoveryTrack(rawTrack);
+    if (!track?.id || !track?.name || !track.artists?.length) return;
+    if (explicitArtist && !trackArtistMatchesLabel(track, explicitArtist)) return;
+    if (trackViolatesSessionConstraints(track, request.sessionConstraints)) return;
+    if (trackViolatesVocalPolicy(track, request)) return;
+    if (playedIds.has(String(track.id)) && !replayRequestAllowsPlayedSong(track, request)) return;
+    const signature = playedSongKey(track.name);
+    if (signature && playedSignatures.has(signature) && !replayRequestAllowsPlayedSong(track, request)) return;
+    if (familiarIds.has(String(track.id)) || (signature && familiarSignatures.has(signature))) return;
+
+    const key = String(track.id);
+    if (candidates.has(key)) return;
+    candidates.set(key, {
+      track,
+      source: 'ai_discovery',
+      noveltyBucket: 'discovery',
+      discoverySource,
+      sourceReason: discoverySourceLabel(discoverySource)
+    });
+  };
+
+  for (const result of results || []) {
+    for (const record of result.records || []) {
+      addTrack(record, result.source || 'netease_discovery');
+    }
+  }
+
+  return [...candidates.values()];
+}
+
+function normalizeDiscoveryTrack(rawTrack) {
+  const normalized = normalizeTrack(rawTrack);
+  if (!normalized?.id || String(normalized.id).startsWith('local-')) return null;
+  if (!normalized.name || !normalized.artists?.length) return null;
+  return normalized;
+}
+
+function discoverySourceLabel(source = '') {
+  const labels = {
+    netease_daily: '网易云每日推荐发现',
+    netease_more: '网易云更多推荐发现',
+    netease_similar: '网易云相似歌曲发现'
+  };
+  return labels[source] || '网易云发现候选';
+}
+
+function getDiscoverySeedSongIds({ db, familiarCandidates = [], accountContext = null } = {}) {
+  const account = normalizeAccountContext(accountContext);
+  const ids = [];
+  const add = (value) => {
+    const id = String(value || '').trim();
+    if (/^\d+$/.test(id) && !ids.includes(id)) ids.push(id);
+  };
+  for (const play of safeCall(() => listRecentPlays(db, 12, account.accountId), [])) {
+    add(play.originalId || play.track_id || play.trackId || play.id);
+  }
+  for (const candidate of familiarCandidates || []) {
+    add(candidate?.track?.originalId || candidate?.track?.id);
+  }
+  return ids.slice(0, 8);
+}
+
+function buildDiscoveryCacheKey({ account, seedSongIds = [] } = {}) {
+  return `${account?.accountId || 'default'}:${seedSongIds.slice(0, 6).join(',') || 'daily'}`;
+}
+
+function readDiscoveryCache(key) {
+  const cached = discoveryCandidateCache.get(key);
+  if (!cached) return null;
+  if (cached.expiresAt && cached.expiresAt <= Date.now()) {
+    discoveryCandidateCache.delete(key);
+    return null;
+  }
+  return cached.value;
+}
+
+function writeDiscoveryCache(key, value, ttlMs) {
+  if (!ttlMs || ttlMs <= 0) return;
+  discoveryCandidateCache.set(key, {
+    value,
+    expiresAt: Date.now() + ttlMs
+  });
+}
+
+function getDiscoveryConfig(config = {}) {
+  const recommendation = config?.recommendation || {};
+  return {
+    ratio: clampNumber(recommendation.discoveryRatio ?? process.env.RECOMMENDATION_DISCOVERY_RATIO, 0, 1, HYBRID_DISCOVERY_DEFAULT_RATIO),
+    timeoutMs: Math.max(1, Number(recommendation.discoveryTimeoutMs ?? process.env.RECOMMENDATION_DISCOVERY_TIMEOUT_MS ?? HYBRID_DISCOVERY_DEFAULT_TIMEOUT_MS) || HYBRID_DISCOVERY_DEFAULT_TIMEOUT_MS),
+    cacheTtlMs: Math.max(0, Number(recommendation.discoveryCacheTtlMs ?? process.env.RECOMMENDATION_DISCOVERY_CACHE_TTL_MS ?? HYBRID_DISCOVERY_DEFAULT_CACHE_TTL_MS) || HYBRID_DISCOVERY_DEFAULT_CACHE_TTL_MS)
+  };
+}
+
+function selectPromptCandidatesByNovelty(candidates = [], { limit = HYBRID_PROMPT_CANDIDATE_LIMIT, discoveryRatio = HYBRID_DISCOVERY_DEFAULT_RATIO, targetNoveltyBucket = 'balanced' } = {}) {
+  const discoveryTarget = Math.max(0, Math.min(limit, Math.round(limit * clampNumber(discoveryRatio, 0, 1, HYBRID_DISCOVERY_DEFAULT_RATIO))));
+  const familiarTarget = limit - discoveryTarget;
+  const discovery = candidates.filter(candidate => candidate.noveltyBucket === 'discovery');
+  const familiar = candidates.filter(candidate => candidate.noveltyBucket !== 'discovery');
+  const selected = [];
+  const selectedIds = new Set();
+  const add = (candidate) => {
+    const id = String(candidate?.track?.id || '');
+    if (!id || selectedIds.has(id) || selected.length >= limit) return false;
+    selected.push(candidate);
+    selectedIds.add(id);
+    return true;
+  };
+
+  for (const candidate of discovery.slice(0, discoveryTarget)) add(candidate);
+  for (const candidate of familiar.slice(0, familiarTarget)) add(candidate);
+  for (const candidate of targetNoveltyBucket === 'discovery' ? discovery : familiar) add(candidate);
+  for (const candidate of targetNoveltyBucket === 'discovery' ? familiar : discovery) add(candidate);
+  for (const candidate of candidates) add(candidate);
+
+  return {
+    candidates: selected,
+    discoveryCount: selected.filter(candidate => candidate.noveltyBucket === 'discovery').length,
+    familiarCount: selected.filter(candidate => candidate.noveltyBucket !== 'discovery').length,
+    discoveryUnderfilled: discovery.length < discoveryTarget,
+    familiarUnderfilled: familiar.length < familiarTarget
+  };
+}
+
+function selectPromptCandidatesForStyle(candidates = [], { limit = HYBRID_PROMPT_CANDIDATE_LIMIT, discoveryRatio = HYBRID_DISCOVERY_DEFAULT_RATIO, targetNoveltyBucket = 'balanced', styleConstraint = null, config = {} } = {}) {
+  const selected = [];
+  const selectedIds = new Set();
+  const add = (candidate) => {
+    const id = String(candidate?.track?.id || '');
+    if (!id || selectedIds.has(id) || selected.length >= limit) return false;
+    selected.push(candidate);
+    selectedIds.add(id);
+    return true;
+  };
+  const styleSearch = candidates.filter(candidate => candidate.source === 'style_search');
+  const qualifiedStyle = styleSearch.filter(candidate => trackMatchesStyleConstraint(candidate.track, styleConstraint, config));
+  const fallbackStyle = styleSearch.filter(candidate => !trackMatchesStyleConstraint(candidate.track, styleConstraint, config));
+  for (const candidate of qualifiedStyle) add(candidate);
+  for (const candidate of fallbackStyle) add(candidate);
+
+  const nonStyleSelection = selectPromptCandidatesByNovelty(
+    candidates.filter(candidate => candidate.source !== 'style_search'),
+    { limit, discoveryRatio, targetNoveltyBucket }
+  );
+  for (const candidate of nonStyleSelection.candidates) add(candidate);
+  for (const candidate of candidates) add(candidate);
+
+  return {
+    candidates: selected,
+    discoveryCount: selected.filter(candidate => candidate.noveltyBucket === 'discovery').length,
+    familiarCount: selected.filter(candidate => candidate.noveltyBucket !== 'discovery').length,
+    styleSearchCount: selected.filter(candidate => candidate.source === 'style_search').length,
+    discoveryUnderfilled: nonStyleSelection.discoveryUnderfilled,
+    familiarUnderfilled: nonStyleSelection.familiarUnderfilled
+  };
+}
+
+function getNoveltyTarget({ db, sessionId = '', accountContext = null, config = {} } = {}) {
+  const account = normalizeAccountContext(accountContext);
+  const ratio = getDiscoveryConfig(config).ratio;
+  const window = HYBRID_DISCOVERY_WINDOW;
+  const recent = getRecentNoveltyWindow(db, sessionId, window, account);
+  const targetDiscoveryCount = Math.round(Math.max(1, recent.length || window) * ratio);
+  const discoveryCount = recent.filter(item => item.noveltyBucket === 'discovery').length;
+  let targetNoveltyBucket = 'balanced';
+  if (recent.length > 0 && discoveryCount < targetDiscoveryCount) targetNoveltyBucket = 'discovery';
+  if (recent.length > 0 && discoveryCount > targetDiscoveryCount) targetNoveltyBucket = 'familiar';
+  return {
+    targetNoveltyBucket,
+    window,
+    recentCount: recent.length,
+    discoveryCount,
+    targetDiscoveryCount
+  };
+}
+
+function getRecentNoveltyWindow(db, sessionId = '', limit = HYBRID_DISCOVERY_WINDOW, accountContext = null) {
+  const account = normalizeAccountContext(accountContext);
+  const items = [];
+  const seen = new Set();
+  const add = (play = {}) => {
+    const key = playedSongKey(play.name) || String(play.track_id || play.trackId || play.id || '').trim();
+    if (!key || seen.has(key)) return;
+    seen.add(key);
+    items.push({
+      key,
+      noveltyBucket: noveltyBucketFromPlay(play)
+    });
+  };
+  try {
+    const context = getSessionContext(db, sessionId);
+    for (const item of context.radioPlayedSongs || []) add(item);
+  } catch {}
+  try {
+    for (const play of listRecentPlays(db, limit * 3, account.accountId)) add(play);
+  } catch {}
+  return items.slice(0, limit);
+}
+
+function noveltyBucketFromPlay(play = {}) {
+  const direct = normalizeNoveltyBucket(play.noveltyBucket || play.novelty_bucket);
+  if (direct) return direct;
+  const source = String(play.source || '').toLowerCase();
+  const reason = String(play.reason || '').toLowerCase();
+  if (source.includes('discovery') || reason.includes('novelty:discovery')) return 'discovery';
+  if (source.includes('familiar') || reason.includes('novelty:familiar')) return 'familiar';
+  return 'familiar';
+}
+
+function normalizeNoveltyBucket(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'discovery') return 'discovery';
+  if (normalized === 'familiar') return 'familiar';
+  return '';
+}
+
+function summarizeDiscoverySources(candidates = []) {
+  const counts = {};
+  for (const candidate of candidates || []) {
+    const source = candidate.discoverySource || 'unknown';
+    counts[source] = (counts[source] || 0) + 1;
+  }
+  return counts;
+}
+
+function clampNumber(value, min, max, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, number));
+}
+
+function safeCall(fn, fallback) {
+  try {
+    return fn();
+  } catch {
+    return fallback;
+  }
+}
+
+function sourcePriority(source) {
+  if (source === 'style_search') return 4;
+  if (source === 'ai_discovery') return 3;
+  if (source === 'library_recent') return 2;
+  return 1;
+}
+
+function trackArtistMatchesLabel(track = {}, normalizedLabel = '') {
+  if (!normalizedLabel) return true;
+  return (track.artists || []).some(artist => {
+    const names = expandArtistAliases([artist]);
+    return names.some(name => name === normalizedLabel || name.includes(normalizedLabel) || normalizedLabel.includes(name));
+  });
+}
+
+function candidateIdForTrack(track = {}) {
+  return String(track?.id || '').trim();
+}
+
+function formatHybridCandidatePrompt(candidates = []) {
+  if (!candidates.length) return '本地候选池：无。';
+  const lines = candidates.map((candidate, index) => {
+    const track = candidate.track || {};
+    const artists = (track.artists || []).join('、') || '未知艺人';
+    const score = Number.isFinite(Number(candidate.score)) ? Math.round(Number(candidate.score) * 10) / 10 : '';
+    const reason = candidate.sourceReason ? `｜依据：${candidate.sourceReason}` : '';
+    return `${index + 1}. candidateId=${candidateIdForTrack(track)}｜《${track.name}》 - ${artists}｜来源：${candidate.source || 'local'}${score !== '' ? `｜分数：${score}` : ''}${reason}`;
+  });
+  return [
+    '本地候选池：优先从下面选择；如果确实不适合当前请求，可以忽略候选并按原规则推荐真实可搜歌曲。',
+    '如果选择候选池歌曲，必须在对应 pick 中原样填写 candidateId；不要改写 candidateId。',
+    ...lines
+  ].join('\n');
+}
+
+function formatBalancedHybridCandidatePrompt(candidates = [], { targetNoveltyBucket = 'balanced' } = {}) {
+  if (!candidates.length) return '候选池：无。';
+  const discovery = candidates.filter(candidate => candidate.noveltyBucket === 'discovery');
+  const familiar = candidates.filter(candidate => candidate.noveltyBucket !== 'discovery');
+  const targetText = targetNoveltyBucket === 'discovery'
+    ? '本轮滚动比例偏熟悉，请优先从「发现候选」里选；只有明显不合适才选熟悉候选。'
+    : targetNoveltyBucket === 'familiar'
+      ? '本轮滚动比例偏发现，请优先从「熟悉候选」里选；只有明显不合适才选发现候选。'
+      : '本轮新旧比例接近平衡，请结合上下文在两组里自然选择。';
+  return [
+    '候选池：下面分为「发现候选」和「熟悉候选」，目标是在最近播放中接近 50% 熟悉歌 + 50% 发现歌。',
+    targetText,
+    '如果选择候选池歌曲，必须在对应 pick 中原样填写 candidateId；不要改写 candidateId。',
+    formatCandidatePromptGroup('发现候选', discovery),
+    formatCandidatePromptGroup('熟悉候选', familiar)
+  ].filter(Boolean).join('\n');
+}
+
+function formatStyleHybridCandidatePrompt(candidates = [], { styleConstraint = null, targetNoveltyBucket = 'balanced' } = {}) {
+  if (!candidates.length) return 'Candidate pool: empty.';
+  const style = candidates.filter(candidate => candidate.source === 'style_search');
+  const qualifiedStyle = style.filter(candidate => trackMatchesStyleConstraint(candidate.track, styleConstraint));
+  const fallbackStyle = style.filter(candidate => !trackMatchesStyleConstraint(candidate.track, styleConstraint));
+  const discovery = candidates.filter(candidate => candidate.source !== 'style_search' && candidate.noveltyBucket === 'discovery');
+  const familiar = candidates.filter(candidate => candidate.source !== 'style_search' && candidate.noveltyBucket !== 'discovery');
+  const targetText = targetNoveltyBucket === 'discovery'
+    ? 'Novelty balance currently prefers discovery after strict style candidates.'
+    : targetNoveltyBucket === 'familiar'
+      ? 'Novelty balance currently prefers familiar after strict style candidates.'
+      : 'Novelty balance is currently even after strict style candidates.';
+  return [
+    'Candidate pool with STRICT STYLE CONSTRAINT.',
+    formatStyleConstraintForPrompt(styleConstraint),
+    'Pick a qualified style_search candidate first when one fits. Do not use ordinary emotional similarity as a substitute for the required style groups.',
+    'If no candidate satisfies the strict style, you may omit candidateId and recommend a real searchable song that satisfies the required style.',
+    targetText,
+    'If choosing a candidate pool song, copy its candidateId exactly.',
+    formatCandidatePromptGroup('qualified_style_search', qualifiedStyle),
+    formatCandidatePromptGroup('style_search_fallback', fallbackStyle),
+    formatCandidatePromptGroup('discovery_candidates', discovery),
+    formatCandidatePromptGroup('familiar_candidates', familiar)
+  ].filter(Boolean).join('\n');
+}
+
+function formatCandidatePromptGroup(title, candidates = []) {
+  if (!candidates.length) return `${title}：无。`;
+  const lines = candidates.map((candidate, index) => {
+    const track = candidate.track || {};
+    const artists = (track.artists || []).join('、') || '未知艺人';
+    const score = Number.isFinite(Number(candidate.score)) ? Math.round(Number(candidate.score) * 10) / 10 : '';
+    const reason = candidate.sourceReason ? `｜依据：${candidate.sourceReason}` : '';
+    return `${index + 1}. candidateId=${candidateIdForTrack(track)}｜《${track.name}》 - ${artists}｜来源：${candidate.source || 'local'}${score !== '' ? `｜分数：${score}` : ''}${reason}`;
+  });
+  return `${title}：\n${lines.join('\n')}`;
+}
+
+function sanitizeCandidateForDebug(candidate = {}) {
+  return {
+    candidateId: candidateIdForTrack(candidate.track),
+    source: candidate.source || '',
+    noveltyBucket: candidate.noveltyBucket || 'familiar',
+    discoverySource: candidate.discoverySource || null,
+    score: Number.isFinite(Number(candidate.score)) ? Math.round(Number(candidate.score) * 100) / 100 : null,
+    scoreParts: candidate.scoreParts || null,
+    sourceReason: String(candidate.sourceReason || '').slice(0, 120),
+    track: sanitizeTrackForDebug(candidate.track || {})
+  };
+}
+
 export function rankAndSelectCandidates(candidates, {
   quotas = AUTO_QUOTAS,
   limit = CANDIDATE_LIMIT,
@@ -4354,6 +5477,7 @@ export function rankAndSelectCandidates(candidates, {
   mode = {},
   userMessage = '',
   conversationMood = null,
+  styleConstraint = null,
   seed = ''
 } = {}) {
   const merged = new Map();
@@ -4376,6 +5500,7 @@ export function rankAndSelectCandidates(candidates, {
       mode,
       userMessage,
       conversationMood,
+      styleConstraint,
       seed
     });
     scored.score = score;
@@ -4414,7 +5539,7 @@ export function rankAndSelectCandidates(candidates, {
   return selected.slice(0, limit);
 }
 
-function scoreCandidate(candidate, { feedback, artistPenaltyByName, profile, mode, userMessage, conversationMood, seed }) {
+function scoreCandidate(candidate, { feedback, artistPenaltyByName, profile, mode, userMessage, conversationMood, styleConstraint, seed }) {
   const track = candidate.track || {};
   const scoreParts = {
     base: SOURCE_BASE_SCORES[candidate.source] ?? 30,
@@ -4422,6 +5547,7 @@ function scoreCandidate(candidate, { feedback, artistPenaltyByName, profile, mod
     artistCooldown: 0,
     profile: 0,
     intent: 0,
+    styleConstraint: 0,
     variety: stableVariety(track.id, seed)
   };
 
@@ -4451,9 +5577,33 @@ function scoreCandidate(candidate, { feedback, artistPenaltyByName, profile, mod
     if (conversationMood.searchHints.some(hint => trackText.includes(String(hint).toLowerCase()))) scoreParts.intent += 14;
     if (hintText && trackText.includes(String(conversationMood.mood || '').toLowerCase())) scoreParts.intent += 6;
   }
+  scoreParts.styleConstraint += scoreStyleConstraint(candidate, styleConstraint);
 
   const score = Object.values(scoreParts).reduce((sum, value) => sum + value, 0);
   return { score, scoreParts };
+}
+
+function scoreStyleConstraint(candidate = {}, styleConstraint = null) {
+  if (!styleConstraint?.strict || !styleConstraint.requiredGroups?.length) return 0;
+  const track = candidate.track || {};
+  const metadataText = styleConstraintEvidenceText(track);
+  const extendedText = `${metadataText} ${candidate.sourceReason || ''}`;
+  let score = candidate.source === 'style_search' ? 28 : 0;
+  for (const group of styleConstraint.requiredGroups || []) {
+    const metadataMatched = (group || []).some(term => styleTermMatchesText(term, metadataText));
+    const extendedMatched = !metadataMatched && (group || []).some(term => styleTermMatchesText(term, extendedText));
+    if (metadataMatched) score += 38;
+    else if (extendedMatched && candidate.source === 'style_search') score += 12;
+    else score -= 55;
+  }
+  for (const term of styleConstraint.softTerms || []) {
+    if (styleTermMatchesText(term, metadataText)) score += 10;
+    else if (candidate.source === 'style_search' && styleTermMatchesText(term, extendedText)) score += 4;
+  }
+  for (const term of styleConstraint.negativeTerms || []) {
+    if (styleTermMatchesText(term, metadataText)) score -= 35;
+  }
+  return score;
 }
 
 function scoreStructuredProfile(track, trackText, profile = {}) {
@@ -4532,7 +5682,7 @@ function getArtistPenaltyByName(db, accountContext = null) {
   for (const play of recent.slice(0, 10)) {
     for (const artist of play.artists || []) {
       const key = String(artist).toLowerCase();
-      penalties.set(key, Math.min(penalties.get(key) || 0, -20));
+      penalties.set(key, Math.min(penalties.get(key) || 0, RECENT_ARTIST_COOLDOWN_PENALTY));
     }
   }
 
@@ -4541,7 +5691,7 @@ function getArtistPenaltyByName(db, accountContext = null) {
     if (!Number.isFinite(playedAt) || playedAt < threeHoursAgo) continue;
     for (const artist of play.artists || []) {
       const key = String(artist).toLowerCase();
-      penalties.set(key, Math.min(penalties.get(key) || 0, -25));
+      penalties.set(key, Math.min(penalties.get(key) || 0, HOT_ARTIST_COOLDOWN_PENALTY));
     }
   }
 
@@ -4557,6 +5707,32 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
   if (!request.vocalPolicy && conversationMood?.vocalPolicy) {
     request.vocalPolicy = normalizeVocalPolicy(conversationMood.vocalPolicy);
   }
+  const moodStyleConstraint = normalizeStyleConstraint(conversationMood?.styleConstraint, {
+    text: userMessage,
+    mode,
+    searchQueries: conversationMood?.styleSearchQueries || []
+  });
+  request.styleConstraint = mergeStyleConstraints(request.styleConstraint, moodStyleConstraint);
+  request.styleSearchQueries = uniqueStrings([
+    ...(request.styleSearchQueries || []),
+    ...(conversationMood?.styleSearchQueries || []),
+    ...(request.styleConstraint?.searchQueries || [])
+  ], 8);
+  const candidateContext = await buildHybridCandidateContext({
+    db,
+    config,
+    netease,
+    sessionId,
+    profile,
+    mode,
+    userMessage,
+    conversationMood,
+    request,
+    playedIds,
+    playedSignatures,
+    accountContext: account
+  });
+  setRadioDebugInfo(db, sessionId, { lastCandidatePool: candidateContext.debug });
   const failedPicks = [];
   let lastPlan = null;
   let newMode = null;
@@ -4578,14 +5754,25 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
       failedPicks,
       playedHistory,
       hostContext,
-      environmentContext
+      environmentContext,
+      candidateContext
     });
     lastPlan = plan;
     setRadioDebugInfo(db, sessionId, { lastSongPlan: sanitizeSongPlan(plan, attempt) });
     if (!newMode) newMode = modeDecisionFromPlan(plan);
     if (!plan.picks.length) break;
 
-    const resolved = await resolveSongPlanTrack({ db, config, netease, sessionId, plan, playedIds, playedSignatures, request });
+    const resolved = await resolveSongPlanTrack({
+      db,
+      config,
+      netease,
+      sessionId,
+      plan,
+      playedIds,
+      playedSignatures,
+      request,
+      candidateById: candidateContext.candidateById
+    });
     setRadioDebugInfo(db, sessionId, { lastSearchDiagnostics: resolved.diagnostics || [] });
     if (resolved.track) {
       const reason = resolved.pick.reason || '根据当前状态和音乐画像推荐';
@@ -4606,6 +5793,8 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
           track: resolved.track,
           reason,
           explanation,
+          noveltyBucket: resolved.noveltyBucket || null,
+          discoverySource: resolved.discoverySource || null,
           newMode
         };
       }
@@ -4631,6 +5820,8 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
         track: resolved.track,
         reason,
         explanation,
+        noveltyBucket: resolved.noveltyBucket || null,
+        discoverySource: resolved.discoverySource || null,
         newMode
       };
     }
@@ -4834,6 +6025,13 @@ async function resolveSameArtistFallback({ db, config, netease, failedPicks = []
         hit.filterReason = 'vocal_policy';
         continue;
       }
+      const styleConstraintResult = getStyleConstraintResult(track, request.styleConstraint, config);
+      hit.styleConstraintResult = styleConstraintResult;
+      if (!styleConstraintResult.accepted) {
+        hit.accepted = false;
+        hit.filterReason = 'style_constraint';
+        continue;
+      }
       if (shouldSkipFallbackTrack(track, { playedIds, playedSignatures, failedNameKeys, request })) {
         hit.accepted = false;
         hit.filterReason = 'played_or_failed_song';
@@ -4889,6 +6087,7 @@ async function resolveProfileLibraryFallback({ db, config, netease, profile = {}
     .filter(track => !shouldSkipFallbackTrack(track, { playedIds, playedSignatures, failedNameKeys, request }))
     .filter(track => !trackViolatesSessionConstraints(track, request.sessionConstraints))
     .filter(track => !trackViolatesVocalPolicy(track, request))
+    .filter(track => !trackViolatesStyleConstraint(track, request.styleConstraint, config))
     .map((track, index) => ({ track, score: scoreFallbackTrack(track, { profile, conversationMood }) - index * 0.01 }))
     .sort((a, b) => b.score - a.score)
     .slice(0, 32);
@@ -4992,7 +6191,7 @@ function playableResolveOptions(config = {}, options = {}) {
   };
 }
 
-async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood, memoryContext, request, failedPicks = [], playedHistory = [], hostContext = {}, environmentContext = {} }) {
+async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood, memoryContext, request, failedPicks = [], playedHistory = [], hostContext = {}, environmentContext = {}, candidateContext = null }) {
   const fallbackPlan = {
     picks: [],
     hostDraft: fallbackChat(timeOfDay, weather, profile),
@@ -5003,10 +6202,12 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
   const modeText = mode?.genre
     ? `当前模式：${mode.genre}（${mode.note || '用户指定'}）。`
     : '当前模式：无特殊模式。';
-  const requestText = [
+  const requestTextParts = [
     request?.artistConstraint?.label ? `指定艺人：${request.artistConstraint.label}` : '',
-    request?.songTitle ? `指定歌名：${request.songTitle}` : ''
-  ].filter(Boolean).join('；') || '无明确歌名/艺人约束';
+    request?.songTitle ? `指定歌名：${request.songTitle}` : '',
+    styleConstraintIsActive(request?.styleConstraint, config) ? formatStyleConstraintForPrompt(request.styleConstraint) : ''
+  ];
+  const requestText = requestTextParts.filter(Boolean).join('；') || '无明确歌名/艺人约束';
   const sessionConstraintText = formatSessionConstraintsForPrompt(request?.sessionConstraints);
   const vocalPolicyText = formatVocalPolicyForPrompt(request);
   const failedText = failedPicks.length
@@ -5017,6 +6218,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
     ? `已播放歌名通常必须避开；但本次用户明确点名《${request.songTitle}》，这一个歌名允许重复播放，其他已播放歌仍必须避开同名任何版本。`
     : '已播放歌名必须避开：只要歌名相同，就不能再推荐任何版本、翻唱、Live、Remix、Album Version 或不同艺人版本。';
   const profilePrompt = formatProfileSummaryForPrompt(profile);
+  const candidatePrompt = candidateContext?.enabled ? candidateContext.promptText : '本地候选池：无，按原规则推荐真实可搜歌曲。';
 
   const raw = await generateChatCompletion(config.llm, [
     {
@@ -5027,16 +6229,19 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         '必须结合时间、天气、听众画像、偏好、当前对话和明确请求，给出 3 首备选歌。',
         '时间天气只是事实背景，不是固定开场模板；不要因为历史对话把当前上午/下午写成晚上，也不要编造未来天气。',
         '每首都必须有明确歌名和主要艺人。优先推荐知名度较高、音乐更可能搜到并可播放的版本。',
+        '如果提供了本地候选池，优先从候选池中挑选最贴合当前语境的歌曲；这能更好利用听众画像、历史反馈和本地可播曲库。',
+        '若选择本地候选池歌曲，pick 必须包含对应 candidateId，歌名和艺人应与候选池一致。若候选池都不合适，可以不填 candidateId 并继续按真实歌曲推荐。',
         '“深夜、安静、陪伴、适合放松、开心、提神”等只能用于理解氛围，不能当作歌曲名或主搜索词，除非它本来就是你明确推荐的真实歌名且给出了艺人。',
         '搜索 queries 必须像音乐软件里会输入的短词，优先“歌名 艺人”和“艺人 歌名”。不要输出长句。',
         '如果用户明确指定艺人、歌名或风格，必须优先满足；不确定时选更常见、更好搜的歌曲。',
+        'If STRICT_STYLE_CONSTRAINT is present, the requiredGroups are hard requirements. Do not substitute a normal ballad, nostalgia song, or mood-similar song when it lacks the requested style evidence.',
         '如果存在本场禁听，禁听优先级高于听众画像、历史偏好和兜底推荐；不要推荐禁听歌手，也不要推荐歌名命中禁听词的歌曲。',
         vocalPolicyText,
         '如果用户说“他的另一首/她的另一首/这个歌手的另一首/换这位歌手”，优先参考最近播放歌曲的艺人，把它理解成当前或上一首歌的主艺人。',
         replayRule,
         'hostLine 只是备用素材，不是最终导播词。不要写成“刚才……现在……”“上一首……接下来……”或“接下来放……”。可以只写一个自然的导播方向。',
         '只输出严格 JSON，不要 Markdown，不要解释。',
-        'JSON 格式：{"picks":[{"name":"歌名","artists":["艺人"],"reason":"一句话理由","queries":["歌名 艺人","艺人 歌名"],"hostLine":"40-90字电台导播词"}],"hostDraft":"40-90字自然主持词","mode":null}'
+        'JSON 格式：{"picks":[{"candidateId":"可选，本地候选池ID","name":"歌名","artists":["艺人"],"reason":"一句话理由","queries":["歌名 艺人","艺人 歌名"],"hostLine":"40-90字电台导播词"}],"hostDraft":"40-90字自然主持词","mode":null}'
       ].join('\n')
     },
     {
@@ -5050,6 +6255,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         `明确请求：${requestText}`,
         sessionConstraintText,
         vocalPolicyText,
+        candidatePrompt,
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
         formatRecentHostPlays(hostContext.recentPlays),
         playedText,
@@ -5093,6 +6299,7 @@ function normalizeSongPick(raw = {}) {
   const name = String(raw.name || raw.song || raw.title || raw.songName || '').trim();
   const artists = normalizeArtistList(raw.artists || raw.artist || raw.singer || raw.singers);
   return {
+    candidateId: String(raw.candidateId || raw.candidate_id || '').trim(),
     name,
     artists,
     reason: String(raw.reason || '').trim(),
@@ -5126,7 +6333,7 @@ function formatPlayedSongExclusions(playedHistory = [], request = {}) {
     : `${replayText}本轮/最近已播放歌名：${replayText ? '除本次指定歌曲外无其他限制' : '无'}`;
 }
 
-async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, playedIds, playedSignatures = new Set(), request = {} }) {
+async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, playedIds, playedSignatures = new Set(), request = {}, candidateById = new Map() }) {
   const failedPicks = [];
   const diagnostics = [];
   for (const pick of plan.picks) {
@@ -5157,6 +6364,26 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
       failedPicks.push(effectivePick);
       continue;
     }
+    const candidateResolved = await resolveCandidatePickTrack({
+      db,
+      config,
+      netease,
+      pick: effectivePick,
+      playedIds,
+      playedSignatures,
+      request,
+      candidateById
+    });
+    if (candidateResolved?.diagnostic) diagnostics.push(candidateResolved.diagnostic);
+    if (candidateResolved?.track) {
+      return {
+        track: candidateResolved.track,
+        pick: candidateResolved.pick,
+        noveltyBucket: candidateResolved.noveltyBucket || null,
+        discoverySource: candidateResolved.discoverySource || null,
+        diagnostics
+      };
+    }
     const search = await searchTracksForSongPick(effectivePick, { request });
     pickDiagnostic.queries = search.queries;
     pickDiagnostic.queryDiagnostics = search.queryDiagnostics;
@@ -5164,12 +6391,16 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
       .map(track => {
         const scoreDetails = scoreSearchTrackForPickDetails(track, effectivePick);
         const score = scoreDetails.score;
+        const styleConstraintResult = getStyleConstraintResult(track, request.styleConstraint, config);
         const diagnostic = {
           track: sanitizeTrackForDebug(track),
           score,
-          accepted: score >= 100,
-          filterReason: score >= 100 ? scoreDetails.filterReason : (scoreDetails.filterReason || 'name_or_artist_mismatch'),
+          accepted: score >= 100 && styleConstraintResult.accepted,
+          filterReason: score >= 100
+            ? (styleConstraintResult.accepted ? scoreDetails.filterReason : 'style_constraint')
+            : (scoreDetails.filterReason || 'name_or_artist_mismatch'),
           scoreParts: scoreDetails.scoreParts,
+          styleConstraintResult,
           playable: null
         };
         pickDiagnostic.hits.push(diagnostic);
@@ -5189,6 +6420,13 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
       if (trackViolatesVocalPolicy(track, request, effectivePick)) {
         item.diagnostic.accepted = false;
         item.diagnostic.filterReason = 'vocal_policy';
+        continue;
+      }
+      const styleConstraintResult = getStyleConstraintResult(track, request.styleConstraint, config);
+      item.diagnostic.styleConstraintResult = styleConstraintResult;
+      if (!styleConstraintResult.accepted) {
+        item.diagnostic.accepted = false;
+        item.diagnostic.filterReason = 'style_constraint';
         continue;
       }
       if (playedIds.has(String(track.id)) && !replayRequestAllowsPlayedSong(track, request)) {
@@ -5223,12 +6461,109 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
       };
     }
     if (!pickDiagnostic.failedReason) {
-      pickDiagnostic.failedReason = ranked.length ? 'no_playable_match' : 'no_matching_search_hit';
+      pickDiagnostic.failedReason = ranked.some(item => item.diagnostic?.filterReason === 'style_constraint')
+        ? 'style_constraint_no_match'
+        : (ranked.length ? 'no_playable_match' : 'no_matching_search_hit');
     }
     diagnostics.push(trimSearchDiagnostic(pickDiagnostic));
     failedPicks.push(effectivePick);
   }
   return { track: null, pick: null, failedPicks, diagnostics };
+}
+
+async function resolveCandidatePickTrack({ db, config, netease, pick = {}, playedIds, playedSignatures, request = {}, candidateById = new Map() } = {}) {
+  const candidateId = String(pick.candidateId || '').trim();
+  if (!candidateId) return null;
+  const candidate = candidateById instanceof Map ? candidateById.get(candidateId) : null;
+  const diagnostic = {
+    pick: sanitizeSongPick(pick),
+    queries: [`candidate:${candidateId}`],
+    hits: [],
+    selectedTrackId: null,
+    failedReason: null,
+    fallbackSource: 'hybrid_candidate',
+    noveltyBucket: candidate?.noveltyBucket || null,
+    discoverySource: candidate?.discoverySource || null
+  };
+  if (!candidate?.track?.id) {
+    diagnostic.failedReason = 'candidate_not_found';
+    return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
+  }
+
+  const track = candidate.track;
+  const hit = {
+    track: sanitizeTrackForDebug(track),
+    score: Number.isFinite(Number(candidate.score)) ? Math.round(Number(candidate.score) * 100) / 100 : null,
+    accepted: true,
+    filterReason: 'candidate_id_match',
+    scoreParts: candidate.scoreParts || null,
+    noveltyBucket: candidate.noveltyBucket || null,
+    discoverySource: candidate.discoverySource || null,
+    playable: null
+  };
+  diagnostic.hits.push(hit);
+
+  if (trackViolatesSessionConstraints(track, request.sessionConstraints)) {
+    hit.accepted = false;
+    hit.filterReason = 'session_constraint';
+    diagnostic.failedReason = 'session_constraint';
+    return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
+  }
+  if (trackViolatesVocalPolicy(track, request, pick)) {
+    hit.accepted = false;
+    hit.filterReason = 'vocal_policy';
+    diagnostic.failedReason = 'vocal_policy';
+    return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
+  }
+  const styleConstraintResult = getStyleConstraintResult(track, request.styleConstraint, config);
+  hit.styleConstraintResult = styleConstraintResult;
+  if (!styleConstraintResult.accepted) {
+    hit.accepted = false;
+    hit.filterReason = 'style_constraint';
+    diagnostic.failedReason = 'style_constraint_no_match';
+    return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
+  }
+  if (playedIds.has(String(track.id)) && !replayRequestAllowsPlayedSong(track, request)) {
+    hit.accepted = false;
+    hit.filterReason = 'played_track_id';
+    diagnostic.failedReason = 'played_track_id';
+    return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
+  }
+  if (trackMatchesPlayedSongName(track, playedSignatures) && !replayRequestAllowsPlayedSong(track, request)) {
+    hit.accepted = false;
+    hit.filterReason = 'played_song_name';
+    diagnostic.failedReason = 'played_song_name';
+    return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
+  }
+
+  const playableStarted = Date.now();
+  const playable = await resolvePlayableTrack(db, netease, track, playableResolveOptions(config, { includeLyric: false }));
+  hit.playable = Boolean(playable?.playable);
+  hit.playableMs = Date.now() - playableStarted;
+  if (!playable?.playable) {
+    hit.accepted = false;
+    hit.filterReason = 'not_playable';
+    diagnostic.failedReason = 'candidate_not_playable';
+    return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
+  }
+
+  const withLyric = await resolvePlayableTrack(db, netease, playable, playableResolveOptions(config, { includeLyric: true }));
+  const selectedTrack = withLyric?.playable ? withLyric : playable;
+  diagnostic.selectedTrackId = String(selectedTrack.id || '');
+  return {
+    track: selectedTrack,
+    pick: normalizeSelectedPick({
+      ...pick,
+      name: selectedTrack.name || pick.name,
+      artists: selectedTrack.artists?.length ? selectedTrack.artists : pick.artists,
+      noveltyBucket: candidate.noveltyBucket || null,
+      discoverySource: candidate.discoverySource || null,
+      reason: pick.reason || candidate.sourceReason || '来自你的本地音乐画像候选'
+    }, selectedTrack),
+    noveltyBucket: candidate.noveltyBucket || null,
+    discoverySource: candidate.discoverySource || null,
+    diagnostic: trimSearchDiagnostic(diagnostic)
+  };
 }
 
 function applyRequestToSongPick(pick = {}, request = {}) {
@@ -5297,6 +6632,7 @@ function sanitizeSongPlan(plan = {}, attempt = 0) {
 
 function sanitizeSongPick(pick = {}) {
   return {
+    candidateId: String(pick.candidateId || '').slice(0, 80),
     name: String(pick.name || '').slice(0, 80),
     artists: normalizeArtistList(pick.artists || []).slice(0, 4),
     reason: String(pick.reason || '').slice(0, 140),
