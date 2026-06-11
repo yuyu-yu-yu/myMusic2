@@ -112,7 +112,8 @@ function deleteGuestAccountData(db, accountId) {
     'user_memories',
     'account_settings',
     'account_music_profiles',
-    'diary_entries'
+    'diary_entries',
+    'diary_signal_feedback'
   ];
   let deleted = 0;
   db.exec('BEGIN IMMEDIATE');

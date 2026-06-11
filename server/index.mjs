@@ -11,6 +11,7 @@ import { extractOpenApiTokenPayload, getNeteaseLoginStatus, resolveQrOpenApiLogi
 import { clearLibraryAccountSnapshot, getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
 import { chatRadio, getMemories, getMoodStatsSummary, getPreferences, getRadioDebug, jumpPlaylistRadio, nextPlaylistRadio, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startPlaylistRadio, startRadio, submitFeedback, updateMemory, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
+import { getDiaryOverview, getDiaryRadioContext, recordDiarySignalFeedback } from './music-recap.mjs';
 import { createNcmPlayer } from './player.mjs';
 import { checkCookieQrLogin, clearCookie, createCookieQrLogin, getCookieStatus, getCookieUserProfile, getSongComments, loadCookie, resolveCommunityApiFile } from './community.mjs';
 import { runDemoSelfCheck } from './diagnostics.mjs';
@@ -377,6 +378,69 @@ const routes = {
   'POST /api/diary/generate': async (req) => {
     const body = await readJson(req);
     return generateDiary(db, await getRequestConfig(req), body.date || today(), getRequestAccount(req));
+  },
+  'GET /api/diary/overview': async (req) => {
+    const url = new URL(req.url, 'http://local');
+    const requestConfig = await getRequestConfig(req);
+    try {
+      return getDiaryOverview(db, {
+        accountContext: getRequestAccount(req),
+        days: url.searchParams.get('days') || 7,
+        date: url.searchParams.get('date') || '',
+        timeZone: requestConfig.app?.timeZone || requestConfig.weather?.timeZone || 'Asia/Shanghai'
+      });
+    } catch (error) {
+      return jsonError(error.message, 400);
+    }
+  },
+  'POST /api/diary/feedback': async (req) => {
+    const body = await readJson(req);
+    try {
+      const result = recordDiarySignalFeedback(db, {
+        accountContext: getRequestAccount(req),
+        date: body.date,
+        signalId: body.signalId,
+        signalType: body.signalType,
+        action: body.action
+      });
+      const requestConfig = await getRequestConfig(req);
+      return {
+        ...result,
+        overview: getDiaryOverview(db, {
+          accountContext: getRequestAccount(req),
+          days: 7,
+          date: body.date,
+          timeZone: requestConfig.app?.timeZone || requestConfig.weather?.timeZone || 'Asia/Shanghai'
+        })
+      };
+    } catch (error) {
+      return jsonError(error.message, 400);
+    }
+  },
+  'POST /api/diary/radio': async (req) => {
+    const body = await readJson(req);
+    const accountContext = getRequestAccount(req);
+    const requestConfig = await getRequestConfig(req);
+    let recapContext;
+    try {
+      recapContext = getDiaryRadioContext(db, {
+        accountContext,
+        date: body.date,
+        timeZone: requestConfig.app?.timeZone || requestConfig.weather?.timeZone || 'Asia/Shanghai'
+      });
+    } catch (error) {
+      return jsonError(error.message, 400);
+    }
+    if (!recapContext) return jsonError('该日期暂无有效记录', 400);
+    const result = await startPlaylistRadio({
+      db,
+      config: requestConfig,
+      netease,
+      sessionId: body.sessionId || crypto.randomUUID(),
+      message: recapContext.message,
+      accountContext
+    });
+    return { ...result, diarySource: { date: body.date, signals: recapContext.signals } };
   }
 };
 

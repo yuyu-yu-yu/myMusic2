@@ -99,6 +99,16 @@ function migrate(db) {
       PRIMARY KEY (account_id, date)
     );
 
+    CREATE TABLE IF NOT EXISTS diary_signal_feedback (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      account_id TEXT NOT NULL DEFAULT 'local:default',
+      date TEXT NOT NULL,
+      signal_id TEXT NOT NULL,
+      signal_type TEXT NOT NULL,
+      action TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
+
     CREATE TABLE IF NOT EXISTS tts_cache (
       id TEXT PRIMARY KEY,
       text TEXT NOT NULL,
@@ -195,6 +205,7 @@ function migrateAccountScope(db) {
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_plays_account_played ON plays(account_id, played_at DESC)'); } catch {}
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_feedback_events_account_created ON track_feedback_events(account_id, created_at DESC)'); } catch {}
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_mood_events_account_created ON mood_events(account_id, created_at DESC)'); } catch {}
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_diary_feedback_account_created ON diary_signal_feedback(account_id, created_at DESC)'); } catch {}
 }
 
 function addAccountIdColumn(db, table, accountId) {
@@ -950,6 +961,11 @@ export function listRecentPlays(db, limit = 30, accountId = DEFAULT_ACCOUNT_ID) 
     return {
       ...play,
       originalId: rawOriginalId === null || rawOriginalId === undefined || rawOriginalId === '' ? null : String(rawOriginalId),
+      semanticTags: raw?.semanticTags || null,
+      language: raw?.language || raw?.semanticTags?.language || '',
+      genreFamily: raw?.genreFamily || raw?.semanticTags?.genreFamily || '',
+      energyBand: raw?.energyBand || raw?.semanticTags?.energyBand || '',
+      tagEvidence: raw?.tagEvidence || raw?.semanticTags?.tagEvidence || [],
       artists: safeJson(row.artists, [])
     };
   });
@@ -967,6 +983,11 @@ function hydrateTrackRow(row) {
     playbackMode: originalId ? 'ncm-cli' : null,
     playable: Boolean(originalId),
     playUrl,
+    semanticTags: raw?.semanticTags || null,
+    language: raw?.language || raw?.semanticTags?.language || '',
+    genreFamily: raw?.genreFamily || raw?.semanticTags?.genreFamily || '',
+    energyBand: raw?.energyBand || raw?.semanticTags?.energyBand || '',
+    tagEvidence: raw?.tagEvidence || raw?.semanticTags?.tagEvidence || [],
     artists: safeJson(row.artists, [])
   };
 }

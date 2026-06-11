@@ -22,6 +22,12 @@ import { searchOnline } from './community.mjs';
 import { getUserPrefs } from './radio.mjs';
 import { normalizeAccountContext } from './account-scope.mjs';
 import { buildCanCanBackgroundPrompt, buildCanCanPersonaPrompt } from './cancan-persona.mjs';
+import {
+  buildDailyMusicRecap as buildSharedDailyMusicRecap,
+  getDiaryRecommendationContext
+} from './music-recap.mjs';
+
+export { buildSharedDailyMusicRecap as buildDailyMusicRecap };
 
 const CANDIDATE_LIMIT = 60;
 const AUTO_QUOTAS = { library_recent: 18, library_deep: 22, ai_discovery: 20 };
@@ -41,6 +47,10 @@ const STYLE_SEARCH_DEFAULT_LIMIT = 30;
 const PROMPT_ARTIST_DEFAULT_LIMIT = 5;
 const ARTIST_DENSITY_DEFAULT_WINDOW = 8;
 const ARTIST_DENSITY_DEFAULT_MAX = 3;
+const GENRE_DENSITY_DEFAULT_WINDOW = 6;
+const GENRE_DENSITY_DEFAULT_MAX = 3;
+const GENRE_ENERGY_STREAK_DEFAULT_MAX = 2;
+const PROMPT_GENRE_FAMILY_LIMIT = 8;
 const RECENT_ARTIST_COOLDOWN_PENALTY = -36;
 const HOT_ARTIST_COOLDOWN_PENALTY = -42;
 const SOURCE_BASE_SCORES = {
@@ -115,6 +125,27 @@ const RADIO_QUEUE_POLICIES = Object.freeze({
 });
 const VOCAL_POLICIES = Object.freeze({
   INSTRUMENTAL_ONLY: 'instrumental_only'
+});
+const LANGUAGE_LABELS = Object.freeze({
+  cantonese: '粤语',
+  mandarin: '国语',
+  english: '英语',
+  japanese: '日语',
+  korean: '韩语',
+  instrumental: '纯音乐',
+  unknown: '未知语种'
+});
+const GENRE_FAMILY_LABELS = Object.freeze({
+  pop_ballad: '流行抒情',
+  rnb_soul: 'R&B/Soul',
+  rock: '摇滚',
+  electronic: '电子舞曲',
+  folk_acoustic: '民谣原声',
+  hiphop_rap: '说唱',
+  chinese_style: '国风古风',
+  jazz_blues: '爵士蓝调',
+  instrumental_ost: '古典器乐/OST',
+  other: '其他'
 });
 const radioQueueJobs = new Set();
 const discoveryCandidateCache = new Map();
@@ -790,6 +821,7 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
   const profilePrompt = formatProfileSummaryForPrompt(profile);
   const weatherRadioPrompt = formatWeatherRadioForPrompt(environmentContext.weatherRadio);
   const musicRecapPrompt = formatOpeningMusicRecapForPrompt(hostContext.openingRecap);
+  const diaryContextPrompt = formatDiaryRecommendationContextForPrompt(hostContext.diaryContext);
   const raw = await generateChatCompletion(config.llm, [
     {
       role: 'system',
@@ -813,6 +845,7 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
         `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
         weatherRadioPrompt,
         musicRecapPrompt,
+        diaryContextPrompt,
         `此刻：${timeOfDay} ${hour}点，${weather}`,
         `听众画像：${profilePrompt}`,
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
@@ -1153,11 +1186,95 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
   const currentTrack = getCurrentTrack(db, account);
   const context = getSessionContext(db, sessionId);
   const conversationState = normalizeConversationState(context.conversationState);
-  const environmentContext = await getEnvironmentContext({ db, sessionId, config });
   const constraintUpdate = parseSessionConstraintUpdate(userMessage);
   const previousSessionConstraints = getSessionConstraintsFromContext(context);
   const sessionConstraints = applySessionConstraintUpdate(previousSessionConstraints, constraintUpdate);
   const constraintsChanged = !sessionConstraintsEqual(previousSessionConstraints, sessionConstraints);
+  if (constraintsChanged) {
+    const avoidLabels = sessionConstraintDisplayTerms(sessionConstraints);
+    const blocked = new Set(avoidLabels.map(normalizeMusicText));
+    const musicContext = normalizeMusicContext({
+      ...(context.musicContext || {}),
+      version: Number(context.musicContext?.version || 0) + 1,
+      searchHints: (context.musicContext?.searchHints || []).filter(hint => !blocked.has(normalizeMusicText(hint))),
+      preferenceHints: (context.musicContext?.preferenceHints || []).filter(hint => !blocked.has(normalizeMusicText(hint))),
+      avoidHints: avoidLabels,
+      musicIntent: 'constraint_update',
+      lastUserMessage: userMessage,
+      reason: 'session constraints updated',
+      updatedAt: nowIso()
+    });
+    const nextConversationState = {
+      ...conversationState,
+      preferenceHints: conversationState.preferenceHints.filter(hint => !blocked.has(normalizeMusicText(hint))),
+      avoidHints: uniqueStrings(avoidLabels, 12),
+      updatedAt: nowIso()
+    };
+    const queueGeneration = Number(context.queueGeneration || 0) + 1;
+    setSessionContext(db, sessionId, {
+      ...context,
+      conversationState: nextConversationState,
+      musicContext,
+      sessionConstraints,
+      queueGeneration
+    });
+    const invalidated = invalidateActiveRadioQueue(db, sessionId, constraintUpdate.reset ? 'constraints_reset' : 'session_constraint_changed');
+    const queueRebuilt = scheduleRadioQueueFill({
+      db,
+      config,
+      netease,
+      sessionId,
+      reason: 'session_constraint_changed',
+      preemptReason: 'session_constraint_changed',
+      preempt: true,
+      force: true,
+      contextSnapshot: musicContext,
+      accountContext: account
+    });
+    const currentConstraintResult = currentTrack?.id
+      ? getTrackConstraintResult(currentTrack, sessionConstraints)
+      : { accepted: true, reason: 'no_current_track' };
+    const explicitSwitchRequested = isImmediateNextRequest(userMessage);
+    const stopCurrent = !constraintUpdate.reset && Boolean(currentTrack?.id) && (
+      explicitSwitchRequested || !currentConstraintResult.accepted
+    );
+    const labelText = avoidLabels.join('、');
+    const chatText = constraintUpdate.reset
+      ? '好，本场禁听限制已经取消，后面的推荐恢复正常。'
+      : stopCurrent
+        ? `好，本场已经避开${labelText}。这首也不继续放，我现在换一首。`
+        : `好，本场已经避开${labelText}，预取的下一首也已经重新检查。`;
+    if (userMessage) saveMessage(db, sessionId, 'user', userMessage, account);
+    saveMessage(db, sessionId, 'assistant', chatText, account);
+    setRadioDebugInfo(db, sessionId, {
+      parsedConstraints: constraintUpdate,
+      prunedPositiveHints: [...blocked],
+      queueContextVersion: musicContext.version,
+      queueInvalidationReason: constraintUpdate.reset ? 'constraints_reset' : 'session_constraint_changed',
+      queueValidationResult: { invalidated, currentConstraintResult }
+    });
+    return {
+      sessionId,
+      chatText,
+      track: null,
+      reason: '',
+      ttsUrl: null,
+      ttsStatus: 'disabled',
+      speech: { shouldSpeak: false, mode: 'off' },
+      mode,
+      profile,
+      conversationMood: mergeSessionConstraintsIntoMood(moodFromMusicContext(musicContext) || {}, sessionConstraints),
+      turnAction: { action: TURN_ACTIONS.CHAT_ONLY, reason: 'session constraints updated', confidence: 1, source: 'hard_rule' },
+      queuePolicy: { action: RADIO_QUEUE_POLICIES.HARD_PREEMPT, reason: 'session constraints changed' },
+      intent: 'constraint_update',
+      intentSource: 'rule',
+      constraintApplied: normalizeSessionConstraints(sessionConstraints),
+      switchRequested: stopCurrent,
+      stopCurrent,
+      queueRebuilt: Boolean(queueRebuilt)
+    };
+  }
+  const environmentContext = await getEnvironmentContext({ db, sessionId, config });
   let baseMood = analyzeTurnContext({
     history,
     userMessage,
@@ -1509,13 +1626,16 @@ export function normalizeRadioQueue(queue = []) {
       createdAt: item?.createdAt || nowIso(),
       updatedAt: item?.updatedAt || item?.createdAt || nowIso(),
       contextVersion: Number(item?.contextVersion || item?.contextSnapshot?.version || 0),
+      queueGeneration: Number(item?.queueGeneration || 0),
       contextSnapshot: normalizeMusicContext(item?.contextSnapshot || {}),
+      constraintSnapshot: normalizeSessionConstraints(item?.constraintSnapshot || {}),
       policy: item?.policy || RADIO_QUEUE_POLICIES.REFRESH_TAIL,
       preemptReason: item?.preemptReason || null,
       reason: item?.reason || '',
       chatText: String(item?.chatText || '').trim(),
       hostDeferred: Boolean(item?.hostDeferred),
       track,
+      semanticTags: item?.semanticTags || (track ? inferTrackSemanticTags(track) : null),
       ttsUrl: item?.ttsUrl || null,
       ttsStatus: item?.ttsStatus || (item?.ttsUrl ? 'ready' : null),
       ttsMs: Number(item?.ttsMs || 0),
@@ -1607,6 +1727,24 @@ function setRadioDebugInfo(db, sessionId, patch = {}) {
       updatedAt: nowIso()
     }
   }));
+}
+
+function invalidateActiveRadioQueue(db, sessionId, reason = 'context_changed') {
+  let invalidated = 0;
+  const queue = getSessionQueue(db, sessionId).map(item => {
+    if (item.status !== 'ready' && item.status !== 'pending') return item;
+    invalidated += 1;
+    return { ...item, status: 'stale', updatedAt: nowIso(), staleReason: reason };
+  });
+  setSessionQueue(db, sessionId, queue);
+  if (invalidated) {
+    updateQueueMetrics(db, sessionId, {
+      queueContextDiscardCount: invalidated,
+      lastMissReason: reason,
+      lastQueueReconcileReason: reason
+    });
+  }
+  return invalidated;
 }
 
 export function consumeReadyRadioQueue(db, sessionId, options = {}) {
@@ -1713,6 +1851,24 @@ async function reconcileQueuedItemBeforeCommit({
       }
     });
     return { action: QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK, payload: item, reason: 'artist_density' };
+  }
+  const typeDensityResult = getGenreDensityResult(item.track, {
+    playedHistory: getPlayedTrackHistory(db, sessionId, 80, accountContext),
+    request: {},
+    config
+  });
+  if (!typeDensityResult.accepted) {
+    setRadioDebugInfo(db, sessionId, {
+      lastQueueReconcile: {
+        action: QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK,
+        reason: typeDensityResult.reason,
+        typeDensityResult,
+        track: sanitizeTrackForDebug(item.track),
+        contextVersion: musicContext.version,
+        updatedAt: nowIso()
+      }
+    });
+    return { action: QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK, payload: item, reason: typeDensityResult.reason };
   }
   try {
     const finalized = await finalizeQueuedTrackForPlayback({
@@ -2090,12 +2246,15 @@ function sanitizeQueueItemForDebug(item = {}) {
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     contextVersion: item.contextVersion,
+    queueGeneration: item.queueGeneration,
     contextSnapshot: item.contextSnapshot,
+    constraintSnapshot: item.constraintSnapshot,
     policy: item.policy,
     preemptReason: item.preemptReason,
     reason: item.reason,
     hostDeferred: Boolean(item.hostDeferred),
     track: item.track ? sanitizeTrackForDebug(item.track) : null,
+    semanticTags: item.semanticTags || (item.track ? inferTrackSemanticTags(item.track) : null),
     explanation: normalizeRecommendationExplanation(item.explanation),
     noveltyBucket: item.noveltyBucket || null,
     discoverySource: item.discoverySource || null,
@@ -2117,6 +2276,8 @@ function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill
     ? normalizeMusicContext(contextSnapshot)
     : getEffectiveMusicContextForRecommendation(context);
   if (musicContext.musicIntent === 'suppressed') return false;
+  const queueGeneration = Number(context.queueGeneration || 0);
+  const sessionConstraints = getSessionConstraintsFromContext(context);
 
   let queue = getSessionQueue(db, sessionId);
   const activeCount = queue.filter(item => item.status === 'ready' || item.status === 'pending').length;
@@ -2130,7 +2291,9 @@ function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill
     createdAt: nowIso(),
     updatedAt: nowIso(),
     contextVersion: musicContext.version,
+    queueGeneration,
     contextSnapshot: musicContext,
+    constraintSnapshot: sessionConstraints,
     policy: preempt ? RADIO_QUEUE_POLICIES.HARD_PREEMPT : RADIO_QUEUE_POLICIES.REFRESH_TAIL,
     preemptReason,
     reason
@@ -2176,7 +2339,10 @@ function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill
         status: 'ready',
         updatedAt: nowIso(),
         contextVersion: musicContext.version,
+        queueGeneration,
         contextSnapshot: musicContext,
+        constraintSnapshot: sessionConstraints,
+        semanticTags: payload?.track ? inferTrackSemanticTags(payload.track) : null,
         policy: pending.policy,
         preemptReason: pending.preemptReason,
         reason
@@ -2231,6 +2397,12 @@ function replacePendingQueueItem(db, sessionId, pendingId, readyItem, accountCon
   const queue = getSessionQueue(db, sessionId);
   const pendingInQueue = queue.some(item => item.id === pendingId && item.status === 'pending');
   if (!pendingInQueue) return;
+  const currentSessionContext = getSessionContext(db, sessionId);
+  const pendingItem = queue.find(item => item.id === pendingId);
+  if (Number(pendingItem?.queueGeneration || 0) !== Number(currentSessionContext.queueGeneration || 0)) {
+    markQueueItemStale(db, sessionId, pendingId, 'queue_generation_changed');
+    return;
+  }
   if (!readyItem?.track?.id) {
     markPendingQueueItemFailed(db, sessionId, pendingId, {
       failedStage: 'recommendation',
@@ -2245,7 +2417,8 @@ function replacePendingQueueItem(db, sessionId, pendingId, readyItem, accountCon
     });
     return;
   }
-  if (trackViolatesSessionConstraints(readyItem.track, getSessionConstraintsFromContext(getSessionContext(db, sessionId)))) {
+  const constraintResult = getTrackConstraintResult(readyItem.track, getSessionConstraintsFromContext(currentSessionContext));
+  if (!constraintResult.accepted) {
     markPendingQueueItemFailed(db, sessionId, pendingId, {
       failedStage: 'session_constraint',
       error: 'prefetched track violates current session constraints'
@@ -2261,6 +2434,18 @@ function replacePendingQueueItem(db, sessionId, pendingId, readyItem, accountCon
     markPendingQueueItemFailed(db, sessionId, pendingId, {
       failedStage: 'artist_density',
       error: 'prefetched track violates artist density'
+    });
+    return;
+  }
+  const typeDensityResult = getGenreDensityResult(readyItem.track, {
+    playedHistory: getPlayedTrackHistory(db, sessionId, 80, account),
+    request: {},
+    config
+  });
+  if (!typeDensityResult.accepted) {
+    markPendingQueueItemFailed(db, sessionId, pendingId, {
+      failedStage: typeDensityResult.reason,
+      error: 'prefetched track violates genre diversity limits'
     });
     return;
   }
@@ -2469,7 +2654,7 @@ function consumeOpeningMusicRecapForHost({ db, accountContext = null, context = 
   const localDate = environmentContext.localDate || getTimeContext(new Date(), environmentContext.timeZone || DEFAULT_APP_TIME_ZONE).localDate;
   if (!localDate) return null;
   if (getAccountSetting(db, account.accountId, DAILY_MUSIC_RECAP_SPOKEN_DATE_KEY) === localDate) return null;
-  const recap = buildDailyMusicRecap(db, {
+  const recap = buildSharedDailyMusicRecap(db, {
     accountContext: account,
     localDate,
     timeZone: environmentContext.timeZone || DEFAULT_APP_TIME_ZONE
@@ -2479,7 +2664,7 @@ function consumeOpeningMusicRecapForHost({ db, accountContext = null, context = 
   return recap;
 }
 
-export function buildDailyMusicRecap(db, { accountContext = null, localDate = '', timeZone = DEFAULT_APP_TIME_ZONE } = {}) {
+function buildLegacyDailyMusicRecap(db, { accountContext = null, localDate = '', timeZone = DEFAULT_APP_TIME_ZONE } = {}) {
   const account = normalizeAccountContext(accountContext);
   const todayLocalDate = localDate || getTimeContext(new Date(), timeZone).localDate;
   const targetDate = shiftLocalDate(todayLocalDate, -1);
@@ -2665,6 +2850,16 @@ function formatOpeningMusicRecapForPrompt(recap = null) {
     recap.openingLine ? `openingLine=${recap.openingLine}` : '',
     recap.recommendationHint ? `recommendationHint=${recap.recommendationHint}` : '',
     `signals=${recap.signals.map(signal => signal.text).join(' / ')}`
+  ].filter(Boolean).join('; ');
+}
+
+function formatDiaryRecommendationContextForPrompt(context = null) {
+  const signals = Array.isArray(context?.signals) ? context.signals.filter(signal => signal?.text).slice(0, 4) : [];
+  const disabledTypes = Array.isArray(context?.disabledSignalTypes) ? context.disabledSignalTypes.slice(0, 8) : [];
+  if (!signals.length && !disabledTypes.length) return 'DIARY_CONTEXT: none';
+  return [
+    signals.length ? `DIARY_CONTEXT: ${signals.map(signal => signal.text).join(' / ')}` : 'DIARY_CONTEXT: no active signals',
+    disabledTypes.length ? `disabledSignalTypes=${disabledTypes.join(' / ')}` : ''
   ].filter(Boolean).join('; ');
 }
 
@@ -2867,7 +3062,7 @@ function buildRecommendationSource({
   if (noveltyBucket === 'discovery') {
     return sourceWithEvidence('similar_artist', discoverySource || 'discovery');
   }
-  if (/歌词|情绪|心情|氛围|mood|lyric|melancholy|comfort|calm/.test(`${pickText} ${messageText}`) || conversationMood?.searchHints?.length) {
+  if (/歌词|情绪|心情|氛围|mood|lyric|melancholy|comfort|calm/.test(pickText) && conversationMood?.searchHints?.length) {
     return sourceWithEvidence('lyric_mood_match', conversationMood?.searchHints?.join(' / ') || selectedPick.reason);
   }
   if (/librarydeep|deep|很久|旧歌|怀旧|long/.test(sourceText) || /怀旧|以前|很久/.test(`${pickText} ${trackText}`)) {
@@ -2876,7 +3071,7 @@ function buildRecommendationSource({
   if ((hostContext.recentFeedback || []).some(event => event?.eventType === 'complete' || event?.eventType === 'like')) {
     return sourceWithEvidence('recent_completion_direction', 'recent_feedback');
   }
-  return sourceWithEvidence('recent_completion_direction', selectedPick.reason || 'radio_context');
+  return null;
 }
 
 function sourceWithEvidence(id, evidence = '') {
@@ -2916,12 +3111,16 @@ export function buildRecommendationExplanation({
   const traceSource = normalizeRecommendationSource(recommendationSource || selectedPick?.recommendationSource || selectedTrack?.recommendationSource);
   if (traceSource) addLabeled('trace_source', '来自', traceSource.label);
 
-  if (String(userMessage || '').trim()) {
+  const constraintUpdate = parseSessionConstraintUpdate(userMessage);
+  if (String(userMessage || '').trim() && !constraintUpdate.changed) {
     add(hasExplicitMusicIntent(userMessage) ? 'explicit_request' : 'chat', `你刚刚说：${String(userMessage).trim().slice(0, 34)}`);
   }
   const pickReason = sanitizeRecommendationReasonForExplanation(selectedPick?.reason, { profile });
   if (pickReason) add('chat', pickReason);
-  if (conversationMood?.searchHints?.length) add('chat', `当前氛围：${conversationMood.searchHints.slice(0, 3).join(' / ')}`);
+  const avoidSet = new Set((conversationMood?.avoidHints || []).map(normalizeMusicText));
+  const positiveHints = (conversationMood?.searchHints || []).filter(hint => !avoidSet.has(normalizeMusicText(hint)));
+  if (positiveHints.length) add('chat', `当前氛围：${positiveHints.slice(0, 3).join(' / ')}`);
+  if (conversationMood?.avoidHints?.length) add('constraint', `本场已避开：${conversationMood.avoidHints.slice(0, 3).join(' / ')}`);
   if (timeOfDay) add('time', `现在是${timeOfDay}`);
   const weatherHint = shortWeatherHint(weather);
   if (weatherHint) add('weather', weatherHint);
@@ -2930,7 +3129,9 @@ export function buildRecommendationExplanation({
   if (hostContext.openingRecap?.recommendationHint) addLabeled('music_recap', '回顾', hostContext.openingRecap.recommendationHint);
   const profileHint = shortProfileHint(profile);
   if (profileHint) add('profile', profileHint);
-  const feedbackHint = shortFeedbackHint(hostContext.recentFeedback);
+  const feedbackHint = traceSource?.id === 'recent_completion_direction'
+    ? shortFeedbackHint((hostContext.recentFeedback || []).filter(event => event?.eventType === 'complete' || event?.eventType === 'like'))
+    : '';
   if (feedbackHint) add('feedback', feedbackHint);
 
   if (!factors.length && selectedTrack?.name) add('fallback', `已确认《${selectedTrack.name}》可播放`);
@@ -3182,6 +3383,100 @@ export function normalizeMusicText(value) {
   return String(value || '')
     .toLowerCase()
     .replace(/[\s·・.．,，、\-_/\\（）()《》<>[\]【】"'“”‘’!！?？:：;；~～]/g, '');
+}
+
+function normalizeLanguage(value = '') {
+  const text = normalizeMusicText(value);
+  if (!text) return '';
+  if (/粤语|广东话|cantonese|cantopop|yue/.test(text)) return 'cantonese';
+  if (/国语|普通话|华语|mandarin/.test(text)) return 'mandarin';
+  if (/英语|英文|english/.test(text)) return 'english';
+  if (/日语|日文|japanese/.test(text)) return 'japanese';
+  if (/韩语|韩文|korean/.test(text)) return 'korean';
+  if (/纯音乐|器乐|伴奏|无人声|instrumental/.test(text)) return 'instrumental';
+  return Object.hasOwn(LANGUAGE_LABELS, text) ? text : '';
+}
+
+function normalizeGenreFamily(value = '') {
+  const text = normalizeMusicText(value);
+  if (!text) return '';
+  if (/r&b|rnb|soul|灵魂乐/.test(text)) return 'rnb_soul';
+  if (/摇滚|rock|朋克|punk|金属|metal/.test(text)) return 'rock';
+  if (/电子|电音|edm|house|techno|trance|remix|dj/.test(text)) return 'electronic';
+  if (/民谣|原声|acoustic|folk/.test(text)) return 'folk_acoustic';
+  if (/说唱|嘻哈|rap|hiphop|hip-hop|trap/.test(text)) return 'hiphop_rap';
+  if (/国风|古风|中国风|戏腔/.test(text)) return 'chinese_style';
+  if (/爵士|蓝调|jazz|blues/.test(text)) return 'jazz_blues';
+  if (/古典|器乐|纯音乐|配乐|原声带|ost|钢琴|小提琴|交响|instrumental|bgm/.test(text)) return 'instrumental_ost';
+  if (/流行|抒情|情歌|ballad|pop/.test(text)) return 'pop_ballad';
+  return Object.hasOwn(GENRE_FAMILY_LABELS, text) ? text : '';
+}
+
+function normalizeEnergyBand(value = '') {
+  const text = normalizeMusicText(value);
+  if (/^(low|medium|high)$/.test(text)) return text;
+  if (/低能量|舒缓|安静|慢歌|轻柔|治愈|助眠|低频/.test(text)) return 'low';
+  if (/高能量|燃|热血|提神|强节奏|舞曲|摇滚|edm|dj|remix/.test(text)) return 'high';
+  if (/中能量|适中|松弛|律动/.test(text)) return 'medium';
+  return '';
+}
+
+export function inferTrackSemanticTags(track = {}, extra = {}) {
+  const explicit = track.semanticTags || {};
+  const lyric = String(track.lyric || track.lyrics || extra.lyric || '');
+  const evidenceText = [
+    track.name,
+    track.album,
+    ...(track.artists || []),
+    ...(track.aliases || track.alias || track.alia || []),
+    track.sourceReason,
+    extra.reason,
+    extra.query,
+    lyric.slice(0, 1200)
+  ].filter(Boolean).join(' ');
+  let language = normalizeLanguage(explicit.language || track.language || extra.language);
+  let detectedLanguage = '';
+  if (/(?:^|[\s，。！？])(唔|嘅|冇|咁|佢|喺|啲|咗|畀|嚟|睇)(?:[\s，。！？]|$)/.test(lyric)) detectedLanguage = 'cantonese';
+  else if (/[ぁ-んァ-ン]/.test(lyric)) detectedLanguage = 'japanese';
+  else if (/[가-힣]/.test(lyric)) detectedLanguage = 'korean';
+  else if (lyric && /[A-Za-z]{3,}/.test(lyric) && !/[\u3400-\u9fff]/.test(lyric) && /^[\x00-\x7F\s\p{P}\d]+$/u.test(lyric)) detectedLanguage = 'english';
+  if (detectedLanguage && language !== 'instrumental') language = detectedLanguage;
+  let genreFamily = normalizeGenreFamily(explicit.genreFamily || track.genreFamily || extra.genreFamily);
+  if (!genreFamily) genreFamily = normalizeGenreFamily(evidenceText);
+  let energyBand = normalizeEnergyBand(explicit.energyBand || track.energyBand || extra.energyBand);
+  if (!energyBand) energyBand = normalizeEnergyBand(evidenceText) || 'medium';
+  const tagEvidence = uniqueStrings([
+    ...(explicit.tagEvidence || track.tagEvidence || []),
+    language ? `language:${language}` : '',
+    genreFamily ? `genre:${genreFamily}` : '',
+    energyBand ? `energy:${energyBand}` : ''
+  ], 8);
+  return {
+    language: language || 'unknown',
+    genreFamily: genreFamily || 'other',
+    energyBand,
+    tagEvidence
+  };
+}
+
+function withSemanticTags(track = {}, extra = {}) {
+  const semanticTags = inferTrackSemanticTags(track, extra);
+  return {
+    ...track,
+    semanticTags,
+    language: semanticTags.language,
+    genreFamily: semanticTags.genreFamily,
+    energyBand: semanticTags.energyBand,
+    tagEvidence: semanticTags.tagEvidence
+  };
+}
+
+function validateResolvedTrack(track = {}, pick = {}, sessionConstraints = {}) {
+  const taggedTrack = withSemanticTags(track, pick);
+  return {
+    track: taggedTrack,
+    constraintResult: getTrackConstraintResult(taggedTrack, sessionConstraints)
+  };
 }
 
 function normalizeVocalPolicy(value = '') {
@@ -3946,6 +4241,9 @@ export function decideHardRuleTurnAction({ userMessage = '', mode = {} } = {}) {
       searchHints: extractActionSearchHints(text, mode)
     });
   }
+  if (parseSessionConstraintUpdate(text).changed) {
+    return result(TURN_ACTIONS.CHAT_ONLY, 'session constraints updated');
+  }
   if (rejectsMusic(text)) return result(TURN_ACTIONS.CHAT_ONLY, 'user explicitly rejected playback or switching');
   return null;
 }
@@ -4190,9 +4488,11 @@ export function analyzeTurnContext({ history = [], userMessage = '', profile = {
       reason: 'ignored stale night signal from history'
     };
   }
-  const preferenceHints = extractPreferenceHints(userMessage);
-  const avoidHints = extractAvoidHints(userMessage);
-  const explicitMusic = hasExplicitMusicIntent(userMessage);
+  const constraintUpdate = parseSessionConstraintUpdate(userMessage);
+  const blockedHints = new Set(sessionConstraintDisplayTerms(constraintUpdate).map(normalizeMusicText));
+  const preferenceHints = extractPreferenceHints(userMessage).filter(hint => !blockedHints.has(normalizeMusicText(hint)));
+  const avoidHints = sessionConstraintDisplayTerms(constraintUpdate);
+  const explicitMusic = !constraintUpdate.changed && hasExplicitMusicIntent(userMessage);
   const suppressMusic = rejectsMusic(userMessage);
   const modeUpdate = isModeUpdateRequest(userMessage);
   const playbackControl = /暂停|停一下|继续播放|继续放|接着放|resume|pause/i.test(String(userMessage || ''));
@@ -4200,7 +4500,7 @@ export function analyzeTurnContext({ history = [], userMessage = '', profile = {
 
   return normalizeMoodDecision({
     ...mood,
-    shouldRecommend: suppressMusic || modeUpdate || playbackControl ? false : (explicitMusic || mood.shouldRecommend),
+    shouldRecommend: constraintUpdate.changed || suppressMusic || modeUpdate || playbackControl ? false : (explicitMusic || mood.shouldRecommend),
     intent: explicitMusic ? 'music' : (mood.shouldRecommend ? 'mood' : 'chat'),
     searchHints: uniqueStrings([
       ...(mode?.genre ? [mode.genre] : []),
@@ -4211,7 +4511,8 @@ export function analyzeTurnContext({ history = [], userMessage = '', profile = {
     reason: explicitMusic ? 'explicit music request' : mood.reason,
     preferenceHints,
     avoidHints,
-    musicIntent: suppressMusic ? 'suppressed'
+    musicIntent: constraintUpdate.changed ? 'constraint_update'
+      : suppressMusic ? 'suppressed'
       : modeUpdate ? 'mode_update'
         : playbackControl ? 'playback_control'
           : explicitMusic ? 'explicit_music'
@@ -4315,62 +4616,118 @@ function extractAvoidHints(text) {
 
 export function parseSessionConstraintUpdate(text) {
   const value = String(text || '').trim();
-  if (!value) return { type: 'none', avoidTerms: [], reset: false, changed: false };
+  if (!value) return emptySessionConstraintUpdate();
   if (/(恢复正常推荐|取消.*(?:限制|禁听|不听|不要|别放|少放)|后面都听|以后都听|接下来都听)/.test(value)) {
-    return { type: 'reset', avoidTerms: [], reset: true, changed: true };
+    return { ...emptySessionConstraintUpdate(), type: 'reset', reset: true, changed: true };
   }
   const avoidTerms = extractSessionAvoidTerms(value);
-  return avoidTerms.length
-    ? { type: 'avoid', avoidTerms, reset: false, changed: true }
-    : { type: 'none', avoidTerms: [], reset: false, changed: false };
+  if (!avoidTerms.length) return emptySessionConstraintUpdate();
+  const classified = classifySessionConstraintTerms(avoidTerms, value);
+  return {
+    type: 'avoid',
+    avoidTerms: classified.avoidTerms,
+    avoidLanguages: classified.avoidLanguages,
+    avoidStyleFamilies: classified.avoidStyleFamilies,
+    avoidArtists: classified.avoidArtists,
+    avoidSongs: classified.avoidSongs,
+    reset: false,
+    changed: true
+  };
+}
+
+function emptySessionConstraintUpdate() {
+  return {
+    type: 'none',
+    avoidTerms: [],
+    avoidLanguages: [],
+    avoidStyleFamilies: [],
+    avoidArtists: [],
+    avoidSongs: [],
+    reset: false,
+    changed: false
+  };
+}
+
+function classifySessionConstraintTerms(terms = [], sourceText = '') {
+  const result = { avoidTerms: [], avoidLanguages: [], avoidStyleFamilies: [], avoidArtists: [], avoidSongs: [] };
+  for (const term of terms) {
+    const language = normalizeLanguage(term);
+    if (language) {
+      result.avoidLanguages.push(language);
+      continue;
+    }
+    const family = normalizeGenreFamily(term);
+    if (family && family !== 'other') {
+      result.avoidStyleFamilies.push(family);
+      continue;
+    }
+    if (new RegExp(`《${escapeRegExp(term)}》`).test(sourceText)) result.avoidSongs.push(term);
+    else result.avoidTerms.push(term);
+  }
+  return Object.fromEntries(Object.entries(result).map(([key, values]) => [key, uniqueStrings(values, 12)]));
 }
 
 export function normalizeSessionConstraints(input = {}) {
-  const avoidTerms = uniqueStrings([
-    ...(input.avoidTerms || []),
-    ...(input.avoidArtists || []),
-    ...(input.avoidSongs || [])
-  ].map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12);
+  const classified = classifySessionConstraintTerms(input.avoidTerms || []);
+  const avoidTerms = uniqueStrings(classified.avoidTerms.map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12);
   return {
     avoidTerms,
+    avoidLanguages: uniqueStrings([...(input.avoidLanguages || []), ...classified.avoidLanguages].map(normalizeLanguage).filter(Boolean), 8),
+    avoidStyleFamilies: uniqueStrings([...(input.avoidStyleFamilies || []), ...classified.avoidStyleFamilies].map(normalizeGenreFamily).filter(Boolean), 8),
+    avoidArtists: uniqueStrings((input.avoidArtists || []).map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12),
+    avoidSongs: uniqueStrings((input.avoidSongs || []).map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12),
     updatedAt: input.updatedAt || null
   };
 }
 
 export function applySessionConstraintUpdate(previous = {}, update = {}) {
   const current = normalizeSessionConstraints(previous);
-  if (update.reset) return { avoidTerms: [], updatedAt: nowIso() };
-  const nextTerms = uniqueStrings([
-    ...current.avoidTerms,
-    ...(update.avoidTerms || [])
-  ].map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12);
-  return {
-    avoidTerms: nextTerms,
-    updatedAt: nextTerms.join('|') === current.avoidTerms.join('|') ? current.updatedAt : nowIso()
-  };
+  if (update.reset) return { ...normalizeSessionConstraints({}), updatedAt: nowIso() };
+  const next = normalizeSessionConstraints({
+    avoidTerms: [...current.avoidTerms, ...(update.avoidTerms || [])],
+    avoidLanguages: [...current.avoidLanguages, ...(update.avoidLanguages || [])],
+    avoidStyleFamilies: [...current.avoidStyleFamilies, ...(update.avoidStyleFamilies || [])],
+    avoidArtists: [...current.avoidArtists, ...(update.avoidArtists || [])],
+    avoidSongs: [...current.avoidSongs, ...(update.avoidSongs || [])]
+  });
+  return { ...next, updatedAt: sessionConstraintsEqual(current, next) ? current.updatedAt : nowIso() };
 }
 
 function sessionConstraintsEqual(a = {}, b = {}) {
-  return normalizeSessionConstraints(a).avoidTerms.join('|') === normalizeSessionConstraints(b).avoidTerms.join('|');
+  const left = normalizeSessionConstraints(a);
+  const right = normalizeSessionConstraints(b);
+  return ['avoidTerms', 'avoidLanguages', 'avoidStyleFamilies', 'avoidArtists', 'avoidSongs']
+    .every(key => left[key].join('|') === right[key].join('|'));
 }
 
 function mergeSessionConstraintsIntoMood(mood = {}, sessionConstraints = {}) {
   const baseMood = mood && typeof mood === 'object' ? mood : {};
   const constraints = normalizeSessionConstraints(sessionConstraints);
-  if (!constraints.avoidTerms.length) return normalizeMoodDecision(baseMood);
+  const avoidLabels = sessionConstraintDisplayTerms(constraints);
+  if (!avoidLabels.length) return normalizeMoodDecision(baseMood);
   const normalized = normalizeMoodDecision(baseMood);
+  const blocked = new Set(avoidLabels.map(normalizeMusicText));
   return normalizeMoodDecision({
     ...normalized,
-    avoidHints: uniqueStrings([...(normalized.avoidHints || []), ...constraints.avoidTerms], 12)
+    searchHints: (normalized.searchHints || []).filter(hint => !blocked.has(normalizeMusicText(hint))),
+    preferenceHints: (normalized.preferenceHints || []).filter(hint => !blocked.has(normalizeMusicText(hint))),
+    avoidHints: uniqueStrings([...(normalized.avoidHints || []), ...avoidLabels], 12)
   });
 }
 
 function extractSessionAvoidTerms(text) {
   const value = String(text || '');
   const terms = [];
-  const pattern = /(?:后面|以后|接下来|之后|下面|本场|这场)?(?:都)?(?:不要再听|别再放|不要听|不再听|不听|不要|别放|少放|不想听|不喜欢)([^，。？！,.!?]{1,48})/g;
+  const pattern = /(?:今晚|今天|后面|以后|接下来|之后|下面|本场|这场|暂时)?(?:都)?(?:不要再听|别再听|别再放|不要听|不再听|不想再听|不想听|不听|不要|别放|少放|不喜欢)([^，。？！,.!?]{1,48})/g;
   let match = null;
   while ((match = pattern.exec(value))) {
+    const target = String(match[1] || '').trim();
+    const rejectsOnlyCurrentTrack = /(?:的)?(?:这首|这歌|当前这首|现在这首|这个版本|这版)$/.test(target);
+    if (rejectsOnlyCurrentTrack && isImmediateNextRequest(value)) continue;
+    terms.push(...splitSessionConstraintTerms(target));
+  }
+  const complaintPattern = /(?:怎么|为什么|咋)(?:还|又|仍然|仍旧).{0,8}(?:推荐|放|播放|播)([^，。？！,.!?]{1,32})/g;
+  while ((match = complaintPattern.exec(value))) {
     terms.push(...splitSessionConstraintTerms(match[1]));
   }
   return uniqueStrings(terms.map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12);
@@ -4404,9 +4761,21 @@ function getSessionConstraintsFromContext(context = {}) {
 
 function formatSessionConstraintsForPrompt(sessionConstraints = {}) {
   const constraints = normalizeSessionConstraints(sessionConstraints);
-  return constraints.avoidTerms.length
-    ? `本场禁听：${constraints.avoidTerms.join('、')}。这些歌手或歌名都不能推荐，也不能作为兜底歌曲。`
+  const labels = sessionConstraintDisplayTerms(constraints);
+  return labels.length
+    ? `本场禁听：${labels.join('、')}。这是硬约束，候选、搜索、兜底和预取队列都不能绕过；存在语言禁令时不得选择语种未知的歌曲。`
     : '本场禁听：无。';
+}
+
+function sessionConstraintDisplayTerms(sessionConstraints = {}) {
+  const constraints = normalizeSessionConstraints(sessionConstraints);
+  return uniqueStrings([
+    ...constraints.avoidTerms,
+    ...constraints.avoidArtists,
+    ...constraints.avoidSongs,
+    ...constraints.avoidLanguages.map(value => LANGUAGE_LABELS[value] || value),
+    ...constraints.avoidStyleFamilies.map(value => GENRE_FAMILY_LABELS[value] || value)
+  ], 24);
 }
 
 function formatVocalPolicyForPrompt(request = {}) {
@@ -4415,17 +4784,31 @@ function formatVocalPolicyForPrompt(request = {}) {
 }
 
 export function trackViolatesSessionConstraints(track = {}, sessionConstraints = {}) {
-  const terms = normalizeSessionConstraints(sessionConstraints).avoidTerms
+  return !getTrackConstraintResult(track, sessionConstraints).accepted;
+}
+
+export function getTrackConstraintResult(track = {}, sessionConstraints = {}) {
+  const constraints = normalizeSessionConstraints(sessionConstraints);
+  const terms = [...constraints.avoidTerms, ...constraints.avoidArtists, ...constraints.avoidSongs]
     .map(normalizeMusicText)
     .filter(term => term.length >= 2);
-  if (!terms.length) return false;
   const searchable = [
     track?.name,
     stripSongVersion(track?.name),
     ...(Array.isArray(track?.artists) ? track.artists : []),
     track?.album
   ].map(normalizeMusicText).filter(Boolean).join(' ');
-  return terms.some(term => searchable.includes(term));
+  const matchedTerms = terms.filter(term => searchable.includes(term));
+  if (matchedTerms.length) return { accepted: false, reason: 'term', matchedTerms, semanticTags: inferTrackSemanticTags(track) };
+  const semanticTags = inferTrackSemanticTags(track);
+  if (constraints.avoidLanguages.length) {
+    if (semanticTags.language === 'unknown') return { accepted: false, reason: 'unknown_language', matchedTerms: [], semanticTags };
+    if (constraints.avoidLanguages.includes(semanticTags.language)) return { accepted: false, reason: 'language', matchedTerms: [semanticTags.language], semanticTags };
+  }
+  if (constraints.avoidStyleFamilies.includes(semanticTags.genreFamily)) {
+    return { accepted: false, reason: 'style_family', matchedTerms: [semanticTags.genreFamily], semanticTags };
+  }
+  return { accepted: true, reason: 'ok', matchedTerms: [], semanticTags };
 }
 
 function songPickViolatesSessionConstraints(pick = {}, sessionConstraints = {}) {
@@ -4797,6 +5180,13 @@ function queueItemConflictsWithAvoidHints(item = {}, musicContext = {}) {
   const avoidHints = (musicContext.avoidHints || []).map(normalizeMusicText).filter(Boolean);
   if (!avoidHints.length) return false;
   const track = item.track || {};
+  const semanticTags = inferTrackSemanticTags(track);
+  for (const hint of musicContext.avoidHints || []) {
+    const language = normalizeLanguage(hint);
+    if (language && (semanticTags.language === language || semanticTags.language === 'unknown')) return true;
+    const family = normalizeGenreFamily(hint);
+    if (family && family !== 'other' && semanticTags.genreFamily === family) return true;
+  }
   const itemContext = normalizeMusicContext(item.contextSnapshot || {});
   const searchable = [
     track.name,
@@ -4987,7 +5377,8 @@ function buildRadioHostContext(db, sessionId, context = {}, userMessage = '', ac
     radioTurnCount: Number(context.radioTurnCount || 0),
     trigger: inferRadioTrigger(userMessage),
     recentPlays: getRecentHostPlays(db, 4, account),
-    recentFeedback: getRecentSessionFeedback(db, sessionId, 6, account)
+    recentFeedback: getRecentSessionFeedback(db, sessionId, 6, account),
+    diaryContext: getDiaryRecommendationContext(db, { accountContext: account })
   };
 }
 
@@ -5007,6 +5398,11 @@ function getPlayedTrackHistory(db, sessionId, limit = 80, accountContext = null)
       name,
       artists: Array.isArray(play.artists) ? play.artists : [],
       album: play.album || '',
+      semanticTags: play.semanticTags || null,
+      language: play.language || play.semanticTags?.language || '',
+      genreFamily: play.genreFamily || play.semanticTags?.genreFamily || '',
+      energyBand: play.energyBand || play.semanticTags?.energyBand || '',
+      tagEvidence: play.tagEvidence || play.semanticTags?.tagEvidence || [],
       playedAt: play.played_at || play.playedAt || ''
     });
   };
@@ -5059,6 +5455,10 @@ function mergePlayedTrackHistory(baseHistory = [], extraTracks = [], limit = 80)
       name: String(track.name || ''),
       artists: Array.isArray(track.artists) ? track.artists : [],
       album: track.album || '',
+      semanticTags: track.semanticTags || null,
+      language: track.language || track.semanticTags?.language || '',
+      genreFamily: track.genreFamily || track.semanticTags?.genreFamily || '',
+      energyBand: track.energyBand || track.semanticTags?.energyBand || '',
       playedAt: track.playedAt || track.played_at || ''
     });
   };
@@ -5368,7 +5768,12 @@ export async function buildHybridCandidateContext({
       familiarCandidates,
       accountContext: account
     });
-    const candidates = [...styleSearchResult.candidates, ...familiarCandidates, ...discoveryResult.candidates];
+    const allCandidates = [...styleSearchResult.candidates, ...familiarCandidates, ...discoveryResult.candidates]
+      .map(candidate => ({ ...candidate, track: withSemanticTags(candidate.track, { reason: candidate.sourceReason }) }));
+    const playedHistory = getPlayedTrackHistory(db, sessionId, 80, account);
+    const candidates = allCandidates
+      .filter(candidate => getTrackConstraintResult(candidate.track, request.sessionConstraints).accepted)
+      .filter(candidate => getGenreDensityResult(candidate.track, { playedHistory, request, config }).accepted);
     if (!candidates.length) {
       return disabled('empty_candidate_pool', {
         familiarCount: 0,
@@ -5442,7 +5847,8 @@ export async function buildHybridCandidateContext({
         reason: strictStyleActive && styleSearchResult.candidates.length
           ? 'hybrid_style_candidate_pool'
           : (discoveryResult.candidates.length ? 'hybrid_balanced_candidate_pool' : 'hybrid_local_candidate_pool'),
-        totalCandidates: candidates.length,
+      totalCandidates: candidates.length,
+      filteredCandidateCount: allCandidates.length - candidates.length,
         familiarCount: familiarCandidates.length,
         styleConstraint: sanitizeStyleConstraintForDebug(request.styleConstraint),
         styleSearchQueries: request.styleSearchQueries || request.styleConstraint?.searchQueries || [],
@@ -5460,6 +5866,9 @@ export async function buildHybridCandidateContext({
         artistLimitApplied: promptSelection.artistLimitApplied,
         artistLimitSkippedCount: promptSelection.artistLimitSkippedCount,
         promptArtistCounts: promptSelection.promptArtistCounts,
+        genreFamilyLimit: promptSelection.genreFamilyLimit,
+        genreFamilySkippedCount: promptSelection.genreFamilySkippedCount,
+        promptGenreFamilyCounts: promptSelection.promptGenreFamilyCounts,
         targetNoveltyBucket: noveltyTarget.targetNoveltyBucket,
         noveltyWindow: noveltyTarget.window,
         discoverySources,
@@ -5773,7 +6182,7 @@ function normalizeDiscoveryTrack(rawTrack) {
   const normalized = normalizeTrack(rawTrack);
   if (!normalized?.id || String(normalized.id).startsWith('local-')) return null;
   if (!normalized.name || !normalized.artists?.length) return null;
-  return normalized;
+  return withSemanticTags({ ...normalized, ...(rawTrack?.semanticTags ? { semanticTags: rawTrack.semanticTags } : {}) });
 }
 
 function discoverySourceLabel(source = '') {
@@ -5846,9 +6255,11 @@ function nonNegativeConfigNumber(value, fallback) {
   return Math.max(0, Math.floor(number));
 }
 
-function createArtistLimitedAdder(selected, selectedIds, { limit, artistLimit = 0 } = {}) {
+function createArtistLimitedAdder(selected, selectedIds, { limit, artistLimit = 0, genreFamilyLimit = PROMPT_GENRE_FAMILY_LIMIT } = {}) {
   const artistCounts = new Map();
+  const genreFamilyCounts = new Map();
   let skippedCount = 0;
+  let genreSkippedCount = 0;
   const add = (candidate) => {
     const id = String(candidate?.track?.id || '');
     if (!id || selectedIds.has(id) || selected.length >= limit) return false;
@@ -5857,9 +6268,15 @@ function createArtistLimitedAdder(selected, selectedIds, { limit, artistLimit = 
       skippedCount += 1;
       return false;
     }
+    const genreFamily = inferTrackSemanticTags(candidate.track).genreFamily;
+    if (genreFamilyLimit > 0 && genreFamily !== 'other' && (genreFamilyCounts.get(genreFamily) || 0) >= genreFamilyLimit) {
+      genreSkippedCount += 1;
+      return false;
+    }
     selected.push(candidate);
     selectedIds.add(id);
     for (const key of artistKeys) artistCounts.set(key, (artistCounts.get(key) || 0) + 1);
+    if (genreFamily !== 'other') genreFamilyCounts.set(genreFamily, (genreFamilyCounts.get(genreFamily) || 0) + 1);
     return true;
   };
   return {
@@ -5868,7 +6285,10 @@ function createArtistLimitedAdder(selected, selectedIds, { limit, artistLimit = 
       artistLimit,
       artistLimitApplied: artistLimit > 0,
       artistLimitSkippedCount: skippedCount,
-      promptArtistCounts: Object.fromEntries([...artistCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12))
+      promptArtistCounts: Object.fromEntries([...artistCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12)),
+      genreFamilyLimit,
+      genreFamilySkippedCount: genreSkippedCount,
+      promptGenreFamilyCounts: Object.fromEntries([...genreFamilyCounts.entries()].sort((a, b) => b[1] - a[1]))
     })
   };
 }
@@ -5920,6 +6340,37 @@ function getArtistDensityResult(track = {}, { playedHistory = [], request = {}, 
     counts: Object.fromEntries(artistKeys.map(key => [key, counts.get(key) || 0])),
     blockingArtists
   };
+}
+
+function getGenreDensityConfig(config = {}) {
+  return {
+    window: nonNegativeConfigNumber(config?.recommendation?.genreDensityWindow, GENRE_DENSITY_DEFAULT_WINDOW),
+    max: nonNegativeConfigNumber(config?.recommendation?.genreDensityMax, GENRE_DENSITY_DEFAULT_MAX),
+    streakMax: nonNegativeConfigNumber(config?.recommendation?.genreEnergyStreakMax, GENRE_ENERGY_STREAK_DEFAULT_MAX)
+  };
+}
+
+function requestBypassesGenreDensity(request = {}) {
+  return Boolean(request?.songTitle || request?.artistConstraint?.label || request?.styleConstraint?.strict);
+}
+
+export function getGenreDensityResult(track = {}, { playedHistory = [], request = {}, config = {} } = {}) {
+  const density = getGenreDensityConfig(config);
+  const semanticTags = inferTrackSemanticTags(track);
+  if (requestBypassesGenreDensity(request) || semanticTags.genreFamily === 'other') {
+    return { accepted: true, reason: requestBypassesGenreDensity(request) ? 'explicit_request' : 'unknown_family', ...density, semanticTags };
+  }
+  const recent = (playedHistory || []).slice(0, density.window).map(item => inferTrackSemanticTags(item));
+  const familyCount = recent.filter(item => item.genreFamily === semanticTags.genreFamily).length;
+  const streak = recent.findIndex(item => item.genreFamily !== semanticTags.genreFamily || item.energyBand !== semanticTags.energyBand);
+  const currentStreak = streak === -1 ? recent.length : streak;
+  if (density.max > 0 && familyCount >= density.max) {
+    return { accepted: false, reason: 'genre_density', familyCount, currentStreak, ...density, semanticTags };
+  }
+  if (density.streakMax > 0 && currentStreak >= density.streakMax) {
+    return { accepted: false, reason: 'genre_energy_streak', familyCount, currentStreak, ...density, semanticTags };
+  }
+  return { accepted: true, reason: 'ok', familyCount, currentStreak, ...density, semanticTags };
 }
 
 function selectPromptCandidatesByNovelty(candidates = [], { limit = HYBRID_PROMPT_CANDIDATE_LIMIT, discoveryRatio = HYBRID_DISCOVERY_DEFAULT_RATIO, targetNoveltyBucket = 'balanced', artistLimit = 0 } = {}) {
@@ -6082,10 +6533,11 @@ function formatHybridCandidatePrompt(candidates = []) {
   if (!candidates.length) return '本地候选池：无。';
   const lines = candidates.map((candidate, index) => {
     const track = candidate.track || {};
+    const tags = inferTrackSemanticTags(track);
     const artists = (track.artists || []).join('、') || '未知艺人';
     const score = Number.isFinite(Number(candidate.score)) ? Math.round(Number(candidate.score) * 10) / 10 : '';
     const reason = candidate.sourceReason ? `｜依据：${candidate.sourceReason}` : '';
-    return `${index + 1}. candidateId=${candidateIdForTrack(track)}｜《${track.name}》 - ${artists}｜来源：${candidate.source || 'local'}${score !== '' ? `｜分数：${score}` : ''}${reason}`;
+    return `${index + 1}. candidateId=${candidateIdForTrack(track)}｜《${track.name}》 - ${artists}｜类型：${GENRE_FAMILY_LABELS[tags.genreFamily] || tags.genreFamily}/${tags.energyBand}｜语种：${LANGUAGE_LABELS[tags.language] || tags.language}｜来源：${candidate.source || 'local'}${score !== '' ? `｜分数：${score}` : ''}${reason}`;
   });
   return [
     '本地候选池：优先从下面选择；如果确实不适合当前请求，可以忽略候选并按原规则推荐真实可搜歌曲。',
@@ -6142,10 +6594,11 @@ function formatCandidatePromptGroup(title, candidates = []) {
   if (!candidates.length) return `${title}：无。`;
   const lines = candidates.map((candidate, index) => {
     const track = candidate.track || {};
+    const tags = inferTrackSemanticTags(track);
     const artists = (track.artists || []).join('、') || '未知艺人';
     const score = Number.isFinite(Number(candidate.score)) ? Math.round(Number(candidate.score) * 10) / 10 : '';
     const reason = candidate.sourceReason ? `｜依据：${candidate.sourceReason}` : '';
-    return `${index + 1}. candidateId=${candidateIdForTrack(track)}｜《${track.name}》 - ${artists}｜来源：${candidate.source || 'local'}${score !== '' ? `｜分数：${score}` : ''}${reason}`;
+    return `${index + 1}. candidateId=${candidateIdForTrack(track)}｜《${track.name}》 - ${artists}｜类型：${GENRE_FAMILY_LABELS[tags.genreFamily] || tags.genreFamily}/${tags.energyBand}｜语种：${LANGUAGE_LABELS[tags.language] || tags.language}｜来源：${candidate.source || 'local'}${score !== '' ? `｜分数：${score}` : ''}${reason}`;
   });
   return `${title}：\n${lines.join('\n')}`;
 }
@@ -6770,6 +7223,13 @@ async function resolveSameArtistFallback({ db, config, netease, failedPicks = []
         hit.filterReason = 'artist_density';
         continue;
       }
+      const typeDensityResult = getGenreDensityResult(track, { playedHistory, request, config });
+      hit.typeDensityResult = typeDensityResult;
+      if (!typeDensityResult.accepted) {
+        hit.accepted = false;
+        hit.filterReason = typeDensityResult.reason;
+        continue;
+      }
       const playable = await resolvePlayableTrack(db, netease, track, playableResolveOptions(config, { includeLyric: false }));
       hit.playable = Boolean(playable?.playable);
       if (!playable?.playable) {
@@ -6778,7 +7238,14 @@ async function resolveSameArtistFallback({ db, config, netease, failedPicks = []
         continue;
       }
       const withLyric = await resolvePlayableTrack(db, netease, playable, playableResolveOptions(config, { includeLyric: true }));
-      const selectedTrack = withLyric?.playable ? withLyric : playable;
+      const validated = validateResolvedTrack(withLyric?.playable ? withLyric : playable, { language: track.language, genreFamily: track.genreFamily, energyBand: track.energyBand }, request.sessionConstraints);
+      if (!validated.constraintResult.accepted) {
+        hit.accepted = false;
+        hit.filterReason = `resolved_${validated.constraintResult.reason}`;
+        hit.styleConstraintResult = validated.constraintResult;
+        continue;
+      }
+      const selectedTrack = validated.track;
       diagnostic.selectedTrackId = String(selectedTrack.id || '');
       diagnostics.push(trimSearchDiagnostic(diagnostic));
       const requestedText = request?.songTitle
@@ -6841,6 +7308,13 @@ async function resolveProfileLibraryFallback({ db, config, netease, profile = {}
       hit.filterReason = 'artist_density';
       continue;
     }
+    const typeDensityResult = getGenreDensityResult(item.track, { playedHistory, request, config });
+    hit.typeDensityResult = typeDensityResult;
+    if (!typeDensityResult.accepted) {
+      hit.accepted = false;
+      hit.filterReason = typeDensityResult.reason;
+      continue;
+    }
     const playable = await resolvePlayableTrack(db, netease, item.track, playableResolveOptions(config, { includeLyric: false }));
     hit.playable = Boolean(playable?.playable);
     if (!playable?.playable) {
@@ -6849,7 +7323,13 @@ async function resolveProfileLibraryFallback({ db, config, netease, profile = {}
       continue;
     }
     const withLyric = await resolvePlayableTrack(db, netease, playable, playableResolveOptions(config, { includeLyric: true }));
-    const selectedTrack = withLyric?.playable ? withLyric : playable;
+    const validated = validateResolvedTrack(withLyric?.playable ? withLyric : playable, item.track, request.sessionConstraints);
+    if (!validated.constraintResult.accepted) {
+      hit.accepted = false;
+      hit.filterReason = `resolved_${validated.constraintResult.reason}`;
+      continue;
+    }
+    const selectedTrack = validated.track;
     diagnostics[0].selectedTrackId = String(selectedTrack.id || '');
     const reason = 'LLM 推荐未确认到可播放源，改用当前账号画像/歌单兜底。';
     return {
@@ -6961,6 +7441,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
   const candidatePrompt = candidateContext?.enabled ? candidateContext.promptText : '本地候选池：无，按原规则推荐真实可搜歌曲。';
   const weatherRadioPrompt = formatWeatherRadioForPrompt(environmentContext.weatherRadio);
   const musicRecapPrompt = formatOpeningMusicRecapForPrompt(hostContext.openingRecap);
+  const diaryContextPrompt = formatDiaryRecommendationContextForPrompt(hostContext.diaryContext);
 
   const raw = await generateChatCompletion(config.llm, [
     {
@@ -6986,7 +7467,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         replayRule,
         'hostLine 只是备用素材，不是最终导播词。不要写成“刚才……现在……”“上一首……接下来……”或“接下来放……”。可以只写一个自然的导播方向。',
         '只输出严格 JSON，不要 Markdown，不要解释。',
-        'JSON 格式：{"picks":[{"candidateId":"可选，本地候选池ID","name":"歌名","artists":["艺人"],"reason":"一句话理由","queries":["歌名 艺人","艺人 歌名"],"hostLine":"40-90字电台导播词"}],"hostDraft":"40-90字自然主持词","mode":null}'
+        'JSON 格式：{"picks":[{"candidateId":"可选，本地候选池ID","name":"歌名","artists":["艺人"],"language":"cantonese|mandarin|english|japanese|korean|instrumental|unknown","genreFamily":"pop_ballad|rnb_soul|rock|electronic|folk_acoustic|hiphop_rap|chinese_style|jazz_blues|instrumental_ost|other","energyBand":"low|medium|high","tagEvidence":["简短证据"],"reason":"一句话理由","queries":["歌名 艺人","艺人 歌名"],"hostLine":"40-90字电台导播词"}],"hostDraft":"40-90字自然主持词","mode":null}'
       ].join('\n')
     },
     {
@@ -7002,6 +7483,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         vocalPolicyText,
         weatherRadioPrompt,
         musicRecapPrompt,
+        diaryContextPrompt,
         candidatePrompt,
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
         formatRecentHostPlays(hostContext.recentPlays),
@@ -7050,6 +7532,10 @@ function normalizeSongPick(raw = {}) {
     name,
     artists,
     reason: String(raw.reason || '').trim(),
+    language: normalizeLanguage(raw.language || raw.semanticTags?.language) || 'unknown',
+    genreFamily: normalizeGenreFamily(raw.genreFamily || raw.semanticTags?.genreFamily) || 'other',
+    energyBand: normalizeEnergyBand(raw.energyBand || raw.semanticTags?.energyBand) || 'medium',
+    tagEvidence: uniqueStrings(raw.tagEvidence || raw.semanticTags?.tagEvidence || [], 8),
     queries: Array.isArray(raw.queries) ? raw.queries.map(q => String(q || '').trim()).filter(Boolean) : [],
     hostLine: String(raw.hostLine || raw.hostText || '').trim()
   };
@@ -7136,7 +7622,8 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
     pickDiagnostic.queries = search.queries;
     pickDiagnostic.queryDiagnostics = search.queryDiagnostics;
     const ranked = search.tracks
-      .map(track => {
+      .map(rawTrack => {
+        const track = withSemanticTags(rawTrack, effectivePick);
         const scoreDetails = scoreSearchTrackForPickDetails(track, effectivePick);
         const score = scoreDetails.score;
         const styleConstraintResult = getStyleConstraintResult(track, request.styleConstraint, config);
@@ -7197,6 +7684,13 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
         item.diagnostic.filterReason = 'artist_density';
         continue;
       }
+      const typeDensityResult = getGenreDensityResult(track, { playedHistory, request, config });
+      item.diagnostic.typeDensityResult = typeDensityResult;
+      if (!typeDensityResult.accepted) {
+        item.diagnostic.accepted = false;
+        item.diagnostic.filterReason = typeDensityResult.reason;
+        continue;
+      }
       const playableStarted = Date.now();
       const playable = await resolvePlayableTrack(db, netease, track, playableResolveOptions(config, { includeLyric: false }));
       item.diagnostic.playable = Boolean(playable?.playable);
@@ -7207,11 +7701,18 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
         continue;
       }
       const withLyric = await resolvePlayableTrack(db, netease, playable, playableResolveOptions(config, { includeLyric: true }));
-      pickDiagnostic.selectedTrackId = String((withLyric?.playable ? withLyric : playable)?.id || '');
+      const validated = validateResolvedTrack(withLyric?.playable ? withLyric : playable, effectivePick, request.sessionConstraints);
+      if (!validated.constraintResult.accepted) {
+        item.diagnostic.accepted = false;
+        item.diagnostic.filterReason = `resolved_${validated.constraintResult.reason}`;
+        item.diagnostic.constraintResult = validated.constraintResult;
+        continue;
+      }
+      pickDiagnostic.selectedTrackId = String(validated.track?.id || '');
       diagnostics.push(trimSearchDiagnostic(pickDiagnostic));
       return {
-        track: withLyric?.playable ? withLyric : playable,
-        pick: normalizeSelectedPick(effectivePick, withLyric?.playable ? withLyric : playable),
+        track: validated.track,
+        pick: normalizeSelectedPick(effectivePick, validated.track),
         diagnostics
       };
     }
@@ -7247,7 +7748,7 @@ async function resolveCandidatePickTrack({ db, config, netease, pick = {}, playe
     return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
   }
 
-  const track = candidate.track;
+  const track = withSemanticTags(candidate.track, pick);
   const hit = {
     track: sanitizeTrackForDebug(track),
     score: Number.isFinite(Number(candidate.score)) ? Math.round(Number(candidate.score) * 100) / 100 : null,
@@ -7300,6 +7801,14 @@ async function resolveCandidatePickTrack({ db, config, netease, pick = {}, playe
     diagnostic.failedReason = 'artist_density';
     return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
   }
+  const typeDensityResult = getGenreDensityResult(track, { playedHistory, request, config });
+  hit.typeDensityResult = typeDensityResult;
+  if (!typeDensityResult.accepted) {
+    hit.accepted = false;
+    hit.filterReason = typeDensityResult.reason;
+    diagnostic.failedReason = typeDensityResult.reason;
+    return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
+  }
 
   const playableStarted = Date.now();
   const playable = await resolvePlayableTrack(db, netease, track, playableResolveOptions(config, { includeLyric: false }));
@@ -7313,7 +7822,15 @@ async function resolveCandidatePickTrack({ db, config, netease, pick = {}, playe
   }
 
   const withLyric = await resolvePlayableTrack(db, netease, playable, playableResolveOptions(config, { includeLyric: true }));
-  const selectedTrack = withLyric?.playable ? withLyric : playable;
+  const validated = validateResolvedTrack(withLyric?.playable ? withLyric : playable, pick, request.sessionConstraints);
+  if (!validated.constraintResult.accepted) {
+    hit.accepted = false;
+    hit.filterReason = `resolved_${validated.constraintResult.reason}`;
+    hit.constraintResult = validated.constraintResult;
+    diagnostic.failedReason = hit.filterReason;
+    return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
+  }
+  const selectedTrack = validated.track;
   diagnostic.selectedTrackId = String(selectedTrack.id || '');
   return {
     track: selectedTrack,
@@ -7406,11 +7923,13 @@ function sanitizeSongPick(pick = {}) {
 }
 
 function sanitizeTrackForDebug(track = {}) {
+  const semanticTags = inferTrackSemanticTags(track);
   return {
     id: String(track.id || ''),
     name: String(track.name || '').slice(0, 80),
     artists: Array.isArray(track.artists) ? track.artists.slice(0, 4) : [],
-    album: String(track.album || '').slice(0, 80)
+    album: String(track.album || '').slice(0, 80),
+    semanticTags
   };
 }
 
@@ -7650,6 +8169,7 @@ export function buildFinalHostMessages({
   const profilePrompt = formatProfileSummaryForPrompt(profile);
   const weatherRadioPrompt = formatWeatherRadioForPrompt(environmentContext.weatherRadio);
   const musicRecapPrompt = formatOpeningMusicRecapForPrompt(hostContext.openingRecap);
+  const diaryContextPrompt = formatDiaryRecommendationContextForPrompt(hostContext.diaryContext);
   return [
     {
       role: 'system',
@@ -7680,6 +8200,7 @@ export function buildFinalHostMessages({
         selectedTrack?.album ? `专辑：${selectedTrack.album}` : '',
         weatherRadioPrompt,
         musicRecapPrompt,
+        diaryContextPrompt,
         `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
         firstTurn ? `时间天气参考：${timeOfDay} ${hour}点，${weather}` : `时间天气仅供理解氛围，不要写进导播词：${timeOfDay} ${hour}点，${weather}`,
         `听众画像：${profilePrompt}`,

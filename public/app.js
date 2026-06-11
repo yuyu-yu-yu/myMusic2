@@ -26,6 +26,7 @@ const state = {
   feedbackSummary: null,
   memories: [],
   moodStats: null,
+  diaryOverview: null,
   mixerRefreshTimer: null,
   librarySyncTimer: null,
   librarySyncStatus: null,
@@ -243,9 +244,6 @@ async function render() {
   // Move persistent audio elements back to hidden layer before clearing view
   if (view.__audioCleanup) { view.__audioCleanup(); view.__audioCleanup = null; }
 
-  if (location.pathname === '/diary') {
-    history.replaceState({}, '', '/mixer');
-  }
   if (state.mixerRefreshTimer && location.pathname !== '/mixer') {
     clearInterval(state.mixerRefreshTimer);
     state.mixerRefreshTimer = null;
@@ -259,6 +257,7 @@ async function render() {
     link.classList.toggle('active', new URL(link.href).pathname === location.pathname);
   });
   if (location.pathname === '/library') return renderLibrary();
+  if (location.pathname === '/diary') return renderDiary();
   if (location.pathname === '/mixer') return renderMixer();
   if (location.pathname === '/settings') return renderSettings();
   return renderPlayer();
@@ -1147,6 +1146,7 @@ function renderPlayer() {
   updateAiMusicDownload(state.current?.track || null);
   renderPlaylistQueue();
   scheduleRadioPrefetch();
+  loadDiaryRadioEntry().catch(() => {});
 }
 
 function ensureFeedbackButtons() {
@@ -1919,6 +1919,11 @@ function handleRadioResponse(data, { loading = null, radioTurn = null } = {}) {
   // Show/hide mode reset button
   const hasMode = data.mode?.genre;
   document.querySelector('#mode-reset-btn').style.display = hasMode ? '' : 'none';
+
+  if (data.switchRequested && data.stopCurrent) {
+    void nextTrack({ skipCurrent: true, silent: true, forceFresh: true });
+    return true;
+  }
 
   if (!data.track) {
     setPlayerStatus(state.current?.track ? '继续播放中' : '等待中', '');
@@ -3447,6 +3452,307 @@ function neteaseTrialLoginCard(status = {}) {
       </div>
     </div>
   `;
+}
+
+async function renderDiary() {
+  const selectedDate = new URLSearchParams(location.search).get('date') || '';
+  view.innerHTML = `
+    <section class="diary-shell diary-loading" aria-live="polite">
+      <div class="diary-loading-signal" aria-hidden="true"></div>
+      <p>正在读取音乐回顾</p>
+    </section>
+  `;
+  try {
+    const query = new URLSearchParams({ days: '7' });
+    if (selectedDate) query.set('date', selectedDate);
+    const overview = await api(`/api/diary/overview?${query.toString()}`);
+    if (location.pathname !== '/diary') return;
+    state.diaryOverview = overview;
+    renderDiaryOverview(overview);
+  } catch (error) {
+    if (location.pathname !== '/diary') return;
+    view.innerHTML = `
+      <section class="diary-shell diary-empty-state">
+        <p class="eyebrow">PRIVATE FREQUENCY ARCHIVE</p>
+        <h1>音乐回顾暂时无法读取</h1>
+        <p>${escapeHtml(error.message)}</p>
+        <a class="diary-primary-action" href="/" data-link>返回电台</a>
+      </section>
+    `;
+  }
+}
+
+function renderDiaryOverview(overview = {}) {
+  const detail = overview.detail || {};
+  const timeline = Array.isArray(overview.timeline) ? overview.timeline : [];
+  view.innerHTML = `
+    <section class="diary-shell">
+      <header class="diary-header">
+        <div>
+          <p class="eyebrow">PRIVATE FREQUENCY ARCHIVE</p>
+          <h1>音乐回顾</h1>
+          <p>基于播放、完整收听、跳过和喜欢记录生成，不使用推测性日记。</p>
+        </div>
+        ${detail.hasActivity ? `<button class="diary-primary-action" type="button" data-diary-radio="${escapeAttr(detail.date || overview.selectedDate || '')}">生成相似电台</button>` : ''}
+      </header>
+
+      <div class="diary-workspace">
+        <aside class="diary-timeline" aria-label="最近七天音乐回顾">
+          <div class="diary-section-heading">
+            <span>最近七天</span>
+            <small>${escapeHtml(overview.timeZone || '')}</small>
+          </div>
+          <div class="diary-date-list">
+            ${timeline.map(day => diaryDateButton(day, overview.selectedDate)).join('')}
+          </div>
+        </aside>
+
+        <main class="diary-detail">
+          ${detail.hasActivity ? diaryDetailHTML(detail) : diaryEmptyDetailHTML(detail)}
+        </main>
+      </div>
+    </section>
+  `;
+  bindDiaryInteractions();
+}
+
+function diaryDateButton(day = {}, selectedDate = '') {
+  const metrics = day.metrics || {};
+  const selected = day.date === selectedDate;
+  return `
+    <button class="diary-date-row${selected ? ' is-selected' : ''}${day.hasActivity ? '' : ' is-empty'}" type="button" data-diary-date="${escapeAttr(day.date || '')}" aria-pressed="${selected}">
+      <span class="diary-date-main">
+        <strong>${escapeHtml(formatDiaryDate(day.date))}</strong>
+        <small>${day.isToday ? '进行中' : day.dominantPeriod?.label || (day.hasActivity ? '有记录' : '无记录')}</small>
+      </span>
+      <span class="diary-date-counts">
+        <b>${Number(metrics.plays || 0)}</b>
+        <small>播放</small>
+        <b>${Number(metrics.completed || 0)}</b>
+        <small>完整</small>
+        <b>${Number(metrics.skipped || 0)}</b>
+        <small>跳过</small>
+      </span>
+    </button>
+  `;
+}
+
+function diaryDetailHTML(detail = {}) {
+  const metrics = detail.metrics || {};
+  const periods = Array.isArray(detail.periods) ? detail.periods : [];
+  const signals = Array.isArray(detail.signals) ? detail.signals : [];
+  const tracks = Array.isArray(detail.tracks) ? detail.tracks : [];
+  const periodMax = Math.max(1, ...periods.map(period => Number(period.count || 0)));
+  return `
+    <section class="diary-day-header">
+      <div>
+        <p class="eyebrow">${detail.isToday ? 'LIVE RECORD' : 'DAILY RECORD'}</p>
+        <h2>${escapeHtml(formatDiaryDate(detail.date))}</h2>
+      </div>
+      <span class="diary-record-state">${detail.isToday ? '进行中' : '已归档'}</span>
+    </section>
+
+    <section class="diary-metrics" aria-label="核心指标">
+      ${diaryMetric('播放', metrics.plays, '首')}
+      ${diaryMetric('完整播放', metrics.completed, '次')}
+      ${diaryMetric('跳过', metrics.skipped, '次')}
+      ${diaryMetric('喜欢', metrics.liked, '次')}
+    </section>
+
+    <section class="diary-section diary-period-section">
+      <div class="diary-section-heading">
+        <span>收听时间分布</span>
+        <small>${detail.dominantPeriod?.label ? `主要时段：${escapeHtml(detail.dominantPeriod.label)}` : '暂无主要时段'}</small>
+      </div>
+      <div class="diary-period-grid">
+        ${periods.map(period => `
+          <div class="diary-period-row">
+            <span>${escapeHtml(period.label)}</span>
+            <div class="diary-period-track"><i style="width:${Math.round((Number(period.count || 0) / periodMax) * 100)}%"></i></div>
+            <strong>${Number(period.count || 0)}</strong>
+          </div>
+        `).join('')}
+      </div>
+    </section>
+
+    <section class="diary-section">
+      <div class="diary-section-heading">
+        <span>可验证趋势</span>
+        <small>${signals.length ? `${signals.filter(signal => signal.effective).length} 项仍在参考` : '证据不足时不生成结论'}</small>
+      </div>
+      <div class="diary-signal-list">
+        ${signals.length ? signals.map(diarySignalHTML).join('') : '<p class="diary-inline-empty">当前记录不足以形成稳定趋势。</p>'}
+      </div>
+    </section>
+
+    <section class="diary-section">
+      <div class="diary-section-heading">
+        <span>歌曲记录</span>
+        <small>${tracks.length} 首</small>
+      </div>
+      <div class="diary-track-list">
+        ${tracks.length ? tracks.map(diaryTrackHTML).join('') : '<p class="diary-inline-empty">暂无歌曲记录。</p>'}
+      </div>
+    </section>
+  `;
+}
+
+function diaryMetric(label, value, unit) {
+  return `<div class="diary-metric"><span>${escapeHtml(label)}</span><strong>${Number(value || 0)}</strong><small>${escapeHtml(unit)}</small></div>`;
+}
+
+function diarySignalHTML(signal = {}) {
+  const disabled = signal.status === 'disabled';
+  const inaccurate = signal.status === 'inaccurate';
+  const accurate = signal.status === 'accurate';
+  return `
+    <article class="diary-signal${disabled ? ' is-disabled' : ''}${inaccurate ? ' is-inaccurate' : ''}">
+      <div class="diary-signal-copy">
+        <div class="diary-signal-title">
+          <span>${escapeHtml(signal.label || '趋势')}</span>
+          <small>${Math.round(Number(signal.confidence || 0) * 100)}% 依据强度</small>
+        </div>
+        <strong>${escapeHtml(signal.text || '')}</strong>
+        <ul>${(signal.evidence || []).map(item => `<li>${escapeHtml(item)}</li>`).join('')}</ul>
+      </div>
+      <div class="diary-signal-actions" role="group" aria-label="趋势反馈">
+        <button type="button" data-diary-feedback="accurate" data-signal-id="${escapeAttr(signal.id)}" data-signal-type="${escapeAttr(signal.type)}" class="${accurate ? 'is-active' : ''}" ${disabled ? 'disabled' : ''}>准确</button>
+        <button type="button" data-diary-feedback="inaccurate" data-signal-id="${escapeAttr(signal.id)}" data-signal-type="${escapeAttr(signal.type)}" class="${inaccurate ? 'is-active' : ''}" ${disabled ? 'disabled' : ''}>不准确</button>
+        <button type="button" data-diary-feedback="${disabled ? 'restore' : 'disable'}" data-signal-id="${escapeAttr(signal.id)}" data-signal-type="${escapeAttr(signal.type)}" class="${disabled ? 'is-active' : ''}">${disabled ? '恢复参考' : '不再参考'}</button>
+      </div>
+    </article>
+  `;
+}
+
+function diaryTrackHTML(track = {}) {
+  const labels = { played: '播放', complete: '完整播放', skip: '跳过', like: '喜欢', dislike: '不喜欢' };
+  return `
+    <article class="diary-track-row">
+      <img src="${escapeAttr(track.coverUrl || '/assets/cover-1.svg')}" alt="" />
+      <div>
+        <strong>${escapeHtml(track.name || '未知歌曲')}</strong>
+        <span>${escapeHtml((track.artists || []).join(' / ') || '未知艺人')}</span>
+      </div>
+      <div class="diary-track-events">${(track.events || []).map(event => `<span class="event-${escapeAttr(event)}">${escapeHtml(labels[event] || event)}</span>`).join('')}</div>
+      <time>${escapeHtml(track.localTime || '')}</time>
+    </article>
+  `;
+}
+
+function diaryEmptyDetailHTML(detail = {}) {
+  return `
+    <section class="diary-empty-state">
+      <p class="eyebrow">NO VALID RECORD</p>
+      <h2>${escapeHtml(formatDiaryDate(detail.date))}</h2>
+      <strong>暂无有效记录</strong>
+      <p>当天没有足够的播放或反馈数据，因此不会生成趋势结论。</p>
+      <a class="diary-primary-action" href="/" data-link>返回电台</a>
+    </section>
+  `;
+}
+
+function bindDiaryInteractions() {
+  view.querySelectorAll('[data-diary-date]').forEach(button => {
+    button.addEventListener('click', () => loadDiaryDate(button.dataset.diaryDate));
+  });
+  view.querySelectorAll('[data-diary-feedback]').forEach(button => {
+    button.addEventListener('click', () => submitDiaryFeedback(button));
+  });
+  view.querySelector('[data-diary-radio]')?.addEventListener('click', event => startDiaryRadio(event.currentTarget));
+}
+
+async function loadDiaryDate(date) {
+  if (!date) return;
+  history.replaceState({}, '', `/diary?date=${encodeURIComponent(date)}`);
+  await renderDiary();
+}
+
+async function submitDiaryFeedback(button) {
+  const date = state.diaryOverview?.detail?.date;
+  if (!date || button.disabled) return;
+  const previousText = button.textContent;
+  button.disabled = true;
+  button.textContent = '处理中';
+  try {
+    const result = await api('/api/diary/feedback', {
+      method: 'POST',
+      body: {
+        date,
+        signalId: button.dataset.signalId,
+        signalType: button.dataset.signalType,
+        action: button.dataset.diaryFeedback
+      }
+    });
+    state.diaryOverview = result.overview;
+    renderDiaryOverview(result.overview);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = previousText;
+    setPlayerStatus(error.message, 'error');
+  }
+}
+
+async function startDiaryRadio(button) {
+  const date = button.dataset.diaryRadio;
+  if (!date) return;
+  const originalText = button.textContent;
+  button.disabled = true;
+  button.textContent = '正在生成';
+  primeVoicePlayback();
+  try {
+    const data = await api('/api/diary/radio', {
+      method: 'POST',
+      body: { sessionId: ensureSessionId(), date }
+    });
+    state.radioMode = 'playlist';
+    history.pushState({}, '', '/');
+    await render();
+    handleRadioResponse(data);
+  } catch (error) {
+    button.disabled = false;
+    button.textContent = originalText;
+    setPlayerStatus(error.message, 'error');
+  }
+}
+
+async function loadDiaryRadioEntry() {
+  const container = document.querySelector('#chat-messages');
+  if (!container || container.querySelector('[data-diary-radio-entry]')) return;
+  const overview = await api('/api/diary/overview?days=7');
+  if (location.pathname !== '/' || !document.querySelector('#chat-messages')) return;
+  const todayIndex = overview.timeline.findIndex(day => day.isToday);
+  const yesterday = todayIndex > 0 ? overview.timeline[todayIndex - 1] : null;
+  if (!yesterday?.hasActivity) return;
+  const dismissKey = `mymusic:diary-entry-dismissed:${overview.today}`;
+  try {
+    if (localStorage.getItem(dismissKey) === 'yes') return;
+  } catch {}
+  const signal = (yesterday.signals || []).find(item => item.effective);
+  const summary = signal?.text || `昨日播放 ${Number(yesterday.metrics?.plays || 0)} 首歌曲`;
+  const html = `
+    <aside class="diary-radio-entry" data-diary-radio-entry>
+      <div>
+        <span>昨日回顾</span>
+        <strong>${escapeHtml(summary)}</strong>
+      </div>
+      <a href="/diary?date=${encodeURIComponent(yesterday.date)}" data-link>查看回顾</a>
+      <button type="button" data-dismiss-diary-entry aria-label="关闭昨日回顾" title="关闭">×</button>
+    </aside>
+  `;
+  const liveContainer = document.querySelector('#chat-messages');
+  const initial = liveContainer?.querySelector('[data-initial-chat]');
+  if (initial) initial.insertAdjacentHTML('afterend', html);
+  else liveContainer?.insertAdjacentHTML('afterbegin', html);
+  liveContainer?.querySelector('[data-dismiss-diary-entry]')?.addEventListener('click', () => {
+    try { localStorage.setItem(dismissKey, 'yes'); } catch {}
+    liveContainer.querySelector('[data-diary-radio-entry]')?.remove();
+  });
+}
+
+function formatDiaryDate(value = '') {
+  const match = String(value).match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return value || '未知日期';
+  return `${Number(match[2])} 月 ${Number(match[3])} 日`;
 }
 
 async function renderMixer() {

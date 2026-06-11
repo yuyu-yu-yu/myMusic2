@@ -6,7 +6,7 @@ export async function generateChatCompletion(config, messages, fallback) {
   if (!config.baseUrl || !config.apiKey || !config.model) return fallback();
   const url = new URL('/v1/chat/completions', config.baseUrl);
   try {
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${config.apiKey}`,
@@ -17,7 +17,7 @@ export async function generateChatCompletion(config, messages, fallback) {
         messages,
         temperature: 0.8
       })
-    });
+    }, config.timeoutMs || 12000);
     if (!response.ok) throw new Error(`LLM HTTP ${response.status}`);
     const json = await response.json();
     return json.choices?.[0]?.message?.content?.trim() || fallback();
@@ -42,7 +42,7 @@ async function synthesizeOpenAiSpeech(config, text, rootDir) {
 
   try {
     const url = new URL('/v1/audio/speech', config.baseUrl);
-    const response = await fetch(url, {
+    const response = await fetchWithTimeout(url, {
       method: 'POST',
       headers: {
         authorization: `Bearer ${config.apiKey}`,
@@ -54,7 +54,7 @@ async function synthesizeOpenAiSpeech(config, text, rootDir) {
         input: text,
         format: 'mp3'
       })
-    });
+    }, config.timeoutMs || 8000);
     if (!response.ok) throw new Error(`TTS HTTP ${response.status}`);
     const bytes = Buffer.from(await response.arrayBuffer());
     fs.writeFileSync(outputPath, bytes);
@@ -83,7 +83,7 @@ async function synthesizeVolcengineSpeech(config, text, rootDir) {
 
   try {
     const reqid = crypto.randomUUID();
-    const response = await fetch(endpoint, {
+    const response = await fetchWithTimeout(endpoint, {
       method: 'POST',
       headers: {
         authorization: `Bearer;${accessToken}`,
@@ -115,7 +115,7 @@ async function synthesizeVolcengineSpeech(config, text, rootDir) {
           silence_duration: 125
         }
       })
-    });
+    }, config.timeoutMs || 8000);
     if (!response.ok) throw new Error(`Volcengine TTS HTTP ${response.status}`);
     const json = await response.json();
     if (json.code !== 3000 || !json.data) {
@@ -150,7 +150,7 @@ async function synthesizeVolcengineV3Speech(config, text, rootDir) {
 
   for (const resourceId of resourceIds) {
     try {
-      const response = await fetch(endpoint, {
+      const response = await fetchWithTimeout(endpoint, {
         method: 'POST',
         headers: buildVolcengineV3Headers(volc, accessKey, appId, resourceId),
         body: JSON.stringify({
@@ -168,7 +168,7 @@ async function synthesizeVolcengineV3Speech(config, text, rootDir) {
             }
           }
         })
-      });
+      }, config.timeoutMs || 8000);
       if (!response.ok) throw new Error(`Volcengine TTS V3 HTTP ${response.status}`);
       const bytes = await readVolcengineV3Audio(response);
       if (!bytes.length) throw new Error('Volcengine TTS V3 returned empty audio');
@@ -229,6 +229,16 @@ function toPercentRate(value, base) {
 
 function uniqueNonEmpty(values) {
   return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))];
+}
+
+async function fetchWithTimeout(url, options = {}, timeoutMs = 12000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(new Error('request timeout')), Math.max(1, Number(timeoutMs) || 12000));
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 function prepareTtsCache(config, text, rootDir) {

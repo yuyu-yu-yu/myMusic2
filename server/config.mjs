@@ -52,7 +52,10 @@ export function getConfig() {
       strictStyle: env.RECOMMENDATION_STRICT_STYLE === undefined ? true : parseBoolean(env.RECOMMENDATION_STRICT_STYLE),
       promptArtistLimit: parseNonNegativeNumber(env.RECOMMENDATION_PROMPT_ARTIST_LIMIT, 5),
       artistDensityWindow: parseNonNegativeNumber(env.RECOMMENDATION_ARTIST_DENSITY_WINDOW, 8),
-      artistDensityMax: parseNonNegativeNumber(env.RECOMMENDATION_ARTIST_DENSITY_MAX, 3)
+      artistDensityMax: parseNonNegativeNumber(env.RECOMMENDATION_ARTIST_DENSITY_MAX, 3),
+      genreDensityWindow: parseNonNegativeNumber(env.RECOMMENDATION_GENRE_DENSITY_WINDOW, 6),
+      genreDensityMax: parseNonNegativeNumber(env.RECOMMENDATION_GENRE_DENSITY_MAX, 3),
+      genreEnergyStreakMax: parseNonNegativeNumber(env.RECOMMENDATION_GENRE_ENERGY_STREAK_MAX, 2)
     },
     netease: {
       baseUrl: env.NETEASE_BASE_URL || 'https://openapi.music.163.com',
@@ -77,7 +80,8 @@ export function getConfig() {
     llm: {
       baseUrl: env.LLM_BASE_URL || '',
       apiKey: env.LLM_API_KEY || '',
-      model: env.LLM_MODEL || ''
+      model: env.LLM_MODEL || '',
+      timeoutMs: Math.max(500, Number(env.LLM_REQUEST_TIMEOUT_MS || 12000) || 12000)
     },
     minimax: {
       baseUrl: env.MINIMAX_MUSIC_BASE_URL || env.MINIMAX_BASE_URL || 'https://api.minimaxi.com',
@@ -91,6 +95,7 @@ export function getConfig() {
       apiKey: env.TTS_API_KEY || '',
       model: env.TTS_MODEL || '',
       voice: env.TTS_VOICE || '',
+      timeoutMs: Math.max(500, Number(env.TTS_REQUEST_TIMEOUT_MS || 8000) || 8000),
       volcengine: {
         appId: env.VOLCENGINE_TTS_APP_ID || '',
         accessToken: env.VOLCENGINE_TTS_ACCESS_TOKEN || '',
@@ -170,7 +175,10 @@ export function publicConfigStatus(config) {
       pipeline: config.recommendation?.pipeline || 'hybrid',
       promptArtistLimit: config.recommendation?.promptArtistLimit ?? 5,
       artistDensityWindow: config.recommendation?.artistDensityWindow ?? 8,
-      artistDensityMax: config.recommendation?.artistDensityMax ?? 3
+      artistDensityMax: config.recommendation?.artistDensityMax ?? 3,
+      genreDensityWindow: config.recommendation?.genreDensityWindow ?? 6,
+      genreDensityMax: config.recommendation?.genreDensityMax ?? 3,
+      genreEnergyStreakMax: config.recommendation?.genreEnergyStreakMax ?? 2
     }
   };
 }

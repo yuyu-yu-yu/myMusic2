@@ -429,6 +429,81 @@ test('session constraints can be reset by a normal recommendation request', () =
   assert.deepEqual(normalizeSessionConstraints({ avoidTerms: [] }).avoidTerms, []);
 });
 
+test('session constraints distinguish current-track rejection from persistent bans', () => {
+  const currentOnly = parseSessionConstraintUpdate('\u4e0d\u60f3\u542c\u9648\u5955\u8fc5\u7684\u8fd9\u9996\uff0c\u6362\u4ed6\u7684\u53e6\u4e00\u9996\u6b4c');
+  const nightlyBan = parseSessionConstraintUpdate('\u6211\u4eca\u665a\u4e0d\u60f3\u518d\u542c\u7ca4\u8bed\u6b4c\u4e86');
+  const complaintBan = parseSessionConstraintUpdate('\u600e\u4e48\u53c8\u63a8\u8350\u7ca4\u8bed\u6b4c');
+
+  assert.equal(currentOnly.changed, false);
+  assert.deepEqual(nightlyBan.avoidLanguages, ['cantonese']);
+  assert.deepEqual(complaintBan.avoidLanguages, ['cantonese']);
+});
+
+test('language ban stops a violating current track and rebuilds the prefetched queue', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  saveTrack(db, {
+    id: 'current-cantonese',
+    name: '\u7ca4\u8bed\u73b0\u573a\u7248',
+    artists: ['Current Artist'],
+    album: 'Current Album',
+    semanticTags: { language: 'cantonese', genreFamily: 'pop_ballad', energyBand: 'medium' }
+  });
+  const safeTrack = saveTrack(db, {
+    id: 'safe-mandarin',
+    name: '\u666e\u901a\u8bdd\u65b0\u65b9\u5411',
+    artists: ['Safe Artist'],
+    album: 'Safe Album',
+    semanticTags: { language: 'mandarin', genreFamily: 'electronic', energyBand: 'high' }
+  });
+  const playlist = savePlaylist(db, { id: 'constraint-safe-playlist', name: 'Safe Playlist', trackCount: 1 }, 'created');
+  linkPlaylistTrack(db, playlist.id, safeTrack.id, 0);
+  db.prepare('INSERT INTO plays (track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?)')
+    .run('current-cantonese', new Date().toISOString(), 'radio', 'test', 'pending');
+  const musicContext = normalizeMusicContext({
+    version: 1,
+    mood: 'calm',
+    energy: 'medium',
+    musicIntent: 'mood_signal'
+  });
+  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
+    .run('constraint-queue-rebuild', new Date().toISOString(), JSON.stringify({ musicContext, queueGeneration: 1 }), JSON.stringify(normalizeRadioQueue([{
+      id: 'old-cantonese-ready',
+      status: 'ready',
+      contextVersion: 1,
+      queueGeneration: 1,
+      contextSnapshot: musicContext,
+      track: {
+        id: 'queued-cantonese',
+        name: '\u65e7\u7684\u7ca4\u8bed\u5019\u9009',
+        artists: ['Queued Artist'],
+        semanticTags: { language: 'cantonese', genreFamily: 'pop_ballad', energyBand: 'medium' }
+      },
+      chatText: 'old host text'
+    }])));
+
+  const result = await chatTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {}, recommendation: { pipeline: 'hybrid' } },
+    netease: { isConfigured: () => false },
+    sessionId: 'constraint-queue-rebuild',
+    message: '\u6211\u4eca\u665a\u4e0d\u60f3\u518d\u542c\u7ca4\u8bed\u6b4c\u4e86'
+  });
+
+  assert.deepEqual(result.constraintApplied.avoidLanguages, ['cantonese']);
+  assert.equal(result.stopCurrent, true);
+  assert.equal(result.switchRequested, true);
+  assert.equal(result.queueRebuilt, true);
+  const immediateStatus = getRadioQueueStatus(db, 'constraint-queue-rebuild');
+  assert.equal(immediateStatus.queue.some(item => item.id === 'old-cantonese-ready' && item.status === 'stale'), true);
+  assert.equal(immediateStatus.queue.some(item => item.id === 'old-cantonese-ready' && item.status === 'ready'), false);
+
+  await new Promise(resolve => setTimeout(resolve, 100));
+  const settledStatus = getRadioQueueStatus(db, 'constraint-queue-rebuild');
+  assert.equal(settledStatus.queue.some(item => item.id === 'old-cantonese-ready' && item.status === 'ready'), false);
+  assert.equal(settledStatus.queue.some(item => item.status === 'ready' && item.semanticTags?.language === 'cantonese'), false);
+});
+
 test('explicit song query treats LLM-guessed artists as weak hints', () => {
   const request = { songTitle: '柑橘乌云', text: '放一首柑橘乌云' };
   const llmPick = {
@@ -3090,7 +3165,7 @@ test('strict style requests populate and prioritize style search candidates', as
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tracks WHERE id = ?').get('style-hit').count, 0);
 });
 
-test('strict style prompt candidates still limit repeated artists', async (t) => {
+test('strict style prompt candidates limit repeated artists and genre families', async (t) => {
   const db = testDb(t);
   const styleRecords = [
     ...Array.from({ length: 9 }, (_, index) => ({
@@ -3129,10 +3204,11 @@ test('strict style prompt candidates still limit repeated artists', async (t) =>
   });
 
   assert.equal(context.enabled, true);
-  assert.equal(context.debug.promptStyleSearchCount, 11);
+  assert.equal(context.debug.promptStyleSearchCount, 8);
   assert.equal(context.debug.artistLimitApplied, true);
-  assert.equal(context.debug.promptArtistCounts.repeatstyleartist, 5);
-  assert.equal(context.candidates.filter(candidate => candidate.track.artists.includes('Repeat Style Artist')).length, 5);
+  assert.equal(context.debug.promptArtistCounts.repeatstyleartist <= 5, true);
+  assert.equal(context.debug.promptGenreFamilyCounts.electronic, 8);
+  assert.equal(context.candidates.filter(candidate => candidate.track.artists.includes('Repeat Style Artist')).length <= 5, true);
 });
 
 test('strict style search timeout falls back to familiar candidates', async (t) => {
