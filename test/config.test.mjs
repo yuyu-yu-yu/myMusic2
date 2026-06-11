@@ -11,7 +11,10 @@ const ENV_KEYS = [
   'RECOMMENDATION_DISCOVERY_CACHE_TTL_MS',
   'RECOMMENDATION_STYLE_SEARCH_TIMEOUT_MS',
   'RECOMMENDATION_STYLE_SEARCH_LIMIT',
-  'RECOMMENDATION_STRICT_STYLE'
+  'RECOMMENDATION_STRICT_STYLE',
+  'RECOMMENDATION_PROMPT_ARTIST_LIMIT',
+  'RECOMMENDATION_ARTIST_DENSITY_WINDOW',
+  'RECOMMENDATION_ARTIST_DENSITY_MAX'
 ];
 
 function withEnv(values, fn) {
@@ -61,7 +64,10 @@ test('recommendation discovery env values are parsed', () => {
     RECOMMENDATION_DISCOVERY_CACHE_TTL_MS: '60000',
     RECOMMENDATION_STYLE_SEARCH_TIMEOUT_MS: '700',
     RECOMMENDATION_STYLE_SEARCH_LIMIT: '12',
-    RECOMMENDATION_STRICT_STYLE: 'false'
+    RECOMMENDATION_STRICT_STYLE: 'false',
+    RECOMMENDATION_PROMPT_ARTIST_LIMIT: '4',
+    RECOMMENDATION_ARTIST_DENSITY_WINDOW: '7',
+    RECOMMENDATION_ARTIST_DENSITY_MAX: '2'
   }, () => {
     const config = getConfig();
     assert.equal(config.recommendation.discoveryRatio, 0.5);
@@ -70,5 +76,8 @@ test('recommendation discovery env values are parsed', () => {
     assert.equal(config.recommendation.styleSearchTimeoutMs, 700);
     assert.equal(config.recommendation.styleSearchLimit, 12);
     assert.equal(config.recommendation.strictStyle, false);
+    assert.equal(config.recommendation.promptArtistLimit, 4);
+    assert.equal(config.recommendation.artistDensityWindow, 7);
+    assert.equal(config.recommendation.artistDensityMax, 2);
   });
 });

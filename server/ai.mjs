@@ -305,8 +305,50 @@ async function getOpenMeteoSummary(config, city) {
     const precipitation = describePrecipitation(current.precipitation, current.rain);
     return `${location.name || city} ${weather}，${temp}°C，体感 ${apparent}°C，湿度 ${humidity}%，${wind}，${precipitation}`;
   } catch (error) {
+    try {
+      return await getWttrInSummary(config, city);
+    } catch {
+      // Keep the original provider error for diagnostics when both providers fail.
+    }
     return `${city}，天气获取失败：${error.message}。按当前时间和本地音乐画像推荐。`;
   }
+}
+
+async function getWttrInSummary(config, city) {
+  const url = new URL(`https://wttr.in/${encodeURIComponent(city)}`);
+  url.searchParams.set('format', 'j1');
+  url.searchParams.set('lang', 'zh');
+  const response = await fetch(url, { headers: { 'User-Agent': 'myMusic2/0.1' } });
+  if (!response.ok) throw new Error(`wttr.in HTTP ${response.status}`);
+  const json = await response.json();
+  const current = json.current_condition?.[0];
+  if (!current) throw new Error('wttr.in missing current weather');
+  const weather = describeWttrWeather(current.weatherCode, current.weatherDesc?.[0]?.value);
+  const temp = roundNumber(current.temp_C);
+  const apparent = roundNumber(current.FeelsLikeC);
+  const humidity = roundNumber(current.humidity);
+  const wind = describeWind(current.windspeedKmph);
+  const precipitation = Number(current.precipMM) > 0 ? `降水 ${roundNumber(current.precipMM)} mm` : '当前无降水';
+  return `${city} ${weather}，${temp}°C，体感 ${apparent}°C，湿度 ${humidity}%，${wind}，${precipitation}`;
+}
+
+function describeWttrWeather(code, description = '') {
+  const numericCode = Number(code);
+  if (numericCode === 113) return '晴';
+  if ([116].includes(numericCode)) return '多云';
+  if ([119, 122].includes(numericCode)) return '阴';
+  if ([143, 248, 260].includes(numericCode)) return '有雾';
+  if ([200, 386, 389, 392, 395].includes(numericCode)) return '雷雨';
+  if ([179, 182, 185, 227, 230, 281, 284, 311, 314, 317, 320, 323, 326, 329, 332, 335, 338, 350, 362, 365, 368, 371, 374, 377].includes(numericCode)) return '雨雪';
+  if ([176, 263, 266, 293, 296, 299, 302, 305, 308, 353, 356, 359].includes(numericCode)) return '有雨';
+  const text = String(description || '').toLowerCase();
+  if (/thunder|storm/.test(text)) return '雷雨';
+  if (/rain|drizzle|shower/.test(text)) return '有雨';
+  if (/snow|sleet|ice/.test(text)) return '雨雪';
+  if (/fog|mist/.test(text)) return '有雾';
+  if (/cloud|overcast/.test(text)) return '多云';
+  if (/sun|clear/.test(text)) return '晴';
+  return '天气平稳';
 }
 
 function hasCoordinates(config = {}) {

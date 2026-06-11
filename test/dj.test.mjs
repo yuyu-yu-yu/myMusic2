@@ -23,11 +23,13 @@ import {
   analyzeConversationMood,
   analyzeTurnContext,
   buildConfirmedTrackHostFallback,
+  buildDailyMusicRecap,
   buildHybridCandidateContext,
   formatEnvironmentContext,
   buildRecommendationExplanation,
   buildMemoryContext,
   buildFinalHostMessages,
+  buildWeatherRadioContext,
   buildSongSearchQueries,
   classifyTurnIntent,
   canProactivelyRecommend,
@@ -241,16 +243,114 @@ test('recommendation explanation hides internal fallback reasons', () => {
   assert.match(text, /\u6559\u5ba4|\u5b89\u9759|\u8f7b\u97f3\u4e50|\u4e0b\u5348/);
 });
 
-test('profile prompt summary removes concrete song titles but keeps preference signals', () => {
+test('recommendation explanation includes traceable source, weather radio, and recap hints', () => {
+  const weatherRadio = buildWeatherRadioContext({
+    weather: '\u4e0a\u6d77\u5c0f\u96e8\uff0c18\u2103',
+    timeOfDay: '\u4e0a\u5348',
+    hour: 9
+  });
+  const explanation = buildRecommendationExplanation({
+    selectedTrack: { name: 'Rain Song', artists: ['DJ Test'] },
+    selectedPick: { reason: '\u548c\u4f60\u5f53\u524d\u60c5\u7eea\u6bd4\u8f83\u63a5\u8fd1' },
+    recommendationSource: { id: 'lyric_mood_match' },
+    weather: '\u4e0a\u6d77\u5c0f\u96e8\uff0c18\u2103',
+    timeOfDay: '\u4e0a\u5348',
+    environmentContext: { weatherRadio },
+    hostContext: {
+      openingRecap: {
+        recommendationHint: '\u8fd9\u51e0\u5929\u4f60\u665a\u4e0a\u90fd\u4e0d\u592a\u60f3\u542c\u592a\u6162\u7684\uff0c\u6211\u4eca\u5929\u4e5f\u5148\u907f\u5f00\u3002'
+      }
+    }
+  });
+
+  const text = JSON.stringify(explanation);
+  assert.match(text, /\u6765\u81ea/);
+  assert.match(text, /\u6b4c\u8bcd\u60c5\u7eea\u76f8\u8fd1/);
+  assert.match(text, /\u5929\u6c14\u7535\u53f0|\u96e8\u5929\u4e0a\u5348/);
+  assert.match(text, /\u56de\u987e|\u4eca\u5929\u4e5f\u5148\u907f\u5f00/);
+  assert.equal(explanation.factors.filter(factor => factor.label === '\u6765\u81ea').length, 1);
+
+  const failedWeatherExplanation = buildRecommendationExplanation({
+    selectedTrack: { name: 'Test Track', artists: ['Test Artist'] },
+    weather: '\u4e0a\u6d77\uff0c\u5929\u6c14\u83b7\u53d6\u5931\u8d25\uff1afetch failed\u3002\u6309\u5f53\u524d\u65f6\u95f4\u548c\u672c\u5730\u97f3\u4e50\u753b\u50cf\u63a8\u8350\u3002',
+    timeOfDay: '\u4e0b\u5348'
+  });
+  assert.equal(failedWeatherExplanation.factors.some(factor => /fetch failed/i.test(factor.text)), false);
+});
+
+test('weather radio maps concrete weather and time scenes', () => {
+  assert.equal(buildWeatherRadioContext({ weather: '\u4e0a\u6d77\u5c0f\u96e8', timeOfDay: '\u4e0a\u5348', hour: 9 }).id, 'rain_morning');
+  assert.equal(buildWeatherRadioContext({ weather: '\u95f7\u70ed\uff0c\u4f53\u611f 34\u2103\uff0c\u6e7f\u5ea6 82%', timeOfDay: '\u4e0b\u5348', hour: 15 }).id, 'muggy_afternoon');
+  assert.equal(buildWeatherRadioContext({ weather: '\u5927\u98ce\u964d\u6e29', timeOfDay: '\u4e0b\u5348', hour: 16 }).id, 'windy_cooling');
+  assert.equal(buildWeatherRadioContext({ weather: '\u6674\u5929', timeOfDay: '\u508d\u665a', hour: 18 }).id, 'clear_evening');
+  assert.equal(buildWeatherRadioContext({ weather: '\u96f7\u96e8', timeOfDay: '\u591c\u665a', hour: 23 }).id, 'thunderstorm_night');
+});
+
+test('daily music recap is silent without yesterday usage and summarizes real activity', (t) => {
+  const emptyDb = testDb(t);
+  assert.equal(buildDailyMusicRecap(emptyDb, { localDate: '2026-06-11', timeZone: 'Asia/Shanghai' }), null);
+
+  const db = testDb(t);
+  saveTrack(db, { id: 'slow-rain', name: '\u5b89\u9759\u6162\u6b4c', artists: ['Soft DJ'], album: '\u96e8\u5929\u94a2\u7434' });
+  saveTrack(db, { id: 'night-electro', name: '\u591c\u665a\u7535\u5b50\u8282\u594f', artists: ['Electro DJ'], album: 'City Beat' });
+  saveTrack(db, { id: 'energy-run', name: '\u63d0\u795e\u8dd1\u6b65\u8282\u594f', artists: ['Run DJ'], album: 'Energy Beat' });
+  db.prepare('INSERT INTO plays (account_id, track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?,?)')
+    .run('local:default', 'slow-rain', '2026-06-10T06:20:00.000Z', 'radio_familiar', '\u4f4e\u80fd\u91cf\u5b89\u9759', 'pending');
+  db.prepare('INSERT INTO plays (account_id, track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?,?)')
+    .run('local:default', 'night-electro', '2026-06-10T12:40:00.000Z', 'radio_familiar', '\u665a\u4e0a\u7535\u5b50\u8282\u594f', 'pending');
+  db.prepare('INSERT INTO track_feedback_events (account_id, track_id, event_type, session_id, elapsed_ms, duration_ms, source, created_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run('local:default', 'slow-rain', 'skip', 'recap-session', 20000, 200000, 'player', '2026-06-10T06:25:00.000Z');
+  db.prepare('INSERT INTO track_feedback_events (account_id, track_id, event_type, session_id, elapsed_ms, duration_ms, source, created_at) VALUES (?,?,?,?,?,?,?,?)')
+    .run('local:default', 'night-electro', 'complete', 'recap-session', 200000, 200000, 'player', '2026-06-10T12:55:00.000Z');
+  recordMoodEvent(db, { mood: 'calm', energy: 'low', createdAt: '2026-06-10T02:00:00.000Z' });
+  recordMoodEvent(db, { mood: 'night', energy: 'low', createdAt: '2026-06-10T13:00:00.000Z' });
+  recordMoodEvent(db, { mood: 'energy', energy: 'high', createdAt: '2026-06-09T13:00:00.000Z' });
+  recordMoodEvent(db, { mood: 'energy', energy: 'high', createdAt: '2026-06-10T12:00:00.000Z' });
+
+  const recap = buildDailyMusicRecap(db, { localDate: '2026-06-11', timeZone: 'Asia/Shanghai' });
+  const ids = recap.signals.map(signal => signal.id);
+  assert.equal(recap.date, '2026-06-10');
+  assert.equal(ids.includes('low_energy_day'), true);
+  assert.equal(ids.includes('afternoon_skipped_slow'), true);
+  assert.equal(ids.includes('evening_electronic_rhythm'), true);
+  assert.equal(ids.includes('three_day_energy_lift'), true);
+  assert.match(recap.openingLine, /\u6628\u5929/);
+  assert.match(recap.recommendationHint, /\u5148\u907f\u5f00|\u6162\u6b4c/);
+});
+
+test('profile prompt summary uses objective llm profile without concrete artists or songs', () => {
   const prompt = formatProfileSummaryForPrompt({
-    summary: '\u4f60\u7684\u97f3\u4e50\u4e16\u754c\u5728\u6e2f\u4e50\u6df1\u60c5\u3001\u534e\u8bed\u6d41\u884c\u4e0e\u6b27\u7f8e\u8282\u594f\u95f4\u4ece\u5bb9\u7a7f\u884c\u3002\u9648\u5955\u8fc5\u548c\u738b\u83f2\u662f\u4f60\u7684\u7075\u9b42\u5e95\u8272\uff0c\u90a3\u4e9b\u5173\u4e8e\u9057\u61be\u4e0e\u91ca\u6000\u7684\u53d9\u4e8b\uff0c\u5728\u300a\u5bcc\u58eb\u5c71\u4e0b\u300b\u300a\u7ea2\u8c46\u300b\u4e2d\u88ab\u53cd\u590d\u8046\u542c\u3002\u4eceHOYO-MiX\u7684\u300a\u539f\u795e\u300b\u914d\u4e50\u5230\u4e45\u77f3\u8ba9\u7684\u52a8\u753b\u539f\u58f0\uff0c\u8425\u9020\u51fa\u5b81\u9759\u7684\u51a5\u60f3\u7a7a\u95f4\u3002'
+    summary: '\u4f60\u7684\u97f3\u4e50\u4e16\u754c\u5728\u6e2f\u4e50\u6df1\u60c5\u3001\u534e\u8bed\u6d41\u884c\u4e0e\u6b27\u7f8e\u8282\u594f\u95f4\u4ece\u5bb9\u7a7f\u884c\u3002\u9648\u5955\u8fc5\u548c\u738b\u83f2\u662f\u4f60\u7684\u7075\u9b42\u5e95\u8272\uff0c\u90a3\u4e9b\u5173\u4e8e\u9057\u61be\u4e0e\u91ca\u6000\u7684\u53d9\u4e8b\uff0c\u5728\u300a\u5bcc\u58eb\u5c71\u4e0b\u300b\u300a\u7ea2\u8c46\u300b\u4e2d\u88ab\u53cd\u590d\u8046\u542c\u3002',
+    structured: {
+      llmProfile: { summary: '\u5ba2\u89c2\u504f\u597d\uff1a\u6e2f\u4e50\u6df1\u60c5\u3001\u534e\u8bed\u6d41\u884c\u3001\u4f4e\u4e2d\u901f\u3001\u591c\u95f4\u966a\u4f34\u611f\uff0c\u4e0d\u70b9\u540d\u9648\u5955\u8fc5\u6216\u300a\u5bcc\u58eb\u5c71\u4e0b\u300b\u3002' },
+      artists: [{ name: '\u9648\u5955\u8fc5' }, { name: '\u738b\u83f2' }],
+      genres: [{ name: '\u534e\u8bed\u6d41\u884c' }],
+      moods: [{ name: '\u966a\u4f34\u611f' }]
+    }
   });
 
   assert.doesNotMatch(prompt, /\u300a|\u300b|\u5bcc\u58eb\u5c71\u4e0b|\u7ea2\u8c46|\u539f\u795e/);
-  assert.match(prompt, /\u9648\u5955\u8fc5/);
-  assert.match(prompt, /\u738b\u83f2/);
+  assert.doesNotMatch(prompt, /\u9648\u5955\u8fc5|\u738b\u83f2/);
   assert.match(prompt, /\u6e2f\u4e50\u6df1\u60c5/);
   assert.match(prompt, /\u534e\u8bed\u6d41\u884c/);
+});
+
+test('profile prompt falls back to non-artist structured signals only', () => {
+  const prompt = formatProfileSummaryForPrompt({
+    summary: '\u9648\u5955\u8fc5\u548c\u738b\u83f2\u662f\u4f60\u7684\u7075\u9b42\u5e95\u8272\uff0c\u300a\u5bcc\u58eb\u5c71\u4e0b\u300b\u88ab\u53cd\u590d\u8046\u542c\u3002',
+    structured: {
+      artists: [{ name: '\u9648\u5955\u8fc5' }, { name: '\u738b\u83f2' }],
+      albums: [{ name: '\u8ba4\u4e86\u5427' }],
+      genres: [{ name: '\u534e\u8bed\u6d41\u884c' }],
+      moods: [{ name: '\u6000\u65e7' }],
+      scenes: [{ name: '\u591c\u95f4\u966a\u4f34' }]
+    }
+  });
+
+  assert.doesNotMatch(prompt, /\u9648\u5955\u8fc5|\u738b\u83f2|\u5bcc\u58eb\u5c71\u4e0b|\u8ba4\u4e86\u5427/);
+  assert.match(prompt, /\u534e\u8bed\u6d41\u884c/);
+  assert.match(prompt, /\u6000\u65e7/);
+  assert.match(prompt, /\u591c\u95f4\u966a\u4f34/);
 });
 
 test('song plan parser creates concrete song-search queries', () => {
@@ -2353,6 +2453,99 @@ test('queued recommendation finalizes host text and tts with latest emotional co
   }
 });
 
+test('queued recommendation is replaced when artist density is too high', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  for (let index = 0; index < 3; index += 1) {
+    const oldTrack = saveTrack(db, {
+      id: `queue-repeat-old-${index}`,
+      originalId: `queue-repeat-old-${index}`,
+      name: `Queue Repeat Old ${index}`,
+      artists: ['Repeat Artist'],
+      album: 'Repeat Album'
+    });
+    db.prepare('INSERT INTO plays (track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?)')
+      .run(oldTrack.id, new Date(Date.now() - index * 1000).toISOString(), 'radio_familiar', '[novelty:familiar]', 'imported');
+  }
+  saveTrack(db, {
+    id: 'queue-repeat-ready',
+    originalId: 'queue-repeat-ready',
+    name: 'Queue Repeat Ready',
+    artists: ['Repeat Artist'],
+    album: 'Repeat Album'
+  });
+  saveTrack(db, {
+    id: 'queue-fresh-sync',
+    originalId: 'queue-fresh-sync',
+    name: 'Queue Fresh Sync',
+    artists: ['Fresh Artist'],
+    album: 'Fresh Album'
+  });
+  db.prepare('INSERT INTO radio_sessions (id, created_at, context_json, queue_json) VALUES (?,?,?,?)')
+    .run('queue-artist-density', new Date().toISOString(), '{}', JSON.stringify(normalizeRadioQueue([
+      {
+        id: 'ready-density',
+        status: 'ready',
+        track: { id: 'queue-repeat-ready', name: 'Queue Repeat Ready', artists: ['Repeat Artist'], album: 'Repeat Album' },
+        chatText: 'old host',
+        reason: 'prepared'
+      }
+    ])));
+
+  const originalFetch = globalThis.fetch;
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url, options) => {
+    const request = JSON.parse(options.body);
+    const promptText = JSON.stringify(request.messages || []);
+    if (promptText.includes('最终可播放歌曲已经确认')) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ chatText: '换成《Queue Fresh Sync》，保持流动。' }) } }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            picks: [{
+              candidateId: 'queue-fresh-sync',
+              name: 'Queue Fresh Sync',
+              artists: ['Fresh Artist'],
+              reason: '避开刚才过密的艺人，换一个声音',
+              queries: ['Queue Fresh Sync Fresh Artist']
+            }],
+            hostDraft: '',
+            mode: null
+          })
+        }
+      }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const result = await djTurn({
+    db,
+    config: {
+      recommendation: { pipeline: 'hybrid', artistDensityWindow: 8, artistDensityMax: 3 },
+      llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' },
+      tts: {},
+      weather: {}
+    },
+    netease: { isConfigured: () => false },
+    sessionId: 'queue-artist-density'
+  });
+
+  const debug = getRadioDebugStatus(db, 'queue-artist-density');
+  assert.equal(result.queueHit, false);
+  assert.equal(result.queueReconciled, 'replace_track');
+  assert.equal(result.track.id, 'queue-fresh-sync');
+  assert.equal(debug.lastQueueReconcile?.reason, 'artist_density');
+
+  await new Promise(resolve => setTimeout(resolve, 60));
+  for (let index = 0; index < 20; index += 1) {
+    if (getRadioQueueStatus(db, 'queue-artist-density').pendingCount === 0) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+});
+
 test('queued host text uses a chat context only once when no new dialogue arrives', async (t) => {
   const db = testDb(t);
   const usedContext = normalizeMusicContext({
@@ -2664,6 +2857,77 @@ test('hybrid candidate context balances familiar and discovery prompt candidates
   assert.match(context.promptText, /熟悉候选/);
 });
 
+test('hybrid prompt candidate pool limits one artist to five visible candidates', async (t) => {
+  const db = testDb(t);
+  for (let index = 0; index < 12; index += 1) {
+    saveTrack(db, {
+      id: `repeat-${index}`,
+      originalId: `repeat-${index}`,
+      name: `Repeat Song ${index}`,
+      artists: ['Repeat Artist'],
+      album: 'Repeat Album'
+    });
+  }
+  for (let index = 0; index < 16; index += 1) {
+    saveTrack(db, {
+      id: `fresh-${index}`,
+      originalId: `fresh-${index}`,
+      name: `Fresh Song ${index}`,
+      artists: [`Fresh Artist ${index}`],
+      album: 'Fresh Album'
+    });
+  }
+
+  const context = await buildHybridCandidateContext({
+    db,
+    config: { recommendation: { pipeline: 'hybrid', promptArtistLimit: 5 } },
+    profile: {
+      structured: {
+        artists: [{ name: 'Repeat Artist', weight: 1 }]
+      }
+    },
+    playedIds: new Set(),
+    playedSignatures: new Set()
+  });
+
+  const repeatCount = context.candidates.filter(candidate => candidate.track.artists.includes('Repeat Artist')).length;
+  assert.equal(context.enabled, true);
+  assert.equal(repeatCount, 5);
+  assert.equal(context.debug.artistLimit, 5);
+  assert.equal(context.debug.artistLimitApplied, true);
+  assert.equal(context.debug.artistLimitSkippedCount > 0, true);
+  assert.equal(context.debug.promptArtistCounts.repeatartist, 5);
+});
+
+test('explicit artist requests bypass prompt artist limit', async (t) => {
+  const db = testDb(t);
+  for (let index = 0; index < 8; index += 1) {
+    saveTrack(db, {
+      id: `explicit-repeat-${index}`,
+      originalId: `explicit-repeat-${index}`,
+      name: `Explicit Repeat ${index}`,
+      artists: ['Repeat Artist'],
+      album: 'Repeat Album'
+    });
+  }
+
+  const context = await buildHybridCandidateContext({
+    db,
+    config: { recommendation: { pipeline: 'hybrid', promptArtistLimit: 5 } },
+    request: {
+      text: '想听 Repeat Artist',
+      artistConstraint: { label: 'Repeat Artist' },
+      sessionConstraints: normalizeSessionConstraints()
+    },
+    playedIds: new Set(),
+    playedSignatures: new Set()
+  });
+
+  assert.equal(context.enabled, true);
+  assert.equal(context.debug.artistLimitApplied, false);
+  assert.equal(context.candidates.filter(candidate => candidate.track.artists.includes('Repeat Artist')).length, 8);
+});
+
 test('hybrid candidate context targets discovery or familiar by recent novelty window', async (t) => {
   const db = testDb(t);
   saveLocalTracks(db, '920', 18);
@@ -2826,6 +3090,51 @@ test('strict style requests populate and prioritize style search candidates', as
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM tracks WHERE id = ?').get('style-hit').count, 0);
 });
 
+test('strict style prompt candidates still limit repeated artists', async (t) => {
+  const db = testDb(t);
+  const styleRecords = [
+    ...Array.from({ length: 9 }, (_, index) => ({
+      id: `style-repeat-${index}`,
+      name: `国风 DJ 逆袭 BGM ${index}`,
+      artists: ['Repeat Style Artist'],
+      album: '国风电音'
+    })),
+    ...Array.from({ length: 6 }, (_, index) => ({
+      id: `style-fresh-${index}`,
+      name: `国风 DJ 燃向 BGM ${index}`,
+      artists: [`Fresh Style Artist ${index}`],
+      album: '国风电音'
+    }))
+  ];
+
+  const context = await buildHybridCandidateContext({
+    db,
+    config: {
+      recommendation: {
+        pipeline: 'hybrid',
+        styleSearchTimeoutMs: 20,
+        styleSearchLimit: 20,
+        promptArtistLimit: 5
+      }
+    },
+    netease: { isConfigured: () => false },
+    request: {
+      styleConstraint: guofengDjStyleConstraint(),
+      styleSearchQueries: ['\u56fd\u98ce DJ \u9006\u88ad BGM'],
+      sessionConstraints: normalizeSessionConstraints({})
+    },
+    styleSearch: async () => styleRecords,
+    playedIds: new Set(),
+    playedSignatures: new Set()
+  });
+
+  assert.equal(context.enabled, true);
+  assert.equal(context.debug.promptStyleSearchCount, 11);
+  assert.equal(context.debug.artistLimitApplied, true);
+  assert.equal(context.debug.promptArtistCounts.repeatstyleartist, 5);
+  assert.equal(context.candidates.filter(candidate => candidate.track.artists.includes('Repeat Style Artist')).length, 5);
+});
+
 test('strict style search timeout falls back to familiar candidates', async (t) => {
   const db = testDb(t);
   saveLocalTracks(db, '970', 4);
@@ -2969,6 +3278,101 @@ test('hybrid candidate id selects local track without increasing LLM calls', asy
   assert.match(JSON.stringify(requests[0].messages), /candidateId=candidate-hit/);
   assert.equal(debug.lastCandidatePool?.enabled, true);
   assert.equal(debug.lastSearchDiagnostics[0]?.fallbackSource, 'hybrid_candidate');
+});
+
+test('artist density rejects an overused candidate id and tries the next pick', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  for (let index = 0; index < 3; index += 1) {
+    const oldTrack = saveTrack(db, {
+      id: `repeat-old-${index}`,
+      originalId: `repeat-old-${index}`,
+      name: `Repeat Old ${index}`,
+      artists: ['Repeat Artist'],
+      album: 'Repeat Album'
+    });
+    db.prepare('INSERT INTO plays (track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?)')
+      .run(oldTrack.id, new Date(Date.now() - index * 1000).toISOString(), 'radio_familiar', '[novelty:familiar]', 'imported');
+  }
+  saveTrack(db, {
+    id: 'repeat-new',
+    originalId: 'repeat-new',
+    name: 'Repeat New',
+    artists: ['Repeat Artist'],
+    album: 'Repeat Album'
+  });
+  saveTrack(db, {
+    id: 'fresh-new',
+    originalId: 'fresh-new',
+    name: 'Fresh New',
+    artists: ['Fresh Artist'],
+    album: 'Fresh Album'
+  });
+
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  t.after(() => { globalThis.fetch = originalFetch; });
+  globalThis.fetch = async (url, options) => {
+    const request = JSON.parse(options.body);
+    requests.push(request);
+    const promptText = JSON.stringify(request.messages || []);
+    if (promptText.includes('最终可播放歌曲已经确认')) {
+      return new Response(JSON.stringify({
+        choices: [{ message: { content: JSON.stringify({ chatText: '先放《Fresh New》，换一个新的声音。' }) } }]
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      choices: [{
+        message: {
+          content: JSON.stringify({
+            picks: [
+              {
+                candidateId: 'repeat-new',
+                name: 'Repeat New',
+                artists: ['Repeat Artist'],
+                reason: '候选池里看起来贴合',
+                queries: ['Repeat New Repeat Artist']
+              },
+              {
+                candidateId: 'fresh-new',
+                name: 'Fresh New',
+                artists: ['Fresh Artist'],
+                reason: '保持氛围但换一个艺人',
+                queries: ['Fresh New Fresh Artist']
+              }
+            ],
+            hostDraft: '',
+            mode: null
+          })
+        }
+      }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const result = await djTurn({
+    db,
+    config: {
+      recommendation: {
+        pipeline: 'hybrid',
+        artistDensityWindow: 8,
+        artistDensityMax: 3
+      },
+      llm: { baseUrl: 'http://llm.local', apiKey: 'test', model: 'deepseek-test' },
+      tts: {},
+      weather: {}
+    },
+    netease: { isConfigured: () => false },
+    sessionId: 'artist-density-candidate-id',
+    userMessage: null,
+    useQueue: false
+  });
+
+  const debug = getRadioDebugStatus(db, 'artist-density-candidate-id');
+  assert.equal(result.track?.id, 'fresh-new');
+  assert.equal(requests.length, 2);
+  assert.equal(debug.lastSearchDiagnostics[0]?.failedReason, 'artist_density');
+  assert.equal(debug.lastSearchDiagnostics[0]?.hits[0]?.artistDensityResult?.accepted, false);
+  assert.equal(debug.lastSearchDiagnostics.some(item => item?.selectedTrackId === 'fresh-new'), true);
 });
 
 test('hybrid discovery candidate id selects discovery track without increasing LLM calls', async (t) => {

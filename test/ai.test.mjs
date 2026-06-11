@@ -253,6 +253,52 @@ test('Open-Meteo weather uses provided coordinates without geocoding', async (t)
   assert.doesNotMatch(calls[0], /geocoding-api/);
 });
 
+test('Open-Meteo weather falls back to wttr.in when forecast is unavailable', async (t) => {
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const calls = [];
+  globalThis.fetch = async (url) => {
+    const href = String(url);
+    calls.push(href);
+    if (href.startsWith('https://geocoding-api.open-meteo.com/v1/search')) {
+      return {
+        ok: true,
+        async json() {
+          return { results: [{ name: '\u4e0a\u6d77', latitude: 31.22222, longitude: 121.45806 }] };
+        }
+      };
+    }
+    if (href.startsWith('https://api.open-meteo.com/v1/forecast')) {
+      return { ok: false, status: 502 };
+    }
+    assert.match(href, /^https:\/\/wttr\.in\//);
+    return {
+      ok: true,
+      async json() {
+        return {
+          current_condition: [{
+            temp_C: '30',
+            FeelsLikeC: '34',
+            humidity: '70',
+            windspeedKmph: '13',
+            precipMM: '0',
+            weatherCode: '113',
+            weatherDesc: [{ value: 'Sunny' }]
+          }]
+        };
+      }
+    };
+  };
+
+  const summary = await getWeatherSummary({ provider: 'openmeteo', city: '\u4e0a\u6d77', countryCode: 'CN' });
+
+  assert.equal(summary, '\u4e0a\u6d77 \u6674\uff0c30\u00b0C\uff0c\u4f53\u611f 34\u00b0C\uff0c\u6e7f\u5ea6 70%\uff0c\u6709\u98ce\uff0c\u5f53\u524d\u65e0\u964d\u6c34');
+  assert.equal(calls.length, 3);
+});
+
 test('Open-Meteo weather failure returns fallback summary', async (t) => {
   const originalFetch = globalThis.fetch;
   t.after(() => {

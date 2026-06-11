@@ -427,6 +427,9 @@ test('LLM JSON profile is parsed into profile_json', async (t) => {
       message: {
         content: JSON.stringify({
           summary: '这是一个偏向夜晚电子和运动场景的长期音乐画像。',
+          llmProfile: {
+            summary: '客观偏好：夜晚电子、运动场景、高能量推进，避开 Runner DJ 和《Night Run》的具体点名。'
+          },
           genres: [{ name: '电子', weight: 0.9, evidence: ['歌单名'] }],
           moods: [{ name: '夜晚', weight: 0.8, evidence: ['歌单名'] }],
           artists: [{ name: 'Runner DJ', weight: 0.7, evidence: ['歌单曲目'] }],
@@ -447,6 +450,9 @@ test('LLM JSON profile is parsed into profile_json', async (t) => {
   assert.equal(profile.summary, '这是一个偏向夜晚电子和运动场景的长期音乐画像。');
   assert.equal(profile.structured.genres[0].name, '电子');
   assert.equal(profile.structured.discoveryDirections[0].name, '夜跑电子');
+  assert.equal(typeof profile.structured.llmProfile.summary, 'string');
+  assert.doesNotMatch(profile.structured.llmProfile.summary, /Runner DJ|Night Run|《|》/);
+  assert.match(profile.structured.llmProfile.summary, /夜晚电子|运动场景|高能量/);
   assert.equal(getProfile(db).structured.avoidSignals[0].name, '重金属');
 });
 
@@ -471,4 +477,6 @@ test('invalid LLM output falls back to rule-based structured profile', async (t)
   assert.equal(profile.structured.source, 'playlist_tracks');
   assert.equal(profile.structured.artists[0].name, 'Sleep Artist');
   assert.equal(profile.structured.trackCount, 1);
+  assert.equal(typeof profile.structured.llmProfile.summary, 'string');
+  assert.doesNotMatch(profile.structured.llmProfile.summary, /Sleep Artist|Calm Sleep Piano|Sleep Album/);
 });

@@ -2274,6 +2274,7 @@ function buildExplanationHTML(explanation = null) {
   const factors = Array.isArray(explanation?.factors)
     ? explanation.factors.flatMap(normalizeExplanationFactor).filter(Boolean)
       .filter(factor => !isInternalExplanationFactor(factor))
+      .filter(uniqueExplanationFactor)
     : [];
   if (!factors.length) return '';
   const factorHtml = `<div class="track-explanation-factors">${factors.map(text =>
@@ -2356,6 +2357,11 @@ function scrollChatToBottom() {
   scroll();
   requestAnimationFrame(scroll);
   setTimeout(scroll, 120);
+}
+
+function uniqueExplanationFactor(factor, index, factors) {
+  const key = `${factor?.label || ''}\u0000${factor?.value || ''}`;
+  return factors.findIndex(item => `${item?.label || ''}\u0000${item?.value || ''}` === key) === index;
 }
 
 async function updatePlayer(data, autoplay) {

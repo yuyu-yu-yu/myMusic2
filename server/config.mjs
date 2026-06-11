@@ -49,7 +49,10 @@ export function getConfig() {
       discoveryCacheTtlMs: Math.max(0, Number(env.RECOMMENDATION_DISCOVERY_CACHE_TTL_MS || 1800000) || 1800000),
       styleSearchTimeoutMs: Math.max(1, Number(env.RECOMMENDATION_STYLE_SEARCH_TIMEOUT_MS || 1500) || 1500),
       styleSearchLimit: parseNonNegativeNumber(env.RECOMMENDATION_STYLE_SEARCH_LIMIT, 30),
-      strictStyle: env.RECOMMENDATION_STRICT_STYLE === undefined ? true : parseBoolean(env.RECOMMENDATION_STRICT_STYLE)
+      strictStyle: env.RECOMMENDATION_STRICT_STYLE === undefined ? true : parseBoolean(env.RECOMMENDATION_STRICT_STYLE),
+      promptArtistLimit: parseNonNegativeNumber(env.RECOMMENDATION_PROMPT_ARTIST_LIMIT, 5),
+      artistDensityWindow: parseNonNegativeNumber(env.RECOMMENDATION_ARTIST_DENSITY_WINDOW, 8),
+      artistDensityMax: parseNonNegativeNumber(env.RECOMMENDATION_ARTIST_DENSITY_MAX, 3)
     },
     netease: {
       baseUrl: env.NETEASE_BASE_URL || 'https://openapi.music.163.com',
@@ -164,7 +167,10 @@ export function publicConfigStatus(config) {
       requireBrowserPlayUrl: Boolean(config.playback?.requireBrowserPlayUrl)
     },
     recommendation: {
-      pipeline: config.recommendation?.pipeline || 'hybrid'
+      pipeline: config.recommendation?.pipeline || 'hybrid',
+      promptArtistLimit: config.recommendation?.promptArtistLimit ?? 5,
+      artistDensityWindow: config.recommendation?.artistDensityWindow ?? 8,
+      artistDensityMax: config.recommendation?.artistDensityMax ?? 3
     }
   };
 }

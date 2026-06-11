@@ -11,6 +11,8 @@ import {
   getFeedbackSummaryMap,
   getSessionMode,
   setSessionMode,
+  getAccountSetting,
+  setAccountSetting,
   recordMoodEvent,
   recordOrMergeUserMemory,
   retrieveRelevantMemories,
@@ -36,6 +38,9 @@ const HYBRID_DISCOVERY_DEFAULT_TIMEOUT_MS = 1200;
 const HYBRID_DISCOVERY_DEFAULT_CACHE_TTL_MS = 30 * 60 * 1000;
 const STYLE_SEARCH_DEFAULT_TIMEOUT_MS = 1500;
 const STYLE_SEARCH_DEFAULT_LIMIT = 30;
+const PROMPT_ARTIST_DEFAULT_LIMIT = 5;
+const ARTIST_DENSITY_DEFAULT_WINDOW = 8;
+const ARTIST_DENSITY_DEFAULT_MAX = 3;
 const RECENT_ARTIST_COOLDOWN_PENALTY = -36;
 const HOT_ARTIST_COOLDOWN_PENALTY = -42;
 const SOURCE_BASE_SCORES = {
@@ -62,6 +67,34 @@ const DEFAULT_PREFS = Object.freeze({
   moodMode: 'auto',
   lowDistractionMode: false,
   note: ''
+});
+const DAILY_MUSIC_RECAP_SPOKEN_DATE_KEY = 'daily_music_recap_spoken_date';
+const RECOMMENDATION_TRACE_SOURCES = Object.freeze({
+  recent_completion_direction: {
+    id: 'recent_completion_direction',
+    label: '你最近完整听完的方向',
+    correctionKey: 'recent_completion'
+  },
+  similar_artist: {
+    id: 'similar_artist',
+    label: '相似艺人发现',
+    correctionKey: 'similar_artist'
+  },
+  lyric_mood_match: {
+    id: 'lyric_mood_match',
+    label: '歌词情绪相近',
+    correctionKey: 'lyric_mood'
+  },
+  long_absent_favorite: {
+    id: 'long_absent_favorite',
+    label: '你很久没听但以前喜欢',
+    correctionKey: 'long_absent'
+  },
+  new_release_radar: {
+    id: 'new_release_radar',
+    label: '新发行雷达',
+    correctionKey: 'new_release'
+  }
 });
 const RADIO_QUEUE_LIMIT = 2;
 const PLAYLIST_SIZE = 5;
@@ -361,6 +394,14 @@ async function buildRadioRecommendation({
     sessionConstraints
   );
   const hostContext = buildRadioHostContext(db, sessionId, context, userMessage, account);
+  const openingRecap = consumeOpeningMusicRecapForHost({
+    db,
+    accountContext: account,
+    context,
+    environmentContext,
+    enabled: !userMessage
+  });
+  if (openingRecap) hostContext.openingRecap = openingRecap;
 
   const history = loadHistory(db, sessionId, account);
   const sessionSummary = await updateSessionSummary(db, config, sessionId, account);
@@ -421,6 +462,7 @@ async function buildRadioRecommendation({
     explanation: result.explanation,
     noveltyBucket: result.noveltyBucket || null,
     discoverySource: result.discoverySource || null,
+    recommendationSource: normalizeRecommendationSource(result.recommendationSource),
     ttsUrl: tts.url,
     ttsStatus: tts.status,
     ttsMs: tts.ms,
@@ -429,6 +471,8 @@ async function buildRadioRecommendation({
     mode: result.newMode || mode,
     profile,
     weather,
+    weatherRadio: environmentContext.weatherRadio || null,
+    musicRecap: hostContext.openingRecap || null,
     environmentContext,
     newMode: result.newMode || null,
     conversationMood: recommendationMood,
@@ -744,6 +788,8 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
   const playedText = formatPlayedSongExclusions(playedHistory, request);
   const vocalPolicyText = formatVocalPolicyForPrompt(request);
   const profilePrompt = formatProfileSummaryForPrompt(profile);
+  const weatherRadioPrompt = formatWeatherRadioForPrompt(environmentContext.weatherRadio);
+  const musicRecapPrompt = formatOpeningMusicRecapForPrompt(hostContext.openingRecap);
   const raw = await generateChatCompletion(config.llm, [
     {
       role: 'system',
@@ -765,6 +811,8 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
       role: 'user',
       content: [
         `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
+        weatherRadioPrompt,
+        musicRecapPrompt,
         `此刻：${timeOfDay} ${hour}点，${weather}`,
         `听众画像：${profilePrompt}`,
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
@@ -975,7 +1023,30 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
   const reason = payload?.reason || '';
   const noveltyBucket = normalizeNoveltyBucket(payload?.noveltyBucket || track?.noveltyBucket);
   const discoverySource = payload?.discoverySource || track?.discoverySource || null;
+  const recommendationSource = normalizeRecommendationSource(payload?.recommendationSource) || (track ? buildRecommendationSource({
+    selectedPick: { reason },
+    selectedTrack: track,
+    noveltyBucket,
+    discoverySource,
+    userMessage,
+    conversationMood,
+    hostContext: { openingRecap: payload?.musicRecap || null }
+  }) : null);
   let explanation = normalizeRecommendationExplanation(payload?.explanation);
+  const alreadyHasRecommendationSource = explanation?.factors?.some((factor) =>
+    factor?.type === 'trace_source' ||
+    (factor?.label === '来自' && factor?.value === recommendationSource?.label)
+  );
+  if (recommendationSource && explanation && !alreadyHasRecommendationSource) {
+    explanation = normalizeRecommendationExplanation({
+      ...explanation,
+      factors: [
+        { type: 'trace_source', label: '来自', value: recommendationSource.label },
+        ...(explanation.factors || [])
+      ],
+      source: explanation.source
+    });
+  }
   if (source === 'queue' && explanation) {
     explanation = normalizeRecommendationExplanation({
       ...explanation,
@@ -993,7 +1064,8 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
       : noveltyBucket === 'familiar'
         ? 'radio_familiar'
         : 'radio';
-    const playReason = noveltyBucket ? `[novelty:${noveltyBucket}] ${reason}`.trim() : reason;
+    const sourceTag = recommendationSource?.id ? `[source:${recommendationSource.id}]` : '';
+    const playReason = [noveltyBucket ? `[novelty:${noveltyBucket}]` : '', sourceTag, reason].filter(Boolean).join(' ').trim();
     db.prepare('INSERT INTO plays (account_id, track_id, played_at, source, reason, host_text, report_status) VALUES (?,?,?,?,?,?,?)')
       .run(account.accountId, track.id, nowIso(), playSource, playReason, chatText, 'pending');
     saveTrack(db, track);
@@ -1011,7 +1083,8 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
       radioPlayedSongs: mergePlayedSongContext(latestContext.radioPlayedSongs, {
         ...track,
         noveltyBucket,
-        discoverySource
+        discoverySource,
+        recommendationSource
       }),
       lastBoundMusicContextVersion
     });
@@ -1052,6 +1125,8 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
     track,
     reason,
     explanation,
+    recommendationSource,
+    reasonSource: recommendationSource,
     ttsUrl,
     ttsStatus,
     ttsMs,
@@ -1060,6 +1135,9 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
     mode,
     profile: payload?.profile || getProfile(db, account),
     weather: payload?.weather || getSessionContext(db, sessionId).weather || '',
+    weatherRadio: payload?.weatherRadio || payload?.environmentContext?.weatherRadio || null,
+    musicRecap: payload?.musicRecap || null,
+    environmentContext: payload?.environmentContext || null,
     queueSource: source
   };
 }
@@ -1446,11 +1524,14 @@ export function normalizeRadioQueue(queue = []) {
       mode: item?.mode || null,
       profile: item?.profile || null,
       weather: item?.weather || '',
+      weatherRadio: item?.weatherRadio || null,
+      musicRecap: item?.musicRecap || null,
       newMode: item?.newMode || null,
       conversationMood: item?.conversationMood ? normalizeMoodDecision(item.conversationMood) : null,
       explanation: normalizeRecommendationExplanation(item?.explanation),
       noveltyBucket: normalizeNoveltyBucket(item?.noveltyBucket),
       discoverySource: item?.discoverySource || null,
+      recommendationSource: normalizeRecommendationSource(item?.recommendationSource),
       failedStage: item?.failedStage || null,
       error: item?.error ? String(item.error).slice(0, 240) : null,
       staleReason: item?.staleReason || null
@@ -1615,6 +1696,24 @@ async function reconcileQueuedItemBeforeCommit({
   if (reason === QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK) {
     return { action: QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK, payload: item, reason: 'context_recommendation_shift' };
   }
+  const artistDensityResult = getArtistDensityResult(item.track, {
+    playedHistory: getPlayedTrackHistory(db, sessionId, 80, accountContext),
+    request: {},
+    config
+  });
+  if (!artistDensityResult.accepted) {
+    setRadioDebugInfo(db, sessionId, {
+      lastQueueReconcile: {
+        action: QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK,
+        reason: 'artist_density',
+        artistDensityResult,
+        track: { id: item.track?.id, name: item.track?.name, artists: item.track?.artists || [] },
+        contextVersion: musicContext.version,
+        updatedAt: nowIso()
+      }
+    });
+    return { action: QUEUE_RECONCILE_ACTIONS.REPLACE_TRACK, payload: item, reason: 'artist_density' };
+  }
   try {
     const finalized = await finalizeQueuedTrackForPlayback({
       db,
@@ -1700,6 +1799,14 @@ async function finalizeQueuedTrackForPlayback({
   const conversationMood = moodFromMusicContext(hostMusicContext) || fallbackConversationMood;
   const latestUserMessage = String(hostMusicContext.lastUserMessage || '').trim();
   const hostContext = buildRadioHostContext(db, sessionId, context, latestUserMessage, account);
+  const openingRecap = consumeOpeningMusicRecapForHost({
+    db,
+    accountContext: account,
+    context,
+    environmentContext,
+    enabled: !latestUserMessage
+  });
+  if (openingRecap) hostContext.openingRecap = openingRecap;
   const sessionSummary = await updateSessionSummary(db, config, sessionId, account);
   const longTermMemories = retrieveRelevantMemories(db, {
     accountId: account.accountId,
@@ -1747,6 +1854,15 @@ async function finalizeQueuedTrackForPlayback({
     chatText,
     reason: item.reason || selectedPick.reason,
     explanation: addQueueFinalizeExplanation(item.explanation, hostMusicContext),
+    recommendationSource: normalizeRecommendationSource(item.recommendationSource) || buildRecommendationSource({
+      selectedPick,
+      selectedTrack: item.track,
+      noveltyBucket: item.noveltyBucket,
+      discoverySource: item.discoverySource,
+      userMessage: latestUserMessage,
+      conversationMood,
+      hostContext
+    }),
     ttsUrl: tts.url,
     ttsStatus: tts.status,
     ttsMs: tts.ms,
@@ -1754,6 +1870,8 @@ async function finalizeQueuedTrackForPlayback({
     speech,
     profile,
     weather,
+    weatherRadio: environmentContext.weatherRadio || item.weatherRadio || null,
+    musicRecap: hostContext.openingRecap || item.musicRecap || null,
     environmentContext,
     conversationMood,
     accountContext: account
@@ -1782,14 +1900,22 @@ async function buildFallbackFinalizedQueuedItem({
     environmentContext = {};
   }
   const hostContext = buildRadioHostContext(db, sessionId, context, latestUserMessage, account);
-  const chatText = buildConfirmedTrackHostFallback({
+  const openingRecap = consumeOpeningMusicRecapForHost({
+    db,
+    accountContext: account,
+    context,
+    environmentContext,
+    enabled: !latestUserMessage
+  });
+  if (openingRecap) hostContext.openingRecap = openingRecap;
+  const chatText = applyOpeningMusicRecapToHostText(buildConfirmedTrackHostFallback({
     selectedTrack: item.track,
     timeOfDay: environmentContext.timeOfDay || '',
     weather: environmentContext.weather || '',
     conversationMood,
     userMessage: latestUserMessage,
     hostContext
-  });
+  }), hostContext.openingRecap);
   const speech = speechDecisionForRecommendation(prefs);
   const tts = speech.shouldSpeak
     ? await synthesizeSpeechWithDiagnostics(config.tts, chatText)
@@ -1808,6 +1934,17 @@ async function buildFallbackFinalizedQueuedItem({
     ttsError: tts.error,
     speech,
     weather: environmentContext.weather || item.weather || '',
+    weatherRadio: environmentContext.weatherRadio || item.weatherRadio || null,
+    musicRecap: hostContext.openingRecap || item.musicRecap || null,
+    recommendationSource: normalizeRecommendationSource(item.recommendationSource) || buildRecommendationSource({
+      selectedPick: queuedItemToSongPick(item, hostMusicContext),
+      selectedTrack: item.track,
+      noveltyBucket: item.noveltyBucket,
+      discoverySource: item.discoverySource,
+      userMessage: latestUserMessage,
+      conversationMood,
+      hostContext
+    }),
     environmentContext,
     conversationMood,
     explanation: addQueueFinalizeExplanation(item.explanation, hostMusicContext),
@@ -1939,6 +2076,7 @@ export function getRadioDebugStatus(db, sessionId, accountContext = null) {
     lastCandidatePool: debug.lastCandidatePool || null,
     lastSongPlan: debug.lastSongPlan || null,
     lastSearchDiagnostics: Array.isArray(debug.lastSearchDiagnostics) ? debug.lastSearchDiagnostics.slice(0, 6) : [],
+    lastQueueReconcile: debug.lastQueueReconcile || null,
     lastRecommendationFailure: debug.lastRecommendationFailure || null,
     lastTtsDiagnostics: debug.lastTtsDiagnostics || null,
     updatedAt: debug.updatedAt || null
@@ -2043,7 +2181,7 @@ function scheduleRadioQueueFill({ db, config, netease, sessionId, reason = 'fill
         preemptReason: pending.preemptReason,
         reason
       }])[0];
-      replacePendingQueueItem(db, sessionId, pendingId, readyItem, account);
+      replacePendingQueueItem(db, sessionId, pendingId, readyItem, account, config);
     } catch (error) {
       console.warn('[radio queue prefetch failed]', error?.message || error);
       markPendingQueueItemFailed(db, sessionId, pendingId, {
@@ -2088,7 +2226,7 @@ function markQueueItemStale(db, sessionId, itemId, staleReason = 'stale') {
   setSessionQueue(db, sessionId, queue);
 }
 
-function replacePendingQueueItem(db, sessionId, pendingId, readyItem, accountContext = null) {
+function replacePendingQueueItem(db, sessionId, pendingId, readyItem, accountContext = null, config = {}) {
   const account = normalizeAccountContext(accountContext);
   const queue = getSessionQueue(db, sessionId);
   const pendingInQueue = queue.some(item => item.id === pendingId && item.status === 'pending');
@@ -2111,6 +2249,18 @@ function replacePendingQueueItem(db, sessionId, pendingId, readyItem, accountCon
     markPendingQueueItemFailed(db, sessionId, pendingId, {
       failedStage: 'session_constraint',
       error: 'prefetched track violates current session constraints'
+    });
+    return;
+  }
+  const artistDensityResult = getArtistDensityResult(readyItem.track, {
+    playedHistory: getPlayedTrackHistory(db, sessionId, 80, account),
+    request: {},
+    config
+  });
+  if (!artistDensityResult.accepted) {
+    markPendingQueueItemFailed(db, sessionId, pendingId, {
+      failedStage: 'artist_density',
+      error: 'prefetched track violates artist density'
     });
     return;
   }
@@ -2163,17 +2313,24 @@ async function getEnvironmentContext({ db, sessionId, config, date = new Date() 
   let weather = '';
   let weatherUpdatedAt = '';
   if (db && sessionId && config?.weather?.city) {
-    weather = await getCachedWeather(db, sessionId, {
+    const resolvedWeather = await getCachedWeather(db, sessionId, {
       ...(config?.weather || {}),
       timeZone
     });
+    weather = isWeatherSummaryUnavailable(resolvedWeather) ? '' : resolvedWeather;
     weatherUpdatedAt = getSessionContext(db, sessionId).weatherUpdatedAt || '';
   }
+  const weatherRadio = buildWeatherRadioContext({
+    weather,
+    timeOfDay: timeContext.timeOfDay,
+    hour: timeContext.hour
+  });
   return {
     ...timeContext,
     timeZone,
     weather,
-    weatherUpdatedAt
+    weatherUpdatedAt,
+    weatherRadio
   };
 }
 
@@ -2236,7 +2393,324 @@ export function formatEnvironmentContext(environmentContext = {}) {
   ];
   if (environmentContext.weather) parts.push(`weather=${environmentContext.weather}`);
   if (environmentContext.weatherUpdatedAt) parts.push(`weatherUpdatedAt=${environmentContext.weatherUpdatedAt}`);
+  if (environmentContext.weatherRadio?.id) parts.push(`weatherRadio=${environmentContext.weatherRadio.id}:${environmentContext.weatherRadio.label}`);
   return parts.filter(Boolean).join('; ');
+}
+
+export function buildWeatherRadioContext({ weather = '', timeOfDay = '', hour = null } = {}) {
+  const text = normalizeMusicText(`${weather} ${timeOfDay}`);
+  if (!text) return null;
+  const numericHour = Number.isFinite(Number(hour)) ? Number(hour) : null;
+  const isMorning = numericHour === null ? /上午|清晨|早/.test(`${weather} ${timeOfDay}`) : numericHour >= 6 && numericHour < 12;
+  const isAfternoon = numericHour === null ? /下午|中午/.test(`${weather} ${timeOfDay}`) : numericHour >= 12 && numericHour < 18;
+  const isEvening = numericHour === null ? /傍晚|晚上|夜/.test(`${weather} ${timeOfDay}`) : numericHour >= 17 && numericHour < 22;
+  const isNight = numericHour === null ? /夜|深夜|晚上/.test(`${weather} ${timeOfDay}`) : numericHour >= 21 || numericHour < 6;
+  const hasRain = /雨|降水|淋|rain|shower|drizzle/.test(text);
+  const hasThunder = /雷|thunder|storm/.test(text);
+  const hasMuggy = /闷|湿|潮|热|高温|体感|humidity|humid|muggy|hot/.test(text);
+  const hasWind = /风|降温|冷|凉|大风|wind|cool|cold/.test(text);
+  const hasClear = /晴|sunny|clear/.test(text);
+
+  if ((hasThunder || (hasRain && /雷|storm/.test(text))) && isNight) {
+    return weatherRadioScene('thunderstorm_night');
+  }
+  if (hasRain && isMorning) return weatherRadioScene('rain_morning');
+  if (hasMuggy && isAfternoon) return weatherRadioScene('muggy_afternoon');
+  if (hasWind) return weatherRadioScene('windy_cooling');
+  if (hasClear && isEvening) return weatherRadioScene('clear_evening');
+  if (hasThunder) return weatherRadioScene('thunderstorm_night');
+  return null;
+}
+
+function weatherRadioScene(id) {
+  const scenes = {
+    rain_morning: {
+      id,
+      label: '雨天上午',
+      description: '低噪、温暖、节奏慢慢起来',
+      searchHints: ['低噪', '温暖', '慢慢起势'],
+      hostLine: '外面在下雨，我不直接给你丧歌，先放一首有点湿润但不压心情的。'
+    },
+    muggy_afternoon: {
+      id,
+      label: '闷热下午',
+      description: '清爽、轻电子、少厚重人声',
+      searchHints: ['清爽', '轻电子', '少厚重人声'],
+      hostLine: '下午有点闷，我会把声音选得清爽一点，不让人声压得太满。'
+    },
+    windy_cooling: {
+      id,
+      label: '大风/降温',
+      description: '厚一点、包裹感、怀旧',
+      searchHints: ['包裹感', '怀旧', '厚一点'],
+      hostLine: '外面风凉一点，我把声音放厚一些，像给耳朵披一层外套。'
+    },
+    clear_evening: {
+      id,
+      label: '晴天傍晚',
+      description: '明亮、松弛、city pop/流行',
+      searchHints: ['明亮', '松弛', 'city pop'],
+      hostLine: '傍晚天气亮一点，先让节奏松开，像路灯刚亮起来。'
+    },
+    thunderstorm_night: {
+      id,
+      label: '雷雨夜',
+      description: '暗色、电影感、低频氛围',
+      searchHints: ['暗色', '电影感', '低频氛围'],
+      hostLine: '雷雨夜不一定要更难过，我给你找一点暗色但稳住心跳的声音。'
+    }
+  };
+  return scenes[id] || null;
+}
+
+function consumeOpeningMusicRecapForHost({ db, accountContext = null, context = {}, environmentContext = {}, enabled = true } = {}) {
+  if (!enabled || !db || context?.radioIntroDone) return null;
+  const account = normalizeAccountContext(accountContext);
+  const localDate = environmentContext.localDate || getTimeContext(new Date(), environmentContext.timeZone || DEFAULT_APP_TIME_ZONE).localDate;
+  if (!localDate) return null;
+  if (getAccountSetting(db, account.accountId, DAILY_MUSIC_RECAP_SPOKEN_DATE_KEY) === localDate) return null;
+  const recap = buildDailyMusicRecap(db, {
+    accountContext: account,
+    localDate,
+    timeZone: environmentContext.timeZone || DEFAULT_APP_TIME_ZONE
+  });
+  if (!recap) return null;
+  setAccountSetting(db, account.accountId, DAILY_MUSIC_RECAP_SPOKEN_DATE_KEY, localDate);
+  return recap;
+}
+
+export function buildDailyMusicRecap(db, { accountContext = null, localDate = '', timeZone = DEFAULT_APP_TIME_ZONE } = {}) {
+  const account = normalizeAccountContext(accountContext);
+  const todayLocalDate = localDate || getTimeContext(new Date(), timeZone).localDate;
+  const targetDate = shiftLocalDate(todayLocalDate, -1);
+  if (!targetDate) return null;
+  const activity = getListeningActivityForLocalDates(db, {
+    accountId: account.accountId,
+    dates: [targetDate, shiftLocalDate(todayLocalDate, -2), shiftLocalDate(todayLocalDate, -3)].filter(Boolean),
+    timeZone
+  });
+  const target = activity.byDate.get(targetDate) || emptyListeningActivity(targetDate);
+  if (!target.plays.length && !target.feedback.length && !target.moods.length) return null;
+
+  const signals = [];
+  const lowEnergyCount = target.moods.filter(event => event.energy === 'low' || ['comfort', 'calm', 'night', 'melancholy', 'healing'].includes(event.mood)).length;
+  const highEnergyCount = target.moods.filter(event => event.energy === 'high' || event.mood === 'energy').length;
+  if (lowEnergyCount >= 2 && lowEnergyCount >= highEnergyCount) {
+    signals.push({
+      id: 'low_energy_day',
+      text: '昨天你听歌偏低能量',
+      evidence: `${lowEnergyCount} 条低能量/安静情绪记录`
+    });
+  }
+
+  const afternoonSlowSkips = target.feedback.filter(event =>
+    event.eventType === 'skip' &&
+    localHourFromIso(event.createdAt, timeZone) >= 12 &&
+    localHourFromIso(event.createdAt, timeZone) < 18 &&
+    trackLooksSlow(event)
+  );
+  if (afternoonSlowSkips.length) {
+    signals.push({
+      id: 'afternoon_skipped_slow',
+      text: '昨天下午开始跳过慢歌',
+      evidence: `${afternoonSlowSkips.length} 次下午慢歌跳过`
+    });
+  }
+
+  const eveningElectronic = [
+    ...target.plays.filter(play => localHourFromIso(play.playedAt, timeZone) >= 18 && trackLooksElectronic(play)),
+    ...target.feedback.filter(event => ['like', 'complete'].includes(event.eventType) && localHourFromIso(event.createdAt, timeZone) >= 18 && trackLooksElectronic(event))
+  ];
+  if (eveningElectronic.length) {
+    signals.push({
+      id: 'evening_electronic_rhythm',
+      text: '昨天晚上更喜欢电子/节奏感',
+      evidence: `${eveningElectronic.length} 条夜间电子或节奏信号`
+    });
+  }
+
+  const energizedDates = [...activity.byDate.values()].filter(day => dayHasEnergyLiftSignal(day)).map(day => day.date);
+  if (new Set(energizedDates).size >= 2) {
+    signals.push({
+      id: 'three_day_energy_lift',
+      text: '最近三天你在用音乐提神',
+      evidence: `${new Set(energizedDates).size} 天出现提神/高能量信号`
+    });
+  }
+
+  if (!signals.length && target.plays.length) {
+    signals.push({
+      id: 'yesterday_listened',
+      text: `昨天你让电台陪你听了 ${target.plays.length} 首歌`,
+      evidence: `${target.plays.length} 条播放记录`
+    });
+  }
+
+  const recommendationHint = buildDailyRecapRecommendationHint(signals);
+  return {
+    date: targetDate,
+    currentDate: todayLocalDate,
+    signals: signals.slice(0, 4),
+    openingLine: buildDailyRecapOpeningLine(signals),
+    recommendationHint,
+    trackCount: target.plays.length,
+    feedbackCount: target.feedback.length,
+    generatedAt: nowIso()
+  };
+}
+
+function getListeningActivityForLocalDates(db, { accountId, dates = [], timeZone = DEFAULT_APP_TIME_ZONE } = {}) {
+  const cleanDates = new Set(dates.filter(Boolean));
+  const byDate = new Map([...cleanDates].map(date => [date, emptyListeningActivity(date)]));
+  if (!cleanDates.size) return { byDate };
+  const earliestDate = [...cleanDates].sort()[0];
+  const cutoff = `${shiftLocalDate(earliestDate, -1) || earliestDate}T00:00:00.000Z`;
+  try {
+    db.prepare(`
+      SELECT p.track_id AS trackId,
+             p.played_at AS playedAt,
+             p.source,
+             p.reason,
+             p.host_text AS hostText,
+             t.name,
+             t.artists,
+             t.album
+      FROM plays p
+      JOIN tracks t ON t.id = p.track_id
+      WHERE p.account_id = ? AND p.played_at >= ?
+      ORDER BY p.played_at DESC
+      LIMIT 240
+    `).all(accountId, cutoff).forEach(row => {
+      const date = localDateFromIso(row.playedAt, timeZone);
+      if (!cleanDates.has(date)) return;
+      byDate.get(date).plays.push({
+        ...row,
+        artists: safeJsonArray(row.artists)
+      });
+    });
+  } catch {}
+  try {
+    db.prepare(`
+      SELECT e.track_id AS trackId,
+             e.event_type AS eventType,
+             e.created_at AS createdAt,
+             t.name,
+             t.artists,
+             t.album
+      FROM track_feedback_events e
+      LEFT JOIN tracks t ON t.id = e.track_id
+      WHERE e.account_id = ? AND e.created_at >= ?
+      ORDER BY e.created_at DESC
+      LIMIT 240
+    `).all(accountId, cutoff).forEach(row => {
+      const date = localDateFromIso(row.createdAt, timeZone);
+      if (!cleanDates.has(date)) return;
+      byDate.get(date).feedback.push({
+        ...row,
+        artists: safeJsonArray(row.artists)
+      });
+    });
+  } catch {}
+  try {
+    db.prepare(`
+      SELECT mood, energy, music_intent AS musicIntent, source, created_at AS createdAt
+      FROM mood_events
+      WHERE account_id = ? AND created_at >= ?
+      ORDER BY created_at DESC
+      LIMIT 240
+    `).all(accountId, cutoff).forEach(row => {
+      const date = localDateFromIso(row.createdAt, timeZone);
+      if (!cleanDates.has(date)) return;
+      byDate.get(date).moods.push(row);
+    });
+  } catch {}
+  return { byDate };
+}
+
+function emptyListeningActivity(date) {
+  return { date, plays: [], feedback: [], moods: [] };
+}
+
+function buildDailyRecapOpeningLine(signals = []) {
+  const texts = signals.map(signal => signal.text).filter(Boolean).slice(0, 2);
+  if (!texts.length) return '';
+  return `昨天我看了下电台记录：${texts.join('；')}。`;
+}
+
+function buildDailyRecapRecommendationHint(signals = []) {
+  const ids = new Set(signals.map(signal => signal.id));
+  if (ids.has('evening_electronic_rhythm') || ids.has('three_day_energy_lift')) {
+    return '这几天你晚上都不太想听太慢的，我今天也先避开。';
+  }
+  if (ids.has('afternoon_skipped_slow')) return '昨天你下午开始跳过慢歌，我今天会避开太拖的开头。';
+  if (ids.has('low_energy_day')) return '昨天整体能量偏低，我今天先从不压心情的歌开始。';
+  return signals[0]?.text ? `${signals[0].text}，今天我会把这个方向当作轻参考。` : '';
+}
+
+function formatWeatherRadioForPrompt(weatherRadio = null) {
+  if (!weatherRadio?.id) return 'WEATHER_RADIO: none';
+  return [
+    `WEATHER_RADIO: ${weatherRadio.id}`,
+    `label=${weatherRadio.label}`,
+    `mood=${weatherRadio.description}`,
+    weatherRadio.hostLine ? `hostLine=${weatherRadio.hostLine}` : '',
+    weatherRadio.searchHints?.length ? `searchHints=${weatherRadio.searchHints.join(' / ')}` : ''
+  ].filter(Boolean).join('; ');
+}
+
+function formatOpeningMusicRecapForPrompt(recap = null) {
+  if (!recap?.signals?.length) return 'MUSIC_RECAP: none';
+  return [
+    `MUSIC_RECAP: ${recap.date}`,
+    recap.openingLine ? `openingLine=${recap.openingLine}` : '',
+    recap.recommendationHint ? `recommendationHint=${recap.recommendationHint}` : '',
+    `signals=${recap.signals.map(signal => signal.text).join(' / ')}`
+  ].filter(Boolean).join('; ');
+}
+
+function applyOpeningMusicRecapToHostText(text = '', recap = null) {
+  const base = String(text || '').trim();
+  const line = String(recap?.openingLine || '').trim();
+  if (!line) return base;
+  if (base.includes(line) || /昨天|这几天/.test(base.slice(0, 60))) return base;
+  return `${line}${base ? ' ' + base : ''}`.slice(0, 220);
+}
+
+function trackLooksSlow(item = {}) {
+  const text = normalizeMusicText(`${item.name || ''} ${item.album || ''} ${item.reason || ''} ${(item.artists || []).join(' ')}`);
+  return /慢|安静|舒缓|轻|钢琴|民谣|抒情|睡|夜|calm|slow|piano|acoustic|ballad/.test(text);
+}
+
+function trackLooksElectronic(item = {}) {
+  const text = normalizeMusicText(`${item.name || ''} ${item.album || ''} ${item.reason || ''} ${(item.artists || []).join(' ')}`);
+  return /电子|电音|节奏|律动|合成器|轻电子|dj|edm|beat|electro|electronic|synth|citypop|city pop/.test(text);
+}
+
+function dayHasEnergyLiftSignal(day = {}) {
+  if ((day.moods || []).some(event => event.energy === 'high' || event.mood === 'energy' || /focus|提神|energy/.test(String(event.musicIntent || event.source || '')))) {
+    return true;
+  }
+  return [...(day.plays || []), ...(day.feedback || [])].some(item => {
+    const text = normalizeMusicText(`${item.name || ''} ${item.album || ''} ${item.reason || ''}`);
+    return /提神|专注|运动|健身|跑步|节奏|电子|energy|focus|workout|beat/.test(text);
+  });
+}
+
+function localDateFromIso(value, timeZone = DEFAULT_APP_TIME_ZONE) {
+  if (!value) return '';
+  return getTimeContext(new Date(value), timeZone).localDate;
+}
+
+function localHourFromIso(value, timeZone = DEFAULT_APP_TIME_ZONE) {
+  if (!value) return -1;
+  return getTimeContext(new Date(value), timeZone).hour;
+}
+
+function shiftLocalDate(localDate = '', days = 0) {
+  const match = String(localDate || '').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (!match) return '';
+  const date = new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]) + Number(days || 0)));
+  return date.toISOString().slice(0, 10);
 }
 
 function isNightTimeOfDay(timeOfDay = '') {
@@ -2328,13 +2802,24 @@ function sanitizeTtsDiagnostics(tts = {}) {
 
 function normalizeRecommendationExplanation(explanation = null) {
   if (!explanation || typeof explanation !== 'object') return null;
+  const seenFactors = new Set();
   const factors = Array.isArray(explanation.factors)
     ? explanation.factors
-      .map((factor) => ({
-        type: String(factor?.type || 'fallback').trim(),
-        text: String(factor?.text || factor?.value || '').trim().slice(0, 80)
-      }))
-      .filter(factor => factor.text && !isInternalRecommendationExplanationText(factor.text))
+      .map((factor) => {
+        const label = String(factor?.label || '').trim().slice(0, 16);
+        const value = String(factor?.value || factor?.text || '').trim().slice(0, 80);
+        const text = String(factor?.text || (label && value ? `${label}：${value}` : value)).trim().slice(0, 80);
+        if (!value || isInternalRecommendationExplanationText(value) || isInternalRecommendationExplanationText(text)) return null;
+        const dedupeKey = `${label}\u0000${value}`;
+        if (seenFactors.has(dedupeKey)) return null;
+        seenFactors.add(dedupeKey);
+        return {
+          type: String(factor?.type || 'fallback').trim(),
+          text,
+          ...(label ? { label, value } : {})
+        };
+      })
+      .filter(Boolean)
       .slice(0, 6)
     : [];
   const rawSummary = String(explanation.summary || factors.map(factor => factor.text).join(' + ')).trim();
@@ -2347,6 +2832,60 @@ function normalizeRecommendationExplanation(explanation = null) {
   };
 }
 
+function normalizeRecommendationSource(source = null) {
+  if (!source) return null;
+  const id = typeof source === 'string' ? source : source.id;
+  const base = RECOMMENDATION_TRACE_SOURCES[id];
+  if (!base) return null;
+  return {
+    ...base,
+    reason: String(source.reason || '').trim().slice(0, 120),
+    evidence: Array.isArray(source.evidence) ? source.evidence.map(item => String(item || '').trim()).filter(Boolean).slice(0, 4) : [],
+    correctionKey: source.correctionKey || base.correctionKey
+  };
+}
+
+function buildRecommendationSource({
+  selectedPick = {},
+  selectedTrack = {},
+  noveltyBucket = null,
+  discoverySource = null,
+  userMessage = '',
+  conversationMood = null,
+  hostContext = {}
+} = {}) {
+  const pickText = normalizeMusicText(`${selectedPick.reason || ''} ${selectedPick.hostLine || ''}`);
+  const trackText = normalizeMusicText(`${selectedTrack.name || ''} ${selectedTrack.album || ''} ${(selectedTrack.artists || []).join(' ')}`);
+  const sourceText = normalizeMusicText(discoverySource || '');
+  const messageText = normalizeMusicText(userMessage || '');
+  if (/new|release|daily|radar|新歌|新发行/.test(sourceText)) {
+    return sourceWithEvidence('new_release_radar', discoverySource);
+  }
+  if (/similar|more|artist|相似/.test(sourceText)) {
+    return sourceWithEvidence('similar_artist', discoverySource);
+  }
+  if (noveltyBucket === 'discovery') {
+    return sourceWithEvidence('similar_artist', discoverySource || 'discovery');
+  }
+  if (/歌词|情绪|心情|氛围|mood|lyric|melancholy|comfort|calm/.test(`${pickText} ${messageText}`) || conversationMood?.searchHints?.length) {
+    return sourceWithEvidence('lyric_mood_match', conversationMood?.searchHints?.join(' / ') || selectedPick.reason);
+  }
+  if (/librarydeep|deep|很久|旧歌|怀旧|long/.test(sourceText) || /怀旧|以前|很久/.test(`${pickText} ${trackText}`)) {
+    return sourceWithEvidence('long_absent_favorite', discoverySource || selectedPick.reason);
+  }
+  if ((hostContext.recentFeedback || []).some(event => event?.eventType === 'complete' || event?.eventType === 'like')) {
+    return sourceWithEvidence('recent_completion_direction', 'recent_feedback');
+  }
+  return sourceWithEvidence('recent_completion_direction', selectedPick.reason || 'radio_context');
+}
+
+function sourceWithEvidence(id, evidence = '') {
+  const base = normalizeRecommendationSource(id);
+  if (!base) return null;
+  const text = String(evidence || '').trim();
+  return text ? { ...base, evidence: [text.slice(0, 80)] } : base;
+}
+
 export function buildRecommendationExplanation({
   selectedPick = {},
   selectedTrack = {},
@@ -2356,25 +2895,39 @@ export function buildRecommendationExplanation({
   weather = '',
   profile = {},
   hostContext = {},
+  environmentContext = {},
+  recommendationSource = null,
   source = 'fallback'
 } = {}) {
   const factors = [];
-  const add = (type, text) => {
+  const add = (type, text, extra = {}) => {
     const value = String(text || '').replace(/\s+/g, ' ').trim();
     if (!value) return;
     if (factors.some(factor => factor.type === type && factor.text === value)) return;
-    factors.push({ type, text: value.slice(0, 80) });
+    factors.push({ type, text: value.slice(0, 80), ...extra });
   };
+  const addLabeled = (type, label, value) => {
+    const cleanLabel = String(label || '').trim();
+    const cleanValue = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!cleanLabel || !cleanValue) return;
+    add(type, `${cleanLabel}：${cleanValue}`, { label: cleanLabel, value: cleanValue.slice(0, 80) });
+  };
+
+  const traceSource = normalizeRecommendationSource(recommendationSource || selectedPick?.recommendationSource || selectedTrack?.recommendationSource);
+  if (traceSource) addLabeled('trace_source', '来自', traceSource.label);
 
   if (String(userMessage || '').trim()) {
     add(hasExplicitMusicIntent(userMessage) ? 'explicit_request' : 'chat', `你刚刚说：${String(userMessage).trim().slice(0, 34)}`);
   }
-  const pickReason = sanitizeRecommendationReasonForExplanation(selectedPick?.reason);
+  const pickReason = sanitizeRecommendationReasonForExplanation(selectedPick?.reason, { profile });
   if (pickReason) add('chat', pickReason);
   if (conversationMood?.searchHints?.length) add('chat', `当前氛围：${conversationMood.searchHints.slice(0, 3).join(' / ')}`);
   if (timeOfDay) add('time', `现在是${timeOfDay}`);
   const weatherHint = shortWeatherHint(weather);
   if (weatherHint) add('weather', weatherHint);
+  const weatherRadio = environmentContext.weatherRadio || buildWeatherRadioContext({ weather, timeOfDay, hour: environmentContext.hour });
+  if (weatherRadio?.label) addLabeled('weather_radio', '天气电台', `${weatherRadio.label}：${weatherRadio.description}`);
+  if (hostContext.openingRecap?.recommendationHint) addLabeled('music_recap', '回顾', hostContext.openingRecap.recommendationHint);
   const profileHint = shortProfileHint(profile);
   if (profileHint) add('profile', profileHint);
   const feedbackHint = shortFeedbackHint(hostContext.recentFeedback);
@@ -2387,9 +2940,20 @@ export function buildRecommendationExplanation({
   });
 }
 
-function sanitizeRecommendationReasonForExplanation(reason = '') {
+function sanitizeRecommendationReasonForExplanation(reason = '', { profile = {} } = {}) {
   const text = String(reason || '').replace(/\s+/g, ' ').trim();
+  if (reasonOverusesConcreteProfileArtist(text, profile)) return '';
   return isInternalRecommendationExplanationText(text) ? '' : text;
+}
+
+function reasonOverusesConcreteProfileArtist(text = '', profile = {}) {
+  const value = String(text || '').trim();
+  if (!value || !/(喜欢|常听|画像|偏好|经常听|长期听)/.test(value)) return false;
+  const artists = profile?.structured?.artists || [];
+  return artists.some(item => {
+    const name = String(item?.name || '').trim();
+    return name.length >= 2 && value.includes(name);
+  });
 }
 
 function isInternalRecommendationExplanationText(text = '') {
@@ -2401,34 +2965,75 @@ function isInternalRecommendationExplanationText(text = '') {
 
 function shortWeatherHint(weather = '') {
   const text = String(weather || '').replace(/\s+/g, ' ').trim();
-  if (!text) return '';
+  if (!text || isWeatherSummaryUnavailable(text)) return '';
   return text
     .replace(/。.*$/g, '')
     .replace(/，.*?天气/g, '，天气')
     .slice(0, 44);
 }
 
+function isWeatherSummaryUnavailable(weather = '') {
+  return /天气获取失败|fetch failed|未配置天气|weather.*(?:failed|error)/i.test(String(weather || ''));
+}
+
 function shortProfileHint(profile = {}) {
   const structured = profile?.structured || {};
-  const artists = Array.isArray(structured.artists) ? structured.artists.map(item => item?.name).filter(Boolean).slice(0, 2) : [];
   const moods = Array.isArray(structured.moods) ? structured.moods.map(item => item?.name).filter(Boolean).slice(0, 2) : [];
   const genres = Array.isArray(structured.genres) ? structured.genres.map(item => item?.name).filter(Boolean).slice(0, 2) : [];
-  const parts = [...artists, ...genres, ...moods].filter(Boolean).slice(0, 3);
+  const scenes = Array.isArray(structured.scenes) ? structured.scenes.map(item => item?.name).filter(Boolean).slice(0, 2) : [];
+  const parts = [...genres, ...moods, ...scenes].filter(Boolean).slice(0, 3);
   if (parts.length) return `你的画像偏好：${parts.join(' / ')}`;
-  const summary = String(profile?.summary || '').trim();
-  return summary ? `参考你的音乐画像：${summary.slice(0, 34)}` : '';
+  const summary = formatProfileSummaryForPrompt(profile);
+  return summary && summary !== '无' && summary !== 'No objective profile available.'
+    ? `你的画像偏好：${summary.slice(0, 34)}`
+    : '';
 }
 
 export function formatProfileSummaryForPrompt(profile = {}) {
-  const summary = String(profile?.summary || '').replace(/\s+/g, ' ').trim();
-  if (!summary) return '无';
-  return summary
-    .replace(/《[^》]{1,40}》([、，,\s]*《[^》]{1,40}》)*/g, '相关作品')
-    .replace(/相关作品(?:[、，,\s]*相关作品)+/g, '相关作品')
-    .replace(/相关作品中/g, '相关作品里')
-    .replace(/\s+/g, ' ')
-    .trim()
-    .slice(0, 420) || '无';
+  const structured = profile?.structured || {};
+  const llmSummary = sanitizeObjectiveProfileText(structured.llmProfile?.summary, structured);
+  if (llmSummary) return llmSummary.slice(0, 420);
+  return buildObjectiveProfilePromptText(structured) || 'No objective profile available.';
+}
+
+function buildObjectiveProfilePromptText(structured = {}) {
+  const groups = [
+    ['genres', structured.genres],
+    ['moods', structured.moods],
+    ['scenes', structured.scenes],
+    ['languages', structured.languages],
+    ['energy', structured.energy],
+    ['eras', structured.eras],
+    ['discovery', structured.discoveryDirections],
+    ['avoid', structured.avoidSignals]
+  ]
+    .map(([label, values]) => {
+      const names = (Array.isArray(values) ? values : [])
+        .map(item => String(item?.name || item || '').trim())
+        .filter(Boolean)
+        .slice(0, label === 'discovery' ? 5 : 4);
+      return names.length ? `${label}: ${names.join(' / ')}` : '';
+    })
+    .filter(Boolean);
+  return groups.length ? `Objective listening profile. ${groups.join('; ')}.`.slice(0, 420) : '';
+}
+
+function sanitizeObjectiveProfileText(text = '', structured = {}) {
+  let value = String(text || '').replace(/《[^》]{1,80}》/g, '').replace(/\s+/g, ' ').trim();
+  if (!value) return '';
+  const concreteTerms = [
+    ...(structured.artists || []).map(item => item?.name),
+    ...(structured.albums || []).map(item => item?.name)
+  ].map(term => String(term || '').trim()).filter(Boolean);
+  for (const term of concreteTerms) {
+    if (term.length < 2) continue;
+    value = value.replace(new RegExp(escapeRegExp(term), 'gi'), '');
+  }
+  return value
+    .replace(/[、，,;；]{2,}/g, '、')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/^[、，,;；\s]+|[、，,;；\s]+$/g, '')
+    .trim();
 }
 
 function shortFeedbackHint(events = []) {
@@ -4472,6 +5077,7 @@ function mergePlayedSongContext(existing = [], track = {}) {
     album: track.album || '',
     noveltyBucket: normalizeNoveltyBucket(track.noveltyBucket),
     discoverySource: track.discoverySource || null,
+    recommendationSource: normalizeRecommendationSource(track.recommendationSource),
     key,
     playedAt: nowIso()
   };
@@ -4791,18 +5397,21 @@ export async function buildHybridCandidateContext({
       seed: `${account.accountId}:${userMessage || conversationMood?.reason || nowIso().slice(0, 10)}`
     });
     const noveltyTarget = getNoveltyTarget({ db, sessionId, accountContext: account, config });
+    const promptArtistLimit = getPromptArtistLimit(config, request);
     const promptSelection = strictStyleActive
       ? selectPromptCandidatesForStyle(ranked, {
           limit: HYBRID_PROMPT_CANDIDATE_LIMIT,
           discoveryRatio: getDiscoveryConfig(config).ratio,
           targetNoveltyBucket: noveltyTarget.targetNoveltyBucket,
           styleConstraint: request.styleConstraint,
-          config
+          config,
+          artistLimit: promptArtistLimit
         })
       : selectPromptCandidatesByNovelty(ranked, {
           limit: HYBRID_PROMPT_CANDIDATE_LIMIT,
           discoveryRatio: getDiscoveryConfig(config).ratio,
-          targetNoveltyBucket: noveltyTarget.targetNoveltyBucket
+          targetNoveltyBucket: noveltyTarget.targetNoveltyBucket,
+          artistLimit: promptArtistLimit
         });
     const promptCandidates = promptSelection.candidates;
     if (!promptCandidates.length) return disabled('empty_ranked_candidate_pool', { totalCandidates: candidates.length });
@@ -4847,6 +5456,10 @@ export async function buildHybridCandidateContext({
         promptDiscoveryCount: promptSelection.discoveryCount,
         discoveryUnderfilled: promptSelection.discoveryUnderfilled,
         familiarUnderfilled: promptSelection.familiarUnderfilled,
+        artistLimit: promptSelection.artistLimit,
+        artistLimitApplied: promptSelection.artistLimitApplied,
+        artistLimitSkippedCount: promptSelection.artistLimitSkippedCount,
+        promptArtistCounts: promptSelection.promptArtistCounts,
         targetNoveltyBucket: noveltyTarget.targetNoveltyBucket,
         noveltyWindow: noveltyTarget.window,
         discoverySources,
@@ -5219,20 +5832,105 @@ function getDiscoveryConfig(config = {}) {
   };
 }
 
-function selectPromptCandidatesByNovelty(candidates = [], { limit = HYBRID_PROMPT_CANDIDATE_LIMIT, discoveryRatio = HYBRID_DISCOVERY_DEFAULT_RATIO, targetNoveltyBucket = 'balanced' } = {}) {
+function getPromptArtistLimit(config = {}, request = {}) {
+  if (requestBypassesArtistRepetition(request)) return 0;
+  return nonNegativeConfigNumber(
+    config?.recommendation?.promptArtistLimit ?? process.env.RECOMMENDATION_PROMPT_ARTIST_LIMIT,
+    PROMPT_ARTIST_DEFAULT_LIMIT
+  );
+}
+
+function nonNegativeConfigNumber(value, fallback) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(0, Math.floor(number));
+}
+
+function createArtistLimitedAdder(selected, selectedIds, { limit, artistLimit = 0 } = {}) {
+  const artistCounts = new Map();
+  let skippedCount = 0;
+  const add = (candidate) => {
+    const id = String(candidate?.track?.id || '');
+    if (!id || selectedIds.has(id) || selected.length >= limit) return false;
+    const artistKeys = getTrackArtistKeys(candidate.track);
+    if (artistLimit > 0 && artistKeys.some(key => (artistCounts.get(key) || 0) >= artistLimit)) {
+      skippedCount += 1;
+      return false;
+    }
+    selected.push(candidate);
+    selectedIds.add(id);
+    for (const key of artistKeys) artistCounts.set(key, (artistCounts.get(key) || 0) + 1);
+    return true;
+  };
+  return {
+    add,
+    getStats: () => ({
+      artistLimit,
+      artistLimitApplied: artistLimit > 0,
+      artistLimitSkippedCount: skippedCount,
+      promptArtistCounts: Object.fromEntries([...artistCounts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 12))
+    })
+  };
+}
+
+function getTrackArtistKeys(track = {}) {
+  return uniqueStrings((track.artists || []).map(normalizeMusicText).filter(Boolean), 8);
+}
+
+function getArtistDensityConfig(config = {}) {
+  return {
+    window: nonNegativeConfigNumber(
+      config?.recommendation?.artistDensityWindow ?? process.env.RECOMMENDATION_ARTIST_DENSITY_WINDOW,
+      ARTIST_DENSITY_DEFAULT_WINDOW
+    ),
+    max: nonNegativeConfigNumber(
+      config?.recommendation?.artistDensityMax ?? process.env.RECOMMENDATION_ARTIST_DENSITY_MAX,
+      ARTIST_DENSITY_DEFAULT_MAX
+    )
+  };
+}
+
+function requestBypassesArtistRepetition(request = {}) {
+  if (request?.songTitle || request?.artistConstraint?.label) return true;
+  const text = normalizeMusicText(request?.text || '');
+  return /同歌手|这个歌手|这位歌手|这个艺人|这位艺人|他的另一首|她的另一首|他的歌|她的歌|换他|换她|换这个歌手|换这位歌手|继续他|继续她|继续这个歌手|继续这位歌手|继续这个艺人|继续这位艺人/.test(text);
+}
+
+function getArtistDensityResult(track = {}, { playedHistory = [], request = {}, config = {} } = {}) {
+  const densityConfig = getArtistDensityConfig(config);
+  const artistKeys = getTrackArtistKeys(track);
+  if (!artistKeys.length || densityConfig.window <= 0 || densityConfig.max <= 0) {
+    return { accepted: true, reason: 'disabled', window: densityConfig.window, max: densityConfig.max, counts: {}, blockingArtists: [] };
+  }
+  if (requestBypassesArtistRepetition(request)) {
+    return { accepted: true, reason: 'explicit_request', window: densityConfig.window, max: densityConfig.max, counts: {}, blockingArtists: [] };
+  }
+  const counts = new Map();
+  for (const item of (playedHistory || []).slice(0, densityConfig.window)) {
+    for (const key of getTrackArtistKeys(item)) {
+      counts.set(key, (counts.get(key) || 0) + 1);
+    }
+  }
+  const blockingArtists = artistKeys.filter(key => (counts.get(key) || 0) >= densityConfig.max);
+  return {
+    accepted: blockingArtists.length === 0,
+    reason: blockingArtists.length ? 'artist_density' : 'ok',
+    window: densityConfig.window,
+    max: densityConfig.max,
+    counts: Object.fromEntries(artistKeys.map(key => [key, counts.get(key) || 0])),
+    blockingArtists
+  };
+}
+
+function selectPromptCandidatesByNovelty(candidates = [], { limit = HYBRID_PROMPT_CANDIDATE_LIMIT, discoveryRatio = HYBRID_DISCOVERY_DEFAULT_RATIO, targetNoveltyBucket = 'balanced', artistLimit = 0 } = {}) {
   const discoveryTarget = Math.max(0, Math.min(limit, Math.round(limit * clampNumber(discoveryRatio, 0, 1, HYBRID_DISCOVERY_DEFAULT_RATIO))));
   const familiarTarget = limit - discoveryTarget;
   const discovery = candidates.filter(candidate => candidate.noveltyBucket === 'discovery');
   const familiar = candidates.filter(candidate => candidate.noveltyBucket !== 'discovery');
   const selected = [];
   const selectedIds = new Set();
-  const add = (candidate) => {
-    const id = String(candidate?.track?.id || '');
-    if (!id || selectedIds.has(id) || selected.length >= limit) return false;
-    selected.push(candidate);
-    selectedIds.add(id);
-    return true;
-  };
+  const limiter = createArtistLimitedAdder(selected, selectedIds, { limit, artistLimit });
+  const add = limiter.add;
 
   for (const candidate of discovery.slice(0, discoveryTarget)) add(candidate);
   for (const candidate of familiar.slice(0, familiarTarget)) add(candidate);
@@ -5245,20 +5943,16 @@ function selectPromptCandidatesByNovelty(candidates = [], { limit = HYBRID_PROMP
     discoveryCount: selected.filter(candidate => candidate.noveltyBucket === 'discovery').length,
     familiarCount: selected.filter(candidate => candidate.noveltyBucket !== 'discovery').length,
     discoveryUnderfilled: discovery.length < discoveryTarget,
-    familiarUnderfilled: familiar.length < familiarTarget
+    familiarUnderfilled: familiar.length < familiarTarget,
+    ...limiter.getStats()
   };
 }
 
-function selectPromptCandidatesForStyle(candidates = [], { limit = HYBRID_PROMPT_CANDIDATE_LIMIT, discoveryRatio = HYBRID_DISCOVERY_DEFAULT_RATIO, targetNoveltyBucket = 'balanced', styleConstraint = null, config = {} } = {}) {
+function selectPromptCandidatesForStyle(candidates = [], { limit = HYBRID_PROMPT_CANDIDATE_LIMIT, discoveryRatio = HYBRID_DISCOVERY_DEFAULT_RATIO, targetNoveltyBucket = 'balanced', styleConstraint = null, config = {}, artistLimit = 0 } = {}) {
   const selected = [];
   const selectedIds = new Set();
-  const add = (candidate) => {
-    const id = String(candidate?.track?.id || '');
-    if (!id || selectedIds.has(id) || selected.length >= limit) return false;
-    selected.push(candidate);
-    selectedIds.add(id);
-    return true;
-  };
+  const limiter = createArtistLimitedAdder(selected, selectedIds, { limit, artistLimit });
+  const add = limiter.add;
   const styleSearch = candidates.filter(candidate => candidate.source === 'style_search');
   const qualifiedStyle = styleSearch.filter(candidate => trackMatchesStyleConstraint(candidate.track, styleConstraint, config));
   const fallbackStyle = styleSearch.filter(candidate => !trackMatchesStyleConstraint(candidate.track, styleConstraint, config));
@@ -5267,7 +5961,7 @@ function selectPromptCandidatesForStyle(candidates = [], { limit = HYBRID_PROMPT
 
   const nonStyleSelection = selectPromptCandidatesByNovelty(
     candidates.filter(candidate => candidate.source !== 'style_search'),
-    { limit, discoveryRatio, targetNoveltyBucket }
+    { limit, discoveryRatio, targetNoveltyBucket, artistLimit: 0 }
   );
   for (const candidate of nonStyleSelection.candidates) add(candidate);
   for (const candidate of candidates) add(candidate);
@@ -5278,7 +5972,8 @@ function selectPromptCandidatesForStyle(candidates = [], { limit = HYBRID_PROMPT
     familiarCount: selected.filter(candidate => candidate.noveltyBucket !== 'discovery').length,
     styleSearchCount: selected.filter(candidate => candidate.source === 'style_search').length,
     discoveryUnderfilled: nonStyleSelection.discoveryUnderfilled,
-    familiarUnderfilled: nonStyleSelection.familiarUnderfilled
+    familiarUnderfilled: nonStyleSelection.familiarUnderfilled,
+    ...limiter.getStats()
   };
 }
 
@@ -5770,11 +6465,21 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
       plan,
       playedIds,
       playedSignatures,
+      playedHistory,
       request,
       candidateById: candidateContext.candidateById
     });
     setRadioDebugInfo(db, sessionId, { lastSearchDiagnostics: resolved.diagnostics || [] });
     if (resolved.track) {
+      const recommendationSource = buildRecommendationSource({
+        selectedPick: resolved.pick,
+        selectedTrack: resolved.track,
+        noveltyBucket: resolved.noveltyBucket,
+        discoverySource: resolved.discoverySource,
+        userMessage,
+        conversationMood,
+        hostContext
+      });
       const reason = resolved.pick.reason || '根据当前状态和音乐画像推荐';
       const explanation = buildRecommendationExplanation({
         selectedPick: resolved.pick,
@@ -5785,6 +6490,8 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
         weather,
         profile,
         hostContext,
+        environmentContext,
+        recommendationSource,
         source: resolved.pick?.reason ? 'llm_pick' : 'fallback'
       });
       if (deferHostText) {
@@ -5795,6 +6502,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
           explanation,
           noveltyBucket: resolved.noveltyBucket || null,
           discoverySource: resolved.discoverySource || null,
+          recommendationSource,
           newMode
         };
       }
@@ -5822,6 +6530,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
         explanation,
         noveltyBucket: resolved.noveltyBucket || null,
         discoverySource: resolved.discoverySource || null,
+        recommendationSource,
         newMode
       };
     }
@@ -5843,6 +6552,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
     lastPlan,
     playedIds,
     playedSignatures,
+    playedHistory,
     request
   });
   if (fallback?.track) {
@@ -5855,6 +6565,15 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
       lastRecommendationFailure: null,
       lastSearchDiagnostics: fallback.diagnostics || []
     });
+    const recommendationSource = buildRecommendationSource({
+      selectedPick: fallback.pick,
+      selectedTrack: fallback.track,
+      noveltyBucket: fallback.noveltyBucket,
+      discoverySource: fallback.discoverySource || 'library_deep',
+      userMessage,
+      conversationMood,
+      hostContext
+    });
     const explanation = buildRecommendationExplanation({
       selectedPick: fallback.pick,
       selectedTrack: fallback.track,
@@ -5864,6 +6583,8 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
       weather,
       profile,
       hostContext,
+      environmentContext,
+      recommendationSource,
       source: 'fallback'
     });
     if (deferHostText) {
@@ -5872,6 +6593,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
         track: fallback.track,
         reason: fallback.reason,
         explanation,
+        recommendationSource,
         newMode
       };
     }
@@ -5897,6 +6619,7 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
       track: fallback.track,
       reason: fallback.reason,
       explanation,
+      recommendationSource,
       newMode
     };
   }
@@ -5932,6 +6655,7 @@ async function resolveRecommendationFallback({
   lastPlan = null,
   playedIds = new Set(),
   playedSignatures = new Set(),
+  playedHistory = [],
   request = {}
 } = {}) {
   const replayKey = requestAllowsRequestedSongReplay(request) ? playedSongKey(request.songTitle) : '';
@@ -5947,6 +6671,7 @@ async function resolveRecommendationFallback({
     failedPicks,
     playedIds,
     playedSignatures,
+    playedHistory,
     failedNameKeys,
     request
   });
@@ -5960,6 +6685,7 @@ async function resolveRecommendationFallback({
     conversationMood,
     playedIds,
     playedSignatures,
+    playedHistory,
     failedNameKeys,
     request
   });
@@ -5981,7 +6707,7 @@ async function resolveRecommendationFallback({
   };
 }
 
-async function resolveSameArtistFallback({ db, config, netease, failedPicks = [], request = {}, playedIds, playedSignatures, failedNameKeys }) {
+async function resolveSameArtistFallback({ db, config, netease, failedPicks = [], request = {}, playedIds, playedSignatures, playedHistory = [], failedNameKeys }) {
   const artists = uniqueStrings([
     ...(failedPicks || []).flatMap(pick => pick?.artists || []),
     request?.artistConstraint?.label || ''
@@ -6037,6 +6763,13 @@ async function resolveSameArtistFallback({ db, config, netease, failedPicks = []
         hit.filterReason = 'played_or_failed_song';
         continue;
       }
+      const artistDensityResult = getArtistDensityResult(track, { playedHistory, request, config });
+      hit.artistDensityResult = artistDensityResult;
+      if (!artistDensityResult.accepted) {
+        hit.accepted = false;
+        hit.filterReason = 'artist_density';
+        continue;
+      }
       const playable = await resolvePlayableTrack(db, netease, track, playableResolveOptions(config, { includeLyric: false }));
       hit.playable = Boolean(playable?.playable);
       if (!playable?.playable) {
@@ -6071,7 +6804,7 @@ async function resolveSameArtistFallback({ db, config, netease, failedPicks = []
   return { track: null, stage: 'netease_search', message: '同艺人兜底没有找到可播放歌曲。', diagnostics };
 }
 
-async function resolveProfileLibraryFallback({ db, config, netease, profile = {}, conversationMood = null, playedIds, playedSignatures, failedNameKeys, request = {} }) {
+async function resolveProfileLibraryFallback({ db, config, netease, profile = {}, conversationMood = null, playedIds, playedSignatures, playedHistory = [], failedNameKeys, request = {} }) {
   const tracks = listProfileFallbackTracks(db, 220);
   const diagnostics = [{
     pick: { name: 'profile_library_fallback', artists: [], reason: 'profile_fallback' },
@@ -6101,6 +6834,13 @@ async function resolveProfileLibraryFallback({ db, config, netease, profile = {}
       playable: null
     };
     diagnostics[0].hits.push(hit);
+    const artistDensityResult = getArtistDensityResult(item.track, { playedHistory, request, config });
+    hit.artistDensityResult = artistDensityResult;
+    if (!artistDensityResult.accepted) {
+      hit.accepted = false;
+      hit.filterReason = 'artist_density';
+      continue;
+    }
     const playable = await resolvePlayableTrack(db, netease, item.track, playableResolveOptions(config, { includeLyric: false }));
     hit.playable = Boolean(playable?.playable);
     if (!playable?.playable) {
@@ -6219,6 +6959,8 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
     : '已播放歌名必须避开：只要歌名相同，就不能再推荐任何版本、翻唱、Live、Remix、Album Version 或不同艺人版本。';
   const profilePrompt = formatProfileSummaryForPrompt(profile);
   const candidatePrompt = candidateContext?.enabled ? candidateContext.promptText : '本地候选池：无，按原规则推荐真实可搜歌曲。';
+  const weatherRadioPrompt = formatWeatherRadioForPrompt(environmentContext.weatherRadio);
+  const musicRecapPrompt = formatOpeningMusicRecapForPrompt(hostContext.openingRecap);
 
   const raw = await generateChatCompletion(config.llm, [
     {
@@ -6226,6 +6968,7 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
       content: [
         '你是灿灿电台的选歌大脑。你的任务不是生成搜索关键词，而是直接推荐真实存在、音乐平台容易搜到的具体歌曲。',
         buildCanCanBackgroundPrompt(userMessage),
+        'If MUSIC_RECAP has openingLine, naturally mention it once at the start. If it is none, do not invent yesterday usage. WEATHER_RADIO is atmosphere only and must not override explicit user requests.',
         '必须结合时间、天气、听众画像、偏好、当前对话和明确请求，给出 3 首备选歌。',
         '时间天气只是事实背景，不是固定开场模板；不要因为历史对话把当前上午/下午写成晚上，也不要编造未来天气。',
         '每首都必须有明确歌名和主要艺人。优先推荐知名度较高、音乐更可能搜到并可播放的版本。',
@@ -6235,6 +6978,8 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         '搜索 queries 必须像音乐软件里会输入的短词，优先“歌名 艺人”和“艺人 歌名”。不要输出长句。',
         '如果用户明确指定艺人、歌名或风格，必须优先满足；不确定时选更常见、更好搜的歌曲。',
         'If STRICT_STYLE_CONSTRAINT is present, the requiredGroups are hard requirements. Do not substitute a normal ballad, nostalgia song, or mood-similar song when it lacks the requested style evidence.',
+        'The listener profile is an objective preference summary. Treat it as style guidance only; do not repeatedly recommend a concrete artist unless the user explicitly asks for that artist.',
+        'WEATHER_RADIO and MUSIC_RECAP are light ranking signals only. Explicit song, artist, style, or current mood requests must win over weather and recap hints.',
         '如果存在本场禁听，禁听优先级高于听众画像、历史偏好和兜底推荐；不要推荐禁听歌手，也不要推荐歌名命中禁听词的歌曲。',
         vocalPolicyText,
         '如果用户说“他的另一首/她的另一首/这个歌手的另一首/换这位歌手”，优先参考最近播放歌曲的艺人，把它理解成当前或上一首歌的主艺人。',
@@ -6255,6 +7000,8 @@ async function generateSongPlan({ config, profile, weather, timeOfDay, hour, mod
         `明确请求：${requestText}`,
         sessionConstraintText,
         vocalPolicyText,
+        weatherRadioPrompt,
+        musicRecapPrompt,
         candidatePrompt,
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
         formatRecentHostPlays(hostContext.recentPlays),
@@ -6333,7 +7080,7 @@ function formatPlayedSongExclusions(playedHistory = [], request = {}) {
     : `${replayText}本轮/最近已播放歌名：${replayText ? '除本次指定歌曲外无其他限制' : '无'}`;
 }
 
-async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, playedIds, playedSignatures = new Set(), request = {}, candidateById = new Map() }) {
+async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, playedIds, playedSignatures = new Set(), playedHistory = [], request = {}, candidateById = new Map() }) {
   const failedPicks = [];
   const diagnostics = [];
   for (const pick of plan.picks) {
@@ -6371,6 +7118,7 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
       pick: effectivePick,
       playedIds,
       playedSignatures,
+      playedHistory,
       request,
       candidateById
     });
@@ -6442,6 +7190,13 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
       if (trackMatchesPlayedSongName(track, playedSignatures) && replayRequestAllowsPlayedSong(track, request)) {
         item.diagnostic.filterReason = 'allowed_explicit_replay';
       }
+      const artistDensityResult = getArtistDensityResult(track, { playedHistory, request, config });
+      item.diagnostic.artistDensityResult = artistDensityResult;
+      if (!artistDensityResult.accepted) {
+        item.diagnostic.accepted = false;
+        item.diagnostic.filterReason = 'artist_density';
+        continue;
+      }
       const playableStarted = Date.now();
       const playable = await resolvePlayableTrack(db, netease, track, playableResolveOptions(config, { includeLyric: false }));
       item.diagnostic.playable = Boolean(playable?.playable);
@@ -6463,6 +7218,8 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
     if (!pickDiagnostic.failedReason) {
       pickDiagnostic.failedReason = ranked.some(item => item.diagnostic?.filterReason === 'style_constraint')
         ? 'style_constraint_no_match'
+        : ranked.some(item => item.diagnostic?.filterReason === 'artist_density')
+          ? 'artist_density'
         : (ranked.length ? 'no_playable_match' : 'no_matching_search_hit');
     }
     diagnostics.push(trimSearchDiagnostic(pickDiagnostic));
@@ -6471,7 +7228,7 @@ async function resolveSongPlanTrack({ db, config, netease, sessionId, plan, play
   return { track: null, pick: null, failedPicks, diagnostics };
 }
 
-async function resolveCandidatePickTrack({ db, config, netease, pick = {}, playedIds, playedSignatures, request = {}, candidateById = new Map() } = {}) {
+async function resolveCandidatePickTrack({ db, config, netease, pick = {}, playedIds, playedSignatures, playedHistory = [], request = {}, candidateById = new Map() } = {}) {
   const candidateId = String(pick.candidateId || '').trim();
   if (!candidateId) return null;
   const candidate = candidateById instanceof Map ? candidateById.get(candidateId) : null;
@@ -6533,6 +7290,14 @@ async function resolveCandidatePickTrack({ db, config, netease, pick = {}, playe
     hit.accepted = false;
     hit.filterReason = 'played_song_name';
     diagnostic.failedReason = 'played_song_name';
+    return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
+  }
+  const artistDensityResult = getArtistDensityResult(track, { playedHistory, request, config });
+  hit.artistDensityResult = artistDensityResult;
+  if (!artistDensityResult.accepted) {
+    hit.accepted = false;
+    hit.filterReason = 'artist_density';
+    diagnostic.failedReason = 'artist_density';
     return { track: null, pick: null, diagnostic: trimSearchDiagnostic(diagnostic) };
   }
 
@@ -6883,12 +7648,15 @@ export function buildFinalHostMessages({
 } = {}) {
   const firstTurn = Boolean(hostContext.isFirstRadioTurn);
   const profilePrompt = formatProfileSummaryForPrompt(profile);
+  const weatherRadioPrompt = formatWeatherRadioForPrompt(environmentContext.weatherRadio);
+  const musicRecapPrompt = formatOpeningMusicRecapForPrompt(hostContext.openingRecap);
   return [
     {
       role: 'system',
       content: [
         '你是灿灿，私人电台 AI DJ。最终可播放歌曲已经确认，你只负责写播出前导播词。',
         buildCanCanBackgroundPrompt(userMessage),
+        'If MUSIC_RECAP has openingLine, naturally mention it once at the start. If it is none, do not invent yesterday usage. WEATHER_RADIO is atmosphere only and must not override explicit user requests.',
         '写 40-110 个中文字，像真实电台里临场说的一小段话。可以温柔、俏皮、安静、直接、轻轻吐槽，但不要像推荐理由、搜索说明或固定播报。',
         '不要套固定模板。尤其避免反复使用“刚才……现在……”“上一首……接下来……”“那首……这首……”“我找到……”“愿这首歌……”“陪你……一会儿”“把声音递给你”“让气氛慢慢……”这类结构。',
         firstTurn
@@ -6910,6 +7678,8 @@ export function buildFinalHostMessages({
         `最终歌曲：${selectedTrack?.name || ''}`,
         `最终艺人：${artistText || (selectedTrack?.artists || selectedPick?.artists || []).join('、') || '未知'}`,
         selectedTrack?.album ? `专辑：${selectedTrack.album}` : '',
+        weatherRadioPrompt,
+        musicRecapPrompt,
         `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
         firstTurn ? `时间天气参考：${timeOfDay} ${hour}点，${weather}` : `时间天气仅供理解氛围，不要写进导播词：${timeOfDay} ${hour}点，${weather}`,
         `听众画像：${profilePrompt}`,
@@ -6991,15 +7761,16 @@ function finalizeSongPlanHostText({ plan, selectedPick, selectedTrack, timeOfDay
     conversationMood,
     userMessage
   });
+  const finalTextWithRecap = applyOpeningMusicRecapToHostText(finalText, hostContext.openingRecap);
   if (hostTextLength(finalText) < 35) {
-    return ensureRecommendationTextMatchesTrack(fallbackText, selectedTrack, candidateTracks, {
+    return applyOpeningMusicRecapToHostText(ensureRecommendationTextMatchesTrack(fallbackText, selectedTrack, candidateTracks, {
       timeOfDay,
       weather,
       conversationMood,
       userMessage
-    });
+    }), hostContext.openingRecap);
   }
-  return finalText;
+  return finalTextWithRecap;
 }
 
 function chooseBestPlanHostText(plan = {}, selectedPick = {}, selectedTrack = {}) {

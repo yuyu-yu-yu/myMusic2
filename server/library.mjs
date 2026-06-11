@@ -421,7 +421,8 @@ async function generateAIPortrait(stats, llmConfig) {
         '不要写成冷冰冰的数据报告；禁止用“用户以”“该用户”“数据显示”“从数据看”“偏好为”开头。',
         '可以有一点文学感，但所有判断都必须来自输入证据，不要编造不存在的艺人或歌单。',
         '所有 name 字段用于前端标签展示，要短、清楚、有质感；优先中文或“中文/英文”组合，例如“华语流行/独立”“影视/游戏原声”“夜晚/宁静”。',
-        'JSON schema: {"summary":"180-320 Chinese chars","genres":[{"name":"...","weight":0-1,"evidence":["..."]}],"moods":[...],"artists":[...],"albums":[...],"languages":[...],"scenes":[...],"eras":[...],"energy":[...],"discoveryDirections":[{"name":"...","weight":0-1,"evidence":["..."]}],"avoidSignals":[{"name":"...","weight":0-1,"evidence":["..."]}]}'
+        'Also return llmProfile for recommendation prompts. llmProfile.summary must be objective and must not contain concrete artist names, song names, or album names.',
+        'JSON schema: {"summary":"180-320 Chinese chars for user display","llmProfile":{"summary":"objective preference summary without concrete artist/song/album names"},"genres":[{"name":"...","weight":0-1,"evidence":["..."]}],"moods":[...],"artists":[...],"albums":[...],"languages":[...],"scenes":[...],"eras":[...],"energy":[...],"discoveryDirections":[{"name":"...","weight":0-1,"evidence":["..."]}],"avoidSignals":[{"name":"...","weight":0-1,"evidence":["..."]}]}'
       ].join('\n')
     },
     {
@@ -1115,7 +1116,75 @@ function normalizeStructuredProfile(profile = {}, stats = {}) {
       ? `你的音乐世界围绕${genreText}展开，${artistText}等声音构成了最常出现的坐标。它既保留熟悉旋律带来的安全感，也留着继续探索新场景、新原声和小众表达的余地。`
       : EMPTY_PROFILE_SUMMARY;
   }
+  normalized.llmProfile = normalizeLlmProfile(profile.llmProfile, normalized, stats);
   return normalized;
+}
+
+function normalizeLlmProfile(input = {}, structured = {}, stats = {}) {
+  const raw = typeof input === 'string' ? { summary: input } : (input || {});
+  const cleanedSummary = sanitizeLlmProfileSummary(raw.summary, structured, stats);
+  const fallbackSummary = buildObjectiveLlmProfileSummary(structured);
+  const summary = (cleanedSummary || fallbackSummary || EMPTY_PROFILE_SUMMARY).slice(0, 420);
+  return {
+    version: 1,
+    source: cleanedSummary ? String(raw.source || 'llm').trim() || 'llm' : 'structured',
+    summary
+  };
+}
+
+function buildObjectiveLlmProfileSummary(structured = {}) {
+  const groups = [
+    ['genres', structured.genres],
+    ['moods', structured.moods],
+    ['scenes', structured.scenes],
+    ['languages', structured.languages],
+    ['energy', structured.energy],
+    ['eras', structured.eras],
+    ['discovery', structured.discoveryDirections],
+    ['avoid', structured.avoidSignals]
+  ]
+    .map(([label, values]) => {
+      const names = weightedNames(values, label === 'discovery' ? 5 : 4);
+      return names.length ? `${label}: ${names.join(' / ')}` : '';
+    })
+    .filter(Boolean);
+  return groups.length ? `Objective listening profile. ${groups.join('; ')}.` : '';
+}
+
+function weightedNames(values = [], limit = 4) {
+  return (Array.isArray(values) ? values : [])
+    .map(item => String(item?.name || item || '').trim())
+    .filter(Boolean)
+    .slice(0, limit);
+}
+
+function sanitizeLlmProfileSummary(summary = '', structured = {}, stats = {}) {
+  let text = String(summary || '').replace(/《[^》]{1,80}》/g, '').replace(/\s+/g, ' ').trim();
+  if (!text) return '';
+  for (const term of concreteProfileTerms(structured, stats)) {
+    if (term.length < 2) continue;
+    text = text.replace(new RegExp(escapeRegExp(term), 'gi'), '');
+  }
+  return text
+    .replace(/[、，,;；]{2,}/g, '、')
+    .replace(/\s{2,}/g, ' ')
+    .replace(/^[、，,;；\s]+|[、，,;；\s]+$/g, '')
+    .trim();
+}
+
+function concreteProfileTerms(structured = {}, stats = {}) {
+  const terms = [
+    ...(structured.artists || []).map(item => item?.name),
+    ...(structured.albums || []).map(item => item?.name),
+    ...(stats.topArtists || []).map(item => item?.name),
+    ...(stats.topAlbums || []).map(item => item?.name),
+    ...(stats.sampleTracks || []).flatMap(track => [track?.name, track?.album, ...(track?.artists || [])])
+  ];
+  return [...new Set(terms.map(term => String(term || '').trim()).filter(Boolean))];
+}
+
+function escapeRegExp(value) {
+  return String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
 function inferRuleSignals(tracks, playlists = []) {
