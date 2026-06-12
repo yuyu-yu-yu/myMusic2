@@ -19,6 +19,7 @@ import { publicAccountContext, resolveAccountContext } from './account-scope.mjs
 import { generateAiMusic } from './ai-music.mjs';
 import { cleanupDemoGuest, cleanupExpiredDemoGuests, getVisitorIdFromRequest, resolveRequestAccountContext } from './demo-guest.mjs';
 import { configWithEnvironment, resolveRequestEnvironment, resolveRequestEnvironmentContext } from './environment.mjs';
+import { initializeDemoRuntime } from './startup.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -163,6 +164,14 @@ function startLibrarySyncJob() {
 
   return getLibrarySyncStatus();
 }
+
+const startupState = initializeDemoRuntime({
+  db,
+  config,
+  cookieStatus: getCookieStatus(),
+  startLibrarySync: startLibrarySyncJob
+});
+console.log(`[startup] demo library ready; shared sync ${startupState.syncScheduled ? 'scheduled' : 'not scheduled'}`);
 
 const routes = {
   'GET /api/health': async () => ({ ok: true, config: tokenStatus(publicConfigStatus(config)) }),

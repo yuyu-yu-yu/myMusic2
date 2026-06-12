@@ -11,6 +11,7 @@ const api = require(apiPath);
 
 let _cookie = null;
 let _cookiePath = null;
+let _cookieSource = null;
 
 export function resolveCommunityApiFile(fileName) {
   const candidates = [
@@ -27,13 +28,28 @@ export function resolveCommunityApiFile(fileName) {
 }
 
 export function loadCookie(rootDir) {
-  const cookieFile = resolveCookieFile(rootDir);
-  if (existsSync(cookieFile)) {
-    _cookie = readFileSync(cookieFile, 'utf8').trim();
-    _cookiePath = cookieFile;
-    console.log('[community] loaded cookie (' + _cookie.length + ' chars)');
+  const environmentCookie = normalizeCookie(process.env.NETEASE_COOKIE);
+  if (environmentCookie) {
+    _cookie = environmentCookie;
+    _cookiePath = null;
+    _cookieSource = 'environment';
+    console.log('[community] loaded cookie from environment');
     return true;
   }
+
+  const cookieFile = resolveCookieFile(rootDir);
+  if (existsSync(cookieFile)) {
+    _cookie = normalizeCookie(readFileSync(cookieFile, 'utf8'));
+    _cookiePath = cookieFile;
+    _cookieSource = 'file';
+    if (_cookie) {
+      console.log('[community] loaded cookie from file');
+      return true;
+    }
+  }
+  _cookie = null;
+  _cookiePath = null;
+  _cookieSource = null;
   return false;
 }
 
@@ -49,7 +65,7 @@ export function getCookieStatus() {
   return {
     configured: true,
     hasCookie: Boolean(_cookie),
-    cookiePath: _cookiePath || null
+    source: _cookieSource
   };
 }
 
@@ -60,18 +76,22 @@ export function saveCookie(rootDir, cookie) {
   writeFileSync(cookieFile, normalized, 'utf8');
   _cookie = normalized;
   _cookiePath = cookieFile;
+  _cookieSource = 'file';
   return getCookieStatus();
 }
 
 export function clearCookie(rootDir) {
   const cookieFile = _cookiePath || resolveCookieFile(rootDir);
-  try {
-    if (existsSync(cookieFile)) rmSync(cookieFile, { force: true });
-  } catch {
-    // Clearing login should not crash the app if the file is already locked.
+  if (_cookieSource !== 'environment') {
+    try {
+      if (existsSync(cookieFile)) rmSync(cookieFile, { force: true });
+    } catch {
+      // Clearing login should not crash the app if the file is already locked.
+    }
   }
   _cookie = null;
-  _cookiePath = cookieFile;
+  _cookiePath = null;
+  _cookieSource = null;
   return getCookieStatus();
 }
 

@@ -1,6 +1,37 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
-import { normalizeSongComments } from '../server/community.mjs';
+import { clearCookie, getCookie, getCookieStatus, loadCookie, normalizeSongComments } from '../server/community.mjs';
+
+test('environment cookie takes precedence over the cookie file', (t) => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mymusic-cookie-'));
+  const cookieFile = path.join(rootDir, 'netease_cookie.txt');
+  const previousCookie = process.env.NETEASE_COOKIE;
+  const previousCookieFile = process.env.NETEASE_COOKIE_FILE;
+  fs.writeFileSync(cookieFile, 'cookie-from-file', 'utf8');
+  process.env.NETEASE_COOKIE = 'cookie-from-environment';
+  delete process.env.NETEASE_COOKIE_FILE;
+
+  t.after(() => {
+    clearCookie(rootDir);
+    if (previousCookie === undefined) delete process.env.NETEASE_COOKIE;
+    else process.env.NETEASE_COOKIE = previousCookie;
+    if (previousCookieFile === undefined) delete process.env.NETEASE_COOKIE_FILE;
+    else process.env.NETEASE_COOKIE_FILE = previousCookieFile;
+    fs.rmSync(rootDir, { recursive: true, force: true });
+  });
+
+  assert.equal(loadCookie(rootDir), true);
+  assert.equal(getCookie(), 'cookie-from-environment');
+  assert.deepEqual(getCookieStatus(), {
+    configured: true,
+    hasCookie: true,
+    source: 'environment'
+  });
+  assert.equal(fs.readFileSync(cookieFile, 'utf8'), 'cookie-from-file');
+});
 
 test('song comments normalize safe hot comments for danmaku', () => {
   const comments = normalizeSongComments({

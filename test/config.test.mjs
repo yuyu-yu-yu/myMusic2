@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { getConfig } from '../server/config.mjs';
+import { getConfig, publicConfigStatus } from '../server/config.mjs';
 
 const ENV_KEYS = [
   'DEMO_GUEST_MODE',
@@ -14,7 +14,10 @@ const ENV_KEYS = [
   'RECOMMENDATION_STRICT_STYLE',
   'RECOMMENDATION_PROMPT_ARTIST_LIMIT',
   'RECOMMENDATION_ARTIST_DENSITY_WINDOW',
-  'RECOMMENDATION_ARTIST_DENSITY_MAX'
+  'RECOMMENDATION_ARTIST_DENSITY_MAX',
+  'LLM_BASE_URL',
+  'LLM_API_KEY',
+  'LLM_MODEL'
 ];
 
 function withEnv(values, fn) {
@@ -79,5 +82,17 @@ test('recommendation discovery env values are parsed', () => {
     assert.equal(config.recommendation.promptArtistLimit, 4);
     assert.equal(config.recommendation.artistDensityWindow, 7);
     assert.equal(config.recommendation.artistDensityMax, 2);
+  });
+});
+
+test('public config status exposes capability flags without provider secrets', () => {
+  withEnv({
+    LLM_BASE_URL: 'https://llm.example.test',
+    LLM_API_KEY: 'private-test-key',
+    LLM_MODEL: 'private-test-model'
+  }, () => {
+    const serialized = JSON.stringify(publicConfigStatus(getConfig()));
+    assert.match(serialized, /\"configured\":true/);
+    assert.doesNotMatch(serialized, /private-test-key|https:\/\/llm\.example\.test/);
   });
 });

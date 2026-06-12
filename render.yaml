@@ -1,0 +1,62 @@
+services:
+  - type: web
+    name: cancan-radio
+    runtime: docker
+    plan: free
+    region: singapore
+    branch: main
+    autoDeployTrigger: commit
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: HOST
+        value: 0.0.0.0
+      - key: COMMUNITY_API_PORT
+        value: 4000
+      - key: APP_TIME_ZONE
+        value: Asia/Shanghai
+      - key: DEMO_GUEST_MODE
+        value: true
+      - key: DEMO_GUEST_TTL_HOURS
+        value: 24
+      - key: REQUIRE_BROWSER_PLAY_URL
+        value: true
+      - key: IP_GEO_PROVIDER
+        value: ip-api
+      - key: IP_GEO_TIMEOUT_MS
+        value: 2500
+      - key: IP_GEO_CACHE_MS
+        value: 600000
+      - key: WEATHER_PROVIDER
+        value: openmeteo
+      - key: WEATHER_CITY
+        value: Shanghai
+      - key: WEATHER_COUNTRY_CODE
+        value: CN
+      - key: WEATHER_TIME_ZONE
+        value: Asia/Shanghai
+      - key: RECOMMENDATION_PIPELINE
+        value: hybrid
+      - key: RECOMMENDATION_DISCOVERY_RATIO
+        value: 0.5
+      - key: RECOMMENDATION_DISCOVERY_TIMEOUT_MS
+        value: 1200
+      - key: RECOMMENDATION_DISCOVERY_CACHE_TTL_MS
+        value: 1800000
+      - key: RECOMMENDATION_STYLE_SEARCH_TIMEOUT_MS
+        value: 1500
+      - key: RECOMMENDATION_STYLE_SEARCH_LIMIT
+        value: 30
+      - key: RECOMMENDATION_STRICT_STYLE
+        value: true
+      - key: NETEASE_COOKIE
+        sync: false
+      - key: LLM_BASE_URL
+        sync: false
+      - key: LLM_API_KEY
+        sync: false
+      - key: LLM_MODEL
+        sync: false
