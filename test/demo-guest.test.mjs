@@ -17,8 +17,8 @@ import {
   setAccountSetting,
   setSetting
 } from '../server/db.mjs';
-import { cleanupDemoGuest, cleanupExpiredDemoGuests, resolveRequestAccountContext } from '../server/demo-guest.mjs';
-import { getLibrary } from '../server/library.mjs';
+import { cleanupDemoGuest, cleanupExpiredDemoGuests, DemoVisitorIdError, resolveRequestAccountContext } from '../server/demo-guest.mjs';
+import { getLibrary, getProfile, updateProfile } from '../server/library.mjs';
 import { getPreferences, submitFeedback, updatePreferences } from '../server/radio.mjs';
 
 function testDb(t) {
@@ -68,6 +68,15 @@ function seedDemoAccount(db) {
     INSERT INTO account_music_profiles (account_id, summary, tags_json, profile_json, updated_at)
     VALUES (?, ?, ?, ?, ?)
   `).run(baseAccountId, 'Base music profile', JSON.stringify(['demo']), JSON.stringify({ source: 'test' }), new Date().toISOString());
+  db.prepare(`
+    INSERT INTO music_profile (id, summary, tags_json, profile_json, updated_at)
+    VALUES (1, ?, ?, ?, ?)
+    ON CONFLICT(id) DO UPDATE SET
+      summary = excluded.summary,
+      tags_json = excluded.tags_json,
+      profile_json = excluded.profile_json,
+      updated_at = excluded.updated_at
+  `).run('Base music profile', JSON.stringify(['demo']), JSON.stringify({ source: 'test' }), new Date().toISOString());
 
   return { baseAccountId, playlistId: playlist.id, trackId: track.id };
 }
@@ -92,6 +101,7 @@ test('demo guest accounts isolate preferences, memories, and feedback while shar
   assert.equal(getAccountSetting(db, guestA.accountId, 'library_synced_user_id'), 'base-user');
   assert.equal(listUserMemories(db, { accountId: guestA.accountId }).length, 0);
   assert.equal(getPreferences({ db, accountContext: guestA }).feedbackSummary.totals.likes, 0);
+  assert.equal(getPreferences({ db, accountContext: guestA }).preferences.note, '');
 
   updatePreferences({ db, accountContext: guestA, payload: { note: 'A note', moodMode: 'focus' } });
   submitFeedback({ db, accountContext: guestA, payload: { trackId: seeded.trackId, eventType: 'like', sessionId: 'a-session' } });
@@ -103,7 +113,7 @@ test('demo guest accounts isolate preferences, memories, and feedback while shar
   });
 
   assert.equal(getPreferences({ db, accountContext: guestA }).preferences.note, 'A note');
-  assert.equal(getPreferences({ db, accountContext: guestB }).preferences.note, 'base note');
+  assert.equal(getPreferences({ db, accountContext: guestB }).preferences.note, '');
   assert.equal(getPreferences({ db, accountContext: guestA }).feedbackSummary.totals.likes, 1);
   assert.equal(getPreferences({ db, accountContext: guestB }).feedbackSummary.totals.likes, 0);
   assert.equal(getMoodStats(db, { accountId: guestA.accountId }).total, 1);
@@ -118,7 +128,36 @@ test('demo guest accounts isolate preferences, memories, and feedback while shar
   assert.equal(cleanup.ok, true);
   assert.equal(getMoodStats(db, { accountId: guestA.accountId }).total, 0);
   assert.equal(getAccountSetting(db, seeded.baseAccountId, 'library_synced_user_id'), 'base-user');
-  assert.equal(getPreferences({ db, accountContext: guestB }).preferences.note, 'base note');
+  assert.equal(getPreferences({ db, accountContext: guestB }).preferences.note, '');
+});
+
+test('demo mode rejects missing or invalid visitor ids instead of using the base account', (t) => {
+  const db = testDb(t);
+  const seeded = seedDemoAccount(db);
+  const config = { demo: { guestMode: true } };
+
+  assert.throws(
+    () => resolveRequestAccountContext(db, config, requestFor('')),
+    (error) => error instanceof DemoVisitorIdError && error.status === 400
+  );
+  assert.throws(
+    () => resolveRequestAccountContext(db, config, requestFor('bad')),
+    (error) => error instanceof DemoVisitorIdError && error.status === 400
+  );
+  assert.equal(getAccountSetting(db, seeded.baseAccountId, 'user_preferences'), JSON.stringify({ note: 'base note', voiceMode: 'recommendations' }));
+});
+
+test('guest portrait updates do not overwrite the shared demo portrait', async (t) => {
+  const db = testDb(t);
+  const seeded = seedDemoAccount(db);
+  const config = { demo: { guestMode: true } };
+  const guest = resolveRequestAccountContext(db, config, requestFor('portrait-visitor-1234'));
+
+  await updateProfile(db, {}, { force: true, accountContext: guest });
+
+  assert.equal(getProfile(db, guest).structured.trackCount, 1);
+  assert.equal(getProfile(db, { accountId: seeded.baseAccountId, source: 'cookie' }).summary, 'Base music profile');
+  assert.equal(db.prepare('SELECT summary FROM music_profile WHERE id = 1').get().summary, 'Base music profile');
 });
 
 test('expired demo guest cleanup only deletes demo guest scoped data', (t) => {
@@ -133,4 +172,20 @@ test('expired demo guest cleanup only deletes demo guest scoped data', (t) => {
   assert.equal(result.accounts, 1);
   assert.equal(getAccountSetting(db, guest.accountId, 'user_preferences'), null);
   assert.equal(getAccountSetting(db, seeded.baseAccountId, 'library_synced_user_id'), 'base-user');
+});
+
+test('30-day cleanup removes stale guests and keeps active guests', (t) => {
+  const db = testDb(t);
+  seedDemoAccount(db);
+  const config = { demo: { guestMode: true } };
+  const stale = resolveRequestAccountContext(db, config, requestFor('stale-device-1234'));
+  const active = resolveRequestAccountContext(db, config, requestFor('active-device-1234'));
+  setAccountSetting(db, stale.accountId, 'demo_guest_last_seen', new Date(Date.now() - 31 * 24 * 60 * 60 * 1000).toISOString());
+  setAccountSetting(db, active.accountId, 'demo_guest_last_seen', new Date(Date.now() - 29 * 24 * 60 * 60 * 1000).toISOString());
+
+  const result = cleanupExpiredDemoGuests(db, 720);
+
+  assert.equal(result.accounts, 1);
+  assert.equal(getAccountSetting(db, stale.accountId, 'demo_guest_seeded_at'), null);
+  assert.notEqual(getAccountSetting(db, active.accountId, 'demo_guest_seeded_at'), null);
 });

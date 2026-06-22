@@ -21,7 +21,7 @@ services:
       - key: DEMO_GUEST_MODE
         value: true
       - key: DEMO_GUEST_TTL_HOURS
-        value: 24
+        value: 720
       - key: REQUIRE_BROWSER_PLAY_URL
         value: true
       - key: IP_GEO_PROVIDER

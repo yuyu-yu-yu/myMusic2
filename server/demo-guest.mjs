@@ -4,17 +4,25 @@ import { getAccountSetting, getSetting, normalizeAccountId, nowIso, setAccountSe
 export const DEMO_GUEST_PREFIX = 'demo:guest:';
 
 const COPY_SETTING_KEYS = [
-  'user_preferences',
   'profile_excluded_playlist_ids',
   'library_synced_user_id',
   'library_synced_playlist_ids'
 ];
 
+export class DemoVisitorIdError extends Error {
+  constructor(message = 'A valid X-Demo-Visitor-Id header is required in demo mode.') {
+    super(message);
+    this.name = 'DemoVisitorIdError';
+    this.status = 400;
+    this.code = 'demo_visitor_id_required';
+  }
+}
+
 export function resolveRequestAccountContext(db, config, req) {
   const baseAccount = resolveAccountContext(db);
   if (!config?.demo?.guestMode) return baseAccount;
   const visitorId = getVisitorIdFromRequest(req);
-  if (!visitorId) return baseAccount;
+  if (!visitorId) throw new DemoVisitorIdError();
   return ensureDemoGuestAccount(db, visitorId, baseAccount);
 }
 
@@ -26,7 +34,7 @@ export function getVisitorIdFromRequest(req, body = null) {
 
 export function ensureDemoGuestAccount(db, visitorId, baseAccount = resolveAccountContext(db)) {
   const normalizedVisitorId = normalizeVisitorId(visitorId);
-  if (!normalizedVisitorId) return baseAccount;
+  if (!normalizedVisitorId) throw new DemoVisitorIdError();
   const base = normalizeAccountContext(baseAccount);
   const accountId = normalizeAccountId(`${DEMO_GUEST_PREFIX}${normalizedVisitorId}`);
   const existingSeededAt = getAccountSetting(db, accountId, 'demo_guest_seeded_at');
@@ -48,8 +56,8 @@ export function cleanupDemoGuest(db, visitorId) {
   return deleteGuestAccountData(db, `${DEMO_GUEST_PREFIX}${normalizedVisitorId}`);
 }
 
-export function cleanupExpiredDemoGuests(db, ttlHours = 24) {
-  const cutoff = new Date(Date.now() - Math.max(1, Number(ttlHours) || 24) * 60 * 60 * 1000).toISOString();
+export function cleanupExpiredDemoGuests(db, ttlHours = 720) {
+  const cutoff = new Date(Date.now() - Math.max(1, Number(ttlHours) || 720) * 60 * 60 * 1000).toISOString();
   const rows = db.prepare(`
     SELECT account_id AS accountId
     FROM account_settings

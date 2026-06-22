@@ -36,7 +36,7 @@ export function getConfig() {
     },
     demo: {
       guestMode: parseBoolean(env.DEMO_GUEST_MODE) && !localDevUnlockDemo,
-      guestTtlHours: Math.max(1, Number(env.DEMO_GUEST_TTL_HOURS || 24) || 24),
+      guestTtlHours: Math.max(1, Number(env.DEMO_GUEST_TTL_HOURS || 720) || 720),
       localDevUnlock: localDevUnlockDemo
     },
     playback: {
@@ -226,7 +226,7 @@ export function publicConfigStatus(config) {
     },
     demo: {
       guestMode: Boolean(config.demo?.guestMode),
-      guestTtlHours: config.demo?.guestTtlHours || 24,
+      guestTtlHours: config.demo?.guestTtlHours || 720,
       localDevUnlock: Boolean(config.demo?.localDevUnlock)
     },
     playback: {

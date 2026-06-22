@@ -4214,6 +4214,13 @@ button.small {
   margin: 0;
 }
 
+.danger-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
 .memory-list {
   display: grid;
   gap: 12px;

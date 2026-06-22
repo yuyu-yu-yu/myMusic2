@@ -186,7 +186,15 @@ const routes = {
   }),
   'POST /api/demo/guest/close': async (req) => {
     const body = await readJson(req);
-    return cleanupDemoGuest(db, getVisitorIdFromRequest(req, body));
+    const visitorId = getVisitorIdFromRequest(req, body);
+    if (!visitorId) return jsonError('A valid X-Demo-Visitor-Id header is required.', 400);
+    return cleanupDemoGuest(db, visitorId);
+  },
+  'POST /api/demo/guest/reset': async (req) => {
+    const body = await readJson(req);
+    const visitorId = getVisitorIdFromRequest(req, body);
+    if (!visitorId) return jsonError('A valid X-Demo-Visitor-Id header is required.', 400);
+    return { ...cleanupDemoGuest(db, visitorId), reset: true };
   },
   'POST /api/diagnostics/self-check': async (req) => {
     const body = await readJson(req);
@@ -697,8 +705,9 @@ const server = http.createServer(async (req, res) => {
     }
     return serveStatic(req, res);
   } catch (error) {
-    console.error(error);
-    return sendJson(res, { ok: false, error: error.message }, 500);
+    const status = Number(error?.status || error?.statusCode || 500);
+    if (status >= 500) console.error(error);
+    return sendJson(res, { ok: false, error: error.message, code: error?.code || undefined }, status);
   }
 });
 

@@ -6,11 +6,9 @@ import {
   getPreviousPlaybackItem,
   movePlaybackCursor
 } from './playback-sequence.js';
+import { ensureDemoDeviceId, rotateDemoDeviceId } from './device-identity.js';
 
 const AI_MUSIC_MODE_STORAGE_KEY = 'mymusic:aiMusicMode';
-const DEMO_VISITOR_STORAGE_KEY = 'mymusic:demoVisitorId';
-
-let fallbackDemoVisitorId = null;
 
 const state = {
   sessionId: null,
@@ -85,22 +83,7 @@ const danmakuState = {
 };
 
 function ensureDemoVisitorId() {
-  try {
-    let id = sessionStorage.getItem(DEMO_VISITOR_STORAGE_KEY);
-    if (!id) {
-      id = createDemoVisitorId();
-      sessionStorage.setItem(DEMO_VISITOR_STORAGE_KEY, id);
-    }
-    return id;
-  } catch {
-    fallbackDemoVisitorId ||= createDemoVisitorId();
-    return fallbackDemoVisitorId;
-  }
-}
-
-function createDemoVisitorId() {
-  if (globalThis.crypto?.randomUUID) return globalThis.crypto.randomUUID();
-  return `web-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return ensureDemoDeviceId();
 }
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
@@ -4569,9 +4552,12 @@ async function renderSettings() {
           <p class="eyebrow">Danger Zone</p>
           <h2>危险操作</h2>
         </div>
-        <button id="clear-memories-btn" class="ghost danger" ${memories.length ? '' : 'disabled'}>清空全部</button>
+        <div class="danger-actions">
+          <button id="clear-memories-btn" class="ghost danger" ${memories.length ? '' : 'disabled'}>清空记忆</button>
+          ${demoGuestMode ? '<button id="reset-device-data-btn" class="ghost danger">重置本设备数据</button>' : ''}
+        </div>
       </div>
-      <p class="muted">长期记忆会影响灿灿后续聊天和推荐。当前共有 ${memories.length} 条；清空后不会删除聊天记录或曲库。</p>
+      <p class="muted">长期记忆共有 ${memories.length} 条。重置本设备会删除当前浏览器的聊天、历史、偏好、画像、记忆和日记，但不会影响共享曲库、网易云账号或其他访客。</p>
     </section>
     <section class="page-panel developer-login-panel">
       <details class="openapi-login-advanced">
@@ -4621,6 +4607,12 @@ async function renderSettings() {
     if (!confirm('清空灿灿的全部长期记忆？聊天历史不会被删除。')) return;
     await api('/api/memories', { method: 'DELETE' });
     renderSettings();
+  });
+  document.querySelector('#reset-device-data-btn')?.addEventListener('click', async () => {
+    if (!confirm('重置本设备的全部数据？这会删除当前浏览器的聊天、历史、偏好、画像、记忆和日记，且无法恢复。')) return;
+    await api('/api/demo/guest/reset', { method: 'POST', body: {} });
+    rotateDemoDeviceId();
+    location.reload();
   });
 }
 

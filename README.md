@@ -32,14 +32,14 @@ For the Tencent Cloud shared-account demo deployment, see:
 docs/deploy-tencent-cloud.md
 ```
 
-The cloud demo can run with one dedicated NetEase demo account while giving each visitor an isolated temporary sandbox:
+The cloud demo can run with one dedicated NetEase demo account while giving each browser profile an isolated anonymous sandbox:
 
 ```dotenv
 DEMO_GUEST_MODE=true
-DEMO_GUEST_TTL_HOURS=24
+DEMO_GUEST_TTL_HOURS=720
 ```
 
-When enabled, each browser tab session sends `X-Demo-Visitor-Id`; visitor chat, memories, feedback, preferences, plays, and diaries do not affect other visitors or the shared demo account.
+When enabled, each browser profile stores a long-lived anonymous device id in `localStorage` and sends it as `X-Demo-Visitor-Id`. Tabs in the same browser profile share one sandbox, while chat, memories, feedback, preferences, plays, portraits, and diaries remain isolated from other visitors and the shared demo account. Inactive sandboxes are removed after 30 days by default.
 
 ## TTS and Weather
 

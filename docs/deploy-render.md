@@ -35,6 +35,8 @@ MiniMax music generation and Volcengine TTS are optional. Add their secret varia
 
 Every instance starts with the built-in Demo library, so the page and basic radio flow remain available without provider credentials. When demo guest mode is enabled and `NETEASE_COOKIE` exists, the server starts a background library sync. Invalid credentials or a failed sync do not fail the health check or remove the Demo fallback.
 
+Each browser profile receives a persistent anonymous device id. Visitors share the demo account's NetEase library and initial music portrait, while chat, playback history, preferences, feedback, memories, diaries, schedules, and later portrait changes stay inside that device sandbox. Set `DEMO_GUEST_TTL_HOURS=720` to clean up devices after 30 inactive days.
+
 Render Free web services sleep after 15 minutes without inbound traffic. A later request can take about one minute to wake the service. The local SQLite database, generated audio, login cache, visitor chat, preferences, memories, and diaries can be lost whenever the instance sleeps, restarts, or redeploys.
 
 ## Verification

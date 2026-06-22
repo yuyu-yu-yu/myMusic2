@@ -460,6 +460,7 @@ function saveMusicProfile(db, accountContext, summary, tags, structured) {
       profile_json = excluded.profile_json,
       updated_at = excluded.updated_at
   `).run(account.accountId, summary, tagsJson, profileJson, updatedAt);
+  if (account.source === 'guest') return;
   db.prepare(`
     INSERT INTO music_profile (id, summary, tags_json, profile_json, updated_at)
     VALUES (1, ?, ?, ?, ?)

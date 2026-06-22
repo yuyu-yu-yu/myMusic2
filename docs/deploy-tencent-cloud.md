@@ -62,7 +62,7 @@ For the judging demo, keep the dedicated NetEase demo account logged in and enab
 
 ```dotenv
 DEMO_GUEST_MODE=true
-DEMO_GUEST_TTL_HOURS=24
+DEMO_GUEST_TTL_HOURS=720
 REQUIRE_BROWSER_PLAY_URL=true
 IP_GEO_PROVIDER=ip-api
 WEATHER_PROVIDER=openmeteo
@@ -70,7 +70,7 @@ WEATHER_CITY=Shanghai
 WEATHER_COUNTRY_CODE=CN
 ```
 
-In guest mode, visitors share the demo account's NetEase cookie, library, and initial music profile, but their chat, feedback, preferences, memories, radio sessions, plays, and diaries are written into separate `demo:guest:*` scopes. The web UI sends a temporary `X-Demo-Visitor-Id` per browser tab session. Stale visitor data is cleaned by TTL.
+In guest mode, visitors share the demo account's NetEase cookie, library, and initial music profile, but their chat, feedback, preferences, memories, radio sessions, plays, portraits, and diaries are written into separate `demo:guest:*` scopes. The web UI stores a persistent anonymous id per browser profile and sends it as `X-Demo-Visitor-Id`; tabs in the same browser share one sandbox. Stale visitor data is cleaned after 30 inactive days by default.
 
 `TTS_PROVIDER` can stay empty so browsers use speech synthesis fallback, or you can configure Volcengine TTS for the same voice as local. You can also leave NetEase OpenAPI values empty and scan the NetEase cookie login QR code once from the web UI before turning on guest mode.
 

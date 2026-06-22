@@ -247,6 +247,7 @@ export function getUserPrefs(db, accountContext = null) {
   const account = getRequestAccount(db, accountContext);
   try {
     const scoped = getAccountSetting(db, account.accountId, 'user_preferences');
+    if (account.source === 'guest') return scoped ? JSON.parse(scoped) : {};
     const raw = scoped ?? getSetting(db, 'user_preferences');
     return raw ? JSON.parse(raw) : {};
   } catch { return {}; }
