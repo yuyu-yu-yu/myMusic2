@@ -219,7 +219,10 @@ export async function syncLibrary(db, netease, options = {}) {
   result.tracks = countLibraryTracks(db, accountContext);
   progress({ phase: 'updating_profile', syncedTracks: result.tracks, syncedPlaylists: result.syncedPlaylists });
   await updateProfile(db, llmConfig, { accountContext });
-  if (result.user.userId) setAccountSetting(db, accountContext.accountId, LIBRARY_SYNCED_USER_ID_KEY, result.user.userId);
+  if (result.user.userId) {
+    setAccountSetting(db, accountContext.accountId, LIBRARY_SYNCED_USER_ID_KEY, result.user.userId);
+    if (accountContext.source !== 'guest') setSetting(db, LIBRARY_SYNCED_USER_ID_KEY, result.user.userId);
+  }
   progress({ phase: 'done', syncedTracks: result.tracks, syncedPlaylists: result.syncedPlaylists });
   return result;
 }
@@ -636,7 +639,9 @@ function getCurrentLibraryAccount(db, accountContext = null) {
 function setActiveLibraryPlaylistIds(db, playlistIds = [], accountContext = null) {
   const account = getLibraryAccountContext(db, accountContext);
   const ids = normalizeIdList(playlistIds);
-  setAccountSetting(db, account.accountId, LIBRARY_SYNCED_PLAYLIST_IDS_KEY, JSON.stringify(ids));
+  const serialized = JSON.stringify(ids);
+  setAccountSetting(db, account.accountId, LIBRARY_SYNCED_PLAYLIST_IDS_KEY, serialized);
+  if (account.source !== 'guest') setSetting(db, LIBRARY_SYNCED_PLAYLIST_IDS_KEY, serialized);
 }
 
 function getActiveLibraryPlaylistIds(db, accountContext = null) {

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { linkPlaylistTrack, openDatabase, savePlaylist, saveTrack, setSetting } from '../server/db.mjs';
+import { getSetting, linkPlaylistTrack, openDatabase, savePlaylist, saveTrack, setSetting } from '../server/db.mjs';
 import { getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from '../server/library.mjs';
 
 function testDb(t) {
@@ -176,6 +176,8 @@ test('library sync paginates all playlists and replaces stale playlist links', a
   assert.equal(library.playlists.find(playlist => playlist.id === 'pl-extra-29').syncedTrackCount, 1);
   assert.equal(db.prepare('SELECT COUNT(*) AS count FROM playlist_tracks WHERE playlist_id = ? AND track_id = ?').get('pl-big', staleTrack.id).count, 0);
   assert.deepEqual(calls.filter(call => call.playlistId === 'pl-big').map(call => call.offset), [0, 200, 400]);
+  assert.equal(getSetting(db, 'library_synced_user_id'), 'user-1');
+  assert.deepEqual(JSON.parse(getSetting(db, 'library_synced_playlist_ids')), playlists.map(playlist => playlist.id));
 });
 
 test('sync clears previous playlist links before rebuilding current account snapshot', async (t) => {
