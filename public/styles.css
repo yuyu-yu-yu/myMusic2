@@ -1765,6 +1765,16 @@ button.danger:hover {
 
 .avatar-video {
   animation: none;
+  z-index: 0;
+  opacity: 0;
+}
+
+.avatar-video.is-active {
+  opacity: 1;
+}
+
+.avatar-video.is-pending {
+  opacity: 0;
 }
 
 .avatar-transition-frame {

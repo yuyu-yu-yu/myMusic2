@@ -100,6 +100,7 @@ let avatarFrameSequenceToken = 0;
 let avatarVideoToken = 0;
 let avatarTransitionToken = 0;
 let avatarTransitionTimer = null;
+let avatarPreloadScheduled = false;
 let preferencesLoadPromise = null;
 const VISUALIZER_DEBUG = false;
 const visualizerReducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)');
@@ -159,7 +160,7 @@ const avatarFrameSequences = {
   happy: makeAvatarFrameSequence('happy', [160, 160, 170, 180, 180, 170, 160, 220], { sprite: false })
 };
 
-const AVATAR_VIDEO_VERSION = '2';
+const AVATAR_VIDEO_VERSION = '3';
 const avatarMotionMap = {
   idle: `/avatar/webm/idle.webm?v=${AVATAR_VIDEO_VERSION}`,
   listening: `/avatar/webm/listening.webm?v=${AVATAR_VIDEO_VERSION}`,
@@ -758,6 +759,79 @@ function stopAvatarFrameSequence() {
   }
 }
 
+function getAvatarVideos(root) {
+  return Array.from(root?.querySelectorAll?.('.avatar-video') || []);
+}
+
+function getActiveAvatarVideo(root) {
+  return getAvatarVideos(root).find((video) => video.classList.contains('is-active') && !video.hidden)
+    || getAvatarVideos(root).find((video) => !video.hidden)
+    || null;
+}
+
+function getStandbyAvatarVideo(root) {
+  const videos = getAvatarVideos(root);
+  const activeVideo = getActiveAvatarVideo(root);
+  return videos.find((video) => video !== activeVideo) || videos[0] || null;
+}
+
+function cancelAvatarVideoFrameCallback(video) {
+  if (!video?.__avatarFrameCallbackId) return;
+  video.cancelVideoFrameCallback?.(video.__avatarFrameCallbackId);
+  video.__avatarFrameCallbackId = null;
+}
+
+function clearAvatarVideoHandlers(video) {
+  if (!video) return;
+  cancelAvatarVideoFrameCallback(video);
+  video.onerror = null;
+  video.onloadeddata = null;
+  video.onended = null;
+}
+
+function waitForAvatarVideoFrame(video, callback) {
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    cancelAvatarVideoFrameCallback(video);
+    callback();
+  };
+  if (typeof video.requestVideoFrameCallback === 'function') {
+    video.__avatarFrameCallbackId = video.requestVideoFrameCallback(finish);
+  } else {
+    requestAnimationFrame(finish);
+  }
+  setTimeout(finish, 220);
+}
+
+function setDisplayedAvatarState(root, displayedState) {
+  root.dataset.state = displayedState;
+  delete root.dataset.pendingState;
+  const status = root.querySelector('.avatar-status');
+  if (status) status.textContent = avatarStateLabels[displayedState] || 'IDLE';
+}
+
+function scheduleAvatarRestore(options = {}) {
+  if (!options.temporaryMs) return;
+  if (avatarRestoreTimer) clearTimeout(avatarRestoreTimer);
+  const restoreState = options.restoreState || getContextualAvatarState();
+  avatarRestoreTimer = setTimeout(() => {
+    avatarRestoreTimer = null;
+    setAvatarState(restoreState);
+  }, options.temporaryMs);
+}
+
+function hideAvatarVideos(root, except = null) {
+  getAvatarVideos(root).forEach((video) => {
+    if (video === except) return;
+    clearAvatarVideoHandlers(video);
+    video.pause();
+    video.hidden = true;
+    video.classList.remove('is-active', 'is-pending');
+  });
+}
+
 function captureAvatarTransitionFrame(root, video, image) {
   const canvas = root.querySelector('#avatar-transition-frame');
   const source = video && !video.hidden && video.readyState >= 2
@@ -823,45 +897,47 @@ function finishAvatarTransition(root, token) {
   }, AVATAR_TRANSITION_MS);
 }
 
-function revealAvatarVideo(root, video, image, transitionToken) {
+function revealAvatarVideo(root, video, image, displayedState, requestToken, options = {}) {
+  if (requestToken !== avatarVideoToken) return;
+  const previousVideo = getActiveAvatarVideo(root);
+  const transitionToken = beginAvatarTransition(root, previousVideo, image);
+
+  hideAvatarVideos(root, video);
   root.classList.remove('is-fallback');
+  root.classList.remove('is-frame-sequence', 'is-sprite-sequence');
+  video.classList.remove('is-pending');
+  video.classList.add('is-active');
   video.hidden = false;
   if (image) image.hidden = true;
-  let finished = false;
-  const finish = () => {
-    if (finished) return;
-    finished = true;
-    finishAvatarTransition(root, transitionToken);
-  };
-  if (typeof video.requestVideoFrameCallback === 'function') {
-    video.requestVideoFrameCallback(finish);
-  } else {
-    requestAnimationFrame(finish);
-  }
-  setTimeout(finish, 180);
+  setDisplayedAvatarState(root, displayedState);
+  finishAvatarTransition(root, transitionToken);
+  scheduleAvatarRestore(options);
 }
 
 function restartAvatarVideo(root, video, image, requestToken) {
   if (requestToken !== avatarVideoToken) return;
   const transitionToken = beginAvatarTransition(root, video, image);
   video.currentTime = 0;
-  requestAnimationFrame(() => finishAvatarTransition(root, transitionToken));
   video.play().then(() => {
     if (requestToken !== avatarVideoToken) return;
     root.classList.remove('is-fallback');
     video.hidden = false;
     if (image) image.hidden = true;
+    waitForAvatarVideoFrame(video, () => {
+      if (requestToken !== avatarVideoToken) return;
+      finishAvatarTransition(root, transitionToken);
+    });
   }).catch(() => finishAvatarTransition(root, transitionToken));
 }
 
 function playAvatarVideoOrFallback(
   root,
-  video,
   image,
   src,
   sequence = null,
   requestToken = avatarVideoToken,
-  transitionToken = null
+  displayedState = 'idle',
+  options = {}
 ) {
   root.classList.remove('is-frame-sequence');
   root.classList.remove('is-sprite-sequence');
@@ -870,50 +946,63 @@ function playAvatarVideoOrFallback(
   if (image) image.src = '/avatar/source/cancan-first-frame.png';
 
   const showSourceFallback = () => {
+    if (requestToken !== avatarVideoToken) return;
     root.classList.add('is-fallback');
-    if (video) {
-      video.pause();
-      video.hidden = true;
-      video.onerror = null;
-      video.onloadeddata = null;
-      video.onended = null;
-    }
+    hideAvatarVideos(root);
     if (image) image.hidden = false;
-    finishAvatarTransition(root, transitionToken);
+    setDisplayedAvatarState(root, displayedState);
+    scheduleAvatarRestore(options);
   };
 
   const showSequenceFallback = () => {
     if (requestToken !== avatarVideoToken) return;
     if (sequence?.frames?.length) {
-      playAvatarFrameSequence(root, video, image, sequence, '');
-      finishAvatarTransition(root, transitionToken);
+      playAvatarFrameSequence(root, image, sequence, '', displayedState, options);
     } else {
       showSourceFallback();
     }
   };
 
+  const activeVideo = getActiveAvatarVideo(root);
+  if (activeVideo?.getAttribute('src') === src && activeVideo.readyState >= 2) {
+    hideAvatarVideos(root, activeVideo);
+    clearAvatarVideoHandlers(activeVideo);
+    activeVideo.onended = () => restartAvatarVideo(root, activeVideo, image, requestToken);
+    activeVideo.play().catch(showSequenceFallback);
+    setDisplayedAvatarState(root, displayedState);
+    scheduleAvatarRestore(options);
+    return;
+  }
+
+  const video = getStandbyAvatarVideo(root);
   if (!video || !src) {
     showSourceFallback();
     return;
   }
 
+  clearAvatarVideoHandlers(video);
+  video.pause();
+  video.hidden = true;
+  video.classList.remove('is-active', 'is-pending');
   video.onerror = () => {
     showSequenceFallback();
   };
   video.onloadeddata = () => {
     if (requestToken !== avatarVideoToken) return;
+    video.currentTime = 0;
+    video.hidden = false;
+    video.classList.add('is-pending');
     video.play().then(() => {
       if (requestToken !== avatarVideoToken) return;
-      revealAvatarVideo(root, video, image, transitionToken);
+      waitForAvatarVideoFrame(video, () => {
+        revealAvatarVideo(root, video, image, displayedState, requestToken, options);
+      });
     }).catch(showSequenceFallback);
   };
   video.loop = false;
   video.onended = () => restartAvatarVideo(root, video, image, requestToken);
 
   if (video.getAttribute('src') !== src) {
-    video.hidden = true;
-    if (image) image.hidden = false;
-    root.classList.add('is-fallback');
     video.src = src;
     video.load();
   } else if (video.readyState >= 2) {
@@ -941,9 +1030,9 @@ function ensureAvatarSprite(root) {
   return { sprite, strip };
 }
 
-function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
+function playAvatarFrameSequence(root, image, sequence, fallbackSrc, displayedState = 'idle', options = {}) {
   if (!image || !sequence?.frames?.length) {
-    playAvatarVideoOrFallback(root, video, image, fallbackSrc);
+    playAvatarVideoOrFallback(root, image, fallbackSrc, null, avatarVideoToken, displayedState, options);
     return;
   }
 
@@ -952,7 +1041,7 @@ function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
   let index = 0;
 
   if (!sequence.spriteSrc) {
-    playAvatarImageFrameSequence(root, video, image, sequence, fallbackSrc, token);
+    playAvatarImageFrameSequence(root, image, sequence, fallbackSrc, token, displayedState, options);
     return;
   }
 
@@ -969,15 +1058,11 @@ function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
   root.classList.remove('is-fallback');
   root.classList.add('is-frame-sequence');
   root.classList.add('is-sprite-sequence');
-  if (video) {
-    video.pause();
-    video.hidden = true;
-    video.onerror = null;
-    video.onloadeddata = null;
-    video.onended = null;
-  }
+  hideAvatarVideos(root);
   image.hidden = true;
   sprite.hidden = false;
+  setDisplayedAvatarState(root, displayedState);
+  scheduleAvatarRestore(options);
   strip.style.width = `${sequence.frames.length * 100}%`;
   strip.style.transform = 'translate3d(0, 0, 0)';
 
@@ -986,7 +1071,7 @@ function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
     root.classList.remove('is-sprite-sequence');
     sprite.hidden = true;
     image.hidden = false;
-    playAvatarImageFrameSequence(root, video, image, sequence, fallbackSrc, token);
+    playAvatarImageFrameSequence(root, image, sequence, fallbackSrc, token, displayedState, options);
   };
   strip.onload = () => {
     if (token !== avatarFrameSequenceToken) return;
@@ -1000,27 +1085,31 @@ function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
   }
 }
 
-function playAvatarImageFrameSequence(root, video, image, sequence, fallbackSrc, token) {
+function playAvatarImageFrameSequence(
+  root,
+  image,
+  sequence,
+  fallbackSrc,
+  token,
+  displayedState = 'idle',
+  options = {}
+) {
   root.classList.remove('is-fallback');
   root.classList.remove('is-sprite-sequence');
   root.classList.add('is-frame-sequence');
 
   const sprite = root.querySelector('#avatar-sprite');
   if (sprite) sprite.hidden = true;
-  if (video) {
-    video.pause();
-    video.hidden = true;
-    video.onerror = null;
-    video.onloadeddata = null;
-    video.onended = null;
-  }
+  hideAvatarVideos(root);
   image.hidden = false;
+  setDisplayedAvatarState(root, displayedState);
+  scheduleAvatarRestore(options);
 
   let index = 0;
   image.onerror = () => {
     if (token !== avatarFrameSequenceToken) return;
     stopAvatarFrameSequence();
-    playAvatarVideoOrFallback(root, video, image, fallbackSrc);
+    playAvatarVideoOrFallback(root, image, fallbackSrc, null, avatarVideoToken, displayedState, options);
   };
   const showFrame = () => {
     if (token !== avatarFrameSequenceToken) return;
@@ -1045,38 +1134,52 @@ function setAvatarState(nextState = 'idle', options = {}) {
   const root = document.querySelector('#ai-dj-avatar');
   if (!root) return;
 
-  const video = document.querySelector('#avatar-video');
   const image = document.querySelector('#avatar-image');
-  const previousState = root.dataset.state || 'idle';
-  const transitionToken = previousState !== normalized
-    ? beginAvatarTransition(root, video, image)
-    : null;
-
-  root.dataset.state = normalized;
-  const status = root.querySelector('.avatar-status');
-  if (status) status.textContent = avatarStateLabels[normalized] || 'IDLE';
+  root.dataset.pendingState = normalized;
 
   const src = avatarMotionMap[normalized];
   const sequence = avatarFrameSequences[normalized];
 
   if (src) {
     stopAvatarFrameSequence();
-    playAvatarVideoOrFallback(root, video, image, src, sequence, avatarVideoToken, transitionToken);
+    playAvatarVideoOrFallback(root, image, src, sequence, avatarVideoToken, normalized, options);
   } else if (sequence) {
-    playAvatarFrameSequence(root, video, image, sequence, '');
-    finishAvatarTransition(root, transitionToken);
+    playAvatarFrameSequence(root, image, sequence, '', normalized, options);
   } else {
     stopAvatarFrameSequence();
-    playAvatarVideoOrFallback(root, video, image, '');
-    finishAvatarTransition(root, transitionToken);
+    playAvatarVideoOrFallback(root, image, '', null, avatarVideoToken, normalized, options);
   }
+}
 
-  if (options.temporaryMs) {
-    const restoreState = options.restoreState || getContextualAvatarState();
-    avatarRestoreTimer = setTimeout(() => {
-      setAvatarState(restoreState);
-    }, options.temporaryMs);
-  }
+function scheduleAvatarVideoPreload() {
+  if (avatarPreloadScheduled) return;
+  avatarPreloadScheduled = true;
+
+  const preload = async () => {
+    const urls = [...new Set(Object.values(avatarMotionMap))];
+    let index = 0;
+    const worker = async () => {
+      while (index < urls.length) {
+        const src = urls[index];
+        index += 1;
+        try {
+          const response = await fetch(src, { cache: 'force-cache', credentials: 'same-origin' });
+          if (response.ok) await response.blob();
+        } catch {
+          // Playback still has its normal network and frame-sequence fallbacks.
+        }
+      }
+    };
+    await Promise.all([worker(), worker()]);
+  };
+
+  setTimeout(() => {
+    if (typeof requestIdleCallback === 'function') {
+      requestIdleCallback(() => { void preload(); }, { timeout: 2500 });
+    } else {
+      void preload();
+    }
+  }, 1200);
 }
 
 function getContextualAvatarState() {
@@ -1293,6 +1396,7 @@ function renderPlayer() {
   scheduleLyricResyncToCurrentPlayback();
   updatePreviousButtonState();
   setAvatarState(state.avatarState || getContextualAvatarState());
+  scheduleAvatarVideoPreload();
   setRadioButtonState(state.sessionId || state.current?.track ? 'active' : 'idle');
   startPlayerPolling();
   initButtonFeedback();

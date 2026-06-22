@@ -21,6 +21,7 @@ import { cleanupDemoGuest, cleanupExpiredDemoGuests, getVisitorIdFromRequest, re
 import { configWithEnvironment, resolveRequestEnvironment, resolveRequestEnvironmentContext } from './environment.mjs';
 import { initializeDemoRuntime } from './startup.mjs';
 import { createScheduleProvider, createScheduleService } from './schedule.mjs';
+import { getStaticCacheControl, serveStaticFile } from './static-files.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -817,11 +818,13 @@ function serveStatic(req, res) {
     '.mp4': 'video/mp4',
     '.mp3': 'audio/mpeg'
   };
-  const cacheControl = ['.html', '.js', '.css'].includes(ext)
-    ? 'no-store'
-    : 'public, max-age=3600';
-  res.writeHead(200, { 'content-type': types[ext] || 'application/octet-stream', 'cache-control': cacheControl });
-  fs.createReadStream(filePath).pipe(res);
+  serveStaticFile(
+    req,
+    res,
+    filePath,
+    types[ext] || 'application/octet-stream',
+    getStaticCacheControl(filePath)
+  );
 }
 
 function makeToneWav(frequency = 440, seconds = 2) {
