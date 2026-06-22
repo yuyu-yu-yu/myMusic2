@@ -26,6 +26,7 @@ import {
   buildDailyMusicRecap as buildSharedDailyMusicRecap,
   getDiaryRecommendationContext
 } from './music-recap.mjs';
+import { getSchedulePlaylistPolicy, publicScheduleContext, scheduleMoodSignal } from './schedule.mjs';
 
 export { buildSharedDailyMusicRecap as buildDailyMusicRecap };
 
@@ -76,6 +77,7 @@ const DEFAULT_PREFS = Object.freeze({
   voiceMode: 'recommendations',
   moodMode: 'auto',
   lowDistractionMode: false,
+  scheduleAwareEnabled: false,
   note: ''
 });
 const DAILY_MUSIC_RECAP_SPOKEN_DATE_KEY = 'daily_music_recap_spoken_date';
@@ -108,7 +110,24 @@ const RECOMMENDATION_TRACE_SOURCES = Object.freeze({
 });
 const RADIO_QUEUE_LIMIT = 2;
 const PLAYLIST_SIZE = 5;
-const PLAYLIST_PLAN_LIMIT = 10;
+const CONCERT_LENGTHS = Object.freeze([5, 8, 12]);
+const CONCERT_PLAN_LIMIT = 18;
+const SESSION_CONSTRAINT_TRACK_LIMIT = 30;
+const SESSION_CONSTRAINT_RULE_FIELDS = Object.freeze({
+  term: 'avoidTerms',
+  language: 'avoidLanguages',
+  style: 'avoidStyleFamilies',
+  artist: 'avoidArtists',
+  song: 'avoidSongs'
+});
+const CONCERT_PERSONAS = Object.freeze([
+  '理性乐评人',
+  '氛围组',
+  '老歌粉',
+  '朋友型观众',
+  '毒舌观众',
+  '共情观众'
+]);
 const RADIO_QUEUE_DIAGNOSTIC_LIMIT = 4;
 const RADIO_QUEUE_DIAGNOSTIC_TTL_MS = 10 * 60 * 1000;
 const QUEUE_ITEM_STATUSES = new Set(['pending', 'ready', 'failed', 'stale']);
@@ -307,10 +326,12 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   return { ...response, queueHit: false };
 }
 
-export async function playlistStartTurn({ db, config, netease, sessionId, userMessage = null, accountContext = null }) {
+export async function concertStartTurn({ db, config, netease, sessionId, settings = {}, userMessage = null, planning = null, scheduleContext = null, accountContext = null }) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
   const normalizedUserMessage = String(userMessage || '').trim();
+  if (normalizedUserMessage) applyConcertConstraintMessage(db, sessionId, normalizedUserMessage);
+  const concertSettings = normalizeConcertSettings(settings, { allowInternalLength: planning?.source === 'schedule' });
   clearRadioQueue(db, sessionId);
   const built = await buildPlaylistRecommendation({
     db,
@@ -318,34 +339,46 @@ export async function playlistStartTurn({ db, config, netease, sessionId, userMe
     netease,
     sessionId,
     userMessage: normalizedUserMessage || null,
+    settings: concertSettings,
+    planning,
+    scheduleContext,
     accountContext: account
   });
-  if (!built.playlist) return built.response;
+  if (!built.concert) return built.response;
   return commitPlaylistPlayback({
     db,
     config,
     sessionId,
-    playlist: built.playlist,
+    playlist: built.concert,
     index: 0,
-    hostPolicy: 'playlist_intro',
+    hostPolicy: 'concert_intro',
+    concertEvent: 'intro',
     userMessage: normalizedUserMessage || null,
     accountContext: account
   });
 }
 
-export async function playlistNextTurn({ db, config, netease, sessionId, accountContext = null }) {
+export async function concertNextTurn({ db, config, netease, sessionId, accountContext = null }) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
   const context = getSessionContext(db, sessionId);
-  const current = normalizeActivePlaylist(context.activePlaylist);
-  if (!current || current.currentIndex >= PLAYLIST_SIZE - 1) {
-    if (current) {
-      setSessionContext(db, sessionId, {
-        ...context,
-        activePlaylist: markPlaylistItemStatus(current, current.currentIndex, 'played')
-      });
-    }
-    return playlistStartTurn({ db, config, netease, sessionId, accountContext: account });
+  const current = normalizeActivePlaylist(context.activeConcert || context.activePlaylist);
+  if (!current) {
+    return { __error: true, ok: false, status: 400, error: 'No active concert.' };
+  }
+  if (current.phase === 'curtain' || current.phase === 'finished') {
+    return concertStateResponse({ db, sessionId, concert: current, concertEvent: 'track_end', accountContext: account });
+  }
+  if (current.currentIndex >= current.items.length - 1) {
+    const waitingForCurtain = markPlaylistItemStatus(current, current.currentIndex, 'played');
+    setSessionContext(db, sessionId, { ...context, activeConcert: waitingForCurtain });
+    return concertStateResponse({
+      db,
+      sessionId,
+      concert: waitingForCurtain,
+      concertEvent: 'track_end',
+      accountContext: account
+    });
   }
   const playlist = movePlaylistToIndex(current, current.currentIndex + 1, { previousStatus: 'played' });
   return commitPlaylistPlayback({
@@ -355,27 +388,72 @@ export async function playlistNextTurn({ db, config, netease, sessionId, account
     playlist,
     index: playlist.currentIndex,
     hostPolicy: 'none',
+    concertEvent: 'track',
     accountContext: account
   });
 }
 
-export async function playlistJumpTurn({ db, config, netease, sessionId, index, accountContext = null }) {
+export async function concertHostTurn({ db, config, sessionId, eventId, replay = false, accountContext = null }) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
   const context = getSessionContext(db, sessionId);
-  const current = normalizeActivePlaylist(context.activePlaylist);
+  const current = normalizeActivePlaylist(context.activeConcert || context.activePlaylist);
+  const id = String(eventId || '').trim();
+  const event = current?.hostEvents?.find(item => item.id === id);
+  if (!current || !event) {
+    return { __error: true, ok: false, status: 404, error: 'Concert host event not found.' };
+  }
+  if (event.status === 'pending' && event.type === 'interlude' && current.currentIndex >= event.beforeIndex) {
+    return { __error: true, ok: false, status: 409, error: 'Concert host event has already been passed.' };
+  }
+  if (!replay && event.status === 'played') {
+    return concertStateResponse({ db, sessionId, concert: current, concertEvent: event.type, accountContext: account });
+  }
+  let concert = markConcertHostEventStatus(current, event.id, 'played');
+  if (event.type === 'curtain') {
+    concert = normalizeActivePlaylist({
+      ...markPlaylistItemStatus(concert, concert.currentIndex, 'played'),
+      phase: concert.encoreUsed && concert.currentIndex >= concert.items.length - 1 ? 'finished' : 'curtain'
+    });
+  }
+  const hostPolicy = {
+    intro: 'concert_intro',
+    interlude: 'concert_interlude',
+    curtain: 'concert_curtain'
+  }[event.type] || 'none';
+  return commitConcertHostEvent({
+    db,
+    config,
+    sessionId,
+    concert,
+    text: event.text,
+    hostPolicy,
+    concertEvent: event.type,
+    accountContext: account
+  });
+}
+
+export async function concertJumpTurn({ db, config, netease, sessionId, index, accountContext = null }) {
+  const account = normalizeAccountContext(accountContext);
+  sessionId = ensureSession(db, sessionId, account);
+  const context = getSessionContext(db, sessionId);
+  const current = normalizeActivePlaylist(context.activeConcert || context.activePlaylist);
   const targetIndex = Number(index);
   if (!current) {
-    return { __error: true, ok: false, status: 400, error: 'No active playlist.' };
+    return { __error: true, ok: false, status: 400, error: 'No active concert.' };
   }
   if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= current.items.length) {
-    return { __error: true, ok: false, status: 400, error: 'Invalid playlist index.' };
+    return { __error: true, ok: false, status: 400, error: 'Invalid concert index.' };
   }
   const target = current.items[targetIndex];
   if (!target?.track?.id || target.status !== 'pending') {
-    return { __error: true, ok: false, status: 400, error: 'Playlist item is not jumpable.' };
+    return { __error: true, ok: false, status: 400, error: 'Concert item is not jumpable.' };
   }
-  const playlist = movePlaylistToIndex(current, targetIndex, { previousStatus: 'skipped' });
+  const playlist = markConcertHostEventsSkipped(
+    movePlaylistToIndex(current, targetIndex, { previousStatus: 'skipped' }),
+    current.currentIndex,
+    targetIndex
+  );
   return commitPlaylistPlayback({
     db,
     config,
@@ -383,18 +461,236 @@ export async function playlistJumpTurn({ db, config, netease, sessionId, index, 
     playlist,
     index: playlist.currentIndex,
     hostPolicy: 'none',
+    concertEvent: 'track',
     accountContext: account
   });
+}
+
+export async function concertReplanTurn({ db, config, netease, sessionId, message = '', accountContext = null }) {
+  const account = normalizeAccountContext(accountContext);
+  sessionId = ensureSession(db, sessionId, account);
+  const context = getSessionContext(db, sessionId);
+  const current = normalizeActivePlaylist(context.activeConcert || context.activePlaylist);
+  const userMessage = String(message || '').trim();
+  if (!current || current.phase === 'curtain' || !userMessage) {
+    return { __error: true, ok: false, status: 400, error: 'Active concert and adjustment message are required.' };
+  }
+  const remainingCount = current.items.length - current.currentIndex - 1;
+  if (remainingCount <= 0) {
+    return { __error: true, ok: false, status: 400, error: 'No remaining concert tracks to replan.' };
+  }
+  applyConcertConstraintMessage(db, sessionId, userMessage);
+  const built = await buildPlaylistRecommendation({
+    db,
+    config,
+    netease,
+    sessionId,
+    userMessage,
+    settings: { ...current.settings, length: remainingCount },
+    targetLength: remainingCount,
+    extraAvoidTracks: current.items.map(item => item.track),
+    accountContext: account
+  });
+  if (!built.concert) return built.response;
+  const keptItems = current.items.slice(0, current.currentIndex + 1);
+  const replacementItems = built.concert.items.map((item, offset) => ({
+    ...item,
+    index: keptItems.length + offset,
+    status: 'pending'
+  }));
+  const merged = await rebuildConcertProgram({
+    config,
+    concert: {
+      ...current,
+      settings: { ...current.settings, note: userMessage.slice(0, 80) },
+      items: [...keptItems, ...replacementItems],
+      audienceCache: {},
+      phase: 'playing'
+    },
+    accountContext: account
+  });
+  setSessionContext(db, sessionId, { ...context, activeConcert: merged });
+  saveMessage(db, sessionId, 'user', userMessage, account);
+  const chatText = `收到，当前歌曲继续播放。我已经按“${userMessage.slice(0, 36)}”重新编排后半场。`;
+  saveMessage(db, sessionId, 'assistant', chatText, account);
+  return concertStateResponse({ db, sessionId, concert: merged, chatText, concertEvent: 'track', accountContext: account });
+}
+
+function applyConcertConstraintMessage(db, sessionId, message) {
+  const context = getSessionContext(db, sessionId);
+  const previous = getSessionConstraintsFromContext(context);
+  const update = parseSessionConstraintUpdate(message, previous);
+  if (!update.changed) return previous;
+  const sessionConstraints = applySessionConstraintUpdate(previous, update);
+  setSessionContext(db, sessionId, { ...context, sessionConstraints });
+  return sessionConstraints;
+}
+
+export async function concertEncoreTurn({ db, config, netease, sessionId, accountContext = null }) {
+  const account = normalizeAccountContext(accountContext);
+  sessionId = ensureSession(db, sessionId, account);
+  const context = getSessionContext(db, sessionId);
+  const current = normalizeActivePlaylist(context.activeConcert || context.activePlaylist);
+  if (!current || current.phase !== 'curtain' || current.encoreUsed) {
+    return { __error: true, ok: false, status: 400, error: 'Encore is not available.' };
+  }
+  const built = await buildPlaylistRecommendation({
+    db,
+    config,
+    netease,
+    sessionId,
+    settings: { ...current.settings, length: 1 },
+    targetLength: 1,
+    extraAvoidTracks: current.items.map(item => item.track),
+    accountContext: account
+  });
+  if (!built.concert) return built.response;
+  const encoreItem = { ...built.concert.items[0], index: current.items.length, status: 'current', encore: true };
+  let concert = normalizeActivePlaylist({
+    ...current,
+    items: [...current.items.map(item => item.status === 'current' ? { ...item, status: 'played' } : item), encoreItem],
+    currentIndex: current.items.length,
+    phase: 'encore',
+    encoreUsed: true,
+    encoreText: buildEncoreHostText(encoreItem.track)
+  });
+  concert = replaceConcertCurtainEvent(concert, {
+    text: '返场到这里也正式结束了。谢谢你把最后一点掌声留在这里，我们下次音乐会再见。',
+    beforeIndex: concert.items.length,
+    status: 'pending'
+  });
+  return commitPlaylistPlayback({
+    db,
+    config,
+    sessionId,
+    playlist: concert,
+    index: concert.currentIndex,
+    hostPolicy: 'concert_encore',
+    concertEvent: 'encore',
+    accountContext: account
+  });
+}
+
+export async function concertAudienceTurn({ db, config, sessionId, trackId, accountContext = null }) {
+  const account = normalizeAccountContext(accountContext);
+  sessionId = ensureSession(db, sessionId, account);
+  const context = getSessionContext(db, sessionId);
+  const concert = normalizeActivePlaylist(context.activeConcert || context.activePlaylist);
+  const item = concert?.items.find(entry => String(entry.track?.id || '') === String(trackId || ''));
+  if (!concert || !item) {
+    return { __error: true, ok: false, status: 404, error: 'Concert track not found.' };
+  }
+  const cacheKey = String(item.track.id);
+  const cached = concert.audienceCache?.[cacheKey];
+  if (Array.isArray(cached) && cached.length) {
+    return { ok: true, sessionId, trackId: cacheKey, comments: cached, cached: true };
+  }
+  const comments = await generateConcertAudience({ config, concert, item });
+  const nextConcert = { ...concert, audienceCache: { ...(concert.audienceCache || {}), [cacheKey]: comments } };
+  setSessionContext(db, sessionId, { ...context, activeConcert: nextConcert });
+  return { ok: true, sessionId, trackId: cacheKey, comments, cached: false };
+}
+
+export async function playlistStartTurn(args) {
+  const policy = args?.planning?.source === 'schedule' && args?.scheduleContext
+    ? getSchedulePlaylistPolicy(args.scheduleContext)
+    : null;
+  if (policy && !policy.canStart) {
+    return {
+      sessionId: args.sessionId,
+      chatText: '离下一项安排太近了，我先不启动新的音乐段，避免一首歌还没听完就要出发。',
+      track: null,
+      reason: policy.reason,
+      concertMode: true,
+      concert: null,
+      playlistMode: true,
+      playlist: null,
+      hostPolicy: 'none',
+      ttsUrl: null,
+      ttsStatus: 'disabled',
+      speech: { shouldSpeak: false, mode: 'off' },
+      scheduleContext: publicScheduleContext(args.scheduleContext)
+    };
+  }
+  return withPlaylistCompatibility(await concertStartTurn({
+    ...args,
+    settings: { length: policy?.targetLength || PLAYLIST_SIZE }
+  }));
+}
+
+export async function playlistNextTurn({ db, config, netease, sessionId, planning = null, scheduleContext = null, accountContext = null }) {
+  const account = normalizeAccountContext(accountContext);
+  sessionId = ensureSession(db, sessionId, account);
+  const context = getSessionContext(db, sessionId);
+  const current = normalizeActivePlaylist(context.activeConcert || context.activePlaylist);
+  if (!current || current.currentIndex >= current.items.length - 1) {
+    if (current) {
+      setSessionContext(db, sessionId, {
+        ...context,
+        activeConcert: markPlaylistItemStatus(current, current.currentIndex, 'played')
+      });
+    }
+    return playlistStartTurn({
+      db,
+      config,
+      netease,
+      sessionId,
+      planning,
+      scheduleContext,
+      accountContext: account
+    });
+  }
+  const playlist = movePlaylistToIndex(current, current.currentIndex + 1, { previousStatus: 'played' });
+  return withPlaylistCompatibility(await commitPlaylistPlayback({
+    db,
+    config,
+    sessionId,
+    playlist,
+    index: playlist.currentIndex,
+    hostPolicy: 'none',
+    concertEvent: 'track',
+    accountContext: account
+  }));
+}
+
+export async function playlistJumpTurn(args) {
+  return withPlaylistCompatibility(await concertJumpTurn(args));
 }
 
 export function clearActivePlaylistSession(db, sessionId, accountContext = null) {
   const account = normalizeAccountContext(accountContext);
   const id = ensureSession(db, sessionId, account);
   updateSessionContext(db, id, (context) => {
-    const { activePlaylist, ...rest } = context;
+    const { activePlaylist, activeConcert, ...rest } = context;
     return rest;
   });
   return { ok: true, sessionId: id };
+}
+
+export function applyScheduleContextToSession(db, sessionId, scheduleContext = null, accountContext = null) {
+  const account = normalizeAccountContext(accountContext);
+  const id = ensureSession(db, sessionId, account);
+  const nextSchedule = publicScheduleContext(scheduleContext);
+  const context = getSessionContext(db, id);
+  const previousFingerprint = String(context.scheduleContext?.fingerprint || '');
+  const nextFingerprint = String(nextSchedule?.fingerprint || '');
+  if (!nextFingerprint || previousFingerprint === nextFingerprint) {
+    return { ok: true, sessionId: id, changed: false, version: Number(context.externalContextVersion || 0) };
+  }
+  const version = Number(context.externalContextVersion || 0) + 1;
+  setSessionContext(db, id, {
+    ...context,
+    scheduleContext: nextSchedule,
+    externalContextVersion: version,
+    queueGeneration: Number(context.queueGeneration || 0) + 1
+  });
+  const queue = getSessionQueue(db, id).map(item => (
+    item.status === 'ready' || item.status === 'pending'
+      ? { ...item, status: 'stale', staleReason: 'schedule_context_changed', updatedAt: nowIso() }
+      : item
+  ));
+  setSessionQueue(db, id, queue);
+  return { ok: true, sessionId: id, changed: true, version };
 }
 
 async function buildRadioRecommendation({
@@ -512,12 +808,29 @@ async function buildRadioRecommendation({
   };
 }
 
-async function buildPlaylistRecommendation({ db, config, netease, sessionId, userMessage = null, accountContext = null }) {
+async function buildPlaylistRecommendation({
+  db,
+  config,
+  netease,
+  sessionId,
+  userMessage = null,
+  settings = {},
+  targetLength = null,
+  extraAvoidTracks = [],
+  planning = null,
+  scheduleContext = null,
+  accountContext = null
+}) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
   const normalizedUserMessage = String(userMessage || '').trim();
+  const concertSettings = normalizeConcertSettings(settings, { allowInternalLength: true });
+  const desiredLength = normalizeConcertTargetLength(targetLength ?? concertSettings.length);
   const profile = getProfile(db, account);
-  const environmentContext = await getEnvironmentContext({ db, sessionId, config });
+  const environmentContext = {
+    ...(await getEnvironmentContext({ db, sessionId, config })),
+    ...(scheduleContext ? { scheduleContext: publicScheduleContext(scheduleContext) } : {})
+  };
   const { hour, timeOfDay, weather } = environmentContext;
   const mode = getSessionMode(db, sessionId);
   const prefs = normalizeRuntimePrefs(getUserPrefs(db, account));
@@ -526,10 +839,16 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, use
   const conversationState = normalizeConversationState(context.conversationState);
   const effectiveMusicContext = getEffectiveMusicContextForRecommendation(context, { userMessage: normalizedUserMessage || null });
   const contextMood = context.musicContext ? moodFromMusicContext(effectiveMusicContext) : null;
+  const scheduleMood = planning?.source === 'schedule' && !hasExplicitMusicIntent(normalizedUserMessage)
+    ? scheduleMoodSignal(scheduleContext)
+    : null;
   const conversationMood = mergeSessionConstraintsIntoMood(
-    contextMood || moodFromConversationState(conversationState, prefs, mode),
+    contextMood || scheduleMood || moodFromConversationState(conversationState, prefs, mode),
     sessionConstraints
   );
+  const schedulePolicy = planning?.source === 'schedule' && scheduleContext
+    ? getSchedulePlaylistPolicy(scheduleContext)
+    : null;
   const hostContext = buildRadioHostContext(db, sessionId, context, normalizedUserMessage || null, account);
   const history = loadHistory(db, sessionId, account);
   const sessionSummary = await updateSessionSummary(db, config, sessionId, account);
@@ -546,7 +865,7 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, use
   if (!request.vocalPolicy && conversationMood?.vocalPolicy) {
     request.vocalPolicy = normalizeVocalPolicy(conversationMood.vocalPolicy);
   }
-  const playedHistory = getPlayedTrackHistory(db, sessionId, 80, account);
+  const playedHistory = [...getPlayedTrackHistory(db, sessionId, 80, account), ...extraAvoidTracks.filter(Boolean)];
   const playedIds = new Set(playedHistory.map(track => String(track.id || '')).filter(Boolean));
   const playedSignatures = buildPlayedSignatureSet(playedHistory);
   const selected = [];
@@ -570,11 +889,14 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, use
       playedHistory,
       hostContext,
       environmentContext,
-      failedPicks
+      failedPicks,
+      concertSettings,
+      targetLength: desiredLength
     })
   ];
 
-  for (let attempt = 0; attempt < 2 && selected.length < PLAYLIST_SIZE; attempt += 1) {
+  const maxAttempts = desiredLength > 8 ? 3 : 2;
+  for (let attempt = 0; attempt < maxAttempts && selected.length < desiredLength; attempt += 1) {
     const plan = plans[attempt] || await generatePlaylistPlan({
       config,
       profile,
@@ -591,12 +913,14 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, use
       playedHistory: [...playedHistory, ...selected.map(item => item.track)],
       hostContext,
       environmentContext,
-      failedPicks
+      failedPicks,
+      concertSettings,
+      targetLength: desiredLength
     });
     if (!plans[attempt]) plans[attempt] = plan;
     setRadioDebugInfo(db, sessionId, { lastPlaylistPlan: sanitizePlaylistPlan(plan, attempt) });
     for (const pick of uniquePlaylistPicks(plan.picks)) {
-      if (selected.length >= PLAYLIST_SIZE) break;
+      if (selected.length >= desiredLength) break;
       const resolved = await resolveSongPlanTrack({
         db,
         config,
@@ -612,11 +936,20 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, use
         failedPicks.push(...(resolved.failedPicks || [pick]));
         continue;
       }
-      addPlaylistSelection(selected, resolved.track, resolved.pick || pick, playedIds, playedSignatures);
+      if (!addPlaylistSelection(
+        selected,
+        resolved.track,
+        resolved.pick || pick,
+        playedIds,
+        playedSignatures,
+        schedulePolicy?.maxDurationMs
+      )) {
+        failedPicks.push({ ...pick, reason: 'exceeds_schedule_window' });
+      }
     }
   }
 
-  if (selected.length < PLAYLIST_SIZE) {
+  if (selected.length < desiredLength) {
     const fallback = await fillPlaylistFromProfile({
       db,
       config,
@@ -627,24 +960,32 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, use
       selected,
       playedIds,
       playedSignatures,
+      targetLength: desiredLength,
+      maxDurationMs: schedulePolicy?.maxDurationMs,
       accountContext: account
     });
     diagnostics.push(...fallback.diagnostics);
   }
 
   setRadioDebugInfo(db, sessionId, { lastPlaylistSearchDiagnostics: diagnostics.slice(0, 12) });
-  if (selected.length < PLAYLIST_SIZE) {
-    const chatText = '这次没凑齐稳定可播的 5 首，我先不硬播。';
+  if (selected.length < desiredLength) {
+    const availableCount = selected.length;
+    const fallbackLengths = CONCERT_LENGTHS.filter(length => length < desiredLength && length <= availableCount).sort((a, b) => b - a);
+    const chatText = `这次只确认到 ${availableCount} 首稳定可播的歌，还不足以完成 ${desiredLength} 首音乐会。`;
     return {
-      playlist: null,
+      concert: null,
       response: {
         sessionId,
         chatText,
         track: null,
-        reason: 'playlist_not_enough_playable_tracks',
-        playlistMode: true,
+        reason: 'concert_not_enough_playable_tracks',
+        concertMode: true,
+        concertEvent: 'track',
         hostPolicy: 'none',
-        playlist: null,
+        concert: null,
+        requestedLength: desiredLength,
+        availableCount,
+        fallbackLengths,
         ttsUrl: null,
         ttsStatus: 'disabled',
         speech: { shouldSpeak: false, mode: 'off' },
@@ -654,17 +995,24 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, use
     };
   }
 
-  const title = buildPlaylistTitle({ timeOfDay, conversationMood });
+  const title = buildPlaylistTitle({ timeOfDay, conversationMood, settings: concertSettings });
   const summary = buildPlaylistSummary({ selected, conversationMood, weather, timeOfDay });
-  const playlist = normalizeActivePlaylist({
-    id: `playlist-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+  let playlist = normalizeActivePlaylist({
+    id: `concert-${Date.now()}-${Math.random().toString(16).slice(2)}`,
     title,
     summary,
     createdAt: nowIso(),
     contextVersion: effectiveMusicContext.version,
     contextSnapshot: effectiveMusicContext,
     currentIndex: 0,
-    items: selected.slice(0, PLAYLIST_SIZE).map((item, index) => ({
+    settings: { ...concertSettings, length: desiredLength },
+    scheduleContext: publicScheduleContext(scheduleContext),
+    schedulePolicy,
+    acts: buildConcertActs(desiredLength),
+    phase: 'playing',
+    audienceCache: {},
+    encoreUsed: false,
+    items: selected.slice(0, desiredLength).map((item, index) => ({
       index,
       track: item.track,
       reason: item.reason,
@@ -675,9 +1023,9 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, use
     environmentContext,
     profile
   });
-  playlist.hostText = await generatePlaylistIntroText({
+  playlist = await generateConcertHostProgram({
     config,
-    playlist,
+    concert: playlist,
     profile,
     prefs,
     history,
@@ -689,12 +1037,17 @@ async function buildPlaylistRecommendation({ db, config, netease, sessionId, use
     hostContext,
     environmentContext
   });
-  return { playlist, response: null };
+  return { concert: playlist, response: null };
 }
 
-function addPlaylistSelection(selected, track, pick, playedIds, playedSignatures) {
+function addPlaylistSelection(selected, track, pick, playedIds, playedSignatures, maxDurationMs = null) {
   const key = playedSongKey(track?.name);
   if (!track?.id || !key || playedSignatures.has(key)) return false;
+  const durationLimit = Number(maxDurationMs || 0);
+  if (durationLimit > 0) {
+    const totalDuration = selected.reduce((sum, item) => sum + estimatedTrackDurationMs(item.track), 0);
+    if (totalDuration + estimatedTrackDurationMs(track) > durationLimit) return false;
+  }
   selected.push({
     track,
     reason: pick?.reason || '符合当前状态、音乐画像和上下文',
@@ -705,7 +1058,7 @@ function addPlaylistSelection(selected, track, pick, playedIds, playedSignatures
   return true;
 }
 
-async function fillPlaylistFromProfile({ db, config, netease, profile, conversationMood, request, selected, playedIds, playedSignatures, accountContext }) {
+async function fillPlaylistFromProfile({ db, config, netease, profile, conversationMood, request, selected, playedIds, playedSignatures, targetLength = PLAYLIST_SIZE, maxDurationMs = null, accountContext }) {
   const diagnostics = [{
     pick: { name: 'playlist_profile_fallback', artists: [], reason: 'profile_fallback' },
     queries: ['current account profile playlists'],
@@ -721,7 +1074,7 @@ async function fillPlaylistFromProfile({ db, config, netease, profile, conversat
     .slice(0, 48);
 
   for (const item of fallbackTracks) {
-    if (selected.length >= PLAYLIST_SIZE) break;
+    if (selected.length >= targetLength) break;
     const hit = {
       track: sanitizeTrackForDebug(item.track),
       score: Math.round(item.score * 100) / 100,
@@ -743,12 +1096,17 @@ async function fillPlaylistFromProfile({ db, config, netease, profile, conversat
       name: selectedTrack.name,
       artists: selectedTrack.artists || [],
       reason: item.track.playlistName ? `来自你的《${item.track.playlistName}》歌单画像` : '来自你的音乐画像'
-    }, playedIds, playedSignatures);
+    }, playedIds, playedSignatures, maxDurationMs);
   }
   return { diagnostics: [trimSearchDiagnostic(diagnostics[0])] };
 }
 
-async function commitPlaylistPlayback({ db, config, sessionId, playlist, index = 0, hostPolicy = 'none', userMessage = null, accountContext = null }) {
+function estimatedTrackDurationMs(track = {}) {
+  const duration = Number(track.durationMs || track.duration || 0);
+  return Number.isFinite(duration) && duration > 0 ? duration : 4 * 60 * 1000;
+}
+
+async function commitPlaylistPlayback({ db, config, sessionId, playlist, index = 0, hostPolicy = 'none', concertEvent = 'track', userMessage = null, accountContext = null }) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
   const normalized = normalizeActivePlaylist({
@@ -757,32 +1115,37 @@ async function commitPlaylistPlayback({ db, config, sessionId, playlist, index =
   });
   const item = normalized.items[index];
   if (!item?.track?.id) {
-    return { __error: true, ok: false, status: 500, error: 'Playlist item missing track.' };
+    return { __error: true, ok: false, status: 500, error: 'Concert item missing track.' };
   }
   const context = getSessionContext(db, sessionId);
-  const nextPlaylist = movePlaylistToIndex(normalized, index, { previousStatus: null });
+  let nextPlaylist = movePlaylistToIndex(normalized, index, { previousStatus: null });
+  if (hostPolicy === 'concert_intro') {
+    const introEvent = nextPlaylist.hostEvents?.find(event => event.type === 'intro');
+    if (introEvent) nextPlaylist = markConcertHostEventStatus(nextPlaylist, introEvent.id, 'played');
+  }
+  const hostText = concertHostTextForPolicy(nextPlaylist, hostPolicy);
   saveTrack(db, item.track);
   db.prepare('INSERT INTO plays (account_id, track_id, played_at, source, reason, host_text, report_status) VALUES (?,?,?,?,?,?,?)')
-    .run(account.accountId, item.track.id, nowIso(), 'playlist', item.reason || normalized.summary || '', hostPolicy === 'playlist_intro' ? normalized.hostText || '' : '', 'pending');
+    .run(account.accountId, item.track.id, nowIso(), 'concert', item.reason || normalized.summary || '', hostText, 'pending');
   setSessionContext(db, sessionId, {
     ...context,
-    activePlaylist: nextPlaylist,
+    activeConcert: nextPlaylist,
     radioIntroDone: true,
     radioIntroAt: context.radioIntroAt || nowIso(),
     radioTurnCount: Number(context.radioTurnCount || 0) + 1,
     radioPlayedSongs: mergePlayedSongContext(context.radioPlayedSongs, item.track)
   });
   const prefs = normalizeRuntimePrefs(getUserPrefs(db, account));
-  const speech = hostPolicy === 'playlist_intro'
+  const speech = hostPolicy !== 'none'
     ? speechDecisionForRecommendation(prefs)
     : { shouldSpeak: false, mode: 'off' };
-  let tts = { url: null, status: hostPolicy === 'playlist_intro' ? 'disabled' : 'disabled', ms: 0, error: null };
-  const chatText = hostPolicy === 'playlist_intro' ? String(nextPlaylist.hostText || '').trim() : '';
-  if (hostPolicy === 'playlist_intro') {
+  let tts = { url: null, status: 'disabled', ms: 0, error: null };
+  const chatText = hostPolicy !== 'none' ? hostText : '';
+  if (hostPolicy !== 'none') {
     if (userMessage) saveMessage(db, sessionId, 'user', userMessage, account);
     if (chatText) saveMessage(db, sessionId, 'assistant', chatText, account);
   }
-  if (hostPolicy === 'playlist_intro' && speech.shouldSpeak && chatText) {
+  if (hostPolicy !== 'none' && speech.shouldSpeak && chatText) {
     tts = await synthesizeSpeechWithDiagnostics(config.tts, chatText);
     if (tts.status === 'failed') updateQueueMetrics(db, sessionId, { ttsFailedCount: 1 });
     setRadioDebugInfo(db, sessionId, { lastTtsDiagnostics: sanitizeTtsDiagnostics(tts) });
@@ -801,13 +1164,16 @@ async function commitPlaylistPlayback({ db, config, sessionId, playlist, index =
     mode: getSessionMode(db, sessionId),
     profile: nextPlaylist.profile || getProfile(db, account),
     weather: nextPlaylist.weather || context.weather || '',
-    playlistMode: true,
+    concertMode: true,
+    concertEvent,
     hostPolicy,
-    playlist: playlistForClient(nextPlaylist)
+    concert: playlistForClient(nextPlaylist),
+    sessionConstraints: publicSessionConstraints(getSessionConstraintsFromContext(getSessionContext(db, sessionId))),
+    scheduleContext: publicScheduleContext(nextPlaylist.scheduleContext || nextPlaylist.environmentContext?.scheduleContext)
   };
 }
 
-async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, conversationMood, memoryContext, userMessage = null, request, playedHistory = [], hostContext = {}, environmentContext = {}, failedPicks = [] }) {
+async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour, mode, prefs, history, conversationMood, memoryContext, userMessage = null, request, playedHistory = [], hostContext = {}, environmentContext = {}, failedPicks = [], concertSettings = {}, targetLength = PLAYLIST_SIZE }) {
   const fallbackPlan = { title: '', summary: '', picks: [], hostDraft: '', mode: null };
   if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return fallbackPlan;
   const modeText = mode?.genre
@@ -826,15 +1192,15 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
     {
       role: 'system',
       content: [
-        '你是灿灿校园电台的歌单策划。请一次设计一张 5 首歌的真实可搜索歌单，但为了后续校验，需要给出 8-10 首候选。',
-        buildCanCanBackgroundPrompt('一键推荐歌单'),
+        `你是灿灿校园电台的音乐会策划。请设计一场 ${targetLength} 首歌的真实可搜索音乐会，为后续可播放校验给出 ${Math.min(CONCERT_PLAN_LIMIT, targetLength + 6)} 首左右候选。`,
+        buildCanCanBackgroundPrompt('音乐会策划'),
         '必须结合当前时间、天气或场景、听众音乐画像、长期记忆、最近对话和禁听约束。',
         '候选必须是真实存在、主要音乐平台容易搜到的具体歌曲；每首必须有明确歌名和主要艺人。',
-        '整体要像一张有顺序感的校园电台歌单，不要五首完全同质，也不要跨度过大。',
+        '整体要像一场有起伏、有分幕感的校园电台音乐会，不要完全同质，也不要跨度过大。',
         '不要推荐已经播放过的同名歌曲；若有禁听歌手或歌名，必须避开。',
         vocalPolicyText,
         'queries 只写短搜索词，优先“歌名 艺人”和“艺人 歌名”。',
-        'hostDraft 是整张歌单的开场导播方向，只描述整体氛围，不逐首长篇介绍。',
+        'hostDraft 是整场音乐会的开场方向，只描述整体氛围，不逐首长篇介绍。',
         '只输出严格 JSON，不要 Markdown。',
         'JSON 格式：{"title":"歌单名","summary":"一句话歌单氛围","picks":[{"name":"歌名","artists":["艺人"],"reason":"一句话理由","queries":["歌名 艺人","艺人 歌名"]}],"hostDraft":"50-110字整张歌单开场导播词"}'
       ].join('\n')
@@ -849,6 +1215,7 @@ async function generatePlaylistPlan({ config, profile, weather, timeOfDay, hour,
         `此刻：${timeOfDay} ${hour}点，${weather}`,
         `听众画像：${profilePrompt}`,
         `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
+        `音乐会设置：${JSON.stringify(concertSettings)}`,
         modeText,
         userMessage ? `SCENE_REQUEST: ${userMessage}` : 'SCENE_REQUEST: none',
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
@@ -882,7 +1249,7 @@ function parsePlaylistPlanResponse(raw, fallbackPlan = { title: '', summary: '',
   return {
     title: String(parsed.title || parsed.name || '').trim().slice(0, 40),
     summary: String(parsed.summary || parsed.reason || '').trim().slice(0, 120),
-    picks: rawPicks.map(normalizeSongPick).filter(pick => pick.name && pick.artists.length).slice(0, PLAYLIST_PLAN_LIMIT),
+    picks: rawPicks.map(normalizeSongPick).filter(pick => pick.name && pick.artists.length).slice(0, CONCERT_PLAN_LIMIT),
     hostDraft: String(parsed.hostDraft || parsed.hostText || parsed.chatText || '').trim(),
     mode: parsed.mode ?? null
   };
@@ -905,7 +1272,7 @@ function sanitizePlaylistPlan(plan = {}, attempt = 0) {
     attempt,
     title: String(plan.title || '').slice(0, 40),
     summary: String(plan.summary || '').slice(0, 120),
-    picks: (plan.picks || []).map(sanitizeSongPick).slice(0, PLAYLIST_PLAN_LIMIT),
+    picks: (plan.picks || []).map(sanitizeSongPick).slice(0, CONCERT_PLAN_LIMIT),
     hostDraft: String(plan.hostDraft || '').slice(0, 180),
     updatedAt: nowIso()
   };
@@ -924,9 +1291,12 @@ function normalizeActivePlaylist(raw = null) {
   if (!items.length) return null;
   const currentIndexRaw = Number(raw.currentIndex || 0);
   const currentIndex = Math.min(Math.max(Number.isInteger(currentIndexRaw) ? currentIndexRaw : 0, 0), items.length - 1);
+  const phase = ['playing', 'curtain', 'encore', 'finished'].includes(raw.phase) ? raw.phase : 'playing';
+  const id = String(raw.id || `concert-${Date.now()}`);
+  const acts = normalizeConcertActs(raw.acts, items.length);
   return {
-    id: String(raw.id || `playlist-${Date.now()}`),
-    title: String(raw.title || '灿灿推荐歌单').slice(0, 40),
+    id,
+    title: String(raw.title || '灿灿音乐会').slice(0, 40),
     summary: String(raw.summary || '').slice(0, 180),
     createdAt: raw.createdAt || nowIso(),
     contextVersion: Number(raw.contextVersion || raw.contextSnapshot?.version || 0),
@@ -935,9 +1305,20 @@ function normalizeActivePlaylist(raw = null) {
     items: items.map((item, index) => ({
       ...item,
       index,
-      status: index === currentIndex ? 'current' : item.status
+      status: index === currentIndex && (phase === 'playing' || phase === 'encore') ? 'current' : item.status
     })),
-    hostText: String(raw.hostText || '').trim(),
+    settings: normalizeConcertSettings(raw.settings || { length: items.length }, { allowInternalLength: true }),
+    acts,
+    phase,
+    hostText: String(raw.hostText || raw.introText || '').trim(),
+    introText: String(raw.introText || raw.hostText || '').trim(),
+    curtainText: String(raw.curtainText || '').trim(),
+    encoreText: String(raw.encoreText || '').trim(),
+    encoreUsed: Boolean(raw.encoreUsed),
+    hostEvents: normalizeConcertHostEvents(raw.hostEvents, { concertId: id, acts, itemCount: items.length }),
+    audienceCache: normalizeAudienceCache(raw.audienceCache),
+    scheduleContext: publicScheduleContext(raw.scheduleContext || raw.environmentContext?.scheduleContext),
+    schedulePolicy: raw.schedulePolicy || null,
     conversationMood: raw.conversationMood ? normalizeMoodDecision(raw.conversationMood) : null,
     weather: raw.weather || '',
     environmentContext: raw.environmentContext || {},
@@ -954,6 +1335,50 @@ function markPlaylistItemStatus(playlist, index, status) {
   };
 }
 
+function markConcertHostEventStatus(concert, eventId, status) {
+  const normalized = normalizeActivePlaylist(concert);
+  if (!normalized) return null;
+  return normalizeActivePlaylist({
+    ...normalized,
+    hostEvents: normalized.hostEvents.map(event => event.id === eventId ? { ...event, status } : event)
+  });
+}
+
+function markConcertHostEventsSkipped(concert, fromIndex, toIndex) {
+  const normalized = normalizeActivePlaylist(concert);
+  if (!normalized || toIndex <= fromIndex) return normalized;
+  return normalizeActivePlaylist({
+    ...normalized,
+    hostEvents: normalized.hostEvents.map(event => (
+      event.status === 'pending'
+      && event.type === 'interlude'
+      && event.beforeIndex > fromIndex
+      && event.beforeIndex <= toIndex
+        ? { ...event, status: 'skipped' }
+        : event
+    ))
+  });
+}
+
+function replaceConcertCurtainEvent(concert, patch = {}) {
+  const normalized = normalizeActivePlaylist(concert);
+  if (!normalized) return null;
+  const current = normalized.hostEvents.find(event => event.type === 'curtain');
+  const curtain = {
+    id: current?.id || `${normalized.id}:curtain`,
+    type: 'curtain',
+    actIndex: normalized.acts.length,
+    beforeIndex: Number.isInteger(Number(patch.beforeIndex)) ? Number(patch.beforeIndex) : normalized.items.length,
+    text: sanitizeSpokenChatText(String(patch.text || current?.text || normalized.curtainText || '')).slice(0, 220),
+    status: ['pending', 'played'].includes(patch.status) ? patch.status : (current?.status || 'pending')
+  };
+  return normalizeActivePlaylist({
+    ...normalized,
+    curtainText: curtain.text,
+    hostEvents: [...normalized.hostEvents.filter(event => event.type !== 'curtain'), curtain]
+  });
+}
+
 function movePlaylistToIndex(playlist, index, { previousStatus = 'played' } = {}) {
   const normalized = normalizeActivePlaylist(playlist);
   if (!normalized) return null;
@@ -965,6 +1390,9 @@ function movePlaylistToIndex(playlist, index, { previousStatus = 'played' } = {}
     items: normalized.items.map((item) => {
       if (item.index === targetIndex) return { ...item, status: 'current' };
       if (previousStatus && item.index === previousIndex && item.status === 'current') return { ...item, status: previousStatus };
+      if (previousStatus === 'skipped' && targetIndex > previousIndex && item.index > previousIndex && item.index < targetIndex && item.status === 'pending') {
+        return { ...item, status: 'skipped' };
+      }
       return item.status === 'current' ? { ...item, status: item.index < targetIndex ? 'played' : 'pending' } : item;
     })
   };
@@ -978,19 +1406,28 @@ function playlistForClient(playlist) {
     title: normalized.title,
     summary: normalized.summary,
     currentIndex: normalized.currentIndex,
+    settings: normalized.settings,
+    acts: normalized.acts,
+    phase: normalized.phase,
+    encoreUsed: normalized.encoreUsed,
+    hostEvents: normalized.hostEvents,
+    scheduleContext: publicScheduleContext(normalized.scheduleContext),
     items: normalized.items.map((item) => ({
       index: item.index,
       track: item.track,
       reason: item.reason,
       status: item.status
-    }))
+    })),
+    audienceReadyTrackIds: Object.keys(normalized.audienceCache || {})
   };
 }
 
-function buildPlaylistTitle({ timeOfDay, conversationMood } = {}) {
+function buildPlaylistTitle({ timeOfDay, conversationMood, settings = {} } = {}) {
+  const selectedGenre = normalizeConcertStringList(settings.genres)[0];
+  if (selectedGenre && selectedGenre !== '自动') return `灿灿的${selectedGenre}音乐会`;
   const mood = String(conversationMood?.mood || conversationMood?.energy || '').trim();
-  if (mood) return `灿灿的${mood}五首`;
-  return `${timeOfDay || '此刻'}校园五首`;
+  if (mood) return `灿灿的${mood}音乐会`;
+  return `${timeOfDay || '此刻'}校园音乐会`;
 }
 
 function buildPlaylistSummary({ selected = [], conversationMood, weather, timeOfDay } = {}) {
@@ -999,20 +1436,29 @@ function buildPlaylistSummary({ selected = [], conversationMood, weather, timeOf
   return [timeOfDay, weather, mood, names ? `从${names}开始` : ''].filter(Boolean).join(' · ').slice(0, 160);
 }
 
-async function generatePlaylistIntroText({ config, playlist, profile, prefs, history, timeOfDay, hour, weather, conversationMood, memoryContext, hostContext, environmentContext }) {
-  const fallback = playlist.hostText || `我给你整理了一张 5 首歌的小歌单，会顺着现在的状态慢慢播放。`;
-  if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return fallback;
-  const songList = playlist.items.map(item => `${item.index + 1}. ${item.track.name} - ${(item.track.artists || []).join('/')}${item.reason ? `：${item.reason}` : ''}`).join('\n');
+async function generateConcertHostProgram({ config, concert, profile, prefs, history = [], timeOfDay = '', hour = '', weather = '', conversationMood = null, memoryContext = null, hostContext = {}, environmentContext = {} }) {
+  const fallback = fallbackConcertHostProgram(concert);
+  if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return applyConcertHostProgram(concert, fallback);
+  const songList = concert.items.map(item => `${item.index + 1}. ${item.track.name} - ${(item.track.artists || []).join('/')}${item.reason ? `：${item.reason}` : ''}`).join('\n');
+  const actList = concert.acts.map(act => {
+    const tracks = concert.items.slice(act.startIndex, act.endIndex + 1)
+      .map(item => `《${item.track.name}》-${(item.track.artists || []).join('/')}`)
+      .join('、');
+    return `第${act.index + 1}幕（startIndex=${act.startIndex}）：${tracks}`;
+  }).join('\n');
   const profilePrompt = formatProfileSummaryForPrompt(profile);
   const raw = await generateChatCompletion(config.llm, [
     {
       role: 'system',
       content: [
-        '你是灿灿校园电台的 AI DJ。请为一张已经确认可播放的 5 首歌歌单写一段开场导播词。',
-        buildCanCanBackgroundPrompt('歌单开场导播'),
-        '只写整张歌单的整体氛围和使用场景，不要逐首详细介绍，不要说后面每首还会继续导播。',
-        '语气自然、亲近、像电台开场，长度 50-110 字。',
-        '只输出纯文本。'
+        `你是灿灿校园电台的 AI DJ。请为一场已经确认可播放的 ${concert.items.length} 首音乐会一次写完开场、幕间串场和谢幕。`,
+        buildCanCanBackgroundPrompt('音乐会主持'),
+        '开场 120-220 字，说明本场主题和情绪走向，并简要介绍第一幕的真实歌曲。',
+        '每段幕间词 70-140 字，只介绍即将开始的下一幕，至少准确提到下一幕的一首歌曲名或艺人。谢幕 50-100 字。',
+        '只描述确定的歌曲、氛围和听众场景，不虚构歌手经历、制作人员或榜单事实。',
+        '幕间词必须按照 actIndex 和 startIndex 绑定，不能引用其他幕的歌曲。',
+        '只输出严格 JSON，不要 Markdown。',
+        'JSON 格式：{"introText":"开场","interludes":[{"actIndex":1,"startIndex":3,"text":"第二幕前串场"}],"curtainText":"谢幕"}'
       ].join('\n')
     },
     {
@@ -1021,31 +1467,428 @@ async function generatePlaylistIntroText({ config, playlist, profile, prefs, his
         `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
         `此刻：${timeOfDay} ${hour}点，${weather}`,
         `听众画像：${profilePrompt}`,
-        `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
+        `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs || {}))}`,
+        `音乐会设置：${JSON.stringify(concert.settings)}`,
         conversationMood ? `对话情绪：${JSON.stringify(conversationMood)}` : '对话情绪：无',
         memoryContext?.promptText || '相关长期记忆：无',
-        formatRecentHostPlays(hostContext.recentPlays),
-        `歌单名：${playlist.title}`,
-        `歌单摘要：${playlist.summary}`,
-        `五首歌：\n${songList}`,
+        formatRecentHostPlays(hostContext?.recentPlays),
+        `音乐会名：${concert.title}`,
+        `音乐会摘要：${concert.summary}`,
+        `分幕：\n${actList}`,
+        `节目单：\n${songList}`,
         `最近对话：${history.length ? '\n' + history.slice(-8).map(h => `[${h.role === 'user' ? '听众' : '灿灿'}]: ${h.content}`).join('\n') : '（新对话）'}`
       ].join('\n')
     }
-  ], () => fallback);
-  return sanitizeSpokenChatText(String(raw || fallback)).slice(0, 180) || fallback;
+  ], () => JSON.stringify(fallback));
+  return applyConcertHostProgram(concert, parseConcertHostProgram(raw, fallback, concert));
+}
+
+async function rebuildConcertProgram({ config, concert }) {
+  const normalized = normalizeActivePlaylist({ ...concert, acts: buildConcertActs(concert.items.length) });
+  return generateConcertHostProgram({
+    config,
+    concert: normalized,
+    profile: normalized.profile,
+    weather: normalized.weather,
+    conversationMood: normalized.conversationMood,
+    environmentContext: normalized.environmentContext
+  });
 }
 
 function buildPlaylistItemExplanation(playlist, item, hostPolicy) {
   return normalizeRecommendationExplanation({
-    summary: hostPolicy === 'playlist_intro'
-      ? `歌单开场：${playlist.summary || item.reason || '5 首连续推荐'}`
-      : `歌单第 ${item.index + 1} 首：${item.reason || playlist.summary || '延续当前歌单氛围'}`,
+    summary: hostPolicy === 'concert_intro'
+      ? `音乐会开场：${playlist.summary || item.reason || '连续推荐'}`
+      : `音乐会第 ${item.index + 1} 首：${item.reason || playlist.summary || '延续当前氛围'}`,
     factors: [
-      { type: 'playlist', text: playlist.title || '歌单模式' },
+      { type: 'playlist', text: playlist.title || '音乐会模式' },
       item.reason ? { type: 'reason', text: item.reason } : null
     ].filter(Boolean),
-    source: 'playlist'
+    source: 'concert'
   });
+}
+
+function normalizeConcertSettings(raw = {}, { allowInternalLength = false } = {}) {
+  const requestedLength = Number(raw.length || PLAYLIST_SIZE);
+  const length = allowInternalLength && Number.isInteger(requestedLength) && requestedLength >= 1 && requestedLength <= 12
+    ? requestedLength
+    : CONCERT_LENGTHS.includes(requestedLength) ? requestedLength : PLAYLIST_SIZE;
+  const allowedGenres = new Set(['流行', '摇滚', '电子', '民谣', 'R&B', '爵士', '纯音乐', '国风', 'ACG']);
+  const genres = normalizeConcertStringList(raw.genres).filter(value => allowedGenres.has(value)).slice(0, 2);
+  const mood = ['自动', '温暖', '热烈', '平静', '浪漫', '怀旧', '专注', '深夜'].includes(raw.mood) ? raw.mood : '自动';
+  const scene = ['自动', '夜晚独处', '学习', '通勤', '运动', '聚会', '放松'].includes(raw.scene) ? raw.scene : '自动';
+  const audiencePreset = ['温暖', '热闹', '专业'].includes(raw.audiencePreset) ? raw.audiencePreset : '温暖';
+  return {
+    length,
+    genres,
+    mood,
+    scene,
+    audiencePreset,
+    note: String(raw.note || '').replace(/\s+/g, ' ').trim().slice(0, 80)
+  };
+}
+
+function normalizeConcertStringList(value) {
+  const values = Array.isArray(value) ? value : value ? [value] : [];
+  return [...new Set(values.map(item => String(item || '').trim()).filter(Boolean))];
+}
+
+function normalizeConcertTargetLength(value) {
+  const length = Number(value || PLAYLIST_SIZE);
+  return Number.isInteger(length) && length >= 1 && length <= 12 ? length : PLAYLIST_SIZE;
+}
+
+function buildConcertActs(length) {
+  const sizes = length === 12 ? [3, 3, 3, 3] : length === 8 ? [3, 3, 2] : length === 5 ? [2, 3] : [length];
+  let cursor = 0;
+  return sizes.map((size, index) => {
+    const act = {
+      index,
+      title: `第 ${index + 1} 幕`,
+      startIndex: cursor,
+      endIndex: cursor + size - 1,
+      hostText: ''
+    };
+    cursor += size;
+    return act;
+  });
+}
+
+function normalizeConcertActs(rawActs, itemCount) {
+  const fallback = buildConcertActs(itemCount);
+  if (!Array.isArray(rawActs) || !rawActs.length) return fallback;
+  const normalized = rawActs.flatMap((raw, index) => {
+    const startIndex = Number(raw?.startIndex);
+    const endIndex = Number(raw?.endIndex);
+    if (!Number.isInteger(startIndex) || !Number.isInteger(endIndex) || startIndex < 0 || endIndex < startIndex || startIndex >= itemCount) return [];
+    return [{
+      index,
+      title: String(raw.title || `第 ${index + 1} 幕`).slice(0, 30),
+      startIndex,
+      endIndex: Math.min(endIndex, itemCount - 1),
+      hostText: sanitizeSpokenChatText(String(raw.hostText || '')).slice(0, 140)
+    }];
+  });
+  if (!normalized.length || normalized[0].startIndex !== 0) return fallback;
+  const lastEnd = normalized[normalized.length - 1].endIndex;
+  if (lastEnd < itemCount - 1) {
+    normalized.push({
+      index: normalized.length,
+      title: '返场',
+      startIndex: lastEnd + 1,
+      endIndex: itemCount - 1,
+      hostText: ''
+    });
+  }
+  return normalized;
+}
+
+function normalizeConcertHostEvents(rawEvents, { concertId, acts, itemCount }) {
+  if (!Array.isArray(rawEvents)) return [];
+  return rawEvents.flatMap((raw, index) => {
+    const type = ['intro', 'interlude', 'curtain'].includes(raw?.type) ? raw.type : null;
+    if (!type) return [];
+    const actIndex = Number.isInteger(Number(raw.actIndex)) ? Number(raw.actIndex) : (type === 'curtain' ? acts.length : 0);
+    const defaultBeforeIndex = type === 'intro' ? 0 : type === 'curtain' ? itemCount : acts[actIndex]?.startIndex;
+    const beforeIndex = Number.isInteger(Number(raw.beforeIndex)) ? Number(raw.beforeIndex) : defaultBeforeIndex;
+    if (!Number.isInteger(beforeIndex) || beforeIndex < 0 || beforeIndex > itemCount) return [];
+    const maxLength = type === 'intro' ? 220 : type === 'interlude' ? 140 : 100;
+    const text = sanitizeSpokenChatText(String(raw.text || '')).slice(0, maxLength);
+    if (!text) return [];
+    return [{
+      id: String(raw.id || `${concertId}:${type}:${actIndex}:${index}`),
+      type,
+      actIndex,
+      beforeIndex,
+      text,
+      status: ['played', 'skipped'].includes(raw.status) ? raw.status : 'pending'
+    }];
+  }).sort((a, b) => a.beforeIndex - b.beforeIndex || hostEventOrder(a.type) - hostEventOrder(b.type));
+}
+
+function hostEventOrder(type) {
+  return type === 'intro' ? 0 : type === 'interlude' ? 1 : 2;
+}
+
+function normalizeAudienceCache(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return {};
+  return Object.fromEntries(Object.entries(raw).map(([trackId, comments]) => [
+    String(trackId),
+    normalizeAudienceComments(comments)
+  ]).filter(([, comments]) => comments.length));
+}
+
+function fallbackConcertHostProgram(concert) {
+  const length = concert.items.length;
+  const firstAct = concert.acts[0] || { startIndex: 0, endIndex: Math.min(1, length - 1) };
+  const firstActTracks = concert.items.slice(firstAct.startIndex, firstAct.endIndex + 1);
+  const firstActNames = firstActTracks.map(item => `《${item.track.name}》`).join('、');
+  const firstActArtists = [...new Set(firstActTracks.flatMap(item => item.track.artists || []))].slice(0, 3).join('、');
+  const themeParts = [concert.settings?.mood, concert.settings?.scene, ...(concert.settings?.genres || [])]
+    .filter(value => value && value !== '自动');
+  const theme = themeParts.join(' · ') || String(concert.summary || '此刻的私人频率').slice(0, 36);
+  return {
+    introText: `欢迎来到这场由灿灿为你编排的 ${length} 首音乐会。本场主题是“${theme}”，情绪会从第一幕的铺陈出发，在后续幕次里逐步改变节奏、亮度与色彩。开场由${firstActNames}建立主线，${firstActArtists || '这些音乐人'}会先把我们带进今晚的声音现场。虚拟观众团已经入场，请把注意力交给第一幕，我们一起听到最后。`,
+    interludes: concert.acts.slice(1).map(act => {
+      const tracks = concert.items.slice(act.startIndex, act.endIndex + 1);
+      const names = tracks.map(item => `《${item.track.name}》`).join('、');
+      const artists = [...new Set(tracks.flatMap(item => item.track.artists || []))].slice(0, 3).join('、');
+      return {
+        actIndex: act.index,
+        startIndex: act.startIndex,
+        text: `上一幕的声音先在这里收束。接下来进入第 ${act.index + 1} 幕，这一段会从${names}展开，由${artists || '这些音乐人'}带来新的节奏和情绪层次。接下来的介绍只属于这一幕，我们把注意力交还给即将响起的旋律，继续往下听。`
+      };
+    }),
+    curtainText: `今晚的 ${length} 首歌已经全部播完。谢谢你和灿灿、也和这群虚拟观众一起留到谢幕。舞台先暗下来，想继续时可以选择返场一首，或者重新生成一场音乐会。`
+  };
+}
+
+function parseConcertHostProgram(raw, fallback, concert) {
+  let parsed = null;
+  try {
+    parsed = JSON.parse(stripCodeFence(String(raw || '')).trim());
+  } catch {
+    const match = String(raw || '').match(/\{[\s\S]*\}/);
+    if (match) {
+      try { parsed = JSON.parse(match[0]); } catch {}
+    }
+  }
+  if (!parsed || typeof parsed !== 'object') return fallback;
+  const parsedIntro = sanitizeSpokenChatText(String(parsed.introText || '')).slice(0, 220);
+  const introText = hostTextMatchesAct(parsedIntro, concert?.acts?.[0], concert) && parsedIntro.length >= 120
+    ? parsedIntro
+    : fallback.introText;
+  const parsedInterludes = Array.isArray(parsed.interludes) && parsed.interludes.length === Math.max(0, (concert?.acts || []).length - 1)
+    ? parsed.interludes
+    : [];
+  const interludes = (concert?.acts || []).slice(1).map((act, index) => {
+    const rawItem = parsedInterludes.length
+      ? parsedInterludes.find(item => typeof item === 'object' && Number(item?.actIndex) === act.index && Number(item?.startIndex) === act.startIndex)
+        || parsedInterludes[index]
+      : null;
+    const text = sanitizeSpokenChatText(String(typeof rawItem === 'string' ? rawItem : rawItem?.text || '')).slice(0, 140);
+    return Number(typeof rawItem === 'object' ? rawItem?.actIndex : act.index) === act.index
+      && Number(typeof rawItem === 'object' ? rawItem?.startIndex : act.startIndex) === act.startIndex
+      && text.length >= 70
+      && hostTextMatchesAct(text, act, concert)
+      ? { actIndex: act.index, startIndex: act.startIndex, text }
+      : fallback.interludes[index];
+  });
+  const parsedCurtain = sanitizeSpokenChatText(String(parsed.curtainText || '')).slice(0, 100);
+  return {
+    introText,
+    interludes,
+    curtainText: parsedCurtain.length >= 50 ? parsedCurtain : fallback.curtainText
+  };
+}
+
+function hostTextMatchesAct(text, act, concert) {
+  if (!text || !act || !concert) return false;
+  const tracks = concert.items.slice(act.startIndex, act.endIndex + 1);
+  const references = tracks.flatMap(item => [item.track.name, ...(item.track.artists || [])])
+    .map(value => normalizeMusicText(value))
+    .filter(value => value.length >= 2);
+  const normalizedText = normalizeMusicText(text);
+  return references.some(reference => normalizedText.includes(reference));
+}
+
+function applyConcertHostProgram(concert, program) {
+  const normalized = normalizeActivePlaylist(concert);
+  const fallback = fallbackConcertHostProgram(normalized);
+  const introText = program.introText || fallback.introText;
+  const curtainText = program.curtainText || fallback.curtainText;
+  const nextActs = normalized.acts.map((act, index) => ({
+    ...act,
+    hostText: index === 0 ? '' : (program.interludes?.[index - 1]?.text || fallback.interludes[index - 1]?.text || '')
+  }));
+  const nextEvents = [
+    { id: `${normalized.id}:intro`, type: 'intro', actIndex: 0, beforeIndex: 0, text: introText, status: 'pending' },
+    ...nextActs.slice(1).map(act => ({
+      id: `${normalized.id}:interlude:${act.index}`,
+      type: 'interlude',
+      actIndex: act.index,
+      beforeIndex: act.startIndex,
+      text: act.hostText,
+      status: 'pending'
+    })),
+    { id: `${normalized.id}:curtain`, type: 'curtain', actIndex: nextActs.length, beforeIndex: normalized.items.length, text: curtainText, status: 'pending' }
+  ].map(event => {
+    const existing = normalized.hostEvents.find(item => item.id === event.id || (item.type === event.type && item.actIndex === event.actIndex));
+    return ['played', 'skipped'].includes(existing?.status)
+      ? { ...event, text: existing.text, status: existing.status }
+      : event;
+  });
+  return normalizeActivePlaylist({
+    ...normalized,
+    hostText: introText,
+    introText,
+    curtainText,
+    acts: nextActs,
+    hostEvents: nextEvents
+  });
+}
+
+function concertHostTextForPolicy(concert, hostPolicy) {
+  if (hostPolicy === 'concert_intro') return String(concert.hostEvents?.find(event => event.type === 'intro')?.text || concert.introText || concert.hostText || '').trim();
+  if (hostPolicy === 'concert_interlude') {
+    return String(concert.acts.find(act => act.startIndex === concert.currentIndex)?.hostText || '').trim();
+  }
+  if (hostPolicy === 'concert_encore') return String(concert.encoreText || '').trim();
+  if (hostPolicy === 'concert_curtain') return String(concert.hostEvents?.find(event => event.type === 'curtain')?.text || concert.curtainText || '').trim();
+  return '';
+}
+
+function buildEncoreHostText(track) {
+  return `灯先别全关，今晚还有一首返场。把掌声留给《${track?.name || '这首歌'}》，我们再一起听最后一次。`;
+}
+
+async function commitConcertHostEvent({ db, config, sessionId, concert, text, hostPolicy, concertEvent, accountContext }) {
+  const account = normalizeAccountContext(accountContext);
+  const normalized = normalizeActivePlaylist(concert);
+  const context = getSessionContext(db, sessionId);
+  setSessionContext(db, sessionId, { ...context, activeConcert: normalized });
+  const chatText = String(text || '').trim();
+  const prefs = normalizeRuntimePrefs(getUserPrefs(db, account));
+  const speech = chatText ? speechDecisionForRecommendation(prefs) : { shouldSpeak: false, mode: 'off' };
+  let tts = { url: null, status: 'disabled', ms: 0, error: null };
+  if (chatText) saveMessage(db, sessionId, 'assistant', chatText, account);
+  if (chatText && speech.shouldSpeak) {
+    tts = await synthesizeSpeechWithDiagnostics(config.tts, chatText);
+    setRadioDebugInfo(db, sessionId, { lastTtsDiagnostics: sanitizeTtsDiagnostics(tts) });
+  }
+  return {
+    sessionId,
+    chatText,
+    track: null,
+    ttsUrl: tts.url,
+    ttsStatus: tts.status,
+    ttsMs: tts.ms,
+    ttsError: tts.error,
+    speech,
+    concertMode: true,
+    concertEvent,
+    hostPolicy,
+    concert: playlistForClient(normalized),
+    sessionConstraints: publicSessionConstraints(getSessionConstraintsFromContext(getSessionContext(db, sessionId)))
+  };
+}
+
+function concertStateResponse({ db, sessionId, concert, chatText = '', concertEvent = 'track', accountContext = null }) {
+  const account = normalizeAccountContext(accountContext);
+  return {
+    sessionId,
+    chatText,
+    track: null,
+    ttsUrl: null,
+    ttsStatus: 'disabled',
+    speech: { shouldSpeak: false, mode: 'off' },
+    mode: getSessionMode(db, sessionId),
+    profile: concert.profile || getProfile(db, account),
+    concertMode: true,
+    concertEvent,
+    hostPolicy: 'none',
+    concert: playlistForClient(concert),
+    sessionConstraints: publicSessionConstraints(getSessionConstraintsFromContext(getSessionContext(db, sessionId)))
+  };
+}
+
+function withPlaylistCompatibility(result = {}) {
+  if (!result?.concertMode) return result;
+  return {
+    ...result,
+    playlistMode: true,
+    playlist: result.concert || null,
+    hostPolicy: result.hostPolicy === 'concert_intro' ? 'playlist_intro' : result.hostPolicy === 'none' ? 'none' : result.hostPolicy
+  };
+}
+
+async function generateConcertAudience({ config, concert, item }) {
+  const fallback = buildFallbackAudienceComments(concert, item);
+  if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) return fallback;
+  const raw = await generateChatCompletion(config.llm, [
+    {
+      role: 'system',
+      content: [
+        '你正在生成音乐会中的 AI 虚拟观众弹幕。',
+        `只能使用这些人格：${CONCERT_PERSONAS.join('、')}。`,
+        '理性乐评人只分析能从歌曲本身合理感知的编曲、歌词和情绪，不得虚构制作人员、榜单、奖项或歌手经历。',
+        '毒舌观众只能轻度调侃音乐感受，不攻击用户、艺人或群体。',
+        '每条 8-32 个中文字符，口吻自然，避免十条都说相同内容。',
+        '只输出严格 JSON 数组：[{"persona":"人格","displayName":"虚拟昵称","content":"弹幕"}]。'
+      ].join('\n')
+    },
+    {
+      role: 'user',
+      content: [
+        `观众预设：${concert.settings.audiencePreset}`,
+        `音乐会氛围：${concert.settings.mood}`,
+        `使用场景：${concert.settings.scene}`,
+        `歌曲：${item.track.name} - ${(item.track.artists || []).join('/')}`,
+        `推荐理由：${item.reason || concert.summary}`,
+        '生成 10 条弹幕。'
+      ].join('\n')
+    }
+  ], () => JSON.stringify(fallback));
+  return normalizeAudienceComments(parseAudienceJson(raw)).slice(0, 10).concat(fallback).slice(0, 10);
+}
+
+function parseAudienceJson(raw) {
+  try {
+    const parsed = JSON.parse(stripCodeFence(String(raw || '')).trim());
+    return Array.isArray(parsed) ? parsed : parsed?.comments || [];
+  } catch {
+    return [];
+  }
+}
+
+function normalizeAudienceComments(comments = []) {
+  if (!Array.isArray(comments)) return [];
+  const seen = new Set();
+  return comments.flatMap((comment, index) => {
+    const persona = CONCERT_PERSONAS.includes(comment?.persona) ? comment.persona : '';
+    const content = String(comment?.content || '').replace(/\s+/g, ' ').trim().slice(0, 64);
+    if (!persona || !content || seen.has(content)) return [];
+    seen.add(content);
+    return [{
+      id: String(comment.id || `ai-${index}-${simpleTextHash(`${persona}:${content}`)}`),
+      source: 'ai',
+      persona,
+      displayName: String(comment.displayName || persona).replace(/\s+/g, ' ').trim().slice(0, 18),
+      content
+    }];
+  });
+}
+
+function buildFallbackAudienceComments(concert, item) {
+  const trackName = item.track?.name || '这首歌';
+  const templates = {
+    '理性乐评人': [`这首的层次推进很耐听`, `情绪没有一下铺满，留白很好`],
+    '氛围组': [`《${trackName}》一响，现场灯都亮了`, `这首太适合${concert.settings.scene === '自动' ? '现在' : concert.settings.scene}了`],
+    '老歌粉': [`这种旋律一出来就有回忆感`, `熟悉的情绪又被这首歌叫醒了`],
+    '朋友型观众': [`别急，我们一起把这首听完`, `这一段很适合安静坐一会儿`],
+    '毒舌观众': [`前奏这么会铺垫，差点以为要放大招`, `好听是好听，就是太会拿捏气氛了`],
+    '共情观众': [`不用马上振作，先让音乐陪着你`, `听到这里，今天的疲惫可以放下一点了`]
+  };
+  const sequence = audiencePersonaSequence(concert.settings.audiencePreset);
+  return sequence.slice(0, 10).map((persona, index) => ({
+    id: `ai-fallback-${index}-${simpleTextHash(`${trackName}:${persona}`)}`,
+    source: 'ai',
+    persona,
+    displayName: persona,
+    content: templates[persona][index % templates[persona].length]
+  }));
+}
+
+function audiencePersonaSequence(preset) {
+  if (preset === '专业') return ['理性乐评人', '老歌粉', '理性乐评人', '朋友型观众', '老歌粉', '氛围组', '理性乐评人', '共情观众', '老歌粉', '毒舌观众'];
+  if (preset === '热闹') return ['氛围组', '朋友型观众', '毒舌观众', '氛围组', '朋友型观众', '氛围组', '老歌粉', '毒舌观众', '共情观众', '理性乐评人'];
+  return ['共情观众', '朋友型观众', '共情观众', '朋友型观众', '老歌粉', '氛围组', '共情观众', '理性乐评人', '朋友型观众', '毒舌观众'];
+}
+
+function simpleTextHash(value) {
+  let hash = 0;
+  for (const char of String(value || '')) hash = ((hash << 5) - hash + char.charCodeAt(0)) | 0;
+  return Math.abs(hash).toString(36);
 }
 
 async function commitRadioRecommendation({ db, config, sessionId, payload, userMessage = null, conversationMood = null, source = 'sync', accountContext = null }) {
@@ -1171,6 +2014,7 @@ async function commitRadioRecommendation({ db, config, sessionId, payload, userM
     weatherRadio: payload?.weatherRadio || payload?.environmentContext?.weatherRadio || null,
     musicRecap: payload?.musicRecap || null,
     environmentContext: payload?.environmentContext || null,
+    sessionConstraints: publicSessionConstraints(getSessionConstraintsFromContext(getSessionContext(db, sessionId))),
     queueSource: source
   };
 }
@@ -1186,8 +2030,8 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
   const currentTrack = getCurrentTrack(db, account);
   const context = getSessionContext(db, sessionId);
   const conversationState = normalizeConversationState(context.conversationState);
-  const constraintUpdate = parseSessionConstraintUpdate(userMessage);
   const previousSessionConstraints = getSessionConstraintsFromContext(context);
+  const constraintUpdate = parseSessionConstraintUpdate(userMessage, previousSessionConstraints);
   const sessionConstraints = applySessionConstraintUpdate(previousSessionConstraints, constraintUpdate);
   const constraintsChanged = !sessionConstraintsEqual(previousSessionConstraints, sessionConstraints);
   if (constraintsChanged) {
@@ -1239,11 +2083,16 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       explicitSwitchRequested || !currentConstraintResult.accepted
     );
     const labelText = avoidLabels.join('、');
+    const removedLabels = previousSessionConstraints.rules
+      .filter(rule => (constraintUpdate.removeRuleIds || []).includes(rule.id))
+      .map(rule => rule.label);
     const chatText = constraintUpdate.reset
       ? '好，本场禁听限制已经取消，后面的推荐恢复正常。'
+      : constraintUpdate.type === 'allow'
+        ? `好，已取消${removedLabels.join('、') || '对应内容'}的临时禁听限制，其他限制保持不变。`
       : stopCurrent
         ? `好，本场已经避开${labelText}。这首也不继续放，我现在换一首。`
-        : `好，本场已经避开${labelText}，预取的下一首也已经重新检查。`;
+        : `好，本场已经避开${labelText}，这项限制最多影响接下来的 ${SESSION_CONSTRAINT_TRACK_LIMIT} 首，预取队列也已重新检查。`;
     if (userMessage) saveMessage(db, sessionId, 'user', userMessage, account);
     saveMessage(db, sessionId, 'assistant', chatText, account);
     setRadioDebugInfo(db, sessionId, {
@@ -1268,7 +2117,8 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       queuePolicy: { action: RADIO_QUEUE_POLICIES.HARD_PREEMPT, reason: 'session constraints changed' },
       intent: 'constraint_update',
       intentSource: 'rule',
-      constraintApplied: normalizeSessionConstraints(sessionConstraints),
+      constraintApplied: publicSessionConstraints(sessionConstraints),
+      sessionConstraints: publicSessionConstraints(sessionConstraints),
       switchRequested: stopCurrent,
       stopCurrent,
       queueRebuilt: Boolean(queueRebuilt)
@@ -2225,6 +3075,8 @@ export function getRadioDebugStatus(db, sessionId, accountContext = null) {
     sessionConstraints: normalizeSessionConstraints(context.sessionConstraints || {}),
     musicContext: normalizeMusicContext(context.musicContext || {}),
     conversationState: normalizeConversationState(context.conversationState || {}),
+    scheduleContext: publicScheduleContext(context.scheduleContext),
+    externalContextVersion: Number(context.externalContextVersion || 0),
     queue: queue.map(sanitizeQueueItemForDebug),
     queueMetrics: normalizeQueueMetrics(context.queueMetrics || {}),
     recentPlayedSongs: getPlayedTrackHistory(db, id, 20, account).map(sanitizeTrackForDebug),
@@ -2579,6 +3431,10 @@ export function formatEnvironmentContext(environmentContext = {}) {
   if (environmentContext.weather) parts.push(`weather=${environmentContext.weather}`);
   if (environmentContext.weatherUpdatedAt) parts.push(`weatherUpdatedAt=${environmentContext.weatherUpdatedAt}`);
   if (environmentContext.weatherRadio?.id) parts.push(`weatherRadio=${environmentContext.weatherRadio.id}:${environmentContext.weatherRadio.label}`);
+  if (environmentContext.scheduleContext?.fingerprint) {
+    const schedule = environmentContext.scheduleContext;
+    parts.push(`schedule=free:${schedule.freeWindowMinutes}m,next:${schedule.nextEventMinutes ?? 'none'}m,category:${schedule.nextEventCategory},location:${schedule.locationType},load:${schedule.dayLoad},transition:${schedule.transitionType}`);
+  }
   return parts.filter(Boolean).join('; ');
 }
 
@@ -2939,6 +3795,7 @@ function normalizeRuntimePrefs(raw = {}) {
     voiceMode: pick(raw.voiceMode, ['off', 'recommendations', 'all'], DEFAULT_PREFS.voiceMode),
     moodMode: pick(raw.moodMode, ['auto', 'comfort', 'focus', 'calm', 'night', 'random'], DEFAULT_PREFS.moodMode),
     lowDistractionMode: raw.lowDistractionMode === true,
+    scheduleAwareEnabled: raw.scheduleAwareEnabled === true,
     note: String(raw.note || '').slice(0, 500)
   };
 }
@@ -4614,25 +5471,39 @@ function extractAvoidHints(text) {
   return extractSessionAvoidTerms(text);
 }
 
-export function parseSessionConstraintUpdate(text) {
+export function parseSessionConstraintUpdate(text, previous = {}) {
   const value = String(text || '').trim();
   if (!value) return emptySessionConstraintUpdate();
-  if (/(恢复正常推荐|取消.*(?:限制|禁听|不听|不要|别放|少放)|后面都听|以后都听|接下来都听)/.test(value)) {
+  if (/(恢复正常推荐|取消(?:全部|所有).*(?:限制|禁听|不听|不要|别放|少放)|清空.*(?:限制|禁听)|后面都听|以后都听|接下来都听)/.test(value)) {
     return { ...emptySessionConstraintUpdate(), type: 'reset', reset: true, changed: true };
   }
   const avoidTerms = extractSessionAvoidTerms(value);
-  if (!avoidTerms.length) return emptySessionConstraintUpdate();
-  const classified = classifySessionConstraintTerms(avoidTerms, value);
-  return {
-    type: 'avoid',
-    avoidTerms: classified.avoidTerms,
-    avoidLanguages: classified.avoidLanguages,
-    avoidStyleFamilies: classified.avoidStyleFamilies,
-    avoidArtists: classified.avoidArtists,
-    avoidSongs: classified.avoidSongs,
-    reset: false,
-    changed: true
-  };
+  if (avoidTerms.length) {
+    const classified = classifySessionConstraintTerms(avoidTerms, value);
+    return {
+      type: 'avoid',
+      avoidTerms: classified.avoidTerms,
+      avoidLanguages: classified.avoidLanguages,
+      avoidStyleFamilies: classified.avoidStyleFamilies,
+      avoidArtists: classified.avoidArtists,
+      avoidSongs: classified.avoidSongs,
+      removeRuleIds: [],
+      reset: false,
+      changed: true
+    };
+  }
+  const current = normalizeSessionConstraints(previous);
+  const reversesConstraint = /(取消|解除|恢复|可以听|想听|要听|来点|放(?:一首|点|些)?|播放|推荐)/.test(value);
+  if (reversesConstraint) {
+    const normalizedText = normalizeMusicText(value);
+    const removeRuleIds = current.rules
+      .filter(rule => [rule.label, rule.value].map(normalizeMusicText).filter(Boolean).some(term => normalizedText.includes(term)))
+      .map(rule => rule.id);
+    if (removeRuleIds.length) {
+      return { ...emptySessionConstraintUpdate(), type: 'allow', removeRuleIds, changed: true };
+    }
+  }
+  return emptySessionConstraintUpdate();
 }
 
 function emptySessionConstraintUpdate() {
@@ -4643,6 +5514,7 @@ function emptySessionConstraintUpdate() {
     avoidStyleFamilies: [],
     avoidArtists: [],
     avoidSongs: [],
+    removeRuleIds: [],
     reset: false,
     changed: false
   };
@@ -4669,35 +5541,128 @@ function classifySessionConstraintTerms(terms = [], sourceText = '') {
 
 export function normalizeSessionConstraints(input = {}) {
   const classified = classifySessionConstraintTerms(input.avoidTerms || []);
-  const avoidTerms = uniqueStrings(classified.avoidTerms.map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12);
-  return {
-    avoidTerms,
-    avoidLanguages: uniqueStrings([...(input.avoidLanguages || []), ...classified.avoidLanguages].map(normalizeLanguage).filter(Boolean), 8),
-    avoidStyleFamilies: uniqueStrings([...(input.avoidStyleFamilies || []), ...classified.avoidStyleFamilies].map(normalizeGenreFamily).filter(Boolean), 8),
-    avoidArtists: uniqueStrings((input.avoidArtists || []).map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12),
-    avoidSongs: uniqueStrings((input.avoidSongs || []).map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm), 12),
+  const legacy = {
+    avoidTerms: classified.avoidTerms.map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm),
+    avoidLanguages: [...(input.avoidLanguages || []), ...classified.avoidLanguages].map(normalizeLanguage).filter(Boolean),
+    avoidStyleFamilies: [...(input.avoidStyleFamilies || []), ...classified.avoidStyleFamilies].map(normalizeGenreFamily).filter(Boolean),
+    avoidArtists: (input.avoidArtists || []).map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm),
+    avoidSongs: (input.avoidSongs || []).map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm)
+  };
+  const rawRules = [
+    ...(Array.isArray(input.rules) ? input.rules : []),
+    ...Object.entries(SESSION_CONSTRAINT_RULE_FIELDS).flatMap(([type, field]) => legacy[field].map(value => ({ type, value })))
+  ];
+  const ruleMap = new Map();
+  for (const raw of rawRules) {
+    const rule = normalizeSessionConstraintRule(raw);
+    if (!rule || rule.remainingTracks <= 0) continue;
+    const existing = ruleMap.get(rule.id);
+    if (!existing || rule.remainingTracks < existing.remainingTracks || raw?.remainingTracks !== undefined) ruleMap.set(rule.id, rule);
+  }
+  const rules = [...ruleMap.values()].slice(0, 24);
+  const result = {
+    avoidTerms: [],
+    avoidLanguages: [],
+    avoidStyleFamilies: [],
+    avoidArtists: [],
+    avoidSongs: [],
+    rules,
+    remainingTracks: rules.length ? Math.min(...rules.map(rule => rule.remainingTracks)) : 0,
     updatedAt: input.updatedAt || null
   };
+  for (const rule of rules) result[SESSION_CONSTRAINT_RULE_FIELDS[rule.type]].push(rule.value);
+  for (const field of Object.values(SESSION_CONSTRAINT_RULE_FIELDS)) result[field] = uniqueStrings(result[field], 12);
+  return result;
+}
+
+function normalizeSessionConstraintRule(raw = {}) {
+  const type = Object.hasOwn(SESSION_CONSTRAINT_RULE_FIELDS, raw.type) ? raw.type : null;
+  if (!type) return null;
+  let value = String(raw.value || '').trim();
+  if (type === 'language') value = normalizeLanguage(value);
+  else if (type === 'style') value = normalizeGenreFamily(value);
+  else value = cleanSessionConstraintTerm(value);
+  if (!value || ((type === 'term' || type === 'artist' || type === 'song') && !isUsefulSessionConstraintTerm(value))) return null;
+  const remainingTracks = Math.min(SESSION_CONSTRAINT_TRACK_LIMIT, Math.max(0, Number(raw.remainingTracks ?? SESSION_CONSTRAINT_TRACK_LIMIT) || 0));
+  const id = String(raw.id || `constraint-${crypto.createHash('sha1').update(`${type}:${normalizeMusicText(value)}`).digest('hex').slice(0, 16)}`);
+  return {
+    id,
+    type,
+    value,
+    label: sessionConstraintRuleLabel(type, value),
+    remainingTracks,
+    createdAt: raw.createdAt || nowIso()
+  };
+}
+
+function sessionConstraintRuleLabel(type, value) {
+  if (type === 'language') return LANGUAGE_LABELS[value] || value;
+  if (type === 'style') return GENRE_FAMILY_LABELS[value] || value;
+  return value;
+}
+
+export function publicSessionConstraints(input = {}) {
+  const constraints = normalizeSessionConstraints(input);
+  return {
+    avoidTerms: constraints.avoidTerms,
+    avoidLanguages: constraints.avoidLanguages,
+    avoidStyleFamilies: constraints.avoidStyleFamilies,
+    avoidArtists: constraints.avoidArtists,
+    avoidSongs: constraints.avoidSongs,
+    remainingTracks: constraints.remainingTracks,
+    rules: constraints.rules.map(rule => ({
+      id: rule.id,
+      type: rule.type,
+      value: rule.value,
+      label: rule.label,
+      remainingTracks: rule.remainingTracks
+    }))
+  };
+}
+
+export function advanceSessionConstraintsForFeedback({ db, sessionId, trackId, eventType, eventId = '', accountContext = null } = {}) {
+  const id = String(sessionId || '').trim();
+  if (!id || !['complete', 'skip'].includes(String(eventType || ''))) return publicSessionConstraints({});
+  const account = normalizeAccountContext(accountContext);
+  const row = db.prepare('SELECT id FROM radio_sessions WHERE id = ? AND account_id = ?').get(id, account.accountId);
+  if (!row) return publicSessionConstraints({});
+  const context = getSessionContext(db, id);
+  const current = getSessionConstraintsFromContext(context);
+  if (!current.rules.length) return publicSessionConstraints(current);
+  const progressKey = String(eventId || `${trackId || 'unknown'}:${eventType}`).slice(0, 180);
+  const processed = uniqueStrings(context.sessionConstraintProgressEvents || [], 160);
+  if (processed.includes(progressKey)) return publicSessionConstraints(current);
+  const rules = current.rules
+    .map(rule => ({ ...rule, remainingTracks: rule.remainingTracks - 1 }))
+    .filter(rule => rule.remainingTracks > 0);
+  const next = normalizeSessionConstraints({ rules, updatedAt: nowIso() });
+  setSessionContext(db, id, {
+    ...context,
+    sessionConstraints: next,
+    sessionConstraintProgressEvents: [...processed, progressKey].slice(-160)
+  });
+  return publicSessionConstraints(next);
 }
 
 export function applySessionConstraintUpdate(previous = {}, update = {}) {
   const current = normalizeSessionConstraints(previous);
   if (update.reset) return { ...normalizeSessionConstraints({}), updatedAt: nowIso() };
-  const next = normalizeSessionConstraints({
-    avoidTerms: [...current.avoidTerms, ...(update.avoidTerms || [])],
-    avoidLanguages: [...current.avoidLanguages, ...(update.avoidLanguages || [])],
-    avoidStyleFamilies: [...current.avoidStyleFamilies, ...(update.avoidStyleFamilies || [])],
-    avoidArtists: [...current.avoidArtists, ...(update.avoidArtists || [])],
-    avoidSongs: [...current.avoidSongs, ...(update.avoidSongs || [])]
-  });
+  const removed = new Set(update.removeRuleIds || []);
+  const additions = normalizeSessionConstraints(update).rules.map(rule => ({ ...rule, remainingTracks: SESSION_CONSTRAINT_TRACK_LIMIT, createdAt: nowIso() }));
+  const rules = current.rules.filter(rule => !removed.has(rule.id));
+  for (const rule of additions) {
+    const index = rules.findIndex(item => item.id === rule.id);
+    if (index >= 0) rules[index] = rule;
+    else rules.push(rule);
+  }
+  const next = normalizeSessionConstraints({ rules });
   return { ...next, updatedAt: sessionConstraintsEqual(current, next) ? current.updatedAt : nowIso() };
 }
 
 function sessionConstraintsEqual(a = {}, b = {}) {
   const left = normalizeSessionConstraints(a);
   const right = normalizeSessionConstraints(b);
-  return ['avoidTerms', 'avoidLanguages', 'avoidStyleFamilies', 'avoidArtists', 'avoidSongs']
-    .every(key => left[key].join('|') === right[key].join('|'));
+  return left.rules.map(rule => rule.id).sort().join('|') === right.rules.map(rule => rule.id).sort().join('|');
 }
 
 function mergeSessionConstraintsIntoMood(mood = {}, sessionConstraints = {}) {

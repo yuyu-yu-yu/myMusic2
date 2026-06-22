@@ -22,6 +22,7 @@ import {
 import {
   analyzeConversationMood,
   analyzeTurnContext,
+  advanceSessionConstraintsForFeedback,
   buildConfirmedTrackHostFallback,
   buildDailyMusicRecap,
   buildHybridCandidateContext,
@@ -34,6 +35,12 @@ import {
   classifyTurnIntent,
   canProactivelyRecommend,
   chatTurn,
+  concertAudienceTurn,
+  concertEncoreTurn,
+  concertHostTurn,
+  concertNextTurn,
+  concertReplanTurn,
+  concertStartTurn,
   consumeReadyRadioQueue,
   decideHardRuleTurnAction,
   decideQueuePolicy,
@@ -74,7 +81,7 @@ import {
   TURN_ACTIONS
 } from '../server/dj.mjs';
 import { resolvePlayableTrack } from '../server/library.mjs';
-import { getMemories, getMoodStatsSummary, getPreferences, nextRadioItem, removeAllMemories, removeMemory, startRadio, submitFeedback, updateMemory, updatePreferences } from '../server/radio.mjs';
+import { getMemories, getMoodStatsSummary, getPreferences, nextRadioItem, removeAllMemories, removeMemory, startPlaylistRadio, startRadio, submitFeedback, updateMemory, updatePreferences } from '../server/radio.mjs';
 import { resolveAccountContext } from '../server/account-scope.mjs';
 import { generateDiary, getDiary } from '../server/diary.mjs';
 import { buildCanCanBackgroundPrompt, buildCanCanPersonaPrompt, shouldUseCanCanCreatorContext } from '../server/cancan-persona.mjs';
@@ -437,6 +444,61 @@ test('session constraints distinguish current-track rejection from persistent ba
   assert.equal(currentOnly.changed, false);
   assert.deepEqual(nightlyBan.avoidLanguages, ['cantonese']);
   assert.deepEqual(complaintBan.avoidLanguages, ['cantonese']);
+});
+
+test('explicit positive request removes only the conflicting temporary constraint', () => {
+  const initial = normalizeSessionConstraints({
+    avoidLanguages: ['cantonese'],
+    avoidTerms: ['陈奕迅']
+  });
+  const update = parseSessionConstraintUpdate('接下来想听粤语歌', initial);
+  const next = applyConstraintUpdateForTest(initial, update);
+
+  assert.equal(update.type, 'allow');
+  assert.deepEqual(next.avoidLanguages, []);
+  assert.deepEqual(next.avoidTerms, ['陈奕迅']);
+
+  const cancelUpdate = parseSessionConstraintUpdate('取消粤语限制', initial);
+  const cancelled = applyConstraintUpdateForTest(initial, cancelUpdate);
+  assert.deepEqual(cancelled.avoidLanguages, []);
+  assert.deepEqual(cancelled.avoidTerms, ['陈奕迅']);
+});
+
+function applyConstraintUpdateForTest(previous, update) {
+  const removed = new Set(update.removeRuleIds || []);
+  return normalizeSessionConstraints({ rules: previous.rules.filter(rule => !removed.has(rule.id)) });
+}
+
+test('temporary constraints expire after 30 unique completed or skipped tracks and do not cross sessions', async (t) => {
+  const db = testDb(t);
+  const args = {
+    db,
+    config: { llm: {}, tts: {}, weather: {}, recommendation: { pipeline: 'hybrid' } },
+    netease: { isConfigured: () => false },
+    sessionId: 'temporary-constraint-session'
+  };
+  const applied = await chatTurn({ ...args, message: '这次对话后面不听粤语歌' });
+  assert.equal(applied.sessionConstraints.rules[0].remainingTracks, 30);
+
+  const once = advanceSessionConstraintsForFeedback({ db, sessionId: args.sessionId, trackId: 'song-1', eventType: 'complete', eventId: 'play-1' });
+  const duplicate = advanceSessionConstraintsForFeedback({ db, sessionId: args.sessionId, trackId: 'song-1', eventType: 'complete', eventId: 'play-1' });
+  assert.equal(once.rules[0].remainingTracks, 29);
+  assert.equal(duplicate.rules[0].remainingTracks, 29);
+
+  let remaining = duplicate;
+  for (let index = 2; index <= 30; index += 1) {
+    remaining = advanceSessionConstraintsForFeedback({
+      db,
+      sessionId: args.sessionId,
+      trackId: `song-${index}`,
+      eventType: index % 2 ? 'complete' : 'skip',
+      eventId: `play-${index}`
+    });
+  }
+  assert.deepEqual(remaining.rules, []);
+
+  const fresh = await chatTurn({ ...args, sessionId: 'fresh-session', message: '你好，推荐一首歌' });
+  assert.deepEqual(fresh.sessionConstraints?.rules || [], []);
 });
 
 test('language ban stops a violating current track and rebuilds the prefetched queue', async (t) => {
@@ -1018,6 +1080,7 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
     voiceMode: 'recommendations',
     moodMode: 'auto',
     lowDistractionMode: false,
+    scheduleAwareEnabled: false,
     note: ''
   });
 
@@ -1029,6 +1092,7 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
       voiceMode: 'all',
       moodMode: 'focus',
       lowDistractionMode: true,
+      scheduleAwareEnabled: true,
       note: '多一点像朋友一样聊天。'
     }
   });
@@ -1037,6 +1101,7 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
   assert.equal(saved.preferences.voiceMode, 'all');
   assert.equal(saved.preferences.moodMode, 'focus');
   assert.equal(saved.preferences.lowDistractionMode, true);
+  assert.equal(saved.preferences.scheduleAwareEnabled, true);
 
   const loaded = getPreferences({ db });
   assert.equal(loaded.preferences.note, '多一点像朋友一样聊天。');
@@ -1063,6 +1128,7 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
       voiceMode: 'robot',
       moodMode: 'chaos',
       lowDistractionMode: 'yes',
+      scheduleAwareEnabled: 'yes',
       note: 'x'.repeat(600)
     }
   });
@@ -1071,6 +1137,7 @@ test('preferences API helpers read defaults, persist updates, and sanitize inval
   assert.equal(sanitized.preferences.voiceMode, 'recommendations');
   assert.equal(sanitized.preferences.moodMode, 'auto');
   assert.equal(sanitized.preferences.lowDistractionMode, false);
+  assert.equal(sanitized.preferences.scheduleAwareEnabled, false);
   assert.equal(sanitized.preferences.note.length, 500);
 });
 
@@ -3647,7 +3714,7 @@ test('playlist mode starts with one intro and continues without per-song speech'
   assert.equal(start.hostPolicy, 'playlist_intro');
   assert.equal(start.playlist.items.length, 5);
   assert.equal(start.playlist.currentIndex, 0);
-  assert.match(start.chatText, /5 首歌|歌单/);
+  assert.match(start.chatText, /5 首音乐会|音乐会/);
   assert.equal(start.speech.shouldSpeak, false);
   const savedSceneMessage = db.prepare('SELECT content FROM messages WHERE session_id = ? AND role = ? ORDER BY id LIMIT 1')
     .get('playlist-mode-session', 'user');
@@ -3668,6 +3735,87 @@ test('playlist mode starts with one intro and continues without per-song speech'
   assert.equal(next.playlist.currentIndex, 1);
   assert.equal(next.playlist.items[0].status, 'played');
   assert.equal(next.playlist.items[1].status, 'current');
+});
+
+test('schedule planning enforces zero, one, and three-to-five track windows', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off', scheduleAwareEnabled: true } });
+  const playlist = savePlaylist(db, { id: 'schedule-profile', name: 'Schedule Profile', trackCount: 8 }, 'created');
+  for (let index = 0; index < 8; index += 1) {
+    const track = saveTrack(db, {
+      id: `schedule-track-${index}`,
+      originalId: `schedule-original-${index}`,
+      name: `Schedule Song ${index + 1}`,
+      artists: [`Schedule Artist ${index + 1}`],
+      album: 'Schedule Album',
+      durationMs: 3 * 60 * 1000
+    });
+    linkPlaylistTrack(db, playlist.id, track.id, index);
+  }
+  const base = {
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    planning: { source: 'schedule' }
+  };
+  const scheduleContext = (freeWindowMinutes) => ({
+    source: 'fake',
+    fingerprint: `window-${freeWindowMinutes}`,
+    fetchedAt: new Date().toISOString(),
+    expiresAt: new Date(Date.now() + 300000).toISOString(),
+    freeWindowMinutes,
+    nextEventMinutes: freeWindowMinutes,
+    nextEventCategory: 'class',
+    locationType: 'campus',
+    dayLoad: 'medium',
+    transitionType: 'pre_event'
+  });
+
+  const tooShort = await playlistStartTurn({ ...base, sessionId: 'schedule-zero', scheduleContext: scheduleContext(5) });
+  assert.equal(tooShort.track, null);
+  assert.equal(tooShort.concertMode, true);
+  assert.equal(tooShort.reason, 'schedule_window_too_short');
+
+  const one = await playlistStartTurn({ ...base, sessionId: 'schedule-one', scheduleContext: scheduleContext(10) });
+  assert.equal(one.playlist.items.length, 1);
+  assert.ok(one.playlist.items[0].track.durationMs <= 8 * 60 * 1000);
+
+  const three = await playlistStartTurn({ ...base, sessionId: 'schedule-three', scheduleContext: scheduleContext(15) });
+  assert.equal(three.playlist.items.length, 3);
+  assert.ok(three.playlist.items.reduce((sum, item) => sum + item.track.durationMs, 0) <= 13 * 60 * 1000);
+
+  const four = await playlistStartTurn({ ...base, sessionId: 'schedule-four', scheduleContext: scheduleContext(24) });
+  assert.equal(four.playlist.items.length, 4);
+
+  const five = await playlistStartTurn({ ...base, sessionId: 'schedule-five', scheduleContext: scheduleContext(45) });
+  assert.equal(five.playlist.items.length, 5);
+});
+
+test('schedule MCP failure falls back to the existing five-track recommendation', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off', scheduleAwareEnabled: true } });
+  const playlist = savePlaylist(db, { id: 'schedule-fallback-profile', name: 'Schedule Fallback', trackCount: 5 }, 'created');
+  for (let index = 0; index < 5; index += 1) {
+    const track = saveTrack(db, {
+      id: `schedule-fallback-${index}`,
+      originalId: `schedule-fallback-original-${index}`,
+      name: `Fallback Song ${index + 1}`,
+      artists: [`Fallback Artist ${index + 1}`],
+      album: 'Fallback Album'
+    });
+    linkPlaylistTrack(db, playlist.id, track.id, index);
+  }
+
+  const result = await startPlaylistRadio({
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'schedule-fallback-session',
+    planning: { source: 'schedule', refresh: true },
+    scheduleService: { getForPlanning: async () => { throw new Error('MCP offline'); } }
+  });
+  assert.equal(result.playlistMode, true);
+  assert.equal(result.playlist.items.length, 5);
 });
 
 test('playlist jump skips the current item and does not generate host speech', async (t) => {
@@ -3701,5 +3849,141 @@ test('playlist jump skips the current item and does not generate host speech', a
   assert.equal(jumped.speech.shouldSpeak, false);
   assert.equal(jumped.playlist.currentIndex, 3);
   assert.equal(jumped.playlist.items[0].status, 'skipped');
+  assert.equal(jumped.playlist.items[1].status, 'skipped');
+  assert.equal(jumped.playlist.items[2].status, 'skipped');
   assert.equal(jumped.playlist.items[3].status, 'current');
+  assert.equal(jumped.playlist.hostEvents.find(event => event.type === 'interlude' && event.beforeIndex === 2)?.status, 'skipped');
+});
+
+test('concert mode supports 12 tracks, fixed acts, interludes, and curtain stop', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  const playlist = savePlaylist(db, { id: 'concert-twelve-profile', name: 'Concert Twelve', trackCount: 12 }, 'created');
+  for (let index = 0; index < 12; index += 1) {
+    const track = saveTrack(db, {
+      id: `concert-twelve-${index}`,
+      originalId: `concert-original-${index}`,
+      name: `Concert Song ${index + 1}`,
+      artists: [`Concert Artist ${index + 1}`],
+      album: 'Concert Album'
+    });
+    linkPlaylistTrack(db, playlist.id, track.id, index);
+  }
+
+  const args = {
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'concert-twelve-session'
+  };
+  const start = await concertStartTurn({
+    ...args,
+    settings: { length: 12, mood: '深夜', scene: '夜晚独处', audiencePreset: '专业' }
+  });
+
+  assert.equal(start.concertMode, true);
+  assert.equal(start.concert.items.length, 12);
+  assert.deepEqual(start.concert.acts.map(act => [act.startIndex, act.endIndex]), [[0, 2], [3, 5], [6, 8], [9, 11]]);
+  assert.equal(start.concertEvent, 'intro');
+  const introEvent = start.concert.hostEvents.find(event => event.type === 'intro');
+  assert.equal(introEvent.status, 'played');
+  assert.ok(introEvent.text.length >= 120 && introEvent.text.length <= 220);
+  assert.equal(start.concert.hostEvents.filter(event => event.type === 'interlude').every(event => event.text.length >= 70 && event.text.length <= 140), true);
+
+  let turn = start;
+  for (let index = 1; index < 12; index += 1) {
+    if ([3, 6, 9].includes(index)) {
+      const event = turn.concert.hostEvents.find(item => item.type === 'interlude' && item.beforeIndex === index);
+      const interlude = await concertHostTurn({ ...args, eventId: event.id });
+      assert.equal(interlude.concertEvent, 'interlude');
+      assert.equal(interlude.hostPolicy, 'concert_interlude');
+      assert.match(interlude.chatText, new RegExp(`Concert Song ${index + 1}`));
+    }
+    turn = await concertNextTurn(args);
+    assert.equal(turn.concertEvent, 'track');
+    assert.equal(turn.hostPolicy, 'none');
+  }
+
+  const curtainEvent = turn.concert.hostEvents.find(event => event.type === 'curtain');
+  const curtain = await concertHostTurn({ ...args, eventId: curtainEvent.id });
+  assert.equal(curtain.track, null);
+  assert.equal(curtain.concertEvent, 'curtain');
+  assert.equal(curtain.concert.phase, 'curtain');
+  const afterCurtain = await concertNextTurn(args);
+  assert.equal(afterCurtain.track, null);
+  assert.equal(afterCurtain.concert.phase, 'curtain');
+  assert.equal(afterCurtain.concertEvent, 'track_end');
+});
+
+test('concert replan preserves played items and replaces only the remaining program', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  const playlist = savePlaylist(db, { id: 'concert-replan-profile', name: 'Concert Replan', trackCount: 16 }, 'created');
+  for (let index = 0; index < 16; index += 1) {
+    const track = saveTrack(db, {
+      id: `concert-replan-${index}`,
+      originalId: `concert-replan-original-${index}`,
+      name: `Replan Song ${index + 1}`,
+      artists: [`Replan Artist ${index + 1}`],
+      album: 'Replan Album'
+    });
+    linkPlaylistTrack(db, playlist.id, track.id, index);
+  }
+  const args = {
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'concert-replan-session'
+  };
+  const start = await concertStartTurn({ ...args, settings: { length: 8 } });
+  await concertNextTurn(args);
+  const originalPrefix = start.concert.items.slice(0, 2).map(item => item.track.id);
+  const replanned = await concertReplanTurn({ ...args, message: '后半场轻快一点' });
+
+  assert.equal(replanned.concert.items.length, 8);
+  assert.deepEqual(replanned.concert.items.slice(0, 2).map(item => item.track.id), originalPrefix);
+  assert.equal(replanned.concert.currentIndex, 1);
+  assert.equal(replanned.concert.items.slice(2).every(item => item.status === 'pending'), true);
+  assert.match(replanned.chatText, /重新编排后半场/);
+});
+
+test('concert audience is explicitly AI sourced and encore ends without looping', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  const playlist = savePlaylist(db, { id: 'concert-encore-profile', name: 'Concert Encore', trackCount: 7 }, 'created');
+  for (let index = 0; index < 7; index += 1) {
+    const track = saveTrack(db, {
+      id: `concert-encore-${index}`,
+      originalId: `concert-encore-original-${index}`,
+      name: `Encore Song ${index + 1}`,
+      artists: [`Encore Artist ${index + 1}`],
+      album: 'Encore Album'
+    });
+    linkPlaylistTrack(db, playlist.id, track.id, index);
+  }
+  const args = {
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'concert-encore-session'
+  };
+  const start = await concertStartTurn({ ...args, settings: { length: 5, audiencePreset: '热闹' } });
+  const audience = await concertAudienceTurn({ ...args, trackId: start.track.id });
+  assert.equal(audience.comments.length, 10);
+  assert.equal(audience.comments.every(comment => comment.source === 'ai' && comment.persona), true);
+
+  let turn = start;
+  for (let index = 1; index < 5; index += 1) turn = await concertNextTurn(args);
+  const curtainEvent = turn.concert.hostEvents.find(event => event.type === 'curtain');
+  await concertHostTurn({ ...args, eventId: curtainEvent.id });
+  const encore = await concertEncoreTurn(args);
+  assert.equal(encore.concertEvent, 'encore');
+  assert.equal(encore.concert.phase, 'encore');
+  assert.equal(encore.concert.items.length, 6);
+  const encoreCurtain = encore.concert.hostEvents.find(event => event.type === 'curtain' && event.status === 'pending');
+  const finished = await concertHostTurn({ ...args, eventId: encoreCurtain.id });
+  assert.equal(finished.track, null);
+  assert.equal(finished.concert.phase, 'finished');
+  const unavailable = await concertEncoreTurn(args);
+  assert.equal(unavailable.ok, false);
 });

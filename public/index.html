@@ -37,9 +37,11 @@
         <div class="left-col">
           <div class="now-panel">
             <div id="ai-dj-avatar" class="ai-dj-avatar" data-state="idle" aria-label="AI DJ 灿灿">
-              <video id="avatar-video" class="avatar-video" muted loop playsinline preload="auto"></video>
-              <img id="avatar-image" class="avatar-image" src="/avatar/source/cancan.png" alt="AI DJ 灿灿" />
-              <span class="avatar-status">ON AIR</span>
+              <video id="avatar-video" class="avatar-video" muted playsinline preload="auto"></video>
+              <img id="avatar-image" class="avatar-image" src="/avatar/source/cancan-first-frame.png" alt="AI DJ 灿灿" />
+              <canvas id="avatar-transition-frame" class="avatar-transition-frame" aria-hidden="true" hidden></canvas>
+              <span class="avatar-transition-mask" aria-hidden="true"></span>
+              <span class="avatar-status">IDLE</span>
             </div>
             <div class="track-meta">
               <p class="eyebrow">AI PRIVATE RADIO</p>
@@ -78,9 +80,70 @@
           </div>
           <div class="radio-mode-launcher" role="group" aria-label="电台启动模式">
             <button id="start-btn" class="primary start-wide radio-mode-btn is-selected" type="button" data-radio-mode="single">单曲模式</button>
-            <button id="playlist-start-btn" class="primary start-wide radio-mode-btn" type="button" data-radio-mode="playlist">歌单模式</button>
+            <button id="concert-start-btn" class="primary start-wide radio-mode-btn" type="button" data-radio-mode="concert">音乐会模式</button>
           </div>
-          <aside id="playlist-queue-panel" class="playlist-queue-panel" hidden></aside>
+          <section id="concert-setup-panel" class="concert-setup-panel" hidden aria-label="音乐会设置">
+            <div class="concert-setup-head">
+              <div>
+                <span>CONCERT PROGRAMMER</span>
+                <strong>编排一场属于你的音乐会</strong>
+              </div>
+              <button id="concert-setup-close" class="concert-icon-btn" type="button" aria-label="关闭音乐会设置">×</button>
+            </div>
+            <div class="concert-setting-group">
+              <span class="concert-setting-label">场次长度</span>
+              <div class="concert-choice-row" data-concert-choice="length">
+                <button type="button" class="is-selected" data-value="5">5 首</button>
+                <button type="button" data-value="8">8 首</button>
+                <button type="button" data-value="12">12 首</button>
+              </div>
+            </div>
+            <div class="concert-setting-group">
+              <span class="concert-setting-label">音乐类型 <small>最多选两个</small></span>
+              <div class="concert-choice-row is-wrap" data-concert-choice="genres">
+                <button type="button" class="is-selected" data-value="自动">自动</button>
+                <button type="button" data-value="流行">流行</button>
+                <button type="button" data-value="摇滚">摇滚</button>
+                <button type="button" data-value="电子">电子</button>
+                <button type="button" data-value="民谣">民谣</button>
+                <button type="button" data-value="R&B">R&amp;B</button>
+                <button type="button" data-value="爵士">爵士</button>
+                <button type="button" data-value="纯音乐">纯音乐</button>
+                <button type="button" data-value="国风">国风</button>
+                <button type="button" data-value="ACG">ACG</button>
+              </div>
+            </div>
+            <div class="concert-setting-grid">
+              <div class="concert-setting-group">
+                <span class="concert-setting-label">氛围</span>
+                <select id="concert-mood">
+                  <option>自动</option><option>温暖</option><option>热烈</option><option>平静</option>
+                  <option>浪漫</option><option>怀旧</option><option>专注</option><option>深夜</option>
+                </select>
+              </div>
+              <div class="concert-setting-group">
+                <span class="concert-setting-label">场景</span>
+                <select id="concert-scene">
+                  <option>自动</option><option>夜晚独处</option><option>学习</option><option>通勤</option>
+                  <option>运动</option><option>聚会</option><option>放松</option>
+                </select>
+              </div>
+              <div class="concert-setting-group">
+                <span class="concert-setting-label">观众团</span>
+                <select id="concert-audience-preset">
+                  <option>温暖</option><option>热闹</option><option>专业</option>
+                </select>
+              </div>
+            </div>
+            <label class="concert-note-field">
+              <span>自由补充 <small id="concert-note-count">0 / 80</small></span>
+              <input id="concert-note" type="text" maxlength="80" placeholder="例如：后半场想更轻快，不要太伤感" />
+            </label>
+            <div class="concert-setup-actions">
+              <button id="concert-create-btn" class="primary" type="button">生成音乐会</button>
+            </div>
+          </section>
+          <aside id="concert-console-panel" class="playlist-queue-panel concert-console-panel" hidden></aside>
           <div class="ai-music-mode">
             <button id="ai-music-toggle" class="ai-music-toggle" type="button" aria-pressed="false">
               <span class="ai-music-toggle-led" aria-hidden="true"></span>
@@ -97,6 +160,7 @@
             <span class="eyebrow">灿灿 · AI DJ</span>
             <button id="mode-reset-btn" class="ghost" title="恢复正常推荐" style="display:none">恢复正常</button>
           </div>
+          <div id="session-constraint-bar" class="session-constraint-bar" hidden aria-live="polite"></div>
           <div id="chat-messages" class="chat-messages">
             <div class="chat-msg dj-msg" data-initial-chat>
               <p>准备好以后，可以先点击选择模式，或者直接点击播放按钮。我会根据你的收藏、时间和心情来推荐音乐，你也可以随时跟我聊天。</p>

@@ -22,7 +22,7 @@ Create and maintain these avatar motion states:
 - `searching_music`: she looks through a floating music playlist or holographic panel
 - `reading_book`: she reads a small book or notebook cutely
 - `happy`: she reacts happily when a good song starts
-- `on_air`: she acts like she is hosting a radio show
+- `on_air`: optional reserved live-host state; keep assets available even when the frontend does not display it
 
 ## Visual consistency rules
 
@@ -73,7 +73,8 @@ The reusable avatar UI should support:
 - `searching`
 - `reading`
 - `happy`
-- `on_air`
+
+Keep the existing `on_air` assets and generation support reserved for possible future use, but do not select or display that state in the current frontend.
 
 The avatar should render a looping muted video when a matching WebM exists, and fall back to the source PNG with CSS motion when it does not.
 

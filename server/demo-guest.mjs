@@ -112,6 +112,7 @@ function deleteGuestAccountData(db, accountId) {
     'user_memories',
     'account_settings',
     'account_music_profiles',
+    'schedule_contexts',
     'diary_entries',
     'diary_signal_feedback'
   ];

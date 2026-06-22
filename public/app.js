@@ -42,8 +42,20 @@ const state = {
   playbackTokenSeq: 0,
   activePlaybackToken: 0,
   radioMode: 'single',
-  activePlaylist: null,
-  playlistStatus: 'idle',
+  scheduleStatus: null,
+  schedulePlanning: false,
+  activeConcert: null,
+  concertStatus: 'idle',
+  concertSettings: {
+    length: 5,
+    genres: [],
+    mood: '自动',
+    scene: '自动',
+    audiencePreset: '温暖',
+    note: ''
+  },
+  concertDanmaku: { ai: true, real: true },
+  sessionConstraints: { rules: [], remainingTracks: 0 },
   aiMusicMode: readStoredAiMusicMode()
 };
 
@@ -68,7 +80,8 @@ const danmakuState = {
   activeSongId: null,
   comments: [],
   remainingComments: [],
-  cache: new Map()
+  realCache: new Map(),
+  aiCache: new Map()
 };
 
 function ensureDemoVisitorId() {
@@ -101,6 +114,9 @@ let savedChatHTML = '';
 let avatarRestoreTimer = null;
 let avatarFrameTimer = null;
 let avatarFrameSequenceToken = 0;
+let avatarVideoToken = 0;
+let avatarTransitionToken = 0;
+let avatarTransitionTimer = null;
 let preferencesLoadPromise = null;
 const VISUALIZER_DEBUG = false;
 const visualizerReducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)');
@@ -157,17 +173,17 @@ const avatarFrameSequences = {
   searching: makeAvatarFrameSequence('searching', [300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300, 300]),
   reading: makeAvatarFrameSequence('reading', [240, 240, 250, 260, 260, 250, 240, 240, 250, 260, 260, 250]),
   // The happy strip can expose adjacent cells in the square avatar viewport; frame PNGs stay single-frame.
-  happy: makeAvatarFrameSequence('happy', [160, 160, 170, 180, 180, 170, 160, 220], { sprite: false }),
-  on_air: makeAvatarFrameSequence('on_air', [233, 233, 233, 233, 233, 233, 233, 233, 233, 233, 233, 237])
+  happy: makeAvatarFrameSequence('happy', [160, 160, 170, 180, 180, 170, 160, 220], { sprite: false })
 };
 
+const AVATAR_VIDEO_VERSION = '2';
 const avatarMotionMap = {
-  listening: '/avatar/webm/listening.webm',
-  talking: '/avatar/webm/talking.webm',
-  searching: '/avatar/webm/searching_music.webm',
-  reading: '/avatar/webm/reading_book.webm',
-  happy: '/avatar/webm/happy.webm',
-  on_air: '/avatar/webm/on_air.webm'
+  idle: `/avatar/webm/idle.webm?v=${AVATAR_VIDEO_VERSION}`,
+  listening: `/avatar/webm/listening.webm?v=${AVATAR_VIDEO_VERSION}`,
+  talking: `/avatar/webm/talking.webm?v=${AVATAR_VIDEO_VERSION}`,
+  searching: `/avatar/webm/searching_music.webm?v=${AVATAR_VIDEO_VERSION}`,
+  reading: `/avatar/webm/reading_book.webm?v=${AVATAR_VIDEO_VERSION}`,
+  happy: `/avatar/webm/happy.webm?v=${AVATAR_VIDEO_VERSION}`
 };
 
 const avatarStateAliases = {
@@ -180,9 +196,9 @@ const avatarStateLabels = {
   talking: 'TALKING',
   searching: 'SEARCH',
   reading: 'READING',
-  happy: 'HAPPY',
-  on_air: 'ON AIR'
+  happy: 'HAPPY'
 };
+const AVATAR_TRANSITION_MS = 260;
 const AVATAR_MIN_TALKING_MS = 1800;
 const AVATAR_MAX_TALKING_MS = 6800;
 const SILENT_AUDIO_DATA_URI = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQQAAAAAAA==';
@@ -244,7 +260,7 @@ async function render() {
   // Move persistent audio elements back to hidden layer before clearing view
   if (view.__audioCleanup) { view.__audioCleanup(); view.__audioCleanup = null; }
 
-  if (state.mixerRefreshTimer && location.pathname !== '/mixer') {
+  if (state.mixerRefreshTimer && !isUsageInsightsRoute()) {
     clearInterval(state.mixerRefreshTimer);
     state.mixerRefreshTimer = null;
   }
@@ -759,31 +775,157 @@ function stopAvatarFrameSequence() {
   }
 }
 
-function playAvatarVideoOrFallback(root, video, image, src) {
+function captureAvatarTransitionFrame(root, video, image) {
+  const canvas = root.querySelector('#avatar-transition-frame');
+  const source = video && !video.hidden && video.readyState >= 2
+    ? video
+    : image && !image.hidden && image.complete
+      ? image
+      : null;
+  if (!canvas || !source) return null;
+
+  const width = video && source === video ? video.videoWidth : image.naturalWidth;
+  const height = video && source === video ? video.videoHeight : image.naturalHeight;
+  if (!width || !height) return null;
+
+  canvas.width = width;
+  canvas.height = height;
+  const context = canvas.getContext('2d');
+  if (!context) return null;
+  try {
+    context.clearRect(0, 0, width, height);
+    context.drawImage(source, 0, 0, width, height);
+  } catch {
+    return null;
+  }
+  return canvas;
+}
+
+function beginAvatarTransition(root, video, image) {
+  avatarTransitionToken += 1;
+  const token = avatarTransitionToken;
+  if (avatarTransitionTimer) {
+    clearTimeout(avatarTransitionTimer);
+    avatarTransitionTimer = null;
+  }
+
+  const canvas = captureAvatarTransitionFrame(root, video, image);
+  root.classList.remove('is-avatar-revealing');
+  root.classList.remove('is-avatar-transitioning');
+  if (!canvas) return token;
+
+  canvas.classList.remove('is-revealing');
+  canvas.hidden = false;
+  void canvas.offsetWidth;
+  root.classList.add('is-avatar-transitioning');
+  return token;
+}
+
+function finishAvatarTransition(root, token) {
+  if (!token || token !== avatarTransitionToken) return;
+  const canvas = root.querySelector('#avatar-transition-frame');
+  if (!canvas || canvas.hidden) {
+    root.classList.remove('is-avatar-transitioning', 'is-avatar-revealing');
+    return;
+  }
+
+  root.classList.add('is-avatar-revealing');
+  canvas.classList.add('is-revealing');
+  avatarTransitionTimer = setTimeout(() => {
+    if (token !== avatarTransitionToken) return;
+    canvas.hidden = true;
+    canvas.classList.remove('is-revealing');
+    root.classList.remove('is-avatar-transitioning', 'is-avatar-revealing');
+    avatarTransitionTimer = null;
+  }, AVATAR_TRANSITION_MS);
+}
+
+function revealAvatarVideo(root, video, image, transitionToken) {
+  root.classList.remove('is-fallback');
+  video.hidden = false;
+  if (image) image.hidden = true;
+  let finished = false;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    finishAvatarTransition(root, transitionToken);
+  };
+  if (typeof video.requestVideoFrameCallback === 'function') {
+    video.requestVideoFrameCallback(finish);
+  } else {
+    requestAnimationFrame(finish);
+  }
+  setTimeout(finish, 180);
+}
+
+function restartAvatarVideo(root, video, image, requestToken) {
+  if (requestToken !== avatarVideoToken) return;
+  const transitionToken = beginAvatarTransition(root, video, image);
+  video.currentTime = 0;
+  requestAnimationFrame(() => finishAvatarTransition(root, transitionToken));
+  video.play().then(() => {
+    if (requestToken !== avatarVideoToken) return;
+    root.classList.remove('is-fallback');
+    video.hidden = false;
+    if (image) image.hidden = true;
+  }).catch(() => finishAvatarTransition(root, transitionToken));
+}
+
+function playAvatarVideoOrFallback(
+  root,
+  video,
+  image,
+  src,
+  sequence = null,
+  requestToken = avatarVideoToken,
+  transitionToken = null
+) {
   root.classList.remove('is-frame-sequence');
   root.classList.remove('is-sprite-sequence');
   const sprite = root.querySelector('#avatar-sprite');
   if (sprite) sprite.hidden = true;
-  if (image) image.src = '/avatar/source/cancan.png';
+  if (image) image.src = '/avatar/source/cancan-first-frame.png';
+
+  const showSourceFallback = () => {
+    root.classList.add('is-fallback');
+    if (video) {
+      video.pause();
+      video.hidden = true;
+      video.onerror = null;
+      video.onloadeddata = null;
+      video.onended = null;
+    }
+    if (image) image.hidden = false;
+    finishAvatarTransition(root, transitionToken);
+  };
+
+  const showSequenceFallback = () => {
+    if (requestToken !== avatarVideoToken) return;
+    if (sequence?.frames?.length) {
+      playAvatarFrameSequence(root, video, image, sequence, '');
+      finishAvatarTransition(root, transitionToken);
+    } else {
+      showSourceFallback();
+    }
+  };
 
   if (!video || !src) {
-    root.classList.add('is-fallback');
-    if (video) video.hidden = true;
-    if (image) image.hidden = false;
+    showSourceFallback();
     return;
   }
 
   video.onerror = () => {
-    root.classList.add('is-fallback');
-    video.hidden = true;
-    if (image) image.hidden = false;
+    showSequenceFallback();
   };
   video.onloadeddata = () => {
-    root.classList.remove('is-fallback');
-    video.hidden = false;
-    if (image) image.hidden = true;
-    video.play().catch(() => {});
+    if (requestToken !== avatarVideoToken) return;
+    video.play().then(() => {
+      if (requestToken !== avatarVideoToken) return;
+      revealAvatarVideo(root, video, image, transitionToken);
+    }).catch(showSequenceFallback);
   };
+  video.loop = false;
+  video.onended = () => restartAvatarVideo(root, video, image, requestToken);
 
   if (video.getAttribute('src') !== src) {
     video.hidden = true;
@@ -792,10 +934,7 @@ function playAvatarVideoOrFallback(root, video, image, src) {
     video.src = src;
     video.load();
   } else if (video.readyState >= 2) {
-    root.classList.remove('is-fallback');
-    video.hidden = false;
-    if (image) image.hidden = true;
-    video.play().catch(() => {});
+    video.onloadeddata();
   }
 }
 
@@ -852,6 +991,7 @@ function playAvatarFrameSequence(root, video, image, sequence, fallbackSrc) {
     video.hidden = true;
     video.onerror = null;
     video.onloadeddata = null;
+    video.onended = null;
   }
   image.hidden = true;
   sprite.hidden = false;
@@ -889,6 +1029,7 @@ function playAvatarImageFrameSequence(root, video, image, sequence, fallbackSrc,
     video.hidden = true;
     video.onerror = null;
     video.onloadeddata = null;
+    video.onended = null;
   }
   image.hidden = false;
 
@@ -911,6 +1052,7 @@ function playAvatarImageFrameSequence(root, video, image, sequence, fallbackSrc,
 function setAvatarState(nextState = 'idle', options = {}) {
   const normalized = normalizeAvatarState(nextState);
   state.avatarState = normalized;
+  avatarVideoToken += 1;
 
   if (avatarRestoreTimer) {
     clearTimeout(avatarRestoreTimer);
@@ -920,20 +1062,30 @@ function setAvatarState(nextState = 'idle', options = {}) {
   const root = document.querySelector('#ai-dj-avatar');
   if (!root) return;
 
-  root.dataset.state = normalized;
-  const status = root.querySelector('.avatar-status');
-  if (status) status.textContent = avatarStateLabels[normalized] || 'ON AIR';
-
   const video = document.querySelector('#avatar-video');
   const image = document.querySelector('#avatar-image');
+  const previousState = root.dataset.state || 'idle';
+  const transitionToken = previousState !== normalized
+    ? beginAvatarTransition(root, video, image)
+    : null;
+
+  root.dataset.state = normalized;
+  const status = root.querySelector('.avatar-status');
+  if (status) status.textContent = avatarStateLabels[normalized] || 'IDLE';
+
   const src = avatarMotionMap[normalized];
   const sequence = avatarFrameSequences[normalized];
 
-  if (sequence) {
-    playAvatarFrameSequence(root, video, image, sequence, src);
+  if (src) {
+    stopAvatarFrameSequence();
+    playAvatarVideoOrFallback(root, video, image, src, sequence, avatarVideoToken, transitionToken);
+  } else if (sequence) {
+    playAvatarFrameSequence(root, video, image, sequence, '');
+    finishAvatarTransition(root, transitionToken);
   } else {
     stopAvatarFrameSequence();
-    playAvatarVideoOrFallback(root, video, image, src);
+    playAvatarVideoOrFallback(root, video, image, '');
+    finishAvatarTransition(root, transitionToken);
   }
 
   if (options.temporaryMs) {
@@ -949,17 +1101,16 @@ function getContextualAvatarState() {
   const songAudio = document.querySelector('#song-audio');
   if (hostAudio?.src && !hostAudio.paused && !hostAudio.ended) return 'talking';
   if (songAudio?.src && !songAudio.paused && !songAudio.ended) return 'listening';
-  if (state.current?.track) return 'on_air';
   return 'idle';
 }
 
 function setRadioButtonState(mode = 'idle') {
   const startBtn = document.querySelector('#start-btn');
-  const playlistStartBtn = document.querySelector('#playlist-start-btn');
-  const activeMode = state.radioMode === 'playlist' ? 'playlist' : 'single';
+  const concertStartBtn = document.querySelector('#concert-start-btn');
+  const activeMode = state.radioMode === 'concert' ? 'concert' : 'single';
   const buttons = [
     { el: startBtn, mode: 'single', idleText: '单曲模式', loadingText: '单曲搜索中', activeText: '单曲电台中' },
-    { el: playlistStartBtn, mode: 'playlist', idleText: '歌单模式', loadingText: '整理歌单中', activeText: '歌单播放中' }
+    { el: concertStartBtn, mode: 'concert', idleText: '音乐会模式', loadingText: '编排音乐会中', activeText: '音乐会进行中' }
   ];
   buttons.forEach(({ el, mode: buttonMode, idleText, loadingText, activeText }) => {
     if (!el) return;
@@ -1012,15 +1163,15 @@ function closestButtonFromEvent(event) {
 }
 
 function setRadioMode(mode = 'single') {
-  state.radioMode = mode === 'playlist' ? 'playlist' : 'single';
+  state.radioMode = mode === 'concert' ? 'concert' : 'single';
   if (state.radioMode === 'single') {
-    state.activePlaylist = null;
-    state.playlistStatus = 'idle';
-  } else if (!state.activePlaylist) {
-    state.playlistStatus = 'loading';
+    state.activeConcert = null;
+    state.concertStatus = 'idle';
+  } else if (!state.activeConcert) {
+    state.concertStatus = 'loading';
   }
   setRadioButtonState(state.current?.track || state.sessionId ? 'active' : 'idle');
-  renderPlaylistQueue();
+  renderConcertConsole();
 }
 
 function hasCurrentPlaybackCandidate() {
@@ -1066,7 +1217,7 @@ function renderPlayer() {
   };
 
   const startBtn = document.querySelector('#start-btn');
-  const playlistStartBtn = document.querySelector('#playlist-start-btn');
+  const concertStartBtn = document.querySelector('#concert-start-btn');
   const previousBtn = document.querySelector('#previous-btn');
   const nextBtn = document.querySelector('#next-btn');
   const playToggleBtn = document.querySelector('#play-toggle-btn');
@@ -1078,11 +1229,7 @@ function renderPlayer() {
   const { likeBtn, dislikeBtn } = ensureFeedbackButtons();
 
   startBtn.addEventListener('click', () => startSingleRadioFromControls());
-  playlistStartBtn?.addEventListener('click', () => {
-    setRadioMode('playlist');
-    api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
-    startPlaylistRadio();
-  });
+  concertStartBtn?.addEventListener('click', () => openConcertSetup());
   previousBtn?.addEventListener('click', () => previousTrack());
   nextBtn.addEventListener('click', () => nextTrack({ skipCurrent: true }));
   playToggleBtn?.addEventListener('click', () => {
@@ -1118,11 +1265,37 @@ function renderPlayer() {
     if (!scene) return;
     handleScenePrompt(scene);
   });
-  document.querySelector('#playlist-queue-panel')?.addEventListener('click', (event) => {
+  bindConcertSetupInteractions();
+  document.querySelector('#concert-console-panel')?.addEventListener('click', (event) => {
     const button = closestButtonFromEvent(event);
-    if (!button?.matches('[data-playlist-index]')) return;
-    const index = Number(button.dataset.playlistIndex);
-    if (Number.isInteger(index)) jumpPlaylistTo(index);
+    if (button?.matches('[data-concert-index]')) {
+      const index = Number(button.dataset.concertIndex);
+      if (Number.isInteger(index)) jumpConcertTo(index);
+      return;
+    }
+    if (button?.matches('[data-concert-host-event]')) {
+      replayConcertHostEvent(button.dataset.concertHostEvent);
+      return;
+    }
+    if (button?.matches('[data-danmaku-source]')) {
+      toggleConcertDanmakuSource(button.dataset.danmakuSource);
+      return;
+    }
+    if (button?.matches('[data-concert-fallback-length]')) {
+      state.concertSettings.length = Number(button.dataset.concertFallbackLength);
+      startConcertRadio({ settings: state.concertSettings });
+      return;
+    }
+    if (button?.matches('[data-concert-encore]')) {
+      startConcertEncore();
+      return;
+    }
+    if (button?.matches('[data-concert-new]')) openConcertSetup();
+  });
+  document.querySelector('#session-constraint-bar')?.addEventListener('click', (event) => {
+    const button = closestButtonFromEvent(event);
+    const label = button?.dataset.constraintLabel;
+    if (label) sendChat(`取消${label}限制`);
   });
 
   // Restore saved chat messages
@@ -1144,7 +1317,8 @@ function renderPlayer() {
   initProgressBar();
   updateAiMusicToggle();
   updateAiMusicDownload(state.current?.track || null);
-  renderPlaylistQueue();
+  renderConcertConsole();
+  renderSessionConstraintBar();
   scheduleRadioPrefetch();
   loadDiaryRadioEntry().catch(() => {});
 }
@@ -1194,8 +1368,8 @@ function setAiMusicMode(enabled, { announce = true } = {}) {
   state.aiMusicMode = Boolean(enabled);
   if (state.aiMusicMode) {
     state.radioMode = 'single';
-    state.activePlaylist = null;
-    state.playlistStatus = 'idle';
+    state.activeConcert = null;
+    state.concertStatus = 'idle';
   }
   try {
     localStorage.setItem(AI_MUSIC_MODE_STORAGE_KEY, state.aiMusicMode ? 'on' : 'off');
@@ -1204,7 +1378,7 @@ function setAiMusicMode(enabled, { announce = true } = {}) {
   }
   updateAiMusicToggle();
   setRadioButtonState(state.current?.track || state.sessionId ? 'active' : 'idle');
-  renderPlaylistQueue();
+  renderConcertConsole();
   if (announce) {
     appendChat({
       role: 'dj',
@@ -1368,16 +1542,16 @@ const aiMusicLoadingMessages = [
   '灿灿正在把最近对话做成旋律...',
 ];
 
-const playlistLoadingMessages = [
-  '灿灿正在整理 5 首歌单...',
+const concertLoadingMessages = [
+  '灿灿正在编排整场音乐会...',
   '灿灿正在校验每首歌能不能稳定播放...',
-  '灿灿正在给这张歌单排顺序...',
-  '灿灿正在写整张歌单的开场导播...',
+  '灿灿正在划分节目幕次...',
+  '灿灿正在写开场、串场和谢幕...',
 ];
 
-const playlistNextLoadingMessages = [
-  '灿灿正在切到歌单下一首...',
-  '灿灿正在保持这张歌单的播放节奏...',
+const concertNextLoadingMessages = [
+  '灿灿正在切到音乐会下一首...',
+  '灿灿正在保持现场节奏...',
 ];
 
 const chatLoadingMessages = [
@@ -1391,10 +1565,10 @@ function startLoadingMessages(kind = 'music') {
     ? chatLoadingMessages
     : kind === 'aiMusic'
     ? aiMusicLoadingMessages
-    : kind === 'playlist'
-    ? playlistLoadingMessages
-    : kind === 'playlistNext'
-    ? playlistNextLoadingMessages
+    : kind === 'concert'
+    ? concertLoadingMessages
+    : kind === 'concertNext'
+    ? concertNextLoadingMessages
     : loadingMessages;
   statusLocked = true;
   setAvatarState(kind === 'chat' ? 'reading' : 'searching');
@@ -1586,7 +1760,7 @@ function pauseCurrentPlaybackForTransition() {
 
 function scheduleRadioPrefetch({ force = false } = {}) {
   if (state.aiMusicMode) return Promise.resolve(null);
-  if (state.radioMode === 'playlist') return Promise.resolve(null);
+  if (state.radioMode === 'concert') return Promise.resolve(null);
   if (state.radioPrefetchPromise && !force) return state.radioPrefetchPromise;
   const sessionId = ensureSessionId();
   state.radioPrefetchPromise = api('/api/radio/prefetch', {
@@ -1613,15 +1787,36 @@ async function startRadio() {
   const sessionId = ensureSessionId();
   setAvatarState('searching');
   setRadioButtonState('loading');
-  appendChat({ role: 'user', text: state.aiMusicMode ? '开启 AI 原创模式' : '启动电台' });
+  appendChat({
+    role: 'user',
+    text: state.aiMusicMode
+      ? '开启 AI 原创模式'
+      : state.preferences?.scheduleAwareEnabled
+        ? '按接下来的日程安排一段音乐'
+        : '启动电台'
+  });
   const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : 'music');
   attachRadioTurnLoading(radioTurn, loading);
   try {
     await loadPreferences().catch(() => null);
     if (!isActiveRadioTurn(radioTurn)) return;
+    const useSchedulePlanning = !state.aiMusicMode && state.preferences?.scheduleAwareEnabled === true;
+    state.schedulePlanning = useSchedulePlanning;
+    if (useSchedulePlanning) {
+      state.radioMode = 'concert';
+      state.concertStatus = 'loading';
+      state.activeConcert = null;
+      renderConcertConsole();
+    }
     const data = state.aiMusicMode
       ? await requestAiMusicTrack({ sessionId, trigger: 'start', signal: radioTurnSignal(radioTurn) })
-      : await api('/api/radio/start', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
+      : useSchedulePlanning
+        ? await api('/api/radio/playlist/start', {
+            method: 'POST',
+            body: { sessionId, planning: { source: 'schedule', refresh: true } },
+            signal: radioTurnSignal(radioTurn)
+          })
+        : await api('/api/radio/start', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
     handleRadioResponse(data, { loading, radioTurn });
   } catch (e) {
     if (isInterruptedRadioTurn(radioTurn, e)) {
@@ -1652,32 +1847,133 @@ async function startRadio() {
   }
 }
 
-async function startPlaylistRadio({ message = '' } = {}) {
+function normalizeConcertSettingsClient(raw = {}) {
+  const length = [5, 8, 12].includes(Number(raw.length)) ? Number(raw.length) : 5;
+  const genres = Array.isArray(raw.genres) ? [...new Set(raw.genres.filter(value => value && value !== '自动'))].slice(0, 2) : [];
+  return {
+    length,
+    genres,
+    mood: raw.mood || '自动',
+    scene: raw.scene || '自动',
+    audiencePreset: raw.audiencePreset || '温暖',
+    note: String(raw.note || '').trim().slice(0, 80)
+  };
+}
+
+function openConcertSetup() {
+  const panel = document.querySelector('#concert-setup-panel');
+  if (!panel) return;
+  panel.hidden = false;
+  syncConcertSetupControls();
+  document.querySelector('#concert-note')?.focus();
+}
+
+function closeConcertSetup() {
+  const panel = document.querySelector('#concert-setup-panel');
+  if (panel) panel.hidden = true;
+}
+
+function bindConcertSetupInteractions() {
+  const panel = document.querySelector('#concert-setup-panel');
+  if (!panel) return;
+  document.querySelector('#concert-setup-close')?.addEventListener('click', closeConcertSetup);
+  document.querySelector('#concert-create-btn')?.addEventListener('click', async () => {
+    await pauseCurrentPlaybackForTransition();
+    startConcertRadio({ settings: readConcertSetupSettings() });
+  });
+  panel.querySelectorAll('[data-concert-choice]').forEach(group => {
+    group.addEventListener('click', event => {
+      const button = closestButtonFromEvent(event);
+      if (!button?.dataset.value) return;
+      const kind = group.dataset.concertChoice;
+      if (kind === 'length') {
+        group.querySelectorAll('button').forEach(item => item.classList.toggle('is-selected', item === button));
+        return;
+      }
+      if (button.dataset.value === '自动') {
+        group.querySelectorAll('button').forEach(item => item.classList.toggle('is-selected', item === button));
+        return;
+      }
+      group.querySelector('[data-value="自动"]')?.classList.remove('is-selected');
+      button.classList.toggle('is-selected');
+      const selected = [...group.querySelectorAll('button.is-selected')];
+      if (selected.length > 2) selected[0].classList.remove('is-selected');
+      if (!group.querySelector('button.is-selected')) group.querySelector('[data-value="自动"]')?.classList.add('is-selected');
+    });
+  });
+  const note = document.querySelector('#concert-note');
+  note?.addEventListener('input', () => {
+    const count = document.querySelector('#concert-note-count');
+    if (count) count.textContent = `${note.value.length} / 80`;
+  });
+}
+
+function syncConcertSetupControls() {
+  const settings = normalizeConcertSettingsClient(state.concertSettings);
+  document.querySelectorAll('[data-concert-choice="length"] button').forEach(button => {
+    button.classList.toggle('is-selected', Number(button.dataset.value) === settings.length);
+  });
+  document.querySelectorAll('[data-concert-choice="genres"] button').forEach(button => {
+    button.classList.toggle('is-selected', button.dataset.value === '自动' ? !settings.genres.length : settings.genres.includes(button.dataset.value));
+  });
+  const mood = document.querySelector('#concert-mood');
+  const scene = document.querySelector('#concert-scene');
+  const audience = document.querySelector('#concert-audience-preset');
+  const note = document.querySelector('#concert-note');
+  if (mood) mood.value = settings.mood;
+  if (scene) scene.value = settings.scene;
+  if (audience) audience.value = settings.audiencePreset;
+  if (note) note.value = settings.note;
+  const count = document.querySelector('#concert-note-count');
+  if (count) count.textContent = `${settings.note.length} / 80`;
+}
+
+function readConcertSetupSettings() {
+  const length = Number(document.querySelector('[data-concert-choice="length"] button.is-selected')?.dataset.value || 5);
+  const genres = [...document.querySelectorAll('[data-concert-choice="genres"] button.is-selected')]
+    .map(button => button.dataset.value)
+    .filter(value => value && value !== '自动');
+  return normalizeConcertSettingsClient({
+    length,
+    genres,
+    mood: document.querySelector('#concert-mood')?.value,
+    scene: document.querySelector('#concert-scene')?.value,
+    audiencePreset: document.querySelector('#concert-audience-preset')?.value,
+    note: document.querySelector('#concert-note')?.value
+  });
+}
+
+async function startConcertRadio({ settings = state.concertSettings, message = '' } = {}) {
   const radioTurn = beginRadioTurn();
   primeVoicePlayback();
   const sessionId = ensureSessionId();
   const userMessage = String(message || '').trim();
-  state.radioMode = 'playlist';
-  state.playlistStatus = 'loading';
-  renderPlaylistQueue();
+  state.concertSettings = normalizeConcertSettingsClient(settings);
+  state.schedulePlanning = false;
+  state.radioMode = 'concert';
+  state.concertStatus = 'loading';
+  state.activeConcert = null;
+  closeConcertSetup();
+  renderConcertConsole();
+  renderSessionConstraintBar();
   setAvatarState('searching');
   setRadioButtonState('loading');
   if (state.aiMusicMode) setAiMusicMode(false, { announce: false });
   if (userMessage) appendChat({ role: 'user', text: userMessage });
   if (!userMessage) {
-    appendChat({ role: 'user', text: '一键推荐 5 首歌单' });
+    appendChat({ role: 'user', text: `生成一场 ${state.concertSettings.length} 首音乐会` });
   }
-  const loading = startLoadingMessages('playlist');
+  const loading = startLoadingMessages('concert');
   attachRadioTurnLoading(radioTurn, loading);
   try {
     await loadPreferences().catch(() => null);
     if (!isActiveRadioTurn(radioTurn)) return;
-    const data = await api('/api/radio/playlist/start', {
+    const data = await api('/api/radio/concert/start', {
       method: 'POST',
-      body: { sessionId, message: userMessage },
+      body: { sessionId, settings: state.concertSettings, message: userMessage },
       signal: radioTurnSignal(radioTurn)
     });
-    state.radioMode = 'playlist';
+    state.radioMode = 'concert';
     handleRadioResponse(data, { loading, radioTurn });
   } catch (e) {
     if (isInterruptedRadioTurn(radioTurn, e)) {
@@ -1687,7 +1983,7 @@ async function startPlaylistRadio({ message = '' } = {}) {
     }
     clearRadioTurnLoading(radioTurn, loading);
     stopLoadingMessages({ loading });
-    replaceLoadingMessage({ text: '整理 5 首歌单时出了一点问题：' + e.message, loading });
+    replaceLoadingMessage({ text: '编排音乐会时出了一点问题：' + e.message, loading });
     setAvatarState(getContextualAvatarState());
     setRadioButtonState(state.current?.track ? 'active' : 'idle');
     setPlayerStatus(e.message, 'error');
@@ -1695,6 +1991,9 @@ async function startPlaylistRadio({ message = '' } = {}) {
 }
 
 async function nextTrack({ skipCurrent = true, silent = false, forceFresh = false } = {}) {
+  if (state.radioMode === 'concert' && state.activeConcert) {
+    return advanceConcertPlayback({ skipCurrent, silent });
+  }
   const storedNext = forceFresh ? null : getNextPlaybackItem(playbackSequenceState());
   if (storedNext?.track) {
     applyPlaybackSequence(movePlaybackCursor(playbackSequenceState(), 1));
@@ -1712,17 +2011,24 @@ async function nextTrack({ skipCurrent = true, silent = false, forceFresh = fals
   if (stopCurrentPromise) await stopCurrentPromise;
   if (!isActiveRadioTurn(radioTurn)) return;
   if (!silent) {
-    appendChat({ role: 'user', text: state.aiMusicMode ? '生成此刻歌曲' : state.radioMode === 'playlist' ? '歌单下一首' : '下一首' });
+    appendChat({ role: 'user', text: state.aiMusicMode ? '生成此刻歌曲' : state.radioMode === 'concert' ? '音乐会下一首' : '下一首' });
   }
-  const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : state.radioMode === 'playlist' ? 'playlistNext' : 'music');
+  const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : state.radioMode === 'concert' ? 'concertNext' : 'music');
   attachRadioTurnLoading(radioTurn, loading);
   try {
     await loadPreferences().catch(() => null);
     if (!isActiveRadioTurn(radioTurn)) return;
+    const scheduleActive = state.schedulePlanning && state.preferences?.scheduleAwareEnabled === true;
+    if (state.schedulePlanning && !scheduleActive) state.schedulePlanning = false;
+    const schedulePlanning = getSchedulePlanningForNextTurn();
     const data = state.aiMusicMode
       ? await requestAiMusicTrack({ sessionId, trigger: 'next', signal: radioTurnSignal(radioTurn) })
-      : state.radioMode === 'playlist'
-      ? await api('/api/radio/playlist/next', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) })
+      : state.radioMode === 'concert'
+      ? await api(scheduleActive ? '/api/radio/playlist/next' : '/api/radio/concert/next', {
+          method: 'POST',
+          body: { sessionId, ...(schedulePlanning ? { planning: schedulePlanning } : {}) },
+          signal: radioTurnSignal(radioTurn)
+        })
       : await api('/api/radio/next', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
     handleRadioResponse(data, { loading, radioTurn });
   } catch (e) {
@@ -1753,9 +2059,105 @@ async function nextTrack({ skipCurrent = true, silent = false, forceFresh = fals
   }
 }
 
-async function jumpPlaylistTo(index) {
-  if (state.radioMode !== 'playlist' || !state.activePlaylist) return;
-  const item = state.activePlaylist.items?.[index];
+async function advanceConcertPlayback({ skipCurrent = true, silent = false } = {}) {
+  const concert = state.activeConcert;
+  const items = Array.isArray(concert?.items) ? concert.items : [];
+  if (!concert || !items.length) return;
+  const currentTrackId = String(state.current?.track?.id || '');
+  const matchedIndex = items.findIndex(item => String(item.track?.id || '') === currentTrackId);
+  const currentIndex = matchedIndex >= 0 ? matchedIndex : Number(concert.currentIndex || 0);
+  const nextIndex = currentIndex + 1;
+  const hostEvent = (concert.hostEvents || []).find(event => {
+    if (event.status !== 'pending') return false;
+    if (nextIndex >= items.length) return event.type === 'curtain';
+    return event.type === 'interlude' && Number(event.beforeIndex) === nextIndex;
+  });
+  const radioTurn = beginRadioTurn();
+  const stopCurrentPromise = pauseCurrentPlaybackForTransition();
+  primeVoicePlayback();
+  setAvatarState('searching');
+  setPlaybackToggleState(false);
+  if (skipCurrent) await reportFeedback('skip');
+  await stopCurrentPromise;
+  if (!isActiveRadioTurn(radioTurn)) return;
+
+  if (hostEvent) {
+    return requestConcertHostEvent(hostEvent.id, {
+      replay: false,
+      continueToNext: hostEvent.type === 'interlude',
+      radioTurn
+    });
+  }
+  if (nextIndex >= items.length) {
+    setPlayerStatus(['curtain', 'finished'].includes(concert.phase) ? '音乐会已谢幕' : '等待谢幕', '');
+    return;
+  }
+
+  const loading = startLoadingMessages('concertNext');
+  attachRadioTurnLoading(radioTurn, loading);
+  try {
+    const data = await api('/api/radio/concert/next', {
+      method: 'POST',
+      body: { sessionId: ensureSessionId() },
+      signal: radioTurnSignal(radioTurn)
+    });
+    handleRadioResponse(data, { loading, radioTurn });
+  } catch (error) {
+    if (isInterruptedRadioTurn(radioTurn, error)) return;
+    stopLoadingMessages({ loading });
+    replaceLoadingMessage({ text: `切换音乐会曲目失败：${error.message}`, loading });
+    setAvatarState(getContextualAvatarState());
+  }
+}
+
+async function requestConcertHostEvent(eventId, { replay = false, continueToNext = false, resumeAfter = false, radioTurn = null } = {}) {
+  const turn = radioTurn || beginRadioTurn({ interruptPlayback: !resumeAfter });
+  const loading = startLoadingMessages('concert');
+  attachRadioTurnLoading(turn, loading);
+  try {
+    const data = await api('/api/radio/concert/host', {
+      method: 'POST',
+      body: { sessionId: ensureSessionId(), eventId, replay },
+      signal: radioTurnSignal(turn)
+    });
+    handleRadioResponse(data, {
+      loading,
+      radioTurn: turn,
+      afterHostSpeech: () => {
+        if (continueToNext) nextTrack({ skipCurrent: false, silent: true });
+        else if (resumeAfter) resumePlayback();
+      }
+    });
+  } catch (error) {
+    if (isInterruptedRadioTurn(turn, error)) return;
+    stopLoadingMessages({ loading });
+    replaceLoadingMessage({ text: `播放音乐会串词失败：${error.message}`, loading });
+    if (continueToNext) nextTrack({ skipCurrent: false, silent: true });
+    else if (resumeAfter) resumePlayback();
+  }
+}
+
+async function replayConcertHostEvent(eventId) {
+  const event = state.activeConcert?.hostEvents?.find(item => item.id === eventId);
+  if (!event || event.status !== 'played') return;
+  const songAudio = document.querySelector('#song-audio');
+  const resumeAfter = Boolean(songAudio?.src && !songAudio.paused && !songAudio.ended && event.type !== 'curtain');
+  if (resumeAfter) await pausePlayback();
+  primeVoicePlayback();
+  return requestConcertHostEvent(eventId, { replay: true, resumeAfter });
+}
+
+function getSchedulePlanningForNextTurn() {
+  if (!state.schedulePlanning || state.preferences?.scheduleAwareEnabled !== true) return null;
+  const items = Array.isArray(state.activeConcert?.items) ? state.activeConcert.items : [];
+  const currentIndex = Number(state.activeConcert?.currentIndex ?? -1);
+  const atSegmentBoundary = items.length === 0 || currentIndex >= items.length - 1;
+  return atSegmentBoundary ? { source: 'schedule', refresh: true } : null;
+}
+
+async function jumpConcertTo(index) {
+  if (state.radioMode !== 'concert' || !state.activeConcert) return;
+  const item = state.activeConcert.items?.[index];
   if (!item || item.status !== 'pending') return;
   const radioTurn = beginRadioTurn();
   const stopCurrentPromise = pauseCurrentPlaybackForTransition();
@@ -1766,16 +2168,16 @@ async function jumpPlaylistTo(index) {
   await reportFeedback('skip');
   await stopCurrentPromise;
   if (!isActiveRadioTurn(radioTurn)) return;
-  appendChat({ role: 'user', text: `跳到歌单第 ${index + 1} 首` });
-  const loading = startLoadingMessages('playlistNext');
+  appendChat({ role: 'user', text: `跳到音乐会第 ${index + 1} 首` });
+  const loading = startLoadingMessages('concertNext');
   attachRadioTurnLoading(radioTurn, loading);
   try {
-    const data = await api('/api/radio/playlist/jump', {
+    const data = await api('/api/radio/concert/jump', {
       method: 'POST',
       body: { sessionId, index },
       signal: radioTurnSignal(radioTurn)
     });
-    state.radioMode = 'playlist';
+    state.radioMode = 'concert';
     handleRadioResponse(data, { loading, radioTurn });
   } catch (e) {
     if (isInterruptedRadioTurn(radioTurn, e)) {
@@ -1785,7 +2187,7 @@ async function jumpPlaylistTo(index) {
     }
     clearRadioTurnLoading(radioTurn, loading);
     stopLoadingMessages({ loading });
-    replaceLoadingMessage({ text: '跳转歌单歌曲时出了一点问题：' + e.message, loading });
+    replaceLoadingMessage({ text: '跳转音乐会歌曲时出了一点问题：' + e.message, loading });
     setAvatarState(getContextualAvatarState());
     setPlayerStatus(e.message, 'error');
   }
@@ -1834,9 +2236,9 @@ function buildScenePromptMessage(scene) {
 
 function handleScenePrompt(scene) {
   const message = buildScenePromptMessage(scene);
-  if (state.radioMode === 'playlist') {
+  if (state.radioMode === 'concert') {
     api('/api/player/stop', { method: 'POST', body: {} }).catch(() => {});
-    startPlaylistRadio({ message });
+    startConcertRadio({ settings: { ...state.concertSettings, scene }, message });
     return;
   }
   setRadioMode('single');
@@ -1844,6 +2246,9 @@ function handleScenePrompt(scene) {
 }
 
 async function sendChat(msg) {
+  if (state.radioMode === 'concert' && state.activeConcert?.phase === 'playing' && isConcertReplanMessage(msg)) {
+    return replanConcert(msg);
+  }
   const radioTurn = beginRadioTurn({ interruptPlayback: false });
   primeVoicePlayback();
   const sessionId = ensureSessionId();
@@ -1878,27 +2283,36 @@ async function resetMode() {
   appendChat({ role: 'dj', text: '好的，恢复正常推荐模式。' });
 }
 
-function handleRadioResponse(data, { loading = null, radioTurn = null } = {}) {
+function handleRadioResponse(data, { loading = null, radioTurn = null, afterHostSpeech = null } = {}) {
   if (isInterruptedRadioTurn(radioTurn)) {
     stopLoadingMessages({ remove: true, loading });
     clearRadioTurnLoading(radioTurn, loading);
     return false;
   }
-  const suppressPlaylistHostBubble = Boolean(data.playlistMode && data.hostPolicy === 'none' && data.track && !data.chatText);
-  stopLoadingMessages({ loading, remove: suppressPlaylistHostBubble });
+  const suppressConcertHostBubble = Boolean(data.concertMode && data.hostPolicy === 'none' && data.track && !data.chatText);
+  stopLoadingMessages({ loading, remove: suppressConcertHostBubble });
   clearRadioTurnLoading(radioTurn, loading);
   state.sessionId = data.sessionId || state.sessionId;
-  if (data.playlistMode) {
-    state.radioMode = 'playlist';
-    state.activePlaylist = data.playlist || null;
-    state.playlistStatus = data.playlist ? 'ready' : 'empty';
+  if (data.sessionConstraints) state.sessionConstraints = data.sessionConstraints;
+  if (data.scheduleContext) {
+    state.scheduleStatus = {
+      ...(state.scheduleStatus || {}),
+      context: data.scheduleContext,
+      fetchedAt: data.scheduleContext.fetchedAt || state.scheduleStatus?.fetchedAt || null
+    };
+  }
+  if (data.concertMode) {
+    state.radioMode = 'concert';
+    state.activeConcert = data.concert || null;
+    state.concertStatus = data.concert ? data.concert.phase || 'ready' : 'empty';
   } else if (data.track) {
-    state.radioMode = state.aiMusicMode ? 'single' : state.radioMode === 'playlist' ? 'single' : state.radioMode;
-    state.activePlaylist = null;
-    state.playlistStatus = 'idle';
+    state.radioMode = state.aiMusicMode ? 'single' : state.radioMode === 'concert' ? 'single' : state.radioMode;
+    state.activeConcert = null;
+    state.concertStatus = 'idle';
   }
   setRadioButtonState(state.sessionId || data.track || state.current?.track ? 'active' : 'idle');
-  renderPlaylistQueue();
+  renderConcertConsole(data);
+  renderSessionConstraintBar();
   if (data.track) {
     stopVisualizer();
     rememberPlaybackRecommendation(data, { truncateFuture: true });
@@ -1906,7 +2320,7 @@ function handleRadioResponse(data, { loading = null, radioTurn = null } = {}) {
     updatePlayer(data, false);
   }
 
-  if (!suppressPlaylistHostBubble) {
+  if (!suppressConcertHostBubble) {
     replaceLoadingMessage({
       text: data.chatText || data.hostText || '',
       track: data.track,
@@ -1926,14 +2340,21 @@ function handleRadioResponse(data, { loading = null, radioTurn = null } = {}) {
   }
 
   if (!data.track) {
-    setPlayerStatus(state.current?.track ? '继续播放中' : '等待中', '');
+    if (data.concertEvent === 'curtain') {
+      setPlaybackToggleState(false);
+      setPlayerStatus('音乐会已谢幕', '');
+      setAvatarState('idle');
+    } else {
+      setPlayerStatus(state.current?.track ? '继续播放中' : '等待中', '');
+    }
     if (responseShouldSpeak(data)) {
       playHostSpeech(data, () => {
         if (!isActiveRadioTurn(radioTurn)) return;
         setAvatarState(getContextualAvatarState());
         switchVisualizerTo(state.current?.track ? 'song' : 'off');
+        afterHostSpeech?.();
       }, { radioTurn });
-    }
+    } else afterHostSpeech?.();
     return true;
   }
 
@@ -2187,29 +2608,32 @@ function buildTrackCardHTML(track, explanation = null) {
   </div>`;
 }
 
-function renderPlaylistQueue() {
-  const panel = document.querySelector('#playlist-queue-panel');
+function renderConcertConsole(response = {}) {
+  const panel = document.querySelector('#concert-console-panel');
   if (!panel) return;
-  const isPlaylistMode = state.radioMode === 'playlist';
-  panel.hidden = !isPlaylistMode;
-  panel.classList.toggle('is-active', isPlaylistMode);
-  if (!isPlaylistMode) {
+  const isConcertMode = state.radioMode === 'concert';
+  panel.hidden = !isConcertMode;
+  panel.classList.toggle('is-active', isConcertMode);
+  if (!isConcertMode) {
     panel.innerHTML = '';
     return;
   }
 
-  const playlist = state.activePlaylist;
-  const items = Array.isArray(playlist?.items) ? playlist.items : [];
-  if (!playlist || !items.length) {
-    const isEmpty = state.playlistStatus === 'empty';
+  const concert = state.activeConcert;
+  const items = Array.isArray(concert?.items) ? concert.items : [];
+  if (!concert || !items.length) {
+    const isEmpty = state.concertStatus === 'empty';
+    const requestedLength = Number(response.requestedLength || state.concertSettings.length || 5);
+    const fallbackLengths = Array.isArray(response.fallbackLengths) ? response.fallbackLengths : [];
     panel.innerHTML = `
       <div class="playlist-queue-head">
-        <span>5 TRACK SET</span>
-        <strong>${isEmpty ? '暂未成单' : '灿灿歌单'}</strong>
-        <small>${isEmpty ? '这次没凑齐稳定可播的 5 首' : '正在整理可播放歌曲'}</small>
+        <span>${requestedLength} TRACK CONCERT</span>
+        <strong>${isEmpty ? '暂未开场' : '音乐会编排中'}</strong>
+        <small>${isEmpty ? `这次只确认到 ${Number(response.availableCount || 0)} 首稳定可播歌曲` : '正在确认节目单、分幕和主持词'}</small>
       </div>
-      <div class="playlist-queue-list" aria-label="歌单准备中">
-        ${Array.from({ length: 5 }, (_, index) => `
+      ${fallbackLengths.length ? `<div class="concert-fallback-actions">${fallbackLengths.map(length => `<button type="button" data-concert-fallback-length="${length}">降级为 ${length} 首</button>`).join('')}</div>` : ''}
+      <div class="playlist-queue-list" aria-label="音乐会准备中">
+        ${Array.from({ length: requestedLength }, (_, index) => `
           <div class="playlist-queue-item is-waiting${isEmpty ? ' is-empty' : ''}">
             <span class="playlist-queue-index">${index + 1}</span>
             <span class="playlist-queue-copy">
@@ -2223,24 +2647,96 @@ function renderPlaylistQueue() {
     return;
   }
 
-  const current = Number(playlist.currentIndex || 0) + 1;
+  const current = Number(concert.currentIndex || 0) + 1;
   const total = items.length;
+  const actMap = new Map((concert.acts || []).map(act => [Number(act.startIndex), act]));
+  const hostEvents = Array.isArray(concert.hostEvents) ? concert.hostEvents : [];
+  const hostEventsByIndex = new Map();
+  hostEvents.forEach(event => {
+    const beforeIndex = Number(event.beforeIndex || 0);
+    if (!hostEventsByIndex.has(beforeIndex)) hostEventsByIndex.set(beforeIndex, []);
+    hostEventsByIndex.get(beforeIndex).push(event);
+  });
+  const phaseLabel = concert.phase === 'curtain' ? 'CURTAIN CALL' : concert.phase === 'encore' ? 'ENCORE' : concert.phase === 'finished' ? 'SHOW COMPLETE' : 'ON AIR';
   panel.innerHTML = `
     <div class="playlist-queue-head">
-      <span>5 TRACK SET</span>
-      <strong>${escapeHtml(playlist.title || '灿灿歌单')}</strong>
-      <small>${escapeHtml(playlist.summary || `第 ${current} / ${total} 首`)}</small>
+      <span>${total} TRACK CONCERT · ${phaseLabel}</span>
+      <strong>${escapeHtml(concert.title || '灿灿音乐会')}</strong>
+      <small>${escapeHtml(concert.summary || `第 ${current} / ${total} 首`)}</small>
+    </div>
+    <div class="concert-console-controls" aria-label="弹幕来源">
+      <button type="button" class="${state.concertDanmaku.ai ? 'is-active' : ''}" data-danmaku-source="ai">AI 观众 ${state.concertDanmaku.ai ? 'ON' : 'OFF'}</button>
+      <button type="button" class="${state.concertDanmaku.real ? 'is-active' : ''}" data-danmaku-source="real">真实热评 ${state.concertDanmaku.real ? 'ON' : 'OFF'}</button>
     </div>
     <div class="playlist-queue-progress" aria-hidden="true">
       <span style="width:${Math.min(100, Math.max(0, (current / Math.max(1, total)) * 100))}%"></span>
     </div>
-    <div class="playlist-queue-list" aria-label="当前推荐歌单">
-      ${items.map((item) => buildPlaylistQueueItemHTML(item)).join('')}
+    <div class="playlist-queue-list" aria-label="当前音乐会节目单">
+      ${items.map((item) => `${(hostEventsByIndex.get(Number(item.index)) || []).map(buildConcertHostEventHTML).join('')}${actMap.has(Number(item.index)) ? `<div class="concert-act-divider">${escapeHtml(actMap.get(Number(item.index)).title || `第 ${actMap.get(Number(item.index)).index + 1} 幕`)}</div>` : ''}${buildConcertQueueItemHTML(item)}`).join('')}
+      ${(hostEventsByIndex.get(total) || []).map(buildConcertHostEventHTML).join('')}
+    </div>
+    ${['curtain', 'finished'].includes(concert.phase) ? `
+      <div class="concert-ending-actions">
+        ${concert.phase === 'curtain' && !concert.encoreUsed ? '<button type="button" data-concert-encore>返场一首</button>' : ''}
+        <button type="button" data-concert-new>生成新场次</button>
+      </div>
+    ` : ''}
+  `;
+}
+
+function buildConcertHostEventHTML(event = {}) {
+  const labels = { intro: '开场白', interlude: `第 ${Number(event.actIndex || 0) + 1} 幕串词`, curtain: '谢幕词' };
+  const played = event.status === 'played';
+  const skipped = event.status === 'skipped';
+  const statusText = played ? '可重播' : skipped ? '已越过' : event.type === 'curtain' ? '待谢幕' : '待播';
+  return `
+    <button
+      type="button"
+      class="concert-host-event is-${escapeAttr(event.type || 'interlude')} ${played ? 'is-played' : skipped ? 'is-skipped' : 'is-pending'}"
+      data-concert-host-event="${escapeAttr(event.id || '')}"
+      ${played ? '' : 'disabled'}
+      title="${played ? '重新播放这段串词' : '播放到这里后自动播出'}"
+    >
+      <span class="concert-host-signal">HOST</span>
+      <span class="concert-host-copy">
+        <strong>${escapeHtml(labels[event.type] || '主持串词')}</strong>
+        <small>${escapeHtml(String(event.text || '').slice(0, 42))}${String(event.text || '').length > 42 ? '…' : ''}</small>
+      </span>
+      <span class="concert-host-status">${statusText}</span>
+    </button>
+  `;
+}
+
+function renderSessionConstraintBar() {
+  const bar = document.querySelector('#session-constraint-bar');
+  if (!bar) return;
+  const rules = Array.isArray(state.sessionConstraints?.rules) ? state.sessionConstraints.rules : [];
+  bar.hidden = !rules.length;
+  if (!rules.length) {
+    bar.innerHTML = '';
+    return;
+  }
+  bar.innerHTML = `
+    <span class="session-constraint-title">本次对话禁听</span>
+    <div class="session-constraint-rules">
+      ${rules.map(rule => `
+        <button type="button" data-constraint-label="${escapeAttr(rule.label || rule.value || '')}" title="取消这项临时限制">
+          <span>${escapeHtml(rule.label || rule.value || '限制')}</span>
+          <small>剩 ${Number(rule.remainingTracks || 0)} 首</small>
+          <b aria-hidden="true">×</b>
+        </button>
+      `).join('')}
     </div>
   `;
 }
 
-function buildPlaylistQueueItemHTML(item = {}) {
+function isConcertReplanMessage(message) {
+  const text = String(message || '').trim();
+  return /(后面|接下来|剩下|后半场|下一幕).*(轻快|安静|热烈|温柔|换|调整|不要|多来|少来|更|节奏|风格|氛围|粤语|国语|中文|英语|日语|纯音乐)/.test(text)
+    || /(轻快|安静|热烈|温柔|节奏|风格|氛围|粤语|国语|中文|英语|日语|纯音乐).*(后面|接下来|剩下|后半场|下一幕)/.test(text);
+}
+
+function buildConcertQueueItemHTML(item = {}) {
   const track = item.track || {};
   const status = ['current', 'played', 'skipped', 'pending'].includes(item.status) ? item.status : 'pending';
   const index = Number(item.index || 0);
@@ -2257,7 +2753,7 @@ function buildPlaylistQueueItemHTML(item = {}) {
     <button
       type="button"
       class="playlist-queue-item is-${escapeAttr(status)}"
-      data-playlist-index="${index}"
+      data-concert-index="${index}"
       ${disabled ? 'disabled' : ''}
       title="${disabled ? escapeAttr(statusText) : `跳到第 ${index + 1} 首`}"
     >
@@ -2364,6 +2860,54 @@ function scrollChatToBottom() {
   setTimeout(scroll, 120);
 }
 
+async function replanConcert(message) {
+  const radioTurn = beginRadioTurn({ interruptPlayback: false });
+  const sessionId = ensureSessionId();
+  appendChat({ role: 'user', text: message });
+  const loading = startLoadingMessages('concert');
+  attachRadioTurnLoading(radioTurn, loading);
+  try {
+    const data = await api('/api/radio/concert/replan', {
+      method: 'POST',
+      body: { sessionId, message },
+      signal: radioTurnSignal(radioTurn)
+    });
+    handleRadioResponse(data, { loading, radioTurn });
+  } catch (error) {
+    if (isInterruptedRadioTurn(radioTurn, error)) return;
+    stopLoadingMessages({ loading });
+    replaceLoadingMessage({ text: `调整后半场失败：${error.message}`, loading });
+  }
+}
+
+async function startConcertEncore() {
+  if (!state.activeConcert || state.activeConcert.encoreUsed) return;
+  const radioTurn = beginRadioTurn();
+  primeVoicePlayback();
+  const loading = startLoadingMessages('concert');
+  attachRadioTurnLoading(radioTurn, loading);
+  appendChat({ role: 'user', text: '返场一首' });
+  try {
+    const data = await api('/api/radio/concert/encore', {
+      method: 'POST',
+      body: { sessionId: ensureSessionId() },
+      signal: radioTurnSignal(radioTurn)
+    });
+    handleRadioResponse(data, { loading, radioTurn });
+  } catch (error) {
+    if (isInterruptedRadioTurn(radioTurn, error)) return;
+    stopLoadingMessages({ loading });
+    replaceLoadingMessage({ text: `返场准备失败：${error.message}`, loading });
+  }
+}
+
+function toggleConcertDanmakuSource(source) {
+  if (!['ai', 'real'].includes(source)) return;
+  state.concertDanmaku[source] = !state.concertDanmaku[source];
+  renderConcertConsole();
+  if (state.current?.track) prepareCommentDanmakuForTrack(state.current.track);
+}
+
 function uniqueExplanationFactor(factor, index, factors) {
   const key = `${factor?.label || ''}\u0000${factor?.value || ''}`;
   return factors.findIndex(item => `${item?.label || ''}\u0000${item?.value || ''}` === key) === index;
@@ -2403,35 +2947,46 @@ async function updatePlayer(data, autoplay) {
 
 function prepareCommentDanmakuForTrack(track = {}) {
   const songId = getTrackNeteaseSongId(track);
+  const trackId = String(track?.id || '');
   stopCommentDanmaku({ clearLayer: true, invalidate: true });
-  danmakuState.activeTrackId = track?.id || null;
+  danmakuState.activeTrackId = trackId || null;
   danmakuState.activeSongId = songId || null;
   danmakuState.comments = [];
   danmakuState.remainingComments = [];
-  if (!songId) return;
-
-  const cached = danmakuState.cache.get(songId);
-  if (cached) {
-    setCommentDanmakuComments(cached);
-    maybeStartCommentDanmaku({ initial: true });
-    return;
-  }
-
   const token = danmakuState.token;
-  api(`/api/track-comments?songId=${encodeURIComponent(songId)}`)
-    .then((data) => {
-      if (token !== danmakuState.token || danmakuState.activeSongId !== songId || String(data.songId || '') !== songId) return;
-      const comments = Array.isArray(data.comments) ? data.comments : [];
-      danmakuState.cache.set(songId, comments);
-      setCommentDanmakuComments(comments);
-      maybeStartCommentDanmaku({ initial: true });
-    })
-    .catch(() => {
-      if (token !== danmakuState.token || danmakuState.activeSongId !== songId) return;
-      danmakuState.cache.set(songId, []);
-      danmakuState.comments = [];
-      danmakuState.remainingComments = [];
-    });
+
+  const realEnabled = state.radioMode !== 'concert' || state.concertDanmaku.real;
+  const realPromise = realEnabled && songId
+    ? danmakuState.realCache.has(songId)
+      ? Promise.resolve(danmakuState.realCache.get(songId))
+      : api(`/api/track-comments?songId=${encodeURIComponent(songId)}`)
+        .then(data => (Array.isArray(data.comments) ? data.comments : []).map(comment => ({
+          ...comment,
+          source: 'real',
+          persona: '',
+          displayName: comment.nickname || '网易云听众'
+        })))
+        .catch(() => [])
+        .then(comments => (danmakuState.realCache.set(songId, comments), comments))
+    : Promise.resolve([]);
+
+  const aiPromise = state.radioMode === 'concert' && state.concertDanmaku.ai && trackId
+    ? danmakuState.aiCache.has(trackId)
+      ? Promise.resolve(danmakuState.aiCache.get(trackId))
+      : api('/api/radio/concert/audience', {
+        method: 'POST',
+        body: { sessionId: ensureSessionId(), trackId }
+      }).then(data => Array.isArray(data.comments) ? data.comments : [])
+        .catch(() => [])
+        .then(comments => (danmakuState.aiCache.set(trackId, comments), comments))
+    : Promise.resolve([]);
+
+  Promise.all([aiPromise, realPromise]).then(([aiComments, realComments]) => {
+    if (token !== danmakuState.token || danmakuState.activeTrackId !== trackId) return;
+    setCommentDanmakuComments(mixConcertComments(aiComments, realComments));
+    maybeStartCommentDanmaku({ initial: true });
+    prefetchNextConcertAudience(trackId);
+  });
 }
 
 function setCommentDanmakuComments(comments = []) {
@@ -2491,10 +3046,13 @@ function spawnCommentDanmaku() {
   }
 
   const bullet = document.createElement('div');
-  bullet.className = 'player-danmaku-bullet';
+  const source = comment.source === 'ai' ? 'ai' : 'real';
+  bullet.className = `player-danmaku-bullet is-${source}`;
   bullet.style.setProperty('--danmaku-y', `${Math.round(randomBetween(8, 76))}%`);
-  const nickname = comment.nickname ? `<em>${escapeHtml(comment.nickname)}</em>` : '';
-  bullet.innerHTML = `<span>${escapeHtml(comment.content || '')}</span>${nickname}`;
+  const displayName = comment.displayName || comment.nickname || comment.persona || '';
+  const nickname = displayName ? `<em>${escapeHtml(displayName)}</em>` : '';
+  const sourceLabel = source === 'ai' ? `AI · ${comment.persona || '虚拟观众'}` : '真实热评';
+  bullet.innerHTML = `<b>${escapeHtml(sourceLabel)}</b><span>${escapeHtml(comment.content || '')}</span>${nickname}`;
   layer.appendChild(bullet);
   const width = Math.max(120, bullet.scrollWidth || bullet.getBoundingClientRect().width || 240);
   const distance = Math.ceil(layer.clientWidth + width + 48);
@@ -2815,7 +3373,8 @@ async function reportFeedback(eventType) {
         sessionId: state.sessionId,
         elapsedMs,
         durationMs: track.durationMs || playback?.durationMs || 0,
-        source: playback?.source || 'ui'
+        source: playback?.source || 'ui',
+        constraintEventId: dedupeId
       }
     });
     applyUsageInsights(result);
@@ -2839,11 +3398,15 @@ function applyUsageInsights(data = {}) {
   if (data.feedbackSummary) state.feedbackSummary = data.feedbackSummary;
   if (Array.isArray(data.memories)) state.memories = data.memories;
   if (data.preferences) applyLowDistractionVisualMode(data.preferences);
+  if (data.sessionConstraints) {
+    state.sessionConstraints = data.sessionConstraints;
+    renderSessionConstraintBar();
+  }
   refreshMixerUsagePanels();
 }
 
 async function refreshUsageInsights() {
-  if (location.pathname !== '/mixer') return;
+  if (!isUsageInsightsRoute()) return;
   try {
     const [prefData, memoryData, moodStatsData] = await Promise.all([
       api('/api/preferences'),
@@ -2862,14 +3425,18 @@ async function refreshUsageInsights() {
 }
 
 function scheduleUsageInsightsRefresh(delayMs = 2200) {
-  if (location.pathname !== '/mixer') return;
+  if (!isUsageInsightsRoute()) return;
   setTimeout(() => refreshUsageInsights(), delayMs);
+}
+
+function isUsageInsightsRoute() {
+  return location.pathname === '/diary' || location.pathname === '/mixer';
 }
 
 function startMixerUsageAutoRefresh() {
   if (state.mixerRefreshTimer) clearInterval(state.mixerRefreshTimer);
   state.mixerRefreshTimer = setInterval(() => {
-    if (location.pathname !== '/mixer') {
+    if (!isUsageInsightsRoute()) {
       clearInterval(state.mixerRefreshTimer);
       state.mixerRefreshTimer = null;
       return;
@@ -3465,10 +4032,20 @@ async function renderDiary() {
   try {
     const query = new URLSearchParams({ days: '7' });
     if (selectedDate) query.set('date', selectedDate);
-    const overview = await api(`/api/diary/overview?${query.toString()}`);
+    const [overview, prefData, moodStatsData] = await Promise.all([
+      api(`/api/diary/overview?${query.toString()}`),
+      api('/api/preferences').catch(() => ({ preferences: state.preferences || {}, feedbackSummary: state.feedbackSummary || {} })),
+      api('/api/mood-stats').catch(() => state.moodStats || { total: 0, buckets: [] })
+    ]);
     if (location.pathname !== '/diary') return;
     state.diaryOverview = overview;
-    renderDiaryOverview(overview);
+    state.preferences = prefData.preferences || state.preferences || {};
+    state.feedbackSummary = prefData.feedbackSummary || state.feedbackSummary || {};
+    state.moodStats = moodStatsData || state.moodStats || { total: 0, buckets: [] };
+    renderDiaryOverview(overview, {
+      feedback: state.feedbackSummary,
+      moodStats: state.moodStats
+    });
   } catch (error) {
     if (location.pathname !== '/diary') return;
     view.innerHTML = `
@@ -3482,7 +4059,35 @@ async function renderDiary() {
   }
 }
 
-function renderDiaryOverview(overview = {}) {
+function mixConcertComments(aiComments = [], realComments = []) {
+  if (state.radioMode !== 'concert') return shuffledComments(realComments);
+  const ai = state.concertDanmaku.ai ? shuffledComments(aiComments) : [];
+  const real = state.concertDanmaku.real ? shuffledComments(realComments) : [];
+  const mixed = [];
+  while (ai.length || real.length) {
+    if (ai.length) mixed.push(ai.shift());
+    if (ai.length) mixed.push(ai.shift());
+    if (ai.length) mixed.push(ai.shift());
+    if (real.length) mixed.push(real.shift());
+    if (real.length) mixed.push(real.shift());
+  }
+  return mixed;
+}
+
+function prefetchNextConcertAudience(currentTrackId) {
+  if (state.radioMode !== 'concert' || !state.activeConcert || !state.concertDanmaku.ai) return;
+  const currentIndex = state.activeConcert.items.findIndex(item => String(item.track?.id || '') === String(currentTrackId || ''));
+  const nextTrack = state.activeConcert.items[currentIndex + 1]?.track;
+  if (!nextTrack?.id || danmakuState.aiCache.has(String(nextTrack.id))) return;
+  api('/api/radio/concert/audience', {
+    method: 'POST',
+    body: { sessionId: ensureSessionId(), trackId: nextTrack.id }
+  }).then(data => {
+    danmakuState.aiCache.set(String(nextTrack.id), Array.isArray(data.comments) ? data.comments : []);
+  }).catch(() => {});
+}
+
+function renderDiaryOverview(overview = {}, insights = {}) {
   const detail = overview.detail || {};
   const timeline = Array.isArray(overview.timeline) ? overview.timeline : [];
   view.innerHTML = `
@@ -3511,9 +4116,53 @@ function renderDiaryOverview(overview = {}) {
           ${detail.hasActivity ? diaryDetailHTML(detail) : diaryEmptyDetailHTML(detail)}
         </main>
       </div>
+      ${diaryFrequencyPanel(insights.feedback || {}, insights.moodStats || {})}
     </section>
   `;
   bindDiaryInteractions();
+  startMixerUsageAutoRefresh();
+}
+
+function diaryFrequencyPanel(feedback = {}, moodStats = {}) {
+  return `
+    <section class="diary-frequency-section" aria-label="近期频率趋势">
+      <div class="diary-section-heading diary-frequency-heading">
+        <div>
+          <p class="eyebrow">Frequency Trace</p>
+          <span>近期频率趋势</span>
+        </div>
+        <small>从历史播放、跳过、喜欢和氛围记录中整理</small>
+      </div>
+      <div class="diary-frequency-grid">
+        <article class="mixer-mood-panel diary-frequency-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Atmosphere</p>
+              <h2>电台氛围记录</h2>
+            </div>
+            <span class="mood-window">近 ${Number(moodStats.windowDays || 30)} 天</span>
+          </div>
+          <div data-mood-stats>
+            ${moodStatsPanel(moodStats)}
+          </div>
+        </article>
+        <article class="mixer-meter-panel diary-frequency-panel">
+          <div class="panel-header">
+            <div>
+              <p class="eyebrow">Feedback</p>
+              <h2>近期反馈趋势</h2>
+            </div>
+          </div>
+          <div data-feedback-meter>
+            ${feedbackMeter(feedback)}
+          </div>
+          <div class="feedback-track-list" data-feedback-tracks>
+            ${feedbackTracks(feedback)}
+          </div>
+        </article>
+      </div>
+    </section>
+  `;
 }
 
 function diaryDateButton(day = {}, selectedDate = '') {
@@ -3684,7 +4333,10 @@ async function submitDiaryFeedback(button) {
       }
     });
     state.diaryOverview = result.overview;
-    renderDiaryOverview(result.overview);
+    renderDiaryOverview(result.overview, {
+      feedback: state.feedbackSummary || {},
+      moodStats: state.moodStats || {}
+    });
   } catch (error) {
     button.disabled = false;
     button.textContent = previousText;
@@ -3704,7 +4356,7 @@ async function startDiaryRadio(button) {
       method: 'POST',
       body: { sessionId: ensureSessionId(), date }
     });
-    state.radioMode = 'playlist';
+    state.radioMode = 'concert';
     history.pushState({}, '', '/');
     await render();
     handleRadioResponse(data);
@@ -3756,19 +4408,14 @@ function formatDiaryDate(value = '') {
 }
 
 async function renderMixer() {
-  const [prefData, memoryData, moodStatsData] = await Promise.all([
+  const [prefData, memoryData] = await Promise.all([
     api('/api/preferences'),
-    api('/api/memories').catch(() => ({ memories: [] })),
-    api('/api/mood-stats').catch(() => ({ total: 0, buckets: [] }))
+    api('/api/memories').catch(() => ({ memories: [] }))
   ]);
   const preferences = prefData.preferences || {};
   state.preferences = preferences;
-  const feedback = prefData.feedbackSummary || {};
   const memories = (memoryData.memories || []).slice(0, 12);
-  const moodStats = moodStatsData || { total: 0, buckets: [] };
-  state.feedbackSummary = feedback;
   state.memories = memories;
-  state.moodStats = moodStats;
   applyLowDistractionVisualMode(preferences);
 
   view.innerHTML = `
@@ -3805,32 +4452,6 @@ async function renderMixer() {
         </article>
       </div>
       <aside class="mixer-side">
-        <article class="mixer-mood-panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">Atmosphere</p>
-              <h2>电台氛围记录</h2>
-            </div>
-            <span class="mood-window">近 ${Number(moodStats.windowDays || 30)} 天</span>
-          </div>
-          <div data-mood-stats>
-            ${moodStatsPanel(moodStats)}
-          </div>
-        </article>
-        <article class="mixer-meter-panel">
-          <div class="panel-header">
-            <div>
-              <p class="eyebrow">Feedback</p>
-              <h2>近期反馈趋势</h2>
-            </div>
-          </div>
-          <div data-feedback-meter>
-            ${feedbackMeter(feedback)}
-          </div>
-          <div class="feedback-track-list" data-feedback-tracks>
-            ${feedbackTracks(feedback)}
-          </div>
-        </article>
         <article class="mixer-memory-panel">
           <div class="panel-header">
             <div>
@@ -3853,13 +4474,18 @@ async function renderMixer() {
 }
 
 async function renderSettings() {
-  const [status, cookieLogin, neteaseLogin, memoryData] = await Promise.all([
+  const [status, cookieLogin, neteaseLogin, memoryData, preferenceData, scheduleStatus] = await Promise.all([
     api('/api/config/status'),
     api('/api/auth/netease-cookie/status').catch(() => ({ configured: true, hasCookie: false, profileReadable: false, source: 'cookie', message: '试用版登录状态读取失败' })),
     api('/api/auth/netease/token-status').catch(() => ({ configured: false, hasToken: false, profileReadable: false, message: '登录状态读取失败' })),
-    api('/api/memories').catch(() => ({ memories: [] }))
+    api('/api/memories').catch(() => ({ memories: [] })),
+    api('/api/preferences').catch(() => ({ preferences: state.preferences || {} })),
+    api('/api/context/schedule/status').catch(() => ({ configured: false, connected: false, status: 'unavailable', errorCode: 'status_unavailable', context: null }))
   ]);
   const memories = memoryData.memories || [];
+  const preferences = preferenceData.preferences || state.preferences || {};
+  state.preferences = preferences;
+  state.scheduleStatus = scheduleStatus;
   const demoGuestMode = Boolean(status.demo?.guestMode);
   view.innerHTML = `
     <section class="page-panel">
@@ -3869,6 +4495,7 @@ async function renderSettings() {
         ${statusRow('LLM', status.llm.configured, status.llm.model)}
         ${statusRow('TTS', status.tts.configured, status.tts.provider)}
         ${statusRow('天气城市', status.weather.configured, status.weather.city)}
+        ${statusRow('日程 MCP', status.schedule?.configured, status.schedule?.provider || 'feishu')}
       </table>
       <div class="netease-login-console trial-login-console ${cookieLogin.profileReadable ? 'is-online' : 'is-offline'}">
         <div class="trial-login-main">
@@ -3902,6 +4529,7 @@ async function renderSettings() {
         </div>
       </div>
     </section>
+    ${scheduleSettingsPanel(scheduleStatus, preferences)}
     <section class="page-panel self-check-panel">
       <div class="panel-header">
         <div>
@@ -3980,6 +4608,8 @@ async function renderSettings() {
   document.querySelector('#qr-btn')?.addEventListener('click', () => startQrLogin());
   document.querySelector('#demo-self-check-btn')?.addEventListener('click', () => runDemoSelfCheck());
   document.querySelector('#radio-debug-refresh')?.addEventListener('click', () => refreshRadioDebugPanel());
+  document.querySelector('#schedule-aware-toggle')?.addEventListener('click', () => toggleScheduleAwareness());
+  document.querySelector('#schedule-refresh-btn')?.addEventListener('click', () => refreshScheduleContext());
   document.querySelector('#qr-refresh-btn')?.addEventListener('click', async () => {
     const statusEl = document.querySelector('#qr-status');
     statusEl.textContent = '正在续期...';
@@ -3992,6 +4622,119 @@ async function renderSettings() {
     await api('/api/memories', { method: 'DELETE' });
     renderSettings();
   });
+}
+
+function scheduleSettingsPanel(status = {}, preferences = {}) {
+  const enabled = preferences.scheduleAwareEnabled === true;
+  const connection = status.connected
+    ? { label: 'CONNECTED', className: 'is-online' }
+    : status.configured
+      ? { label: status.status === 'error' ? 'DEGRADED' : 'READY', className: status.status === 'error' ? 'is-error' : 'is-ready' }
+      : { label: 'NOT CONFIGURED', className: 'is-offline' };
+  return `
+    <section class="page-panel schedule-context-panel ${connection.className}">
+      <div class="schedule-context-header">
+        <div>
+          <p class="eyebrow">Schedule Context</p>
+          <h2>日程感知电台</h2>
+        </div>
+        <span id="schedule-connection-badge" class="schedule-status-badge">${connection.label}</span>
+      </div>
+      <div class="schedule-context-layout">
+        <div class="schedule-context-copy">
+          <p>在播放开始和一段歌单结束时按需读取近期忙闲，只用空档长度和本地分类安排下一段音乐。</p>
+          <div class="schedule-context-actions">
+            <button id="schedule-aware-toggle" class="switch-control ${enabled ? 'is-on' : ''}" type="button" role="switch" aria-checked="${enabled}">
+              <span class="switch-track" aria-hidden="true"><span></span></span>
+              <strong>${enabled ? '已开启' : '已关闭'}</strong>
+            </button>
+            <button id="schedule-refresh-btn" class="ghost" type="button" ${status.configured ? '' : 'disabled'}>重新安排下一段</button>
+          </div>
+          <p id="schedule-action-status" class="muted">${scheduleRefreshLabel(status)}</p>
+        </div>
+        <div id="schedule-context-summary" class="schedule-context-summary">
+          ${scheduleContextSummary(status.context)}
+        </div>
+      </div>
+      <div class="schedule-privacy-note">
+        <strong>本地脱敏</strong>
+        <span>不读取或保存会议正文、参与者和附件；标题仅在服务端分类后立即丢弃，课程表不会进入长期记忆。</span>
+      </div>
+    </section>
+  `;
+}
+
+function scheduleContextSummary(context = null) {
+  if (!context?.fingerprint) {
+    return '<p class="muted">尚无可用的脱敏日程摘要。开启后会在需要规划音乐时读取。</p>';
+  }
+  const categoryLabels = { class: '课程', exam: '考试', meeting: '会议', commute: '通勤', personal: '个人', unknown: '未知' };
+  const loadLabels = { light: '轻', medium: '中', heavy: '高' };
+  const transitionLabels = { busy: '安排进行中', pre_event: '即将进入安排', between_events: '安排间隙', commute: '通勤转换', open_block: '开放时段' };
+  const nextEvent = context.nextEventMinutes == null ? '暂无' : `${context.nextEventMinutes} 分钟后`;
+  return `
+    <dl class="schedule-metrics">
+      <div><dt>可用空档</dt><dd>${Number(context.freeWindowMinutes || 0)} 分钟</dd></div>
+      <div><dt>下一安排</dt><dd>${escapeHtml(nextEvent)}</dd></div>
+      <div><dt>本地分类</dt><dd>${escapeHtml(categoryLabels[context.nextEventCategory] || '未知')}</dd></div>
+      <div><dt>当日负载</dt><dd>${escapeHtml(loadLabels[context.dayLoad] || context.dayLoad || '未知')}</dd></div>
+      <div><dt>转换状态</dt><dd>${escapeHtml(transitionLabels[context.transitionType] || context.transitionType || '未知')}</dd></div>
+      <div><dt>情境指纹</dt><dd><code>${escapeHtml(context.fingerprint)}</code></dd></div>
+    </dl>
+  `;
+}
+
+function scheduleRefreshLabel(status = {}) {
+  if (status.errorCode) return `最近状态：${escapeHtml(status.errorCode)}`;
+  if (!status.cachedAt) return status.configured ? '等待首次按需刷新' : '需要在服务端配置飞书 MCP 凭据';
+  const time = new Date(status.cachedAt);
+  return Number.isNaN(time.getTime()) ? '已有缓存摘要' : `最近刷新：${time.toLocaleString('zh-CN', { hour12: false })}`;
+}
+
+async function toggleScheduleAwareness() {
+  const button = document.querySelector('#schedule-aware-toggle');
+  if (!button) return;
+  const nextEnabled = button.getAttribute('aria-checked') !== 'true';
+  button.disabled = true;
+  try {
+    const result = await api('/api/preferences', { method: 'PUT', body: { scheduleAwareEnabled: nextEnabled } });
+    state.preferences = result.preferences || { ...(state.preferences || {}), scheduleAwareEnabled: nextEnabled };
+    state.schedulePlanning = nextEnabled;
+    button.classList.toggle('is-on', nextEnabled);
+    button.setAttribute('aria-checked', String(nextEnabled));
+    const label = button.querySelector('strong');
+    if (label) label.textContent = nextEnabled ? '已开启' : '已关闭';
+  } catch (error) {
+    const status = document.querySelector('#schedule-action-status');
+    if (status) status.textContent = `开关保存失败：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function refreshScheduleContext() {
+  const button = document.querySelector('#schedule-refresh-btn');
+  const statusEl = document.querySelector('#schedule-action-status');
+  if (!button) return;
+  button.disabled = true;
+  if (statusEl) statusEl.textContent = '正在读取脱敏日程并安排下一段...';
+  try {
+    const result = await api('/api/context/schedule/refresh', {
+      method: 'POST',
+      body: { ...(state.sessionId ? { sessionId: state.sessionId } : {}) }
+    });
+    state.scheduleStatus = result;
+    if (state.preferences?.scheduleAwareEnabled) state.schedulePlanning = true;
+    const summary = document.querySelector('#schedule-context-summary');
+    if (summary) summary.innerHTML = scheduleContextSummary(result.context);
+    if (statusEl) statusEl.textContent = result.refreshed
+      ? `已刷新，下一段将使用新情境${result.changed ? '（日程有变化）' : ''}`
+      : `暂未刷新：${result.errorCode || '当前无可用日程'}`;
+  } catch (error) {
+    if (statusEl) statusEl.textContent = `刷新失败，电台将继续使用普通推荐：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
 }
 
 async function runDemoSelfCheck() {

@@ -124,8 +124,69 @@ export function getConfig() {
       provider: env.IP_GEO_PROVIDER || 'ip-api',
       timeoutMs: Math.max(500, Number(env.IP_GEO_TIMEOUT_MS || 2500) || 2500),
       cacheMs: Math.max(60000, Number(env.IP_GEO_CACHE_MS || 10 * 60 * 1000) || 10 * 60 * 1000)
-    }
+    },
+    schedule: buildScheduleConfig(env)
   };
+}
+
+function buildScheduleConfig(env) {
+  const enabled = parseBoolean(env.SCHEDULE_MCP_ENABLED);
+  const allowedTools = parseStringArray(env.SCHEDULE_MCP_ALLOWED_TOOLS_JSON, [
+    'calendar.v4.calendar.primary',
+    'calendar.v4.calendarEvent.list',
+    'calendar.v4.freebusy.list'
+  ]);
+  const explicitArgs = parseStringArray(env.SCHEDULE_MCP_ARGS_JSON, []);
+  const hasFeishuCredentials = Boolean(env.FEISHU_APP_ID && env.FEISHU_APP_SECRET);
+  const defaultArgs = hasFeishuCredentials
+    ? [
+        '-y',
+        '@larksuiteoapi/lark-mcp',
+        'mcp',
+        '-a',
+        '${FEISHU_APP_ID}',
+        '-s',
+        '${FEISHU_APP_SECRET}',
+        '--token-mode',
+        'auto',
+        '-t',
+        allowedTools.join(',')
+      ]
+    : [];
+  return {
+    enabled,
+    provider: env.SCHEDULE_MCP_PROVIDER || 'feishu',
+    command: env.SCHEDULE_MCP_COMMAND || (enabled ? 'npx' : ''),
+    args: explicitArgs.length ? explicitArgs : defaultArgs,
+    cwd: env.SCHEDULE_MCP_CWD || '',
+    env: parseStringMap(env.SCHEDULE_MCP_ENV_JSON),
+    allowedTools,
+    timeoutMs: Math.max(250, Number(env.SCHEDULE_MCP_TIMEOUT_MS || 2500) || 2500),
+    cacheMs: Math.max(1000, Number(env.SCHEDULE_MCP_CACHE_MS || 5 * 60 * 1000) || 5 * 60 * 1000),
+    failureCacheMs: Math.max(1000, Number(env.SCHEDULE_MCP_FAILURE_CACHE_MS || 30 * 60 * 1000) || 30 * 60 * 1000),
+    lookaheadHours: Math.max(1, Math.min(72, Number(env.SCHEDULE_MCP_LOOKAHEAD_HOURS || 24) || 24))
+  };
+}
+
+function parseStringArray(value, fallback = []) {
+  if (!value) return [...fallback];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed.map(item => String(item || '').trim()).filter(Boolean) : [...fallback];
+  } catch {
+    return [...fallback];
+  }
+}
+
+function parseStringMap(value) {
+  if (!value) return {};
+  try {
+    const parsed = JSON.parse(value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(Object.entries(parsed).map(([key, item]) => [String(key), String(item ?? '')]));
+  } catch {
+    return {};
+  }
 }
 
 export function publicConfigStatus(config) {
@@ -179,6 +240,13 @@ export function publicConfigStatus(config) {
       genreDensityWindow: config.recommendation?.genreDensityWindow ?? 6,
       genreDensityMax: config.recommendation?.genreDensityMax ?? 3,
       genreEnergyStreakMax: config.recommendation?.genreEnergyStreakMax ?? 2
+    },
+    schedule: {
+      enabled: Boolean(config.schedule?.enabled),
+      configured: Boolean(config.schedule?.enabled && config.schedule?.command && config.schedule?.args?.length),
+      provider: config.schedule?.provider || 'feishu',
+      timeoutMs: config.schedule?.timeoutMs || 2500,
+      cacheMs: config.schedule?.cacheMs || 300000
     }
   };
 }

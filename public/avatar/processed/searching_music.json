@@ -1,0 +1,23 @@
+{
+  "motion": "searching_music",
+  "source": "C:\\myMusic2\\public\\avatar\\generated\\searching_music.mp4",
+  "output": "C:\\myMusic2\\public\\avatar\\processed\\searching_music.mp4",
+  "fps": 24.0,
+  "frames": 240,
+  "provider": "DmlExecutionProvider",
+  "model": "https://huggingface.co/skytnt/anime-seg",
+  "background": "C:\\myMusic2\\public\\avatar\\background\\cyber-radio-master.png",
+  "transform": {
+    "median_bbox": [
+      54.0,
+      24.0,
+      591.0,
+      696.0
+    ],
+    "scale": 0.93391,
+    "translation": [
+      33.6,
+      37.59
+    ]
+  }
+}

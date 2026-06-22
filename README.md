@@ -77,12 +77,32 @@ The radio prompt receives the current hour, live weather summary, user chat mess
 - Do not put private keys, access tokens, or API keys in frontend code.
 - The server falls back to local demo music when NetEase credentials are not configured, so the UI and AI radio flow can be tested before credentials are added.
 
+## Schedule-Aware Radio
+
+The optional schedule integration is disabled by default and is intended for private local deployments. It starts the official Feishu MCP server over `stdio`, lists its tools, and only calls the configured read-only calendar tools.
+
+Set these server-side environment variables:
+
+```dotenv
+SCHEDULE_MCP_ENABLED=true
+FEISHU_APP_ID=cli_your_app_id
+FEISHU_APP_SECRET=your_app_secret
+```
+
+The default command is equivalent to:
+
+```powershell
+npx -y @larksuiteoapi/lark-mcp mcp -a $env:FEISHU_APP_ID -s $env:FEISHU_APP_SECRET --token-mode auto
+```
+
+Open **Settings > 日程感知电台** to enable the feature and test a manual refresh. The app stores only an expiring summary containing the free-window length, local event category, location type, day load, transition type, and a fingerprint. Event titles are discarded after local classification; descriptions, attendees, and attachments are not persisted or returned by the API.
+
 ## AI DJ Avatar
 
 The main player artwork area is now the AI DJ host avatar. The source image lives at:
 
 ```txt
-public/avatar/source/cancan.png
+public/avatar/source/cancan-first-frame.png
 ```
 
 The frontend first tries to play a matching WebM motion clip from `public/avatar/webm`. If the clip does not exist yet, it falls back to the PNG and uses CSS motion so the host still feels alive without any external API calls.
@@ -96,7 +116,6 @@ talking
 searching
 reading
 happy
-on_air
 ```
 
 These map to WebM files:
@@ -108,68 +127,104 @@ public/avatar/webm/talking.webm
 public/avatar/webm/searching_music.webm
 public/avatar/webm/reading_book.webm
 public/avatar/webm/happy.webm
-public/avatar/webm/on_air.webm
 ```
 
 The radio UI switches avatar state automatically: searching while recommendations are loading, talking while the AI host speaks, listening while music plays, idle while paused or stopped, and happy after liking a song.
 
+The legacy `on_air` frames, sprite, prompt, and processing support are retained as reserved assets, but the frontend does not currently select or display that state.
+
 ### Generate Avatar Videos
 
-The repository keeps generation optional so the local app stays zero-build and zero-React.
-
-Install only the provider client you need:
+Avatar motion is generated through the Jimeng website, so no video API key is required. Run the environment check first:
 
 ```powershell
-npm install @fal-ai/client
-# or
-npm install @runwayml/sdk
+npm run avatar:doctor
 ```
 
-Set provider keys in your shell or `.env.local`; never put them in frontend code:
-
-```dotenv
-FAL_KEY=your_fal_key
-RUNWAY_API_KEY=your_runway_key
-RUNWAYML_API_SECRET=your_runway_key
-```
-
-Most image-to-video providers need a public image URL or a provider-supported data URL for `public/avatar/source/cancan.png`.
-
-fal.ai Pika example:
+Print the prompt for the motion being generated:
 
 ```powershell
-node scripts/generate-avatar-motion.mjs --provider fal --motion all --image-url "https://example.com/cancan.png" --duration 5 --resolution 720p
+npm run avatar:prompt -- --motion idle
 ```
 
-Runway example:
+In Jimeng, use image-to-video with `public/avatar/source/cancan-first-frame.png`, a 1:1 ratio, five-second duration, and no generated audio. Generate `idle` first, then `talking` and `listening` after the character identity is accepted.
+
+After downloading the MP4, import it with a stable motion name:
 
 ```powershell
-node scripts/generate-avatar-motion.mjs --provider runway --motion talking --image-url "https://example.com/cancan.png" --duration 5 --model gen4_turbo
+npm run avatar:import -- --motion idle --input "C:\Downloads\jimeng-video.mp4"
 ```
 
-The script downloads MP4 files into:
+Use `--force` only when intentionally replacing an existing motion.
+
+### Convert and Validate
+
+The project includes Windows-compatible FFmpeg and FFprobe binaries. Convert all available MP4 files:
+
+```powershell
+npm run avatar:convert
+npm run avatar:validate
+```
+
+To process one motion:
+
+```powershell
+npm run avatar:convert -- --motion idle
+npm run avatar:validate -- --motion idle
+```
+
+If a generated clip moves too quickly, slow it during conversion:
+
+```powershell
+npm run avatar:convert -- --motion idle --speed 0.5
+```
+
+Add `--interpolate` only when the half-speed output looks choppy. Interpolation can soften pixel edges, so keep the non-interpolated output if it looks cleaner.
+
+The converter crops to a square, outputs 720x720 VP9 WebM without audio, and applies a short loop transition. Files are written to:
 
 ```txt
 public/avatar/generated/<motion>.mp4
-```
-
-References:
-
-- [fal.ai Pika image-to-video API](https://fal.ai/models/fal-ai/pika/v2.2/image-to-video/api)
-- [Runway API reference](https://docs.dev.runwayml.com/api/)
-
-### Convert MP4 to WebM
-
-Install `ffmpeg`, then run:
-
-```powershell
-bash scripts/convert-avatar-videos.sh
-```
-
-The converter writes WebM clips to:
-
-```txt
 public/avatar/webm/<motion>.webm
 ```
 
-It uses nearest-neighbor scaling to preserve pixel-art edges.
+The frontend loads WebM first and falls back to the existing PNG frame animation if the video is absent or cannot play.
+
+### Unify Avatar Backgrounds
+
+The generated clips can be composited onto one shared cyber radio studio background. The original MP4 files remain unchanged.
+
+Set up the isolated Python environment and download the Apache-2.0 anime segmentation model:
+
+```powershell
+npm run avatar:unify:setup
+```
+
+Unify one motion or every available motion:
+
+```powershell
+npm run avatar:unify -- --motion idle
+npm run avatar:unify -- --motion all
+```
+
+The shared background lives at:
+
+```txt
+public/avatar/background/cyber-radio-master.png
+public/avatar/background/cyber-radio-loop.mp4
+```
+
+Composited MP4 files and metadata are written without replacing the generated sources:
+
+```txt
+public/avatar/processed/<motion>.mp4
+public/avatar/processed/<motion>.json
+```
+
+The command then replaces the matching frontend WebM with the unified version. Run the automated metadata, watermark-corner, and contact-sheet audit with:
+
+```powershell
+npm run avatar:audit
+```
+
+Audit images are generated under `public/avatar/audit` and are ignored by Git.

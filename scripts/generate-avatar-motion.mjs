@@ -37,8 +37,8 @@ Bright smile, subtle shoulder bounce, cyan headphones glow, small neon heart spa
 Keep the camera locked, preserve identity, outfit, headphones, pixel art style, seamless loop.
 `,
   on_air: `
-Same pixel art AI radio host girl presenting a late-night cyber radio show.
-Warm confident smile, small hand movement near headphones, ON AIR neon mood, gentle blinking.
+Same pixel art AI radio host girl in a calm live-broadcast standby pose.
+Closed-mouth smile, no lip movement, one subtle nod, gentle blinking, restrained cyan headphone glow.
 Preserve character identity, blue-purple pixel art style, dark radio studio background, seamless loop.
 `
 };

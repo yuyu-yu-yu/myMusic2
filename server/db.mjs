@@ -181,6 +181,16 @@ function migrate(db) {
       profile_json TEXT NOT NULL DEFAULT '{}',
       updated_at TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS schedule_contexts (
+      account_id TEXT PRIMARY KEY,
+      context_json TEXT NOT NULL DEFAULT '{}',
+      fingerprint TEXT NOT NULL DEFAULT '',
+      version INTEGER NOT NULL DEFAULT 0,
+      fetched_at TEXT NOT NULL,
+      expires_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
   `);
 }
 
@@ -206,6 +216,7 @@ function migrateAccountScope(db) {
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_feedback_events_account_created ON track_feedback_events(account_id, created_at DESC)'); } catch {}
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_mood_events_account_created ON mood_events(account_id, created_at DESC)'); } catch {}
   try { db.exec('CREATE INDEX IF NOT EXISTS idx_diary_feedback_account_created ON diary_signal_feedback(account_id, created_at DESC)'); } catch {}
+  try { db.exec('CREATE INDEX IF NOT EXISTS idx_schedule_contexts_expires ON schedule_contexts(expires_at)'); } catch {}
 }
 
 function addAccountIdColumn(db, table, accountId) {
@@ -394,6 +405,56 @@ export function deleteAccountSettings(db, accountId, keys = []) {
     WHERE account_id = ? AND key IN (${placeholders})
   `).run(normalizeAccountId(accountId), ...cleanKeys);
   return { ok: true, deleted: result.changes || 0 };
+}
+
+export function getScheduleContext(db, accountId = DEFAULT_ACCOUNT_ID) {
+  const row = db.prepare(`
+    SELECT context_json AS contextJson, fingerprint, version,
+           fetched_at AS fetchedAt, expires_at AS expiresAt, updated_at AS updatedAt
+    FROM schedule_contexts
+    WHERE account_id = ?
+  `).get(normalizeAccountId(accountId));
+  if (!row) return null;
+  return {
+    context: safeJson(row.contextJson, {}),
+    fingerprint: row.fingerprint || '',
+    version: Number(row.version || 0),
+    fetchedAt: row.fetchedAt || null,
+    expiresAt: row.expiresAt || null,
+    updatedAt: row.updatedAt || null
+  };
+}
+
+export function saveScheduleContext(db, {
+  accountId = DEFAULT_ACCOUNT_ID,
+  context = {},
+  fingerprint = '',
+  version = 0,
+  fetchedAt = nowIso(),
+  expiresAt = nowIso()
+} = {}) {
+  const updatedAt = nowIso();
+  db.prepare(`
+    INSERT INTO schedule_contexts (
+      account_id, context_json, fingerprint, version, fetched_at, expires_at, updated_at
+    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(account_id) DO UPDATE SET
+      context_json = excluded.context_json,
+      fingerprint = excluded.fingerprint,
+      version = excluded.version,
+      fetched_at = excluded.fetched_at,
+      expires_at = excluded.expires_at,
+      updated_at = excluded.updated_at
+  `).run(
+    normalizeAccountId(accountId),
+    JSON.stringify(context || {}),
+    String(fingerprint || '').slice(0, 64),
+    Math.max(0, Number(version || 0)),
+    String(fetchedAt || updatedAt),
+    String(expiresAt || updatedAt),
+    updatedAt
+  );
+  return getScheduleContext(db, accountId);
 }
 
 export function getSessionMode(db, sessionId) {

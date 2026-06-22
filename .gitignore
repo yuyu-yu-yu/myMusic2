@@ -6,6 +6,10 @@ netease_cookie.txt
 data/
 cache/
 node_modules/
+.venv-avatar/
+__pycache__/
+models/avatar/*.onnx
+public/avatar/audit/
 release/
 public/ai-music/generated/
 packaging/work/

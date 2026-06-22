@@ -9,7 +9,7 @@ import { openDatabase, getSetting, saveTrack, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { extractOpenApiTokenPayload, getNeteaseLoginStatus, resolveQrOpenApiLogin, saveNeteaseUserProfile, saveOpenApiToken } from './netease-auth.mjs';
 import { clearLibraryAccountSnapshot, getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
-import { chatRadio, getMemories, getMoodStatsSummary, getPreferences, getRadioDebug, jumpPlaylistRadio, nextPlaylistRadio, nextRadioItem, prefetchRadio, removeAllMemories, removeMemory, reportPlay, startPlaylistRadio, startRadio, submitFeedback, updateMemory, updatePreferences } from './radio.mjs';
+import { applyScheduleContext, chatRadio, encoreConcertRadio, getConcertAudience, getMemories, getMoodStatsSummary, getPreferences, getRadioDebug, jumpConcertRadio, jumpPlaylistRadio, nextConcertRadio, nextPlaylistRadio, nextRadioItem, playConcertHost, prefetchRadio, removeAllMemories, removeMemory, replanConcertRadio, reportPlay, startConcertRadio, startPlaylistRadio, startRadio, submitFeedback, updateMemory, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { getDiaryOverview, getDiaryRadioContext, recordDiarySignalFeedback } from './music-recap.mjs';
 import { createNcmPlayer } from './player.mjs';
@@ -20,6 +20,7 @@ import { generateAiMusic } from './ai-music.mjs';
 import { cleanupDemoGuest, cleanupExpiredDemoGuests, getVisitorIdFromRequest, resolveRequestAccountContext } from './demo-guest.mjs';
 import { configWithEnvironment, resolveRequestEnvironment, resolveRequestEnvironmentContext } from './environment.mjs';
 import { initializeDemoRuntime } from './startup.mjs';
+import { createScheduleProvider, createScheduleService } from './schedule.mjs';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
@@ -28,6 +29,8 @@ const config = getConfig();
 const db = openDatabase(rootDir);
 const netease = new NeteaseClient(config.netease);
 const player = createNcmPlayer({ db });
+const scheduleProvider = createScheduleProvider(config.schedule);
+const scheduleService = createScheduleService({ db, provider: scheduleProvider, config: config.schedule });
 netease.onTokenChange = (accessToken, refreshToken) => {
   setSetting(db, 'netease_access_token', accessToken);
   setSetting(db, 'netease_refresh_token', refreshToken || '');
@@ -279,7 +282,12 @@ const routes = {
     const url = new URL(req.url, 'http://local');
     const songId = url.searchParams.get('songId') || '';
     if (!/^\d+$/.test(songId)) return { ok: true, comments: [] };
-    const comments = await getSongComments(songId, { limit: 40 });
+    const comments = (await getSongComments(songId, { limit: 40 })).map(comment => ({
+      ...comment,
+      source: 'real',
+      persona: null,
+      displayName: comment.nickname || '网易云听众'
+    }));
     return { ok: true, songId, comments };
   },
   'PUT /api/library/profile-playlists': async (req) => {
@@ -313,13 +321,41 @@ const routes = {
     const body = await readJson(req);
     return nextRadioItem({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), userMessage: body.message || '', accountContext: getRequestAccount(req) });
   },
+  'POST /api/radio/concert/start': async (req) => {
+    const body = await readJson(req);
+    return startConcertRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), settings: body.settings || {}, message: body.message || '', accountContext: getRequestAccount(req) });
+  },
+  'POST /api/radio/concert/next': async (req) => {
+    const body = await readJson(req);
+    return nextConcertRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), accountContext: getRequestAccount(req) });
+  },
+  'POST /api/radio/concert/host': async (req) => {
+    const body = await readJson(req);
+    return playConcertHost({ db, config: await getRequestConfig(req), sessionId: body.sessionId || crypto.randomUUID(), eventId: body.eventId || '', replay: body.replay, accountContext: getRequestAccount(req) });
+  },
+  'POST /api/radio/concert/jump': async (req) => {
+    const body = await readJson(req);
+    return jumpConcertRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), index: body.index, accountContext: getRequestAccount(req) });
+  },
+  'POST /api/radio/concert/replan': async (req) => {
+    const body = await readJson(req);
+    return replanConcertRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), message: body.message || '', accountContext: getRequestAccount(req) });
+  },
+  'POST /api/radio/concert/audience': async (req) => {
+    const body = await readJson(req);
+    return getConcertAudience({ db, config: await getRequestConfig(req), sessionId: body.sessionId || crypto.randomUUID(), trackId: body.trackId || '', accountContext: getRequestAccount(req) });
+  },
+  'POST /api/radio/concert/encore': async (req) => {
+    const body = await readJson(req);
+    return encoreConcertRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), accountContext: getRequestAccount(req) });
+  },
   'POST /api/radio/playlist/start': async (req) => {
     const body = await readJson(req);
-    return startPlaylistRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), message: body.message || '', accountContext: getRequestAccount(req) });
+    return startPlaylistRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), message: body.message || '', planning: sanitizeSchedulePlanning(body.planning), scheduleService, accountContext: getRequestAccount(req) });
   },
   'POST /api/radio/playlist/next': async (req) => {
     const body = await readJson(req);
-    return nextPlaylistRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), accountContext: getRequestAccount(req) });
+    return nextPlaylistRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), planning: sanitizeSchedulePlanning(body.planning), scheduleService, accountContext: getRequestAccount(req) });
   },
   'POST /api/radio/playlist/jump': async (req) => {
     const body = await readJson(req);
@@ -364,6 +400,25 @@ const routes = {
   'GET /api/memories': async (req) => getMemories({ db, accountContext: getRequestAccount(req) }),
   'DELETE /api/memories': async (req) => removeAllMemories({ db, accountContext: getRequestAccount(req) }),
   'GET /api/mood-stats': async (req) => getMoodStatsSummary({ db, accountContext: getRequestAccount(req) }),
+  'GET /api/context/schedule/status': async (req) => {
+    const accountContext = getRequestAccount(req);
+    const status = await scheduleService.getStatus({ accountContext });
+    return {
+      ...status,
+      preferenceEnabled: Boolean(getPreferences({ db, accountContext }).preferences.scheduleAwareEnabled)
+    };
+  },
+  'POST /api/context/schedule/refresh': async (req) => {
+    const body = await readJson(req);
+    const sessionId = sanitizeOptionalSessionId(body.sessionId);
+    if (body.sessionId !== undefined && !sessionId) return jsonError('invalid sessionId', 400);
+    const accountContext = getRequestAccount(req);
+    const result = await scheduleService.refresh({ accountContext, force: true });
+    const sessionUpdate = result.context && sessionId
+      ? applyScheduleContext({ db, sessionId, scheduleContext: result.context, accountContext })
+      : { changed: false };
+    return { ...result, sessionChanged: Boolean(sessionUpdate.changed) };
+  },
   'GET /api/preferences': async (req) => getPreferences({ db, accountContext: getRequestAccount(req) }),
   'PUT /api/preferences': async (req) => {
     const body = await readJson(req);
@@ -441,11 +496,12 @@ const routes = {
       return jsonError(error.message, 400);
     }
     if (!recapContext) return jsonError('该日期暂无有效记录', 400);
-    const result = await startPlaylistRadio({
+    const result = await startConcertRadio({
       db,
       config: requestConfig,
       netease,
       sessionId: body.sessionId || crypto.randomUUID(),
+      settings: { length: 5, mood: '怀旧', scene: '放松', audiencePreset: '温暖' },
       message: recapContext.message,
       accountContext
     });
@@ -649,6 +705,9 @@ const server = http.createServer(async (req, res) => {
 server.listen(config.server.port, config.server.host, () => {
   console.log(`myMusic running at http://${config.server.host}:${config.server.port}`);
 });
+server.on('close', () => {
+  void scheduleService.close();
+});
 
 async function readJson(req) {
   const chunks = [];
@@ -664,6 +723,18 @@ function sendJson(res, data, status = 200) {
 
 function jsonError(error, status = 400) {
   return { __error: true, ok: false, error, status };
+}
+
+function sanitizeSchedulePlanning(value) {
+  if (!value || value.source !== 'schedule') return null;
+  return { source: 'schedule', refresh: value.refresh === true };
+}
+
+function sanitizeOptionalSessionId(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== 'string') return null;
+  const sessionId = value.trim();
+  return sessionId && sessionId.length <= 160 ? sessionId : null;
 }
 
 function serveTts(req, res) {

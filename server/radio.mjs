@@ -1,6 +1,24 @@
 // Radio routes — thin wrappers over the conversational DJ engine
 import crypto from 'node:crypto';
-import { chatTurn, clearActivePlaylistSession, djTurn, getRadioDebugStatus, playlistJumpTurn, playlistNextTurn, playlistStartTurn, prefetchRadioQueue } from './dj.mjs';
+import {
+  advanceSessionConstraintsForFeedback,
+  applyScheduleContextToSession,
+  chatTurn,
+  clearActivePlaylistSession,
+  concertAudienceTurn,
+  concertEncoreTurn,
+  concertHostTurn,
+  concertJumpTurn,
+  concertNextTurn,
+  concertReplanTurn,
+  concertStartTurn,
+  djTurn,
+  getRadioDebugStatus,
+  playlistJumpTurn,
+  playlistNextTurn,
+  playlistStartTurn,
+  prefetchRadioQueue
+} from './dj.mjs';
 import {
   clearUserMemories,
   deleteUserMemory,
@@ -40,15 +58,38 @@ export async function nextRadioItem({ db, config, netease, sessionId, userMessag
   return attachAccount(result, account);
 }
 
-export async function startPlaylistRadio({ db, config, netease, sessionId, message, accountContext }) {
+export async function startPlaylistRadio({ db, config, netease, sessionId, message, planning, scheduleService, accountContext }) {
   const account = getRequestAccount(db, accountContext);
-  const result = await playlistStartTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), userMessage: message || '', accountContext: account });
+  const id = sessionId || crypto.randomUUID();
+  const scheduleContext = await resolveSchedulePlanningContext({ db, account, planning, scheduleService });
+  if (scheduleContext) applyScheduleContextToSession(db, id, scheduleContext, account);
+  const result = await playlistStartTurn({
+    db,
+    config,
+    netease,
+    sessionId: id,
+    userMessage: message || '',
+    planning: planning || null,
+    scheduleContext,
+    accountContext: account
+  });
   return attachAccount(result, account);
 }
 
-export async function nextPlaylistRadio({ db, config, netease, sessionId, accountContext }) {
+export async function nextPlaylistRadio({ db, config, netease, sessionId, planning, scheduleService, accountContext }) {
   const account = getRequestAccount(db, accountContext);
-  const result = await playlistNextTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), accountContext: account });
+  const id = sessionId || crypto.randomUUID();
+  const scheduleContext = await resolveSchedulePlanningContext({ db, account, planning, scheduleService });
+  if (scheduleContext) applyScheduleContextToSession(db, id, scheduleContext, account);
+  const result = await playlistNextTurn({
+    db,
+    config,
+    netease,
+    sessionId: id,
+    planning: planning || null,
+    scheduleContext,
+    accountContext: account
+  });
   return attachAccount(result, account);
 }
 
@@ -56,6 +97,56 @@ export async function jumpPlaylistRadio({ db, config, netease, sessionId, index,
   const account = getRequestAccount(db, accountContext);
   const result = await playlistJumpTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), index, accountContext: account });
   return attachAccount(result, account);
+}
+
+export async function startConcertRadio({ db, config, netease, sessionId, settings, message, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(await concertStartTurn({
+    db,
+    config,
+    netease,
+    sessionId: sessionId || crypto.randomUUID(),
+    settings: settings || {},
+    userMessage: message || '',
+    accountContext: account
+  }), account);
+}
+
+export async function nextConcertRadio({ db, config, netease, sessionId, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(await concertNextTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), accountContext: account }), account);
+}
+
+export async function playConcertHost({ db, config, sessionId, eventId, replay, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(await concertHostTurn({
+    db,
+    config,
+    sessionId: sessionId || crypto.randomUUID(),
+    eventId,
+    replay: Boolean(replay),
+    accountContext: account
+  }), account);
+}
+
+export async function jumpConcertRadio({ db, config, netease, sessionId, index, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(await concertJumpTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), index, accountContext: account }), account);
+}
+
+export async function replanConcertRadio({ db, config, netease, sessionId, message, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(await concertReplanTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), message, accountContext: account }), account);
+}
+
+export async function encoreConcertRadio({ db, config, netease, sessionId, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(await concertEncoreTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), accountContext: account }), account);
+}
+
+export async function getConcertAudience({ db, config, sessionId, trackId, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  return attachAccount(await concertAudienceTurn({ db, config, sessionId: sessionId || crypto.randomUUID(), trackId, accountContext: account }), account);
 }
 
 export function prefetchRadio({ db, config, netease, sessionId, force = false, accountContext }) {
@@ -66,6 +157,12 @@ export function prefetchRadio({ db, config, netease, sessionId, force = false, a
 export function getRadioDebug({ db, sessionId, accountContext }) {
   const account = getRequestAccount(db, accountContext);
   return attachAccount(getRadioDebugStatus(db, sessionId, account), account);
+}
+
+export function applyScheduleContext({ db, sessionId, scheduleContext, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  if (!sessionId || !scheduleContext) return { ok: true, changed: false };
+  return applyScheduleContextToSession(db, sessionId, scheduleContext, account);
 }
 
 export async function reportPlay({ db, netease, payload }) {
@@ -97,11 +194,20 @@ export function submitFeedback({ db, payload, accountContext }) {
       sessionId: payload.sessionId,
       feedback
     });
+    const sessionConstraints = advanceSessionConstraintsForFeedback({
+      db,
+      sessionId: payload.sessionId,
+      trackId: payload.trackId || payload.songId,
+      eventType: payload.eventType,
+      eventId: payload.constraintEventId,
+      accountContext: account
+    });
     return {
       ok: true,
       feedback,
       feedbackSummary: getFeedbackSummary(db, account.accountId),
       memories: listUserMemories(db, { accountId: account.accountId, limit: 8 }),
+      sessionConstraints,
       account: publicAccountContext(account)
     };
   } catch (error) {
@@ -186,8 +292,23 @@ function normalizePreferences(raw = {}) {
     voiceMode: pick(raw.voiceMode, ['off', 'recommendations', 'all'], 'recommendations'),
     moodMode: pick(raw.moodMode, ['auto', 'comfort', 'focus', 'calm', 'night', 'random'], 'auto'),
     lowDistractionMode: raw.lowDistractionMode === true,
+    scheduleAwareEnabled: raw.scheduleAwareEnabled === true,
     note: String(raw.note || '').slice(0, 500)
   };
+}
+
+async function resolveSchedulePlanningContext({ db, account, planning, scheduleService }) {
+  if (planning?.source !== 'schedule' || !scheduleService) return null;
+  const preferences = normalizePreferences(getUserPrefs(db, account));
+  if (!preferences.scheduleAwareEnabled) return null;
+  try {
+    return await scheduleService.getForPlanning({
+      accountContext: account,
+      refresh: planning.refresh === true
+    });
+  } catch {
+    return null;
+  }
 }
 
 function getFeedbackSummary(db, accountId) {

@@ -17,7 +17,19 @@ const ENV_KEYS = [
   'RECOMMENDATION_ARTIST_DENSITY_MAX',
   'LLM_BASE_URL',
   'LLM_API_KEY',
-  'LLM_MODEL'
+  'LLM_MODEL',
+  'SCHEDULE_MCP_ENABLED',
+  'SCHEDULE_MCP_PROVIDER',
+  'SCHEDULE_MCP_COMMAND',
+  'SCHEDULE_MCP_ARGS_JSON',
+  'SCHEDULE_MCP_ENV_JSON',
+  'SCHEDULE_MCP_ALLOWED_TOOLS_JSON',
+  'SCHEDULE_MCP_TIMEOUT_MS',
+  'SCHEDULE_MCP_CACHE_MS',
+  'SCHEDULE_MCP_FAILURE_CACHE_MS',
+  'SCHEDULE_MCP_LOOKAHEAD_HOURS',
+  'FEISHU_APP_ID',
+  'FEISHU_APP_SECRET'
 ];
 
 function withEnv(values, fn) {
@@ -94,5 +106,34 @@ test('public config status exposes capability flags without provider secrets', (
     const serialized = JSON.stringify(publicConfigStatus(getConfig()));
     assert.match(serialized, /\"configured\":true/);
     assert.doesNotMatch(serialized, /private-test-key|https:\/\/llm\.example\.test/);
+  });
+});
+
+test('schedule MCP config uses read-only defaults and keeps credentials out of public status', () => {
+  withEnv({
+    SCHEDULE_MCP_ENABLED: 'true',
+    FEISHU_APP_ID: 'cli_test_app_id',
+    FEISHU_APP_SECRET: 'private_feishu_secret',
+    SCHEDULE_MCP_TIMEOUT_MS: '2500',
+    SCHEDULE_MCP_CACHE_MS: '300000',
+    SCHEDULE_MCP_FAILURE_CACHE_MS: '1800000',
+    SCHEDULE_MCP_LOOKAHEAD_HOURS: '24'
+  }, () => {
+    const config = getConfig();
+    assert.equal(config.schedule.enabled, true);
+    assert.equal(config.schedule.command, 'npx');
+    assert.deepEqual(config.schedule.allowedTools, [
+      'calendar.v4.calendar.primary',
+      'calendar.v4.calendarEvent.list',
+      'calendar.v4.freebusy.list'
+    ]);
+    assert.match(config.schedule.args.join(' '), /@larksuiteoapi\/lark-mcp/);
+    assert.match(config.schedule.args.join(' '), /\$\{FEISHU_APP_SECRET\}/);
+
+    const status = publicConfigStatus(config);
+    assert.equal(status.schedule.configured, true);
+    assert.equal(status.schedule.timeoutMs, 2500);
+    assert.equal(status.schedule.cacheMs, 300000);
+    assert.doesNotMatch(JSON.stringify(status), /private_feishu_secret|cli_test_app_id|FEISHU_APP_SECRET/);
   });
 });

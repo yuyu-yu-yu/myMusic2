@@ -1,5 +1,5 @@
-const CACHE = 'mymusic-v24';
-const ASSETS = ['/', '/styles.css', '/app.js', '/manifest.webmanifest', '/assets/icon.svg', '/avatar/source/cancan.png'];
+const CACHE = 'mymusic-v34';
+const ASSETS = ['/', '/styles.css', '/app.js', '/manifest.webmanifest', '/assets/icon.svg', '/avatar/source/cancan-first-frame.png'];
 
 self.addEventListener('install', (event) => {
   event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS)));
