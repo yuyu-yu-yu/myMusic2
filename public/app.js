@@ -183,6 +183,7 @@ const avatarStateLabels = {
   happy: 'HAPPY'
 };
 const AVATAR_TRANSITION_MS = 260;
+const AVATAR_HAPPY_DISPLAY_MS = 6000;
 const AVATAR_MIN_TALKING_MS = 1800;
 const AVATAR_MAX_TALKING_MS = 6800;
 const SILENT_AUDIO_DATA_URI = 'data:audio/wav;base64,UklGRigAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQQAAAAAAA==';
@@ -1329,7 +1330,7 @@ function renderPlayer() {
     if (aiMusicDownload.getAttribute('aria-disabled') === 'true') event.preventDefault();
   });
   likeBtn.addEventListener('click', () => {
-    setAvatarState('happy', { temporaryMs: 1400 });
+    setAvatarState('happy', { temporaryMs: AVATAR_HAPPY_DISPLAY_MS });
     showLikeBurst();
     reportFeedback('like');
   });
