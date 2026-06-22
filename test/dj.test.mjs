@@ -971,6 +971,40 @@ test('playable resolution keeps originalId tracks eligible for ncm-cli fallback'
   assert.match(strictBrowserPlayback.playbackError, /browser-playable/);
 });
 
+test('playable resolution uses community cookie without NetEase OpenAPI configuration', async () => {
+  const calls = [];
+  const resolved = await resolvePlayableTrack(null, {
+    isConfigured: () => false
+  }, {
+    id: '123456',
+    name: 'Community Song',
+    artists: ['Community Artist']
+  }, {
+    includeLyric: true,
+    requireBrowserPlayUrl: true,
+    communityClient: {
+      hasCookie: () => true,
+      getSongUrl: async (songId, levels) => {
+        calls.push({ kind: 'url', songId, levels });
+        return { url: 'https://music.example.test/song.mp3' };
+      },
+      getLyric: async (songId) => {
+        calls.push({ kind: 'lyric', songId });
+        return '[00:00.00] Community lyric';
+      }
+    }
+  });
+
+  assert.equal(resolved.playable, true);
+  assert.equal(resolved.playUrl, 'https://music.example.test/song.mp3');
+  assert.equal(resolved.playbackMode, 'browser-direct');
+  assert.equal(resolved.lyric, '[00:00.00] Community lyric');
+  assert.deepEqual(calls, [
+    { kind: 'url', songId: '123456', levels: ['exhigh', 'higher', 'standard'] },
+    { kind: 'lyric', songId: '123456' }
+  ]);
+});
+
 test('feedback and artist cooldown change candidate order', () => {
   const feedbackById = new Map([
     ['liked', { likes: 1, dislikes: 0, completions: 2, skips: 0 }],

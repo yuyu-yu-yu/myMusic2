@@ -1303,10 +1303,21 @@ function inferTags(tracks) {
   return tags.slice(0, 5);
 }
 
-export async function resolvePlayableTrack(db, netease, track, { includeLyric = true, requireBrowserPlayUrl = false } = {}) {
+export async function resolvePlayableTrack(db, netease, track, {
+  includeLyric = true,
+  requireBrowserPlayUrl = false,
+  communityClient = null
+} = {}) {
   if (!track) return null;
   const normalized = normalizeTrack(track);
-  if (!netease.isConfigured() || normalized.id.startsWith('demo-')) {
+  const community = communityClient || {
+    hasCookie: hasCommunityCookie,
+    getSongUrl,
+    getLyric: getCommunityLyric
+  };
+  const communityConfigured = Boolean(community.hasCookie?.());
+  const openApiConfigured = Boolean(netease?.isConfigured?.());
+  if ((!communityConfigured && !openApiConfigured) || normalized.id.startsWith('demo-')) {
     const demoUrl = `/assets/${normalized.id}.mp3`;
     return {
       ...normalized,
@@ -1323,13 +1334,15 @@ export async function resolvePlayableTrack(db, netease, track, { includeLyric = 
   // for tracks that still have a NetEase originalId.
   let url = null;
   let lyric = null;
-  try {
-    const songUrl = await getSongUrl(normalized.originalId || normalized.id, ['exhigh', 'higher', 'standard']);
-    if (songUrl?.url) url = songUrl.url;
-  } catch { /* fall through */ }
+  if (communityConfigured) {
+    try {
+      const songUrl = await community.getSongUrl(normalized.originalId || normalized.id, ['exhigh', 'higher', 'standard']);
+      if (songUrl?.url) url = songUrl.url;
+    } catch { /* fall through */ }
+  }
 
   // Fallback: NetEase OpenAPI with descending bitrates
-  if (!url) {
+  if (!url && openApiConfigured) {
     for (const br of [320, 128, 96]) {
       try {
         const res = await netease.playUrl(normalized.id, br);
@@ -1342,10 +1355,12 @@ export async function resolvePlayableTrack(db, netease, track, { includeLyric = 
 
   if (includeLyric) {
     // Lyric - try community first
-    try {
-      lyric = await getCommunityLyric(normalized.id);
-    } catch { /* fall through */ }
-    if (!lyric) {
+    if (communityConfigured) {
+      try {
+        lyric = await community.getLyric(normalized.id);
+      } catch { /* fall through */ }
+    }
+    if (!lyric && openApiConfigured) {
       try {
         const lyricRes = await netease.lyric(normalized.id);
         lyric = lyricRes?.data?.lyric || lyricRes?.data?.lrc?.lyric || null;
