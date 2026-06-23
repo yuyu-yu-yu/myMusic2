@@ -1,5 +1,5 @@
-const CACHE = 'mymusic-v37';
-const ASSETS = ['/', '/styles.css', '/app.js', '/device-identity.js', '/manifest.webmanifest', '/assets/icon.svg', '/avatar/source/cancan-first-frame.png'];
+const CACHE = 'mymusic-v38';
+const ASSETS = ['/', '/styles.css', '/app.js', '/device-identity.js', '/track-identity.js', '/manifest.webmanifest', '/assets/icon.svg', '/avatar/source/cancan-first-frame.png'];
 
 function parseRange(rangeHeader, size) {
   const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader || '');

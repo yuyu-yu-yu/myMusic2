@@ -7,6 +7,7 @@ import {
   movePlaybackCursor
 } from './playback-sequence.js';
 import { ensureDemoDeviceId, rotateDemoDeviceId } from './device-identity.js';
+import { getTrackNeteaseSongId } from './track-identity.js';
 
 const AI_MUSIC_MODE_STORAGE_KEY = 'mymusic:aiMusicMode';
 
@@ -3075,12 +3076,6 @@ function setCommentDanmakuComments(comments = []) {
   const safeComments = Array.isArray(comments) ? comments.filter(comment => comment?.content) : [];
   danmakuState.comments = safeComments;
   danmakuState.remainingComments = shuffledComments(safeComments);
-}
-
-function getTrackNeteaseSongId(track = {}) {
-  const value = track?.originalId || '';
-  const id = String(value || '').trim();
-  return /^\d+$/.test(id) ? id : '';
 }
 
 function stopCommentDanmaku({ clearLayer = false, invalidate = false } = {}) {
