@@ -26,6 +26,14 @@ import {
   buildDailyMusicRecap as buildSharedDailyMusicRecap,
   getDiaryRecommendationContext
 } from './music-recap.mjs';
+import {
+  commandHasConstraintChanges,
+  compileMusicCommand as compileStructuredMusicCommand,
+  compileMusicCommandFallback,
+  MUSIC_COMMAND_ACTIONS,
+  MUSIC_VOCAL_POLICIES,
+  normalizeMusicCommand
+} from './music-command.mjs';
 import { getSchedulePlaylistPolicy, publicScheduleContext, scheduleMoodSignal } from './schedule.mjs';
 
 export { buildSharedDailyMusicRecap as buildDailyMusicRecap };
@@ -69,7 +77,6 @@ const SESSION_SUMMARY_STEP = 8;
 const LONG_MEMORY_LIMIT = 8;
 const LONG_MEMORY_MAX_CHARS = 800;
 const CHAT_LLM_TIMEOUT_MS = 9000;
-const INTENT_LLM_TIMEOUT_MS = 4000;
 const INTENT_FALLBACK_SENTINEL = '__INTENT_CLASSIFIER_FALLBACK__';
 const DEFAULT_PREFS = Object.freeze({
   chatMusicBalance: 'friend',
@@ -118,7 +125,8 @@ const SESSION_CONSTRAINT_RULE_FIELDS = Object.freeze({
   language: 'avoidLanguages',
   style: 'avoidStyleFamilies',
   artist: 'avoidArtists',
-  song: 'avoidSongs'
+  song: 'avoidSongs',
+  vocal: 'avoidVocalPolicies'
 });
 const CONCERT_PERSONAS = Object.freeze([
   '理性乐评人',
@@ -143,7 +151,8 @@ const RADIO_QUEUE_POLICIES = Object.freeze({
   CLEAR: 'clear'
 });
 const VOCAL_POLICIES = Object.freeze({
-  INSTRUMENTAL_ONLY: 'instrumental_only'
+  INSTRUMENTAL_ONLY: MUSIC_VOCAL_POLICIES.INSTRUMENTAL_ONLY,
+  VOCAL_REQUIRED: MUSIC_VOCAL_POLICIES.VOCAL_REQUIRED
 });
 const LANGUAGE_LABELS = Object.freeze({
   cantonese: '粤语',
@@ -228,10 +237,45 @@ const GENERIC_ARTIST_PHRASES = new Set([
   '快歌'
 ].map(normalizeMusicText));
 
-export async function djTurn({ db, config, netease, sessionId, userMessage, conversationMood = null, useQueue = true, accountContext = null }) {
+export async function djTurn({ db, config, netease, sessionId, userMessage, conversationMood = null, useQueue = true, accountContext = null, musicCommand = null }) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
   const normalizedUserMessage = String(userMessage || '').trim();
+  let effectiveMusicCommand = musicCommand ? normalizeCommandForDj(musicCommand, getSessionMode(db, sessionId)) : null;
+  if (normalizedUserMessage && !effectiveMusicCommand) {
+    const context = getSessionContext(db, sessionId);
+    effectiveMusicCommand = await compileMusicCommand({
+      config,
+      userMessage: normalizedUserMessage,
+      history: loadHistory(db, sessionId, account),
+      currentTrack: getCurrentTrack(db, account),
+      activeConcert: context.activeConcert || context.activePlaylist || null,
+      sessionConstraints: getSessionConstraintsFromContext(context),
+      mode: getSessionMode(db, sessionId),
+      baseMood: conversationMood || {}
+    });
+  }
+  if (effectiveMusicCommand && commandHasConstraintChanges(effectiveMusicCommand)) {
+    const context = getSessionContext(db, sessionId);
+    const previousConstraints = getSessionConstraintsFromContext(context);
+    const update = constraintUpdateFromMusicCommand(effectiveMusicCommand, previousConstraints);
+    const nextConstraints = applySessionConstraintUpdate(previousConstraints, update);
+    if (!sessionConstraintsEqual(previousConstraints, nextConstraints)) {
+      const musicContext = nextMusicContext(
+        context.musicContext || {},
+        applyMusicCommandToMood(conversationMood || {}, effectiveMusicCommand),
+        effectiveMusicCommand
+      );
+      setSessionContext(db, sessionId, {
+        ...context,
+        musicContext: mergeMusicContextWithSessionConstraints(musicContext, nextConstraints),
+        sessionConstraints: nextConstraints,
+        lastMusicCommand: sanitizeMusicCommandForDebug(effectiveMusicCommand),
+        queueGeneration: Number(context.queueGeneration || 0) + 1
+      });
+      invalidateActiveRadioQueue(db, sessionId, 'session_constraint_changed');
+    }
+  }
 
   if (useQueue && !normalizedUserMessage) {
     const queued = consumeReadyRadioQueue(db, sessionId, { recordHit: false, accountContext: account });
@@ -305,6 +349,7 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
     sessionId,
     userMessage: normalizedUserMessage || null,
     conversationMood,
+    musicCommand: effectiveMusicCommand,
     accountContext: account
   });
   const response = await commitRadioRecommendation({
@@ -323,14 +368,40 @@ export async function djTurn({ db, config, netease, sessionId, userMessage, conv
   if (useQueue && !normalizedUserMessage) {
     updateQueueMetrics(db, sessionId, { syncFallbackCount: 1 });
   }
-  return { ...response, queueHit: false };
+  return {
+    ...response,
+    queueHit: false,
+    sessionConstraints: publicSessionConstraints(getSessionConstraintsFromContext(getSessionContext(db, sessionId))),
+    interpretation: effectiveMusicCommand
+      ? buildMusicCommandInterpretation(effectiveMusicCommand, getSessionConstraintsFromContext(getSessionContext(db, sessionId)))
+      : null
+  };
 }
 
-export async function concertStartTurn({ db, config, netease, sessionId, settings = {}, userMessage = null, planning = null, scheduleContext = null, accountContext = null }) {
+export async function concertStartTurn({ db, config, netease, sessionId, settings = {}, userMessage = null, musicCommand = null, planning = null, scheduleContext = null, accountContext = null }) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
   const normalizedUserMessage = String(userMessage || '').trim();
-  if (normalizedUserMessage) applyConcertConstraintMessage(db, sessionId, normalizedUserMessage);
+  const context = getSessionContext(db, sessionId);
+  const command = musicCommand
+    ? normalizeCommandForDj(musicCommand, getSessionMode(db, sessionId))
+    : normalizedUserMessage
+      ? await compileMusicCommand({
+          config,
+          userMessage: normalizedUserMessage,
+          history: loadHistory(db, sessionId, account),
+          currentTrack: getCurrentTrack(db, account),
+          activeConcert: context.activeConcert || context.activePlaylist || null,
+          sessionConstraints: getSessionConstraintsFromContext(context),
+          mode: getSessionMode(db, sessionId)
+        })
+      : normalizeCommandForDj({
+          originalText: '',
+          action: MUSIC_COMMAND_ACTIONS.RECOMMEND_AND_PLAY,
+          confidence: 1,
+          source: 'internal'
+        });
+  if (commandHasConstraintChanges(command)) applyConcertConstraintMessage(db, sessionId, command);
   const concertSettings = normalizeConcertSettings(settings, { allowInternalLength: planning?.source === 'schedule' });
   clearRadioQueue(db, sessionId);
   const built = await buildPlaylistRecommendation({
@@ -339,6 +410,7 @@ export async function concertStartTurn({ db, config, netease, sessionId, setting
     netease,
     sessionId,
     userMessage: normalizedUserMessage || null,
+    musicCommand: command,
     settings: concertSettings,
     planning,
     scheduleContext,
@@ -466,7 +538,7 @@ export async function concertJumpTurn({ db, config, netease, sessionId, index, a
   });
 }
 
-export async function concertReplanTurn({ db, config, netease, sessionId, message = '', accountContext = null }) {
+export async function concertReplanTurn({ db, config, netease, sessionId, message = '', musicCommand = null, constraintsAlreadyApplied = false, accountContext = null }) {
   const account = normalizeAccountContext(accountContext);
   sessionId = ensureSession(db, sessionId, account);
   const context = getSessionContext(db, sessionId);
@@ -479,13 +551,27 @@ export async function concertReplanTurn({ db, config, netease, sessionId, messag
   if (remainingCount <= 0) {
     return { __error: true, ok: false, status: 400, error: 'No remaining concert tracks to replan.' };
   }
-  applyConcertConstraintMessage(db, sessionId, userMessage);
+  const command = musicCommand
+    ? normalizeCommandForDj(musicCommand, getSessionMode(db, sessionId))
+    : await compileMusicCommand({
+        config,
+        userMessage,
+        history: loadHistory(db, sessionId, account),
+        currentTrack: getCurrentTrack(db, account),
+        activeConcert: current,
+        sessionConstraints: getSessionConstraintsFromContext(context),
+        mode: getSessionMode(db, sessionId)
+      });
+  if (!constraintsAlreadyApplied && commandHasConstraintChanges(command)) {
+    applyConcertConstraintMessage(db, sessionId, command);
+  }
   const built = await buildPlaylistRecommendation({
     db,
     config,
     netease,
     sessionId,
     userMessage,
+    musicCommand: command,
     settings: { ...current.settings, length: remainingCount },
     targetLength: remainingCount,
     extraAvoidTracks: current.items.map(item => item.track),
@@ -511,18 +597,26 @@ export async function concertReplanTurn({ db, config, netease, sessionId, messag
   });
   setSessionContext(db, sessionId, { ...context, activeConcert: merged });
   saveMessage(db, sessionId, 'user', userMessage, account);
-  const chatText = `收到，当前歌曲继续播放。我已经按“${userMessage.slice(0, 36)}”重新编排后半场。`;
+  const chatText = `收到，当前歌曲继续播放。我已经按“${command.normalizedSummary || userMessage.slice(0, 36)}”重新编排后半场。`;
   saveMessage(db, sessionId, 'assistant', chatText, account);
-  return concertStateResponse({ db, sessionId, concert: merged, chatText, concertEvent: 'track', accountContext: account });
+  return {
+    ...concertStateResponse({ db, sessionId, concert: merged, chatText, concertEvent: 'track', accountContext: account }),
+    interpretation: buildMusicCommandInterpretation(command, getSessionConstraintsFromContext(getSessionContext(db, sessionId)))
+  };
 }
 
-function applyConcertConstraintMessage(db, sessionId, message) {
+function applyConcertConstraintMessage(db, sessionId, musicCommand) {
   const context = getSessionContext(db, sessionId);
   const previous = getSessionConstraintsFromContext(context);
-  const update = parseSessionConstraintUpdate(message, previous);
+  const update = constraintUpdateFromMusicCommand(musicCommand, previous);
   if (!update.changed) return previous;
   const sessionConstraints = applySessionConstraintUpdate(previous, update);
-  setSessionContext(db, sessionId, { ...context, sessionConstraints });
+  setSessionContext(db, sessionId, {
+    ...context,
+    sessionConstraints,
+    lastMusicCommand: sanitizeMusicCommandForDebug(musicCommand),
+    queueGeneration: Number(context.queueGeneration || 0) + 1
+  });
   return sessionConstraints;
 }
 
@@ -700,6 +794,7 @@ async function buildRadioRecommendation({
   sessionId,
   userMessage,
   conversationMood = null,
+  musicCommand = null,
   extraAvoidTracks = [],
   accountContext = null,
   deferHostAndSpeech = false
@@ -731,6 +826,33 @@ async function buildRadioRecommendation({
   if (openingRecap) hostContext.openingRecap = openingRecap;
 
   const history = loadHistory(db, sessionId, account);
+  const effectiveMusicCommand = musicCommand
+    ? normalizeCommandForDj(musicCommand, mode)
+    : userMessage
+      ? await compileMusicCommand({
+          config,
+          userMessage,
+          history,
+          currentTrack: getCurrentTrack(db, account),
+          activeConcert: context.activeConcert || context.activePlaylist || null,
+          sessionConstraints,
+          mode,
+          baseMood: recommendationMood,
+          environmentContext
+        })
+      : normalizeCommandForDj({
+          originalText: '',
+          action: MUSIC_COMMAND_ACTIONS.RECOMMEND_AND_PLAY,
+          confidence: 1,
+          source: 'internal'
+        }, mode);
+  if (userMessage || effectiveMusicCommand.source !== 'internal') {
+    updateSessionContext(db, sessionId, current => ({
+      ...current,
+      lastMusicCommand: sanitizeMusicCommandForDebug(effectiveMusicCommand)
+    }));
+    setRadioDebugInfo(db, sessionId, { lastMusicCommand: sanitizeMusicCommandForDebug(effectiveMusicCommand) });
+  }
   const sessionSummary = await updateSessionSummary(db, config, sessionId, account);
   const longTermMemories = retrieveRelevantMemories(db, {
     accountId: account.accountId,
@@ -755,6 +877,7 @@ async function buildRadioRecommendation({
     prefs,
     history,
     userMessage,
+    musicCommand: effectiveMusicCommand,
     conversationMood: recommendationMood,
     memoryContext,
     hostContext,
@@ -814,6 +937,7 @@ async function buildPlaylistRecommendation({
   netease,
   sessionId,
   userMessage = null,
+  musicCommand = null,
   settings = {},
   targetLength = null,
   extraAvoidTracks = [],
@@ -842,7 +966,7 @@ async function buildPlaylistRecommendation({
   const scheduleMood = planning?.source === 'schedule' && !hasExplicitMusicIntent(normalizedUserMessage)
     ? scheduleMoodSignal(scheduleContext)
     : null;
-  const conversationMood = mergeSessionConstraintsIntoMood(
+  let conversationMood = mergeSessionConstraintsIntoMood(
     contextMood || scheduleMood || moodFromConversationState(conversationState, prefs, mode),
     sessionConstraints
   );
@@ -861,7 +985,28 @@ async function buildPlaylistRecommendation({
     maxChars: LONG_MEMORY_MAX_CHARS
   });
   const memoryContext = buildMemoryContext({ sessionSummary, longTermMemories });
-  const request = getMusicRequestConstraints(db, normalizedUserMessage || null, mode, sessionConstraints);
+  const effectiveMusicCommand = musicCommand
+    ? normalizeCommandForDj(musicCommand, mode)
+    : normalizedUserMessage
+      ? await compileMusicCommand({
+          config,
+          userMessage: normalizedUserMessage,
+          history,
+          currentTrack: getCurrentTrack(db, account),
+          activeConcert: context.activeConcert || context.activePlaylist || null,
+          sessionConstraints,
+          mode,
+          baseMood: conversationMood,
+          environmentContext
+        })
+      : normalizeCommandForDj({
+          originalText: '',
+          action: MUSIC_COMMAND_ACTIONS.RECOMMEND_AND_PLAY,
+          confidence: 1,
+          source: 'internal'
+        }, mode);
+  conversationMood = mergeSessionConstraintsIntoMood(applyMusicCommandToMood(conversationMood, effectiveMusicCommand), sessionConstraints);
+  const request = getMusicRequestConstraints(db, effectiveMusicCommand, mode, sessionConstraints);
   if (!request.vocalPolicy && conversationMood?.vocalPolicy) {
     request.vocalPolicy = normalizeVocalPolicy(conversationMood.vocalPolicy);
   }
@@ -2031,21 +2176,62 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
   const context = getSessionContext(db, sessionId);
   const conversationState = normalizeConversationState(context.conversationState);
   const previousSessionConstraints = getSessionConstraintsFromContext(context);
-  const constraintUpdate = parseSessionConstraintUpdate(userMessage, previousSessionConstraints);
+  const environmentContext = await getEnvironmentContext({ db, sessionId, config });
+  let baseMood = analyzeTurnContext({
+    history,
+    userMessage,
+    profile,
+    currentTrack,
+    mode,
+    prefs,
+    conversationState,
+    environmentContext,
+    parseMusicSemantics: false
+  });
+  baseMood = mergeSessionConstraintsIntoMood(baseMood, previousSessionConstraints);
+  const compilerMemoryContext = buildMemoryContext({
+    sessionSummary: context.sessionSummary || '',
+    longTermMemories: retrieveRelevantMemories(db, {
+      accountId: account.accountId,
+      text: userMessage,
+      mood: baseMood,
+      mode,
+      limit: LONG_MEMORY_LIMIT,
+      maxChars: LONG_MEMORY_MAX_CHARS
+    })
+  });
+  const musicCommand = await compileMusicCommand({
+    config,
+    userMessage,
+    history,
+    currentTrack,
+    activeConcert: context.activeConcert || context.activePlaylist || null,
+    sessionConstraints: previousSessionConstraints,
+    mode,
+    baseMood,
+    environmentContext,
+    memoryContext: compilerMemoryContext
+  });
+  updateSessionContext(db, sessionId, current => ({
+    ...current,
+    lastMusicCommand: sanitizeMusicCommandForDebug(musicCommand)
+  }));
+  setRadioDebugInfo(db, sessionId, { lastMusicCommand: sanitizeMusicCommandForDebug(musicCommand) });
+  const constraintUpdate = constraintUpdateFromMusicCommand(musicCommand, previousSessionConstraints);
   const sessionConstraints = applySessionConstraintUpdate(previousSessionConstraints, constraintUpdate);
   const constraintsChanged = !sessionConstraintsEqual(previousSessionConstraints, sessionConstraints);
   if (constraintsChanged) {
     const avoidLabels = sessionConstraintDisplayTerms(sessionConstraints);
     const blocked = new Set(avoidLabels.map(normalizeMusicText));
+    const commandMood = applyMusicCommandToMood(baseMood, musicCommand);
     const musicContext = normalizeMusicContext({
-      ...(context.musicContext || {}),
-      version: Number(context.musicContext?.version || 0) + 1,
+      ...nextMusicContext(context.musicContext || {}, commandMood, musicCommand),
       searchHints: (context.musicContext?.searchHints || []).filter(hint => !blocked.has(normalizeMusicText(hint))),
       preferenceHints: (context.musicContext?.preferenceHints || []).filter(hint => !blocked.has(normalizeMusicText(hint))),
       avoidHints: avoidLabels,
-      musicIntent: 'constraint_update',
+      musicIntent: musicCommand.action === MUSIC_COMMAND_ACTIONS.RECOMMEND_AND_PLAY ? 'explicit_music' : 'constraint_update',
       lastUserMessage: userMessage,
-      reason: 'session constraints updated',
+      reason: musicCommand.normalizedSummary || 'session constraints updated',
       updatedAt: nowIso()
     });
     const nextConversationState = {
@@ -2063,22 +2249,22 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       queueGeneration
     });
     const invalidated = invalidateActiveRadioQueue(db, sessionId, constraintUpdate.reset ? 'constraints_reset' : 'session_constraint_changed');
-    const queueRebuilt = scheduleRadioQueueFill({
-      db,
-      config,
-      netease,
-      sessionId,
-      reason: 'session_constraint_changed',
-      preemptReason: 'session_constraint_changed',
-      preempt: true,
-      force: true,
-      contextSnapshot: musicContext,
-      accountContext: account
-    });
+    const queueRebuilt = musicCommand.switchNow ? false : scheduleRadioQueueFill({
+        db,
+        config,
+        netease,
+        sessionId,
+        reason: 'session_constraint_changed',
+        preemptReason: 'session_constraint_changed',
+        preempt: true,
+        force: true,
+        contextSnapshot: musicContext,
+        accountContext: account
+      });
     const currentConstraintResult = currentTrack?.id
       ? getTrackConstraintResult(currentTrack, sessionConstraints)
       : { accepted: true, reason: 'no_current_track' };
-    const explicitSwitchRequested = isImmediateNextRequest(userMessage);
+    const explicitSwitchRequested = musicCommand.switchNow;
     const stopCurrent = !constraintUpdate.reset && Boolean(currentTrack?.id) && (
       explicitSwitchRequested || !currentConstraintResult.accepted
     );
@@ -2093,15 +2279,63 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       : stopCurrent
         ? `好，本场已经避开${labelText}。这首也不继续放，我现在换一首。`
         : `好，本场已经避开${labelText}，这项限制最多影响接下来的 ${SESSION_CONSTRAINT_TRACK_LIMIT} 首，预取队列也已重新检查。`;
-    if (userMessage) saveMessage(db, sessionId, 'user', userMessage, account);
-    saveMessage(db, sessionId, 'assistant', chatText, account);
     setRadioDebugInfo(db, sessionId, {
+      lastMusicCommand: sanitizeMusicCommandForDebug(musicCommand),
       parsedConstraints: constraintUpdate,
       prunedPositiveHints: [...blocked],
       queueContextVersion: musicContext.version,
       queueInvalidationReason: constraintUpdate.reset ? 'constraints_reset' : 'session_constraint_changed',
       queueValidationResult: { invalidated, currentConstraintResult }
     });
+    if (musicCommand.action === MUSIC_COMMAND_ACTIONS.ADJUST_CONCERT && (context.activeConcert || context.activePlaylist)) {
+      return concertReplanTurn({
+        db,
+        config,
+        netease,
+        sessionId,
+        message: userMessage,
+        musicCommand,
+        constraintsAlreadyApplied: true,
+        accountContext: account
+      });
+    }
+    if (stopCurrent && musicCommand.action === MUSIC_COMMAND_ACTIONS.RECOMMEND_AND_PLAY) {
+      const result = await djTurn({
+        db,
+        config,
+        netease,
+        sessionId,
+        userMessage,
+        conversationMood: mergeSessionConstraintsIntoMood(commandMood, sessionConstraints),
+        useQueue: false,
+        accountContext: account,
+        musicCommand
+      });
+      const immediateQueueRebuilt = scheduleRadioQueueFill({
+        db,
+        config,
+        netease,
+        sessionId,
+        reason: 'after_constraint_switch',
+        force: true,
+        contextSnapshot: musicContext,
+        accountContext: account
+      });
+      return {
+        ...result,
+        interpretation: buildMusicCommandInterpretation(musicCommand, sessionConstraints),
+        constraintApplied: publicSessionConstraints(sessionConstraints),
+        sessionConstraints: publicSessionConstraints(sessionConstraints),
+        turnAction: turnActionFromMusicCommand(musicCommand, commandMood),
+        intent: 'constraint_update',
+        intentSource: musicCommand.source || 'fallback',
+        switchRequested: true,
+        stopCurrent: true,
+        queueRebuilt: Boolean(immediateQueueRebuilt)
+      };
+    }
+    if (userMessage) saveMessage(db, sessionId, 'user', userMessage, account);
+    saveMessage(db, sessionId, 'assistant', chatText, account);
     return {
       sessionId,
       chatText,
@@ -2121,21 +2355,22 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       sessionConstraints: publicSessionConstraints(sessionConstraints),
       switchRequested: stopCurrent,
       stopCurrent,
-      queueRebuilt: Boolean(queueRebuilt)
+      queueRebuilt: Boolean(queueRebuilt),
+      interpretation: buildMusicCommandInterpretation(musicCommand, sessionConstraints)
     };
   }
-  const environmentContext = await getEnvironmentContext({ db, sessionId, config });
-  let baseMood = analyzeTurnContext({
-    history,
-    userMessage,
-    profile,
-    currentTrack,
-    mode,
-    prefs,
-    conversationState,
-    environmentContext
-  });
-  baseMood = mergeSessionConstraintsIntoMood(baseMood, sessionConstraints);
+  if (musicCommand.action === MUSIC_COMMAND_ACTIONS.ADJUST_CONCERT && (context.activeConcert || context.activePlaylist)) {
+    return concertReplanTurn({
+      db,
+      config,
+      netease,
+      sessionId,
+      message: userMessage,
+      musicCommand,
+      accountContext: account
+    });
+  }
+  baseMood = mergeSessionConstraintsIntoMood(applyMusicCommandToMood(baseMood, musicCommand), sessionConstraints);
   const sessionSummary = await updateSessionSummary(db, config, sessionId, account);
   const longTermMemories = retrieveRelevantMemories(db, {
     accountId: account.accountId,
@@ -2156,25 +2391,12 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
     mood: baseMood,
     prefs
   });
-  const hardAction = decideHardRuleTurnAction({ userMessage, mode });
-  const intentDecision = hardAction
-    ? { turnAction: hardAction, intentSource: 'rule', skipFriendLlm: false }
-    : await resolveTurnActionWithIntentModel({
-      config,
-      userMessage,
-      history,
-      baseMood,
-      explicitIntent,
-      canSuggest,
-      currentTrack,
-      profile,
-      mode,
-      prefs,
-      conversationState,
-      userMessageCount: userMessageCountAfterThisTurn,
-      memoryContext,
-      environmentContext
-    });
+  const compiledTurnAction = turnActionFromMusicCommand(musicCommand, baseMood);
+  const intentDecision = {
+    turnAction: compiledTurnAction,
+    intentSource: musicCommand.source || 'fallback',
+    skipFriendLlm: false
+  };
   const turnAction = intentDecision.turnAction;
   const intentSource = intentDecision.intentSource;
   const nextConversationState = updateConversationState({
@@ -2203,7 +2425,7 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
         ...(baseMood.styleSearchQueries || [])
       ], 8)
     }), sessionConstraints);
-    const musicContext = nextMusicContext(getSessionContext(db, sessionId).musicContext, conversationMood, userMessage);
+    const musicContext = nextMusicContext(getSessionContext(db, sessionId).musicContext, conversationMood, musicCommand);
     let queuePolicy = decideQueuePolicy({
       analysis: musicContext,
       turnAction,
@@ -2265,7 +2487,7 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       musicContext,
       sessionConstraints
     });
-    const result = await djTurn({ db, config, netease, sessionId, userMessage, conversationMood, useQueue: false, accountContext: account });
+    const result = await djTurn({ db, config, netease, sessionId, userMessage, conversationMood, useQueue: false, accountContext: account, musicCommand });
     setSessionContext(db, sessionId, {
       ...getSessionContext(db, sessionId),
       conversationState: {
@@ -2280,7 +2502,15 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
       }),
       sessionConstraints
     });
-    return { ...result, conversationMood, turnAction, queuePolicy, intent: explicitIntent ? 'explicit' : 'mood', intentSource };
+    return {
+      ...result,
+      conversationMood,
+      turnAction,
+      queuePolicy,
+      intent: explicitIntent ? 'explicit' : 'mood',
+      intentSource,
+      interpretation: buildMusicCommandInterpretation(musicCommand, sessionConstraints)
+    };
   }
 
   const rawChatDecision = await generateFriendReply({
@@ -2316,7 +2546,7 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
     userMessage,
     userMessageCount: userMessageCountAfterThisTurn
   });
-  const musicContext = nextMusicContext(getSessionContext(db, sessionId).musicContext, conversationMood, userMessage);
+  const musicContext = nextMusicContext(getSessionContext(db, sessionId).musicContext, conversationMood, musicCommand);
   let queuePolicy = decideQueuePolicy({
     analysis: musicContext,
     turnAction,
@@ -2362,7 +2592,8 @@ export async function chatTurn({ db, config, netease, sessionId, message, accoun
     turnAction,
     queuePolicy,
     intent: 'chat',
-    intentSource
+    intentSource,
+    interpretation: buildMusicCommandInterpretation(musicCommand, sessionConstraints)
   };
 }
 
@@ -2640,7 +2871,7 @@ export function consumeReadyRadioQueue(db, sessionId, options = {}) {
     }
     const contextMismatch = !queueItemMatchesMusicContext(item, musicContext);
     const staleByContext = (item.contextVersion < musicContext.version && contextMismatch) ||
-      (musicContext.vocalPolicy === VOCAL_POLICIES.INSTRUMENTAL_ONLY && contextMismatch);
+      (Boolean(musicContext.vocalPolicy) && contextMismatch);
     if (staleByContext) {
       queue[index] = {
         ...item,
@@ -3086,8 +3317,41 @@ export function getRadioDebugStatus(db, sessionId, accountContext = null) {
     lastSearchDiagnostics: Array.isArray(debug.lastSearchDiagnostics) ? debug.lastSearchDiagnostics.slice(0, 6) : [],
     lastQueueReconcile: debug.lastQueueReconcile || null,
     lastRecommendationFailure: debug.lastRecommendationFailure || null,
+    lastMusicCommand: debug.lastMusicCommand || null,
     lastTtsDiagnostics: debug.lastTtsDiagnostics || null,
     updatedAt: debug.updatedAt || null
+  };
+}
+
+function sanitizeMusicCommandForDebug(command = {}) {
+  const normalized = normalizeCommandForDj(command);
+  return {
+    version: normalized.version,
+    action: normalized.action,
+    targets: normalized.targets,
+    constraints: normalized.constraints,
+    vocalPolicy: normalized.vocalPolicy,
+    switchNow: normalized.switchNow,
+    scope: normalized.scope,
+    confidence: normalized.confidence,
+    needsClarification: normalized.needsClarification,
+    normalizedSummary: normalized.normalizedSummary,
+    source: normalized.source,
+    latencyMs: normalized.latencyMs,
+    fallbackReason: normalized.fallbackReason,
+    conflictCorrected: normalized.conflictCorrected === true,
+    styleConstraint: normalized.styleConstraint
+  };
+}
+
+function buildMusicCommandInterpretation(command = {}, sessionConstraints = {}) {
+  if (!commandHasConstraintChanges(command)) return null;
+  const summary = String(command.normalizedSummary || '').trim();
+  return {
+    visible: true,
+    text: summary ? `已理解：${summary}` : '已理解并更新本次对话的音乐限制',
+    source: command.source || 'fallback',
+    constraints: publicSessionConstraints(sessionConstraints)
   };
 }
 
@@ -3304,7 +3568,7 @@ function replacePendingQueueItem(db, sessionId, pendingId, readyItem, accountCon
   const currentContext = normalizeMusicContext(getSessionContext(db, sessionId).musicContext || {});
   const contextMismatch = !queueItemMatchesMusicContext(readyItem, currentContext);
   if ((readyItem.contextVersion < currentContext.version && contextMismatch) ||
-      (currentContext.vocalPolicy === VOCAL_POLICIES.INSTRUMENTAL_ONLY && contextMismatch)) {
+      (Boolean(currentContext.vocalPolicy) && contextMismatch)) {
     markQueueItemStale(db, sessionId, pendingId, 'context_changed_before_ready');
     return;
   }
@@ -4140,7 +4404,7 @@ function updateConversationState({ previous = {}, analysis = {}, turnAction = {}
     lastAnalyzedMessageId: userMessageCount,
     updatedAt: nowIso()
   };
-  if (turnAction?.reason === 'user explicitly rejected playback or switching') {
+  if (turnAction?.musicIntent === 'suppressed' || turnAction?.reason === 'user explicitly rejected playback or switching' || rejectsMusic(userMessage)) {
     next.noMusicUntilUserCount = Math.max(next.noMusicUntilUserCount, userMessageCount + 3);
   }
   return next;
@@ -4337,23 +4601,17 @@ function validateResolvedTrack(track = {}, pick = {}, sessionConstraints = {}) {
 }
 
 function normalizeVocalPolicy(value = '') {
-  return value === VOCAL_POLICIES.INSTRUMENTAL_ONLY ? VOCAL_POLICIES.INSTRUMENTAL_ONLY : '';
-}
-
-function detectVocalPolicyUpdate(text = '') {
-  const value = String(text || '').trim();
-  if (!value) return null;
-  if (/(?:\u6062\u590d\u6b63\u5e38|\u6b63\u5e38\u63a8\u8350|\u4e0d\u7528\u7eaf\u97f3\u4e50|\u53ef\u4ee5\u6709\u4eba\u58f0|\u6709\u4eba\u58f0|\u6709\u6b4c\u8bcd)/i.test(value)) {
-    return '';
-  }
-  if (/(?:\u7eaf\u97f3\u4e50|\u4f34\u594f|\u65e0\u4eba\u58f0|\u6ca1\u6709\u4eba\u58f0|\u4e0d\u8981\u4eba\u58f0|\u65e0\u6b4c\u8bcd|\u6ca1\u6709\u6b4c\u8bcd|\u4e0d\u8981\u6b4c\u8bcd|instrumental|no\s+vocal|no\s+lyrics)/i.test(value)) {
-    return VOCAL_POLICIES.INSTRUMENTAL_ONLY;
-  }
-  return null;
+  if (value === VOCAL_POLICIES.INSTRUMENTAL_ONLY) return VOCAL_POLICIES.INSTRUMENTAL_ONLY;
+  if (value === VOCAL_POLICIES.VOCAL_REQUIRED) return VOCAL_POLICIES.VOCAL_REQUIRED;
+  return '';
 }
 
 function requestRequiresInstrumental(request = {}) {
   return normalizeVocalPolicy(request?.vocalPolicy) === VOCAL_POLICIES.INSTRUMENTAL_ONLY;
+}
+
+function requestRequiresVocals(request = {}) {
+  return normalizeVocalPolicy(request?.vocalPolicy) === VOCAL_POLICIES.VOCAL_REQUIRED;
 }
 
 function hasInstrumentalEvidence(...values) {
@@ -4379,11 +4637,27 @@ function hasInstrumentalEvidence(...values) {
 }
 
 function songPickViolatesVocalPolicy(pick = {}, request = {}) {
-  return requestRequiresInstrumental(request) && !hasInstrumentalEvidence(pick);
+  if (requestRequiresInstrumental(request)) return !hasInstrumentalEvidence(pick);
+  if (requestRequiresVocals(request)) return !hasVocalEvidence(pick);
+  return false;
 }
 
 function trackViolatesVocalPolicy(track = {}, request = {}, pick = null) {
-  return requestRequiresInstrumental(request) && !hasInstrumentalEvidence(track, pick);
+  if (requestRequiresInstrumental(request)) return !hasInstrumentalEvidence(track, pick);
+  if (requestRequiresVocals(request)) return !hasVocalEvidence(track, pick);
+  return false;
+}
+
+function hasVocalEvidence(...values) {
+  for (const value of values) {
+    if (!value) continue;
+    const tags = inferTrackSemanticTags(
+      value?.track && typeof value.track === 'object' ? value.track : value,
+      value
+    );
+    if (['mandarin', 'cantonese', 'english', 'japanese', 'korean'].includes(tags.language)) return true;
+  }
+  return false;
 }
 
 function trackDisplayName(track = {}) {
@@ -4639,23 +4913,27 @@ export function extractRequestedArtistConstraint(text, tracks = [], mode = {}) {
   return findKnownArtistConstraint(modeText) || findLibraryArtistConstraint(modeText, tracks);
 }
 
-function getMusicRequestConstraints(db, userMessage = '', mode = {}, sessionConstraints = {}) {
-  const text = String(userMessage || '').trim();
+function getMusicRequestConstraints(db, musicCommand = null, mode = {}, sessionConstraints = {}) {
+  const command = normalizeCommandForDj(musicCommand);
+  const text = command.originalText;
   const tracks = safeListTracks(db);
-  const artistConstraint = extractRequestedArtistConstraint(text, tracks, mode);
-  const songTitle = extractRequestedSongTitle(text, artistConstraint);
-  const messageVocalPolicy = detectVocalPolicyUpdate(text);
-  const styleConstraint = inferStyleConstraintFromText(text, mode);
+  const artistTarget = String(command.targets?.artist || '').trim();
+  const artistConstraint = artistTarget
+    ? findKnownArtistConstraint(artistTarget) || findLibraryArtistConstraint(artistTarget, tracks) || buildArtistConstraint(artistTarget)
+    : null;
+  const songTitle = String(command.targets?.song || '').trim();
+  const styleConstraint = command.styleConstraint || null;
   return {
     text,
     artistConstraint,
     songTitle,
-    vocalPolicy: messageVocalPolicy || '',
+    vocalPolicy: normalizeVocalPolicy(command.vocalPolicy),
     sessionConstraints: normalizeSessionConstraints(sessionConstraints),
     styleConstraint,
-    styleSearchQueries: styleConstraint?.searchQueries || [],
+    styleSearchQueries: uniqueStrings(command.styleSearchQueries || styleConstraint?.searchQueries || [], 8),
     allowRequestedSongReplay: Boolean(songTitle),
-    allowPlayedSongReplay: Boolean(songTitle && isExplicitReplayRequest(text))
+    allowPlayedSongReplay: Boolean(songTitle && command.allowPlayedSongReplay),
+    musicCommand: command
   };
 }
 
@@ -4990,6 +5268,149 @@ export function isOngoingArtistRequest(text) {
   return /后面|接下来|以后|之后|后续|几首|多来几首|一会儿|接着|连续|都听|只听/.test(String(text || ''));
 }
 
+export async function compileMusicCommand({
+  config,
+  userMessage = '',
+  history = [],
+  currentTrack = null,
+  activeConcert = null,
+  sessionConstraints = {},
+  mode = {},
+  baseMood = {},
+  environmentContext = {},
+  memoryContext = {}
+} = {}) {
+  const command = await compileStructuredMusicCommand({
+    config,
+    text: userMessage,
+    history,
+    currentTrack,
+    activeConcert,
+    sessionConstraints: publicSessionConstraints(sessionConstraints),
+    mode,
+    baseMood,
+    environmentContext,
+    memoryContext
+  });
+  return normalizeCommandForDj(command, mode);
+}
+
+function normalizeCommandForDj(command = null, mode = {}) {
+  const normalized = normalizeMusicCommand(command || {}, { text: command?.originalText || '' });
+  const styleText = [
+    normalized.targets?.style,
+    ...(normalized.targets?.searchHints || [])
+  ].filter(Boolean).join(' ');
+  const styleConstraint = normalizeStyleConstraint(normalized.styleConstraint, {
+    text: styleText,
+    mode,
+    searchQueries: normalized.styleSearchQueries || []
+  }) || (styleText ? inferStyleConstraintFromText(styleText, mode) : null);
+  return {
+    ...normalized,
+    styleConstraint,
+    styleSearchQueries: uniqueStrings([
+      ...(normalized.styleSearchQueries || []),
+      ...(styleConstraint?.searchQueries || [])
+    ], 8),
+    allowPlayedSongReplay: Boolean(normalized.targets?.song && isExplicitReplayRequest(normalized.originalText))
+  };
+}
+
+function turnActionFromMusicCommand(command = {}, fallbackMood = {}) {
+  const actionMap = {
+    [MUSIC_COMMAND_ACTIONS.CHAT_ONLY]: TURN_ACTIONS.CHAT_ONLY,
+    [MUSIC_COMMAND_ACTIONS.ASK_FOLLOWUP]: TURN_ACTIONS.ASK_FOLLOWUP,
+    [MUSIC_COMMAND_ACTIONS.RECOMMEND_AND_PLAY]: TURN_ACTIONS.RECOMMEND_AND_PLAY,
+    [MUSIC_COMMAND_ACTIONS.CONTINUE_CURRENT_SONG]: TURN_ACTIONS.CONTINUE_CURRENT_SONG,
+    [MUSIC_COMMAND_ACTIONS.UPDATE_CONSTRAINTS]: TURN_ACTIONS.CHAT_ONLY,
+    [MUSIC_COMMAND_ACTIONS.ADJUST_CONCERT]: TURN_ACTIONS.CHAT_ONLY
+  };
+  return {
+    action: actionMap[command.action] || TURN_ACTIONS.CHAT_ONLY,
+    reason: command.normalizedSummary || 'structured music command',
+    confidence: command.confidence ?? 0.7,
+    source: command.source || 'fallback',
+    mood: command.targets?.mood || fallbackMood.mood,
+    energy: command.targets?.energy || fallbackMood.energy,
+    musicIntent: musicIntentFromCommand(command, 'chat'),
+    searchHints: uniqueStrings(command.targets?.searchHints || [], 8),
+    vocalPolicy: normalizeVocalPolicy(command.vocalPolicy),
+    styleConstraint: command.styleConstraint || null,
+    styleSearchQueries: command.styleSearchQueries || []
+  };
+}
+
+function applyMusicCommandToMood(mood = {}, command = {}) {
+  const normalized = normalizeMoodDecision(mood);
+  return normalizeMoodDecision({
+    ...normalized,
+    shouldRecommend: command.action === MUSIC_COMMAND_ACTIONS.RECOMMEND_AND_PLAY ? true : normalized.shouldRecommend,
+    mood: command.targets?.mood || normalized.mood,
+    energy: command.targets?.energy || normalized.energy,
+    searchHints: uniqueStrings([
+      ...(command.targets?.searchHints || []),
+      ...(normalized.searchHints || [])
+    ], 8),
+    preferenceHints: uniqueStrings([
+      ...(command.targets?.searchHints || []),
+      ...(normalized.preferenceHints || [])
+    ], 8),
+    musicIntent: musicIntentFromCommand(command, normalized.musicIntent),
+    vocalPolicy: normalizeVocalPolicy(command.vocalPolicy),
+    styleConstraint: command.styleConstraint || normalized.styleConstraint || null,
+    styleSearchQueries: command.styleSearchQueries || normalized.styleSearchQueries || [],
+    reason: command.normalizedSummary || normalized.reason
+  });
+}
+
+function musicIntentFromCommand(command = {}, fallback = 'chat') {
+  if (command.action === MUSIC_COMMAND_ACTIONS.RECOMMEND_AND_PLAY) return 'explicit_music';
+  if (
+    command.action === MUSIC_COMMAND_ACTIONS.CHAT_ONLY
+    && /暂不播放|不播放音乐|先聊/.test(String(command.normalizedSummary || ''))
+  ) {
+    return 'suppressed';
+  }
+  return fallback;
+}
+
+function constraintUpdateFromMusicCommand(command = {}, previous = {}) {
+  if (!commandHasConstraintChanges(command)) return emptySessionConstraintUpdate();
+  const current = normalizeSessionConstraints(previous);
+  const update = emptySessionConstraintUpdate();
+  for (const constraint of command.constraints || []) {
+    if (constraint.operation === 'clear') {
+      update.type = 'reset';
+      update.reset = true;
+      update.changed = true;
+      return update;
+    }
+    if (constraint.operation === 'remove') {
+      const removeIds = current.rules
+        .filter(rule => rule.type === constraint.type && normalizeMusicText(rule.value) === normalizeMusicText(constraint.value))
+        .map(rule => rule.id);
+      update.removeRuleIds.push(...removeIds);
+      if (removeIds.length) {
+        update.type = 'allow';
+        update.changed = true;
+      }
+      continue;
+    }
+    if (constraint.operation !== 'add') continue;
+    const field = SESSION_CONSTRAINT_RULE_FIELDS[constraint.type] || 'avoidTerms';
+    if (!Array.isArray(update[field])) update[field] = [];
+    update[field].push(constraint.value);
+    update.type = 'avoid';
+    update.changed = true;
+  }
+  for (const field of Object.values(SESSION_CONSTRAINT_RULE_FIELDS)) {
+    update[field] = uniqueStrings(update[field] || [], 12);
+  }
+  update.removeRuleIds = uniqueStrings(update.removeRuleIds || [], 24);
+  return update;
+}
+
 export function decideTurnAction({
   userMessage = '',
   history = [],
@@ -5093,76 +5514,20 @@ export function decideHardRuleTurnAction({ userMessage = '', mode = {} } = {}) {
       searchHints: extractActionSearchHints(text, mode)
     });
   }
+  if (rejectsMusic(text)) return result(TURN_ACTIONS.CHAT_ONLY, 'user explicitly rejected playback or switching');
+  const semanticCommand = normalizeCommandForDj(compileMusicCommandFallback(text, { mode }), mode);
+  if (commandHasConstraintChanges(semanticCommand)) {
+    const compiledAction = turnActionFromMusicCommand(semanticCommand);
+    return result(compiledAction.action, semanticCommand.normalizedSummary || 'structured constraint update', {
+      searchHints: semanticCommand.targets?.searchHints || []
+    });
+  }
   if (isDirectMusicRequest(text)) {
     return result(TURN_ACTIONS.RECOMMEND_AND_PLAY, 'user directly requested music from chat', {
       searchHints: extractActionSearchHints(text, mode)
     });
   }
-  if (parseSessionConstraintUpdate(text).changed) {
-    return result(TURN_ACTIONS.CHAT_ONLY, 'session constraints updated');
-  }
-  if (rejectsMusic(text)) return result(TURN_ACTIONS.CHAT_ONLY, 'user explicitly rejected playback or switching');
   return null;
-}
-
-async function resolveTurnActionWithIntentModel({
-  config,
-  userMessage,
-  history,
-  baseMood,
-  explicitIntent,
-  canSuggest,
-  currentTrack,
-  profile,
-  mode,
-  prefs,
-  conversationState,
-  userMessageCount,
-  memoryContext,
-  environmentContext
-}) {
-  const fallbackAction = () => decideTurnAction({
-    userMessage,
-    history,
-    baseMood,
-    explicitIntent,
-    canSuggest,
-    currentTrack,
-    mode,
-    prefs,
-    conversationState,
-    userMessageCount,
-    memoryContext,
-    environmentContext
-  });
-
-  const classified = await classifyTurnIntent({
-    config,
-    userMessage,
-    history,
-    currentTrack,
-    profile,
-    mode,
-    prefs,
-    baseMood,
-    memoryContext,
-    canSuggest,
-    explicitIntent,
-    environmentContext
-  });
-
-  if (classified.accepted) {
-    if (classified.action === TURN_ACTIONS.RECOMMEND_AND_PLAY && !explicitIntent && !canSuggest) {
-      return { turnAction: fallbackAction(), intentSource: 'fallback', skipFriendLlm: false };
-    }
-    return { turnAction: classified, intentSource: 'llm', skipFriendLlm: false };
-  }
-
-  return {
-    turnAction: fallbackAction(),
-    intentSource: 'fallback',
-    skipFriendLlm: Boolean(classified.skipFriendLlm)
-  };
 }
 
 export async function classifyTurnIntent({
@@ -5179,135 +5544,39 @@ export async function classifyTurnIntent({
   explicitIntent = false,
   environmentContext = {}
 } = {}) {
-  if (!config?.llm?.baseUrl || !config?.llm?.apiKey || !config?.llm?.model) {
-    return { accepted: false, source: 'fallback', reason: 'LLM is not configured', skipFriendLlm: false };
-  }
-
-  const profilePrompt = formatProfileSummaryForPrompt(profile);
-  const messages = [
-    {
-      role: 'system',
-      content: [
-        '你是 AI 电台灿灿的轻量意图路由器，只判断这一轮该聊天还是该切歌，不负责写聊天回复，也不负责选歌。',
-        '必须只输出 JSON，不要 Markdown，不要解释。',
-        'action 只能是：chat_only、ask_followup、recommend_and_play、continue_current_song。',
-        '普通聊天、问观点、问歌手喜好、问知识，不要切歌；明确点歌、换歌、要求某风格/歌手/歌曲，才 recommend_and_play。',
-        '带有“放/来点/想听/推荐/给我”这类播放动作，并且目标是歌、音乐、BGM、歌手、风格、场景或曲风时，必须 recommend_and_play。',
-        '用户情绪表达但没有明确要音乐时，通常 ask_followup；只有上下文显示适合自然接歌且允许主动推荐时，才 recommend_and_play。',
-        '如果只是“你喜欢陈奕迅吗/你觉得这首歌如何”，这是聊天，不是点歌。',
-        '输出字段：{"action":"...","confidence":0-1,"mood":"comfort|melancholy|calm|healing|focus|energy|romantic|nostalgic|night|random","energy":"low|medium|high","musicIntent":"none|explicit_song|artist|genre|mood|skip|playback_control","searchHints":["关键词"],"reason":"简短中文理由"}'
-      ].join('\n')
-    },
-    {
-      role: 'user',
-      content: [
-        `听众刚说：${userMessage}`,
-        `最近对话：${history.slice(-8).map(h => `${h.role}: ${h.content}`).join('\n') || '无'}`,
-        `当前歌曲：${getCurrentTrackPromptContext(userMessage, currentTrack)}`,
-        `听众画像：${profilePrompt}`,
-        `当前模式：${mode?.genre || '无'}`,
-        `偏好设置：${JSON.stringify(normalizeRuntimePrefs(prefs))}`,
-        `长期记忆：${memoryContext.promptText || '无'}`,
-        `会话摘要：${memoryContext.sessionSummary || '无'}`,
-        `APP_TIME_CONTEXT：${formatEnvironmentContext(environmentContext)}`,
-        '时间天气只是事实锚点，不要从历史对话把当前时段误判成晚上；如果用户当前没有明确说夜晚/睡不着，就以 APP_TIME_CONTEXT 为准。',
-        `启发式情绪：${JSON.stringify(baseMood)}`,
-        `本地显式音乐意图：${explicitIntent}`,
-        `允许主动推荐：${canSuggest}`
-      ].join('\n')
-    }
-  ];
-  messages[0].content += '\nFor explicit style/use requests, also output styleConstraint and searchQueries. styleConstraint format: {"strict":true,"requiredGroups":[["termA","termB"],["termC"]],"softTerms":["term"],"negativeTerms":["term"],"searchQueries":["short music query"]}. Example: guofeng DJ ni xi BGM => requiredGroups [["国风","古风","中国风"],["DJ","remix","电音","BGM"]], softTerms ["逆袭","燃","力量","短视频"]. For ordinary emotional chat, strict must be false or omitted.';
-
-  const raw = await withTimeout(
-    generateChatCompletion(config.llm, messages, () => INTENT_FALLBACK_SENTINEL),
-    INTENT_LLM_TIMEOUT_MS,
-    INTENT_FALLBACK_SENTINEL
-  );
-
-  if (raw === INTENT_FALLBACK_SENTINEL) {
-    return { accepted: false, source: 'fallback', reason: 'intent classifier unavailable or timed out', skipFriendLlm: false };
-  }
-
-  try {
-    const parsed = parseIntentDecision(raw);
-    const action = normalizeIntentAction(parsed.action);
-    const confidence = Number(parsed.confidence);
-    if (!action || !Number.isFinite(confidence) || confidence < 0.55) {
-      return {
-        accepted: false,
-        source: 'fallback',
-        reason: 'intent classifier returned low confidence or invalid action',
-        candidate: parsed,
-        skipFriendLlm: false
-      };
-    }
-    const styleConstraint = normalizeStyleConstraint(parsed.styleConstraint, {
-      text: userMessage,
-      mode,
-      searchQueries: [
-        ...(Array.isArray(parsed.searchQueries) ? parsed.searchQueries : []),
-        ...((parsed.styleConstraint && Array.isArray(parsed.styleConstraint.searchQueries)) ? parsed.styleConstraint.searchQueries : [])
-      ]
-    });
-    const normalizedMood = normalizeMoodDecision({
-      mood: parsed.mood,
-      energy: parsed.energy,
-      intent: action === TURN_ACTIONS.RECOMMEND_AND_PLAY ? 'music' : 'chat',
-      musicIntent: parsed.musicIntent || 'none',
-      searchHints: Array.isArray(parsed.searchHints) ? parsed.searchHints : [],
-      reason: parsed.reason,
-      confidence,
-      styleConstraint: action === TURN_ACTIONS.RECOMMEND_AND_PLAY ? styleConstraint : null,
-      styleSearchQueries: action === TURN_ACTIONS.RECOMMEND_AND_PLAY ? (styleConstraint?.searchQueries || []) : []
-    });
-    return {
-      ...normalizedMood,
-      accepted: true,
-      action,
-      confidence,
-      source: 'llm',
-      reason: parsed.reason || 'LLM intent classifier',
-      searchHints: normalizedMood.searchHints,
-      musicIntent: parsed.musicIntent || normalizedMood.musicIntent || 'none',
-      styleConstraint: normalizedMood.styleConstraint,
-      styleSearchQueries: normalizedMood.styleSearchQueries
-    };
-  } catch (error) {
-    return {
-      accepted: false,
-      source: 'fallback',
-      reason: `intent classifier JSON parse failed: ${error.message}`,
-      skipFriendLlm: false
-    };
-  }
-}
-
-function parseIntentDecision(raw) {
-  const text = stripCodeFence(String(raw || '')).trim();
-  try {
-    return JSON.parse(text);
-  } catch {}
-  const objectMatch = text.match(/\{[\s\S]*\}/);
-  if (objectMatch) return JSON.parse(objectMatch[0]);
-  throw new Error('intent decision is not JSON');
-}
-
-function normalizeIntentAction(action) {
-  const value = String(action || '').trim().toLowerCase();
-  const map = {
-    chat_only: TURN_ACTIONS.CHAT_ONLY,
-    chat: TURN_ACTIONS.CHAT_ONLY,
-    ask_followup: TURN_ACTIONS.ASK_FOLLOWUP,
-    followup: TURN_ACTIONS.ASK_FOLLOWUP,
-    soft_offer_music: TURN_ACTIONS.SOFT_OFFER_MUSIC,
-    recommend_and_play: TURN_ACTIONS.RECOMMEND_AND_PLAY,
-    recommend_now: TURN_ACTIONS.RECOMMEND_AND_PLAY,
-    play_music: TURN_ACTIONS.RECOMMEND_AND_PLAY,
-    continue_current_song: TURN_ACTIONS.CONTINUE_CURRENT_SONG,
-    playback_control: TURN_ACTIONS.CONTINUE_CURRENT_SONG
+  const command = await compileMusicCommand({
+    config,
+    userMessage,
+    history,
+    currentTrack,
+    mode,
+    baseMood,
+    environmentContext
+  });
+  const turnAction = turnActionFromMusicCommand(command, baseMood);
+  const accepted = command.source === 'llm' || command.source === 'hard_rule';
+  return {
+    ...normalizeMoodDecision({
+      ...baseMood,
+      shouldRecommend: turnAction.action === TURN_ACTIONS.RECOMMEND_AND_PLAY,
+      mood: turnAction.mood,
+      energy: turnAction.energy,
+      intent: turnAction.action === TURN_ACTIONS.RECOMMEND_AND_PLAY ? 'music' : 'chat',
+      musicIntent: turnAction.musicIntent,
+      searchHints: turnAction.searchHints,
+      reason: turnAction.reason,
+      confidence: turnAction.confidence,
+      vocalPolicy: turnAction.vocalPolicy,
+      styleConstraint: turnAction.styleConstraint,
+      styleSearchQueries: turnAction.styleSearchQueries
+    }),
+    ...turnAction,
+    accepted,
+    source: command.source,
+    reason: command.normalizedSummary || command.fallbackReason || 'music command compiler',
+    musicCommand: command,
+    skipFriendLlm: false
   };
-  return map[value] || null;
 }
 
 function isImmediateNextRequest(text) {
@@ -5329,7 +5598,17 @@ function modeUpdateFromText(text) {
   return genre ? { genre, note: '用户指定' } : null;
 }
 
-export function analyzeTurnContext({ history = [], userMessage = '', profile = {}, currentTrack = null, mode = {}, prefs = {}, conversationState = {}, environmentContext = {} } = {}) {
+export function analyzeTurnContext({
+  history = [],
+  userMessage = '',
+  profile = {},
+  currentTrack = null,
+  mode = {},
+  prefs = {},
+  conversationState = {},
+  environmentContext = {},
+  parseMusicSemantics = true
+} = {}) {
   const normalizedPrefs = normalizeRuntimePrefs(prefs);
   let mood = applyMoodPreferenceOverride(
     analyzeConversationMood({ history, userMessage, profile, currentTrack, mode }),
@@ -5345,14 +5624,19 @@ export function analyzeTurnContext({ history = [], userMessage = '', profile = {
       reason: 'ignored stale night signal from history'
     };
   }
-  const constraintUpdate = parseSessionConstraintUpdate(userMessage);
+  const constraintUpdate = parseMusicSemantics
+    ? parseSessionConstraintUpdate(userMessage)
+    : emptySessionConstraintUpdate();
   const blockedHints = new Set(sessionConstraintDisplayTerms(constraintUpdate).map(normalizeMusicText));
-  const preferenceHints = extractPreferenceHints(userMessage).filter(hint => !blockedHints.has(normalizeMusicText(hint)));
+  const preferenceHints = parseMusicSemantics
+    ? extractPreferenceHints(userMessage).filter(hint => !blockedHints.has(normalizeMusicText(hint)))
+    : [];
   const avoidHints = sessionConstraintDisplayTerms(constraintUpdate);
-  const explicitMusic = !constraintUpdate.changed && hasExplicitMusicIntent(userMessage);
-  const suppressMusic = rejectsMusic(userMessage);
-  const modeUpdate = isModeUpdateRequest(userMessage);
-  const playbackControl = /暂停|停一下|继续播放|继续放|接着放|resume|pause/i.test(String(userMessage || ''));
+  const explicitMusic = parseMusicSemantics && !constraintUpdate.changed && hasExplicitMusicIntent(userMessage);
+  const suppressMusic = parseMusicSemantics && rejectsMusic(userMessage);
+  const modeUpdate = parseMusicSemantics && isModeUpdateRequest(userMessage);
+  const playbackControl = parseMusicSemantics
+    && /暂停|停一下|继续播放|继续放|接着放|resume|pause/i.test(String(userMessage || ''));
   const state = normalizeConversationState(conversationState);
 
   return normalizeMoodDecision({
@@ -5514,6 +5798,7 @@ function emptySessionConstraintUpdate() {
     avoidStyleFamilies: [],
     avoidArtists: [],
     avoidSongs: [],
+    avoidVocalPolicies: [],
     removeRuleIds: [],
     reset: false,
     changed: false
@@ -5546,7 +5831,8 @@ export function normalizeSessionConstraints(input = {}) {
     avoidLanguages: [...(input.avoidLanguages || []), ...classified.avoidLanguages].map(normalizeLanguage).filter(Boolean),
     avoidStyleFamilies: [...(input.avoidStyleFamilies || []), ...classified.avoidStyleFamilies].map(normalizeGenreFamily).filter(Boolean),
     avoidArtists: (input.avoidArtists || []).map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm),
-    avoidSongs: (input.avoidSongs || []).map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm)
+    avoidSongs: (input.avoidSongs || []).map(cleanSessionConstraintTerm).filter(isUsefulSessionConstraintTerm),
+    avoidVocalPolicies: (input.avoidVocalPolicies || []).filter(value => value === 'instrumental' || value === 'vocal')
   };
   const rawRules = [
     ...(Array.isArray(input.rules) ? input.rules : []),
@@ -5566,6 +5852,7 @@ export function normalizeSessionConstraints(input = {}) {
     avoidStyleFamilies: [],
     avoidArtists: [],
     avoidSongs: [],
+    avoidVocalPolicies: [],
     rules,
     remainingTracks: rules.length ? Math.min(...rules.map(rule => rule.remainingTracks)) : 0,
     updatedAt: input.updatedAt || null
@@ -5581,6 +5868,7 @@ function normalizeSessionConstraintRule(raw = {}) {
   let value = String(raw.value || '').trim();
   if (type === 'language') value = normalizeLanguage(value);
   else if (type === 'style') value = normalizeGenreFamily(value);
+  else if (type === 'vocal') value = value === 'instrumental' ? 'instrumental' : value === 'vocal' ? 'vocal' : '';
   else value = cleanSessionConstraintTerm(value);
   if (!value || ((type === 'term' || type === 'artist' || type === 'song') && !isUsefulSessionConstraintTerm(value))) return null;
   const remainingTracks = Math.min(SESSION_CONSTRAINT_TRACK_LIMIT, Math.max(0, Number(raw.remainingTracks ?? SESSION_CONSTRAINT_TRACK_LIMIT) || 0));
@@ -5598,6 +5886,7 @@ function normalizeSessionConstraintRule(raw = {}) {
 function sessionConstraintRuleLabel(type, value) {
   if (type === 'language') return LANGUAGE_LABELS[value] || value;
   if (type === 'style') return GENRE_FAMILY_LABELS[value] || value;
+  if (type === 'vocal') return value === 'instrumental' ? '纯音乐' : value === 'vocal' ? '有人声歌曲' : value;
   return value;
 }
 
@@ -5609,6 +5898,7 @@ export function publicSessionConstraints(input = {}) {
     avoidStyleFamilies: constraints.avoidStyleFamilies,
     avoidArtists: constraints.avoidArtists,
     avoidSongs: constraints.avoidSongs,
+    avoidVocalPolicies: constraints.avoidVocalPolicies,
     remainingTracks: constraints.remainingTracks,
     rules: constraints.rules.map(rule => ({
       id: rule.id,
@@ -5680,6 +5970,18 @@ function mergeSessionConstraintsIntoMood(mood = {}, sessionConstraints = {}) {
   });
 }
 
+function mergeMusicContextWithSessionConstraints(musicContext = {}, sessionConstraints = {}) {
+  const constraints = normalizeSessionConstraints(sessionConstraints);
+  const avoidLabels = sessionConstraintDisplayTerms(constraints);
+  const blocked = new Set(avoidLabels.map(normalizeMusicText));
+  return normalizeMusicContext({
+    ...musicContext,
+    searchHints: (musicContext.searchHints || []).filter(hint => !blocked.has(normalizeMusicText(hint))),
+    preferenceHints: (musicContext.preferenceHints || []).filter(hint => !blocked.has(normalizeMusicText(hint))),
+    avoidHints: uniqueStrings([...(musicContext.avoidHints || []), ...avoidLabels], 12)
+  });
+}
+
 function extractSessionAvoidTerms(text) {
   const value = String(text || '');
   const terms = [];
@@ -5739,13 +6041,19 @@ function sessionConstraintDisplayTerms(sessionConstraints = {}) {
     ...constraints.avoidArtists,
     ...constraints.avoidSongs,
     ...constraints.avoidLanguages.map(value => LANGUAGE_LABELS[value] || value),
-    ...constraints.avoidStyleFamilies.map(value => GENRE_FAMILY_LABELS[value] || value)
+    ...constraints.avoidStyleFamilies.map(value => GENRE_FAMILY_LABELS[value] || value),
+    ...constraints.avoidVocalPolicies.map(value => sessionConstraintRuleLabel('vocal', value))
   ], 24);
 }
 
 function formatVocalPolicyForPrompt(request = {}) {
-  if (!requestRequiresInstrumental(request)) return '人声约束：无';
-  return '人声约束：只能推荐纯音乐/伴奏/无人声/无歌词作品。这是硬约束；候选 reason 或 queries 应明确写出“纯音乐、伴奏、无人声、钢琴、器乐、OST、BGM、instrumental”等证据；找不到时不要用普通人声歌曲兜底。';
+  if (requestRequiresInstrumental(request)) {
+    return '人声约束：只能推荐纯音乐/伴奏/无人声/无歌词作品。这是硬约束；候选 reason 或 queries 应明确写出“纯音乐、伴奏、无人声、钢琴、器乐、OST、BGM、instrumental”等证据；找不到时不要用普通人声歌曲兜底。';
+  }
+  if (requestRequiresVocals(request)) {
+    return '人声约束：只能推荐能够确认有人声或歌词的歌曲。这是硬约束；禁止纯音乐、伴奏、无人声、无歌词和语种未知的候选；找不到时不要用纯音乐兜底。';
+  }
+  return '人声约束：无';
 }
 
 export function trackViolatesSessionConstraints(track = {}, sessionConstraints = {}) {
@@ -5772,6 +6080,12 @@ export function getTrackConstraintResult(track = {}, sessionConstraints = {}) {
   }
   if (constraints.avoidStyleFamilies.includes(semanticTags.genreFamily)) {
     return { accepted: false, reason: 'style_family', matchedTerms: [semanticTags.genreFamily], semanticTags };
+  }
+  if (constraints.avoidVocalPolicies.includes('instrumental') && semanticTags.language === 'instrumental') {
+    return { accepted: false, reason: 'vocal_policy', matchedTerms: ['instrumental'], semanticTags };
+  }
+  if (constraints.avoidVocalPolicies.includes('vocal') && semanticTags.language !== 'instrumental') {
+    return { accepted: false, reason: 'vocal_policy', matchedTerms: ['vocal'], semanticTags };
   }
   return { accepted: true, reason: 'ok', matchedTerms: [], semanticTags };
 }
@@ -6011,10 +6325,13 @@ export function normalizeMusicContext(input = {}) {
   };
 }
 
-function nextMusicContext(previous = {}, analysis = {}, userMessage = '') {
+function nextMusicContext(previous = {}, analysis = {}, musicCommand = null) {
   const normalizedPrevious = normalizeMusicContext(previous);
   const normalizedAnalysis = normalizeMoodDecision(analysis);
-  const messageVocalPolicy = detectVocalPolicyUpdate(userMessage);
+  const command = normalizeCommandForDj(musicCommand);
+  const commandVocalPolicy = normalizeVocalPolicy(command.vocalPolicy);
+  const hasVocalCommand = command.vocalPolicy !== MUSIC_VOCAL_POLICIES.ANY ||
+    (command.constraints || []).some(item => item.type === 'vocal' || item.operation === 'clear');
   return normalizeMusicContext({
     ...normalizedPrevious,
     ...normalizedAnalysis,
@@ -6032,8 +6349,8 @@ function nextMusicContext(previous = {}, analysis = {}, userMessage = '') {
       ...(normalizedPrevious.avoidHints || [])
     ], 8),
     musicIntent: normalizedAnalysis.musicIntent || normalizedPrevious.musicIntent || 'chat',
-    vocalPolicy: messageVocalPolicy !== null
-      ? messageVocalPolicy
+    vocalPolicy: hasVocalCommand
+      ? commandVocalPolicy
       : (normalizedAnalysis.vocalPolicy || normalizedPrevious.vocalPolicy || ''),
     styleConstraint: normalizedAnalysis.styleConstraint || normalizedPrevious.styleConstraint || null,
     styleSearchQueries: uniqueStrings([
@@ -6042,7 +6359,7 @@ function nextMusicContext(previous = {}, analysis = {}, userMessage = '') {
     ], 8),
     confidence: normalizedAnalysis.confidence ?? normalizedPrevious.confidence,
     reason: normalizedAnalysis.reason || normalizedPrevious.reason || '',
-    lastUserMessage: userMessage || normalizedPrevious.lastUserMessage || '',
+    lastUserMessage: command.originalText || normalizedPrevious.lastUserMessage || '',
     updatedAt: nowIso()
   });
 }
@@ -6119,6 +6436,8 @@ export function queueItemMatchesMusicContext(item = {}, musicContext = {}) {
   if (target.musicIntent === 'explicit_music') return false;
   if (target.vocalPolicy === VOCAL_POLICIES.INSTRUMENTAL_ONLY &&
       itemContext.vocalPolicy !== VOCAL_POLICIES.INSTRUMENTAL_ONLY) return false;
+  if (target.vocalPolicy === VOCAL_POLICIES.VOCAL_REQUIRED &&
+      itemContext.vocalPolicy !== VOCAL_POLICIES.VOCAL_REQUIRED) return false;
   if (queueItemConflictsWithAvoidHints(item, target)) return false;
   if (itemContext.energy === 'high' && target.energy === 'low') return false;
   if (itemContext.energy === 'low' && target.energy === 'high') return false;
@@ -7811,12 +8130,12 @@ function getArtistPenaltyByName(db, accountContext = null) {
   return penalties;
 }
 
-async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, conversationMood = null, memoryContext = {}, hostContext = {}, environmentContext = {}, avoidTracks = [], sessionConstraints = {}, accountContext = null, deferHostText = false }) {
+async function callDJ({ db, config, netease, sessionId, profile, weather, timeOfDay, hour, mode, prefs, history, userMessage, musicCommand = null, conversationMood = null, memoryContext = {}, hostContext = {}, environmentContext = {}, avoidTracks = [], sessionConstraints = {}, accountContext = null, deferHostText = false }) {
   const account = normalizeAccountContext(accountContext);
   const playedHistory = mergePlayedTrackHistory(getPlayedTrackHistory(db, sessionId, 80, account), avoidTracks);
   const playedIds = new Set(playedHistory.map(track => String(track.id || '')).filter(Boolean));
   const playedSignatures = buildPlayedSignatureSet(playedHistory);
-  const request = getMusicRequestConstraints(db, userMessage, mode, sessionConstraints);
+  const request = getMusicRequestConstraints(db, musicCommand, mode, sessionConstraints);
   if (!request.vocalPolicy && conversationMood?.vocalPolicy) {
     request.vocalPolicy = normalizeVocalPolicy(conversationMood.vocalPolicy);
   }
@@ -7955,24 +8274,62 @@ async function callDJ({ db, config, netease, sessionId, profile, weather, timeOf
     failedPicks.push(...resolved.failedPicks);
   }
 
-  const fallback = await resolveRecommendationFallback({
-    db,
-    config,
-    netease,
-    sessionId,
-    profile,
-    timeOfDay,
-    weather,
-    conversationMood,
-    userMessage,
-    hostContext,
-    failedPicks,
-    lastPlan,
-    playedIds,
-    playedSignatures,
-    playedHistory,
-    request
-  });
+  const topCandidate = candidateContext.candidates?.[0] || null;
+  let fallback = null;
+  if (topCandidate?.track?.id) {
+    const candidatePick = {
+      candidateId: candidateIdForTrack(topCandidate.track),
+      name: topCandidate.track.name,
+      artists: topCandidate.track.artists || [],
+      language: topCandidate.track.language || topCandidate.track.semanticTags?.language || 'unknown',
+      genreFamily: topCandidate.track.genreFamily || topCandidate.track.semanticTags?.genreFamily || 'other',
+      energyBand: topCandidate.track.energyBand || topCandidate.track.semanticTags?.energyBand || 'medium',
+      tagEvidence: topCandidate.track.tagEvidence || topCandidate.track.semanticTags?.tagEvidence || [],
+      reason: topCandidate.sourceReason || '根据当前结构化音乐要求选择',
+      queries: []
+    };
+    const resolvedCandidate = await resolveSongPlanTrack({
+      db,
+      config,
+      netease,
+      sessionId,
+      plan: { picks: [candidatePick], hostDraft: '', mode: null },
+      playedIds,
+      playedSignatures,
+      playedHistory,
+      request,
+      candidateById: candidateContext.candidateById
+    });
+    if (resolvedCandidate.track) {
+      fallback = {
+        track: resolvedCandidate.track,
+        pick: resolvedCandidate.pick,
+        reason: resolvedCandidate.pick?.reason || candidatePick.reason,
+        hostDraft: '',
+        diagnostics: resolvedCandidate.diagnostics || [],
+        noveltyBucket: resolvedCandidate.noveltyBucket || topCandidate.noveltyBucket || null,
+        discoverySource: resolvedCandidate.discoverySource || topCandidate.discoverySource || topCandidate.source || 'library_deep'
+      };
+    }
+  }
+  if (!fallback) fallback = await resolveRecommendationFallback({
+      db,
+      config,
+      netease,
+      sessionId,
+      profile,
+      timeOfDay,
+      weather,
+      conversationMood,
+      userMessage,
+      hostContext,
+      failedPicks,
+      lastPlan,
+      playedIds,
+      playedSignatures,
+      playedHistory,
+      request
+    });
   if (fallback?.track) {
     const fallbackPlan = {
       picks: [fallback.pick],

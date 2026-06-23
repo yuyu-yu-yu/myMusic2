@@ -2334,9 +2334,6 @@ function handleScenePrompt(scene) {
 }
 
 async function sendChat(msg) {
-  if (state.radioMode === 'concert' && state.activeConcert?.phase === 'playing' && isConcertReplanMessage(msg)) {
-    return replanConcert(msg);
-  }
   const radioTurn = beginRadioTurn({ interruptPlayback: false });
   primeVoicePlayback();
   const sessionId = ensureSessionId();
@@ -2382,6 +2379,9 @@ function handleRadioResponse(data, { loading = null, radioTurn = null, afterHost
   clearRadioTurnLoading(radioTurn, loading);
   state.sessionId = data.sessionId || state.sessionId;
   if (data.sessionConstraints) state.sessionConstraints = data.sessionConstraints;
+  if (data.interpretation?.visible && data.interpretation.text) {
+    appendChat({ role: 'dj', text: data.interpretation.text });
+  }
   if (data.scheduleContext) {
     state.scheduleStatus = {
       ...(state.scheduleStatus || {}),
@@ -2422,7 +2422,7 @@ function handleRadioResponse(data, { loading = null, radioTurn = null, afterHost
   const hasMode = data.mode?.genre;
   document.querySelector('#mode-reset-btn').style.display = hasMode ? '' : 'none';
 
-  if (data.switchRequested && data.stopCurrent) {
+  if (data.switchRequested && data.stopCurrent && !data.track) {
     void nextTrack({ skipCurrent: true, silent: true, forceFresh: true });
     return true;
   }
@@ -2816,12 +2816,6 @@ function renderSessionConstraintBar() {
       `).join('')}
     </div>
   `;
-}
-
-function isConcertReplanMessage(message) {
-  const text = String(message || '').trim();
-  return /(后面|接下来|剩下|后半场|下一幕).*(轻快|安静|热烈|温柔|换|调整|不要|多来|少来|更|节奏|风格|氛围|粤语|国语|中文|英语|日语|纯音乐)/.test(text)
-    || /(轻快|安静|热烈|温柔|节奏|风格|氛围|粤语|国语|中文|英语|日语|纯音乐).*(后面|接下来|剩下|后半场|下一幕)/.test(text);
 }
 
 function buildConcertQueueItemHTML(item = {}) {

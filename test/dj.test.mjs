@@ -566,6 +566,76 @@ test('language ban stops a violating current track and rebuilds the prefetched q
   assert.equal(settledStatus.queue.some(item => item.status === 'ready' && item.semanticTags?.language === 'cantonese'), false);
 });
 
+test('rejecting instrumental music switches to a verified vocal track', async (t) => {
+  const db = testDb(t);
+  updatePreferences({ db, payload: { voiceMode: 'off' } });
+  saveTrack(db, {
+    id: 'current-instrumental',
+    name: 'Current Instrumental',
+    artists: ['Instrumental Artist'],
+    album: 'Instrumental Album',
+    semanticTags: { language: 'instrumental', genreFamily: 'instrumental_ost', energyBand: 'low' }
+  });
+  const vocalTrack = saveTrack(db, {
+    id: 'verified-vocal',
+    originalId: 'verified-vocal-original',
+    name: 'Verified Vocal Song',
+    artists: ['Vocal Artist'],
+    album: 'Vocal Album',
+    playUrl: '/assets/verified-vocal.mp3',
+    lyric: '[00:00.00]今天开始唱一首歌',
+    semanticTags: { language: 'mandarin', genreFamily: 'pop_ballad', energyBand: 'medium' }
+  });
+  const playlist = savePlaylist(db, { id: 'verified-vocal-playlist', name: 'Verified Vocal Playlist', trackCount: 1 }, 'created');
+  linkPlaylistTrack(db, playlist.id, vocalTrack.id, 0);
+  db.prepare('INSERT INTO plays (track_id, played_at, source, reason, report_status) VALUES (?,?,?,?,?)')
+    .run('current-instrumental', new Date().toISOString(), 'radio', 'current instrumental playback', 'pending');
+
+  const result = await chatTurn({
+    db,
+    config: { llm: {}, tts: {}, weather: {}, recommendation: { pipeline: 'hybrid' } },
+    netease: {
+      isConfigured: () => true,
+      playUrl: async () => ({ data: { url: 'https://music.local/verified-vocal.mp3' } }),
+      lyric: async () => ({ data: { lyric: '[00:00.00]今天开始唱一首歌' } })
+    },
+    sessionId: 'reject-instrumental-session',
+    message: '不想听纯音乐'
+  });
+
+  assert.equal(result.turnAction?.action || TURN_ACTIONS.RECOMMEND_AND_PLAY, TURN_ACTIONS.RECOMMEND_AND_PLAY);
+  assert.equal(result.track?.id, 'verified-vocal');
+  assert.deepEqual(result.sessionConstraints.avoidVocalPolicies, ['instrumental']);
+  assert.equal(result.interpretation?.text, '已理解：本次对话避开纯音乐');
+  const debug = getRadioDebugStatus(db, 'reject-instrumental-session');
+  assert.equal(debug.musicContext.vocalPolicy, 'vocal_required');
+  assert.equal(debug.musicContext.searchHints.includes('纯音乐'), false);
+  assert.equal(debug.lastMusicCommand.vocalPolicy, 'vocal_required');
+  for (let index = 0; index < 20; index += 1) {
+    if (getRadioQueueStatus(db, 'reject-instrumental-session').pendingCount === 0) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+});
+
+test('allowing instrumental music removes only its session restriction', async (t) => {
+  const db = testDb(t);
+  const args = {
+    db,
+    config: { llm: {}, tts: {}, weather: {} },
+    netease: { isConfigured: () => false },
+    sessionId: 'restore-instrumental-session'
+  };
+  await chatTurn({ ...args, message: '不想听纯音乐' });
+  const restored = await chatTurn({ ...args, message: '可以听纯音乐了' });
+
+  assert.deepEqual(restored.sessionConstraints.avoidVocalPolicies, []);
+  assert.equal(restored.interpretation?.text, '已理解：取消本次对话对纯音乐的限制');
+  for (let index = 0; index < 20; index += 1) {
+    if (getRadioQueueStatus(db, 'restore-instrumental-session').pendingCount === 0) break;
+    await new Promise(resolve => setTimeout(resolve, 20));
+  }
+});
+
 test('explicit song query treats LLM-guessed artists as weak hints', () => {
   const request = { songTitle: '柑橘乌云', text: '放一首柑橘乌云' };
   const llmPick = {

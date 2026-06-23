@@ -332,7 +332,7 @@ const routes = {
   },
   'POST /api/radio/concert/start': async (req) => {
     const body = await readJson(req);
-    return startConcertRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), settings: body.settings || {}, message: body.message || '', accountContext: getRequestAccount(req) });
+    return startConcertRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), settings: body.settings || {}, message: body.message || '', musicCommand: body.musicCommand || null, accountContext: getRequestAccount(req) });
   },
   'POST /api/radio/concert/next': async (req) => {
     const body = await readJson(req);
@@ -348,7 +348,7 @@ const routes = {
   },
   'POST /api/radio/concert/replan': async (req) => {
     const body = await readJson(req);
-    return replanConcertRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), message: body.message || '', accountContext: getRequestAccount(req) });
+    return replanConcertRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), message: body.message || '', musicCommand: body.musicCommand || null, accountContext: getRequestAccount(req) });
   },
   'POST /api/radio/concert/audience': async (req) => {
     const body = await readJson(req);
@@ -360,7 +360,7 @@ const routes = {
   },
   'POST /api/radio/playlist/start': async (req) => {
     const body = await readJson(req);
-    return startPlaylistRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), message: body.message || '', planning: sanitizeSchedulePlanning(body.planning), scheduleService, accountContext: getRequestAccount(req) });
+    return startPlaylistRadio({ db, config: await getRequestConfig(req), netease, sessionId: body.sessionId || crypto.randomUUID(), message: body.message || '', musicCommand: body.musicCommand || null, planning: sanitizeSchedulePlanning(body.planning), scheduleService, accountContext: getRequestAccount(req) });
   },
   'POST /api/radio/playlist/next': async (req) => {
     const body = await readJson(req);
@@ -512,6 +512,19 @@ const routes = {
       sessionId: body.sessionId || crypto.randomUUID(),
       settings: { length: 5, mood: '怀旧', scene: '放松', audiencePreset: '温暖' },
       message: recapContext.message,
+      musicCommand: {
+        action: 'recommend_and_play',
+        targets: {
+          searchHints: recapContext.signals.map(signal => signal.text).filter(Boolean).slice(0, 6)
+        },
+        constraints: [],
+        vocalPolicy: 'any',
+        switchNow: false,
+        scope: 'session',
+        confidence: 1,
+        normalizedSummary: `根据 ${body.date} 的音乐回顾生成相似电台`,
+        source: 'internal'
+      },
       accountContext
     });
     return { ...result, diarySource: { date: body.date, signals: recapContext.signals } };

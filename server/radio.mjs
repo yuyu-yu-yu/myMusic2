@@ -58,7 +58,7 @@ export async function nextRadioItem({ db, config, netease, sessionId, userMessag
   return attachAccount(result, account);
 }
 
-export async function startPlaylistRadio({ db, config, netease, sessionId, message, planning, scheduleService, accountContext }) {
+export async function startPlaylistRadio({ db, config, netease, sessionId, message, musicCommand, planning, scheduleService, accountContext }) {
   const account = getRequestAccount(db, accountContext);
   const id = sessionId || crypto.randomUUID();
   const scheduleContext = await resolveSchedulePlanningContext({ db, account, planning, scheduleService });
@@ -69,6 +69,7 @@ export async function startPlaylistRadio({ db, config, netease, sessionId, messa
     netease,
     sessionId: id,
     userMessage: message || '',
+    musicCommand: musicCommand || null,
     planning: planning || null,
     scheduleContext,
     accountContext: account
@@ -99,7 +100,7 @@ export async function jumpPlaylistRadio({ db, config, netease, sessionId, index,
   return attachAccount(result, account);
 }
 
-export async function startConcertRadio({ db, config, netease, sessionId, settings, message, accountContext }) {
+export async function startConcertRadio({ db, config, netease, sessionId, settings, message, musicCommand, accountContext }) {
   const account = getRequestAccount(db, accountContext);
   return attachAccount(await concertStartTurn({
     db,
@@ -108,6 +109,7 @@ export async function startConcertRadio({ db, config, netease, sessionId, settin
     sessionId: sessionId || crypto.randomUUID(),
     settings: settings || {},
     userMessage: message || '',
+    musicCommand: musicCommand || null,
     accountContext: account
   }), account);
 }
@@ -134,9 +136,9 @@ export async function jumpConcertRadio({ db, config, netease, sessionId, index, 
   return attachAccount(await concertJumpTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), index, accountContext: account }), account);
 }
 
-export async function replanConcertRadio({ db, config, netease, sessionId, message, accountContext }) {
+export async function replanConcertRadio({ db, config, netease, sessionId, message, musicCommand, accountContext }) {
   const account = getRequestAccount(db, accountContext);
-  return attachAccount(await concertReplanTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), message, accountContext: account }), account);
+  return attachAccount(await concertReplanTurn({ db, config, netease, sessionId: sessionId || crypto.randomUUID(), message, musicCommand: musicCommand || null, accountContext: account }), account);
 }
 
 export async function encoreConcertRadio({ db, config, netease, sessionId, accountContext }) {
