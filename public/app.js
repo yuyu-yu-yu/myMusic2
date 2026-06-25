@@ -304,6 +304,8 @@ let avatarVideoToken = 0;
 let avatarTransitionToken = 0;
 let avatarTransitionTimer = null;
 let avatarPreloadScheduled = false;
+let avatarHealthMonitorReady = false;
+let avatarVideoRetryTimer = null;
 let preferencesLoadPromise = null;
 const VISUALIZER_DEBUG = false;
 const visualizerReducedMotion = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)');
@@ -992,6 +994,9 @@ function clearAvatarVideoHandlers(video) {
   video.onerror = null;
   video.onloadeddata = null;
   video.onended = null;
+  video.onpause = null;
+  video.onstalled = null;
+  video.onwaiting = null;
 }
 
 function waitForAvatarVideoFrame(video, callback) {
@@ -1104,6 +1109,10 @@ function finishAvatarTransition(root, token) {
 
 function revealAvatarVideo(root, video, image, displayedState, requestToken, options = {}) {
   if (requestToken !== avatarVideoToken) return;
+  if (avatarVideoRetryTimer) {
+    clearTimeout(avatarVideoRetryTimer);
+    avatarVideoRetryTimer = null;
+  }
   const previousVideo = getActiveAvatarVideo(root);
   const transitionToken = beginAvatarTransition(root, previousVideo, image);
 
@@ -1119,7 +1128,7 @@ function revealAvatarVideo(root, video, image, displayedState, requestToken, opt
   scheduleAvatarRestore(options);
 }
 
-function restartAvatarVideo(root, video, image, requestToken) {
+function restartAvatarVideo(root, video, image, requestToken, displayedState = 'idle', options = {}) {
   if (requestToken !== avatarVideoToken) return;
   const transitionToken = beginAvatarTransition(root, video, image);
   video.currentTime = 0;
@@ -1132,7 +1141,30 @@ function restartAvatarVideo(root, video, image, requestToken) {
       if (requestToken !== avatarVideoToken) return;
       finishAvatarTransition(root, transitionToken);
     });
-  }).catch(() => finishAvatarTransition(root, transitionToken));
+  }).catch(() => {
+    finishAvatarTransition(root, transitionToken);
+    scheduleAvatarVideoRetry(displayedState, requestToken, options);
+  });
+}
+
+function scheduleAvatarVideoRetry(displayedState, requestToken, options = {}, delayMs = 2400) {
+  if (requestToken !== avatarVideoToken) return;
+  if (!avatarMotionMap[displayedState]) return;
+  if (avatarVideoRetryTimer) clearTimeout(avatarVideoRetryTimer);
+  avatarVideoRetryTimer = setTimeout(() => {
+    avatarVideoRetryTimer = null;
+    if (requestToken !== avatarVideoToken) return;
+    const root = document.querySelector('#ai-dj-avatar');
+    if (!root) return;
+    const activeVideo = getActiveAvatarVideo(root);
+    const needsRetry = root.classList.contains('is-fallback')
+      || root.classList.contains('is-frame-sequence')
+      || !activeVideo
+      || activeVideo.paused
+      || activeVideo.ended
+      || activeVideo.readyState < 2;
+    if (needsRetry) setAvatarState(displayedState, options);
+  }, delayMs);
 }
 
 function playAvatarVideoOrFallback(
@@ -1163,12 +1195,14 @@ function playAvatarVideoOrFallback(
     }
     setDisplayedAvatarState(root, displayedState);
     scheduleAvatarRestore(options);
+    scheduleAvatarVideoRetry(displayedState, requestToken, options);
   };
 
   const showSequenceFallback = () => {
     if (requestToken !== avatarVideoToken) return;
     if (sequence?.frames?.length) {
       playAvatarFrameSequence(root, image, sequence, '', displayedState, options);
+      scheduleAvatarVideoRetry(displayedState, requestToken, options);
     } else {
       showSourceFallback();
     }
@@ -1177,7 +1211,8 @@ function playAvatarVideoOrFallback(
   if (activeVideo?.getAttribute('src') === src && activeVideo.readyState >= 2) {
     hideAvatarVideos(root, activeVideo);
     clearAvatarVideoHandlers(activeVideo);
-    activeVideo.onended = () => restartAvatarVideo(root, activeVideo, image, requestToken);
+    activeVideo.loop = true;
+    activeVideo.onended = () => restartAvatarVideo(root, activeVideo, image, requestToken, displayedState, options);
     activeVideo.play().catch(showSequenceFallback);
     setDisplayedAvatarState(root, displayedState);
     scheduleAvatarRestore(options);
@@ -1197,6 +1232,8 @@ function playAvatarVideoOrFallback(
   video.onerror = () => {
     showSequenceFallback();
   };
+  video.onstalled = () => scheduleAvatarVideoRetry(displayedState, requestToken, options);
+  video.onwaiting = () => scheduleAvatarVideoRetry(displayedState, requestToken, options, 5000);
   video.onloadeddata = () => {
     if (requestToken !== avatarVideoToken) return;
     video.currentTime = 0;
@@ -1209,8 +1246,8 @@ function playAvatarVideoOrFallback(
       });
     }).catch(showSequenceFallback);
   };
-  video.loop = false;
-  video.onended = () => restartAvatarVideo(root, video, image, requestToken);
+  video.loop = true;
+  video.onended = () => restartAvatarVideo(root, video, image, requestToken, displayedState, options);
 
   if (video.getAttribute('src') !== src) {
     video.src = src;
@@ -1352,7 +1389,7 @@ function setAvatarState(nextState = 'idle', options = {}) {
 
   if (src) {
     stopAvatarFrameSequence();
-    playAvatarVideoOrFallback(root, image, src, null, avatarVideoToken, normalized, options);
+    playAvatarVideoOrFallback(root, image, src, sequence, avatarVideoToken, normalized, options);
   } else if (sequence) {
     playAvatarFrameSequence(root, image, sequence, '', normalized, options);
   } else {
@@ -1390,6 +1427,41 @@ function scheduleAvatarVideoPreload() {
       void preload();
     }
   }, 1200);
+}
+
+function reviveAvatarVideo() {
+  if (avatarRestoreTimer) return;
+  const root = document.querySelector('#ai-dj-avatar');
+  if (!root) return;
+  const normalized = normalizeAvatarState(state.avatarState || getContextualAvatarState());
+  const src = avatarMotionMap[normalized];
+  if (!src) return;
+  const activeVideo = getActiveAvatarVideo(root);
+  const needsRevive = root.classList.contains('is-fallback')
+    || root.classList.contains('is-frame-sequence')
+    || !activeVideo
+    || activeVideo.getAttribute('src') !== src
+    || activeVideo.paused
+    || activeVideo.ended
+    || activeVideo.readyState < 2;
+  if (!needsRevive) return;
+  if (activeVideo?.getAttribute('src') === src && !activeVideo.hidden && activeVideo.readyState >= 2) {
+    activeVideo.loop = true;
+    activeVideo.play().catch(() => setAvatarState(normalized));
+    return;
+  }
+  setAvatarState(normalized);
+}
+
+function startAvatarHealthMonitor() {
+  if (avatarHealthMonitorReady) return;
+  avatarHealthMonitorReady = true;
+  setInterval(() => reviveAvatarVideo(), 12000);
+  document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) setTimeout(() => reviveAvatarVideo(), 250);
+  });
+  window.addEventListener('focus', () => setTimeout(() => reviveAvatarVideo(), 250));
+  window.addEventListener('pageshow', () => setTimeout(() => reviveAvatarVideo(), 250));
 }
 
 function getContextualAvatarState() {
@@ -1609,6 +1681,7 @@ function renderPlayer() {
   updatePreviousButtonState();
   setAvatarState(state.avatarState || getContextualAvatarState());
   scheduleAvatarVideoPreload();
+  startAvatarHealthMonitor();
   setRadioButtonState(state.sessionId || state.current?.track ? 'active' : 'idle');
   startPlayerPolling();
   initButtonFeedback();
