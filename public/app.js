@@ -81,8 +81,9 @@ const DANMAKU_MAX_VISIBLE = 4;
 const RADIO_PREFETCH_TARGET_ACTIVE = 2;
 const RADIO_PREFETCH_RETRY_DELAY_MS = 8000;
 const RADIO_PREFETCH_MAX_RETRIES = 2;
-const TTS_SONG_OVERLAP_MS = 2000;
-const SONG_FADE_IN_MS = 2000;
+const TTS_SONG_OVERLAP_MS = 5000;
+const SONG_FADE_IN_MS = 5000;
+const HOST_TTS_DUCK_VOLUME = 0.65;
 const danmakuState = {
   timer: null,
   token: 0,
@@ -1831,6 +1832,7 @@ function interruptPendingHostSpeech() {
     hostAudio.onended = null;
     hostAudio.onplay = null;
     hostAudio.ontimeupdate = null;
+    hostAudio.volume = 1;
     hostAudio.pause();
   }
   const wasFadingSong = state.songFadeInActive || Boolean(state.songFadeInTrackKey);
@@ -1868,6 +1870,8 @@ function cancelSongFadeIn({ resetVolume = true } = {}) {
   state.songFadeInOfficial = false;
   const songAudio = document.querySelector('#song-audio');
   if (resetVolume && songAudio) songAudio.volume = 1;
+  const hostAudio = document.querySelector('#host-audio');
+  if (hostAudio && hostAudio.dataset.voicePriming !== 'true') hostAudio.volume = 1;
 }
 
 function isSongFadeInPreparedForTrack(track = {}) {
@@ -2711,6 +2715,7 @@ function maybeStartSongFadeInDuringHost(data, radioTurn, hostAudio) {
     }
     const ratio = Math.min(1, Math.max(0, (now - startedAt) / SONG_FADE_IN_MS));
     songAudio.volume = ratio;
+    hostAudio.volume = 1 - ((1 - HOST_TTS_DUCK_VOLUME) * ratio);
     if (ratio < 1) {
       state.songFadeInFrame = requestAnimationFrame(step);
       return;
@@ -2720,6 +2725,7 @@ function maybeStartSongFadeInDuringHost(data, radioTurn, hostAudio) {
     state.songFadeInTrackKey = null;
     state.songFadeInOfficial = false;
     songAudio.volume = 1;
+    hostAudio.volume = HOST_TTS_DUCK_VOLUME;
   };
 
   songAudio.play()
@@ -2752,6 +2758,7 @@ function playHostSpeech(data, onEnd, { radioTurn = null } = {}) {
       hostAudio.onended = null;
       hostAudio.onplay = null;
       hostAudio.ontimeupdate = null;
+      hostAudio.volume = 1;
     }
     if (!isActiveRadioTurn(radioTurn)) return;
     onEnd?.();
@@ -2775,6 +2782,7 @@ function playHostSpeech(data, onEnd, { radioTurn = null } = {}) {
 
   try {
     hostAudio.muted = false;
+    hostAudio.volume = 1;
     hostAudio.src = data.ttsUrl;
     hostAudio.onended = finish;
     hostAudio.ontimeupdate = () => {
@@ -2791,11 +2799,13 @@ function playHostSpeech(data, onEnd, { radioTurn = null } = {}) {
     hostAudio.play().catch((error) => {
       console.warn('[tts skipped]', error?.message || error);
       hostAudio.ontimeupdate = null;
+      hostAudio.volume = 1;
       cancelSongFadeIn({ resetVolume: true });
       finishAfterVisualHold();
     });
   } catch (error) {
     console.warn('[tts skipped]', error?.message || error);
+    if (hostAudio) hostAudio.volume = 1;
     cancelSongFadeIn({ resetVolume: true });
     finishAfterVisualHold();
   }
