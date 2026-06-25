@@ -478,7 +478,8 @@ export function recordTrackFeedback(db, {
   sessionId = null,
   elapsedMs = null,
   durationMs = null,
-  source = null
+  source = null,
+  createdAt = nowIso()
 } = {}) {
   const id = String(trackId || '').trim();
   const type = String(eventType || '').trim();
@@ -487,7 +488,7 @@ export function recordTrackFeedback(db, {
   if (!id) throw new Error('trackId is required');
   if (!column) throw new Error('eventType must be one of like, dislike, complete, skip');
 
-  const now = nowIso();
+  const now = normalizeIsoTimestamp(createdAt) || nowIso();
   db.prepare(`
     INSERT INTO track_feedback_events (account_id, track_id, event_type, session_id, elapsed_ms, duration_ms, source, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -511,6 +512,14 @@ export function recordTrackFeedback(db, {
   `).run(scopedAccountId, id, now);
 
   return getTrackFeedbackSummary(db, id, scopedAccountId);
+}
+
+function normalizeIsoTimestamp(value) {
+  if (!value) return '';
+  const date = new Date(value);
+  const time = date.getTime();
+  if (!Number.isFinite(time)) return '';
+  return date.toISOString();
 }
 
 export function getTrackFeedbackSummary(db, trackId, accountId = DEFAULT_ACCOUNT_ID) {

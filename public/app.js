@@ -13,6 +13,8 @@ const AI_MUSIC_MODE_STORAGE_KEY = 'mymusic:aiMusicMode';
 const DEVICE_SNAPSHOT_STORAGE_PREFIX = 'mymusic:deviceSnapshot:v1:';
 const DEVICE_SNAPSHOT_VERSION = 1;
 const DEVICE_SNAPSHOT_MAX_MEMORIES = 80;
+const DEVICE_SNAPSHOT_MAX_HISTORY_EVENTS = 400;
+const DEVICE_SNAPSHOT_HISTORY_TTL_MS = 30 * 24 * 60 * 60 * 1000;
 const DEFAULT_DEVICE_PREFERENCES = {
   chatMusicBalance: 'friend',
   recommendationFrequency: 'medium',
@@ -149,7 +151,8 @@ function persistDeviceSnapshot(data = {}, options = {}) {
     preferences: previous.preferences || null,
     memories: Array.isArray(previous.memories) ? previous.memories : [],
     feedbackSummary: previous.feedbackSummary || null,
-    moodStats: previous.moodStats || null
+    moodStats: previous.moodStats || null,
+    history: Array.isArray(previous.history) ? sanitizeHistorySnapshotList(previous.history) : []
   };
 
   if (Object.prototype.hasOwnProperty.call(data, 'preferences')) {
@@ -168,6 +171,12 @@ function persistDeviceSnapshot(data = {}, options = {}) {
   }
   if (data.feedbackSummary) next.feedbackSummary = data.feedbackSummary;
   if (data.moodStats) next.moodStats = data.moodStats;
+  if (Object.prototype.hasOwnProperty.call(data, 'history')) {
+    const history = sanitizeHistorySnapshotList(data.history);
+    next.history = history.length || options.replaceHistory || !next.history.length
+      ? history
+      : next.history;
+  }
 
   if (!hasUsefulDeviceSnapshot(next)) return;
   try {
@@ -210,6 +219,103 @@ function sanitizeMemorySnapshot(memory = {}) {
   };
 }
 
+function sanitizeHistorySnapshotList(history = []) {
+  if (!Array.isArray(history)) return [];
+  const cutoff = Date.now() - DEVICE_SNAPSHOT_HISTORY_TTL_MS;
+  const map = new Map();
+  for (const item of history) {
+    const event = sanitizeHistorySnapshotEvent(item);
+    if (!event) continue;
+    const eventTime = new Date(event.playedAt || event.createdAt).getTime();
+    if (!Number.isFinite(eventTime) || eventTime < cutoff) continue;
+    map.set(historySnapshotEventKey(event), event);
+  }
+  return [...map.values()]
+    .sort((a, b) => new Date(a.playedAt || a.createdAt) - new Date(b.playedAt || b.createdAt))
+    .slice(-DEVICE_SNAPSHOT_MAX_HISTORY_EVENTS);
+}
+
+function sanitizeHistorySnapshotEvent(event = {}) {
+  if (!event || typeof event !== 'object') return null;
+  const type = event.type === 'feedback' ? 'feedback' : event.type === 'play' ? 'play' : '';
+  if (!type) return null;
+  const track = sanitizeHistoryTrackSnapshot(event.track || event);
+  if (!track?.id) return null;
+  const createdAt = normalizeHistorySnapshotIso(event.createdAt || event.playedAt);
+  const playedAt = normalizeHistorySnapshotIso(event.playedAt || event.createdAt);
+  if (type === 'play') {
+    if (!playedAt) return null;
+    return {
+      type,
+      track,
+      trackId: track.id,
+      playedAt,
+      source: String(event.source || 'browser').slice(0, 40),
+      reason: String(event.reason || '').slice(0, 240)
+    };
+  }
+  const eventType = ['like', 'dislike', 'complete', 'skip'].includes(event.eventType) ? event.eventType : '';
+  if (!eventType || !createdAt) return null;
+  return {
+    type,
+    track,
+    trackId: track.id,
+    eventType,
+    createdAt,
+    sessionId: event.sessionId ? String(event.sessionId).slice(0, 80) : null,
+    elapsedMs: Math.max(0, Number(event.elapsedMs) || 0),
+    durationMs: Math.max(0, Number(event.durationMs || track.durationMs) || 0),
+    source: String(event.source || 'ui').slice(0, 40)
+  };
+}
+
+function sanitizeHistoryTrackSnapshot(track = {}) {
+  if (!track || typeof track !== 'object') return null;
+  const id = String(track.id || track.trackId || '').trim();
+  if (!id) return null;
+  return {
+    id,
+    name: String(track.name || '未知歌曲').slice(0, 160),
+    artists: Array.isArray(track.artists) ? track.artists.map((artist) => String(artist || '').trim()).filter(Boolean).slice(0, 8) : [],
+    album: String(track.album || '').slice(0, 160),
+    coverUrl: String(track.coverUrl || track.cover_url || '').slice(0, 500),
+    durationMs: Math.max(0, Number(track.durationMs || track.duration_ms) || 0)
+  };
+}
+
+function normalizeHistorySnapshotIso(value) {
+  const date = value ? new Date(value) : new Date();
+  const time = date.getTime();
+  if (!Number.isFinite(time)) return '';
+  const maxFuture = Date.now() + 60 * 60 * 1000;
+  if (time > maxFuture) return '';
+  return date.toISOString();
+}
+
+function historySnapshotEventKey(event = {}) {
+  return [
+    event.type || '',
+    event.trackId || event.track?.id || '',
+    event.eventType || '',
+    event.playedAt || event.createdAt || ''
+  ].join('|');
+}
+
+function persistDeviceHistoryEvent(event = {}) {
+  let deviceId = '';
+  try {
+    deviceId = ensureDemoVisitorId();
+  } catch {
+    return;
+  }
+  const previous = readDeviceSnapshot(deviceId) || {};
+  const history = sanitizeHistorySnapshotList([
+    ...(Array.isArray(previous.history) ? previous.history : []),
+    event
+  ]);
+  persistDeviceSnapshot({ history }, { replaceHistory: true });
+}
+
 function clampNumber(value, min, max, fallback) {
   const numeric = Number(value);
   if (!Number.isFinite(numeric)) return fallback;
@@ -218,7 +324,8 @@ function clampNumber(value, min, max, fallback) {
 
 function hasUsefulDeviceSnapshot(snapshot = {}) {
   return hasUsefulPreferenceSnapshot(snapshot.preferences)
-    || (Array.isArray(snapshot.memories) && snapshot.memories.length > 0);
+    || (Array.isArray(snapshot.memories) && snapshot.memories.length > 0)
+    || (Array.isArray(snapshot.history) && snapshot.history.length > 0);
 }
 
 function hasUsefulPreferenceSnapshot(preferences = {}) {
@@ -231,6 +338,9 @@ function hasUsefulPreferenceSnapshot(preferences = {}) {
 
 function shouldRestoreDeviceSnapshot(snapshot = {}, serverState = {}) {
   if (!hasUsefulDeviceSnapshot(snapshot)) return false;
+  if ((snapshot.history || []).length > 0 && shouldRestoreDiaryHistorySnapshot(snapshot.history, serverState.diaryOverview)) {
+    return true;
+  }
   const serverMemories = Array.isArray(serverState.memories) ? serverState.memories : [];
   if ((snapshot.memories || []).length > 0 && serverMemories.length === 0) return true;
 
@@ -242,6 +352,37 @@ function shouldRestoreDeviceSnapshot(snapshot = {}, serverState = {}) {
     return String(value ?? defaultValue) !== String(defaultValue)
       && String(serverPrefs[key] ?? defaultValue) === String(defaultValue);
   });
+}
+
+function shouldRestoreDiaryHistorySnapshot(history = [], overview = null) {
+  if (!overview || !Array.isArray(history) || history.length === 0) return false;
+  const detailHasActivity = Boolean(overview.detail?.hasActivity);
+  const timelineHasActivity = Array.isArray(overview.timeline) && overview.timeline.some((day) => day?.hasActivity);
+  if (detailHasActivity) return false;
+  const dates = new Set([
+    overview.selectedDate,
+    overview.detail?.date,
+    ...(Array.isArray(overview.timeline) && !timelineHasActivity ? overview.timeline.map((day) => day?.date) : [])
+  ].filter(Boolean));
+  if (!dates.size) return !timelineHasActivity;
+  const timeZone = overview.timeZone || 'Asia/Shanghai';
+  return history.some((event) => dates.has(localDateFromHistoryEvent(event, timeZone)));
+}
+
+function localDateFromHistoryEvent(event = {}, timeZone = 'Asia/Shanghai') {
+  const iso = event.playedAt || event.createdAt;
+  if (!iso) return '';
+  try {
+    const parts = new Intl.DateTimeFormat('zh-CN', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).formatToParts(new Date(iso)).reduce((result, item) => ({ ...result, [item.type]: item.value }), {});
+    return parts.year && parts.month && parts.day ? `${parts.year}-${parts.month}-${parts.day}` : '';
+  } catch {
+    return '';
+  }
 }
 
 async function restoreDeviceSnapshotIfNeeded(serverState = {}) {
@@ -3891,13 +4032,20 @@ function handleBrowserPlaybackIssue(radioTurn, track, playbackToken = null) {
 
 function markPlaybackStarted(track, source) {
   if (!track?.id) return;
+  const startedAt = Date.now();
   state.activePlayback = {
     trackId: track.id,
     source,
-    startedAt: Date.now(),
+    startedAt,
     durationMs: Number(track.durationMs) || 0,
     completed: false
   };
+  persistDeviceHistoryEvent({
+    type: 'play',
+    track,
+    playedAt: new Date(startedAt).toISOString(),
+    source
+  });
 }
 
 async function reportFeedback(eventType) {
@@ -3910,6 +4058,17 @@ async function reportFeedback(eventType) {
   const elapsedMs = playback ? Date.now() - playback.startedAt : 0;
   state.feedbackSent.add(dedupeId);
   if (eventType === 'complete' && playback) playback.completed = true;
+  const feedbackEvent = {
+    type: 'feedback',
+    track,
+    eventType,
+    createdAt: new Date().toISOString(),
+    sessionId: state.sessionId,
+    elapsedMs,
+    durationMs: track.durationMs || playback?.durationMs || 0,
+    source: playback?.source || 'ui'
+  };
+  persistDeviceHistoryEvent(feedbackEvent);
 
   try {
     const result = await api('/api/feedback', {
@@ -4600,7 +4759,7 @@ async function renderDiary() {
   try {
     const query = new URLSearchParams({ days: '7' });
     if (selectedDate) query.set('date', selectedDate);
-    const [overview, prefData, moodStatsData] = await Promise.all([
+    let [overview, prefData, moodStatsData] = await Promise.all([
       api(`/api/diary/overview?${query.toString()}`),
       api('/api/preferences').catch(() => ({ preferences: state.preferences || {}, feedbackSummary: state.feedbackSummary || {} })),
       api('/api/mood-stats').catch(() => state.moodStats || { total: 0, buckets: [] })
@@ -4610,6 +4769,17 @@ async function renderDiary() {
     state.preferences = prefData.preferences || state.preferences || {};
     state.feedbackSummary = prefData.feedbackSummary || state.feedbackSummary || {};
     state.moodStats = moodStatsData || state.moodStats || { total: 0, buckets: [] };
+    const restoreResult = await restoreDeviceSnapshotIfNeeded({
+      preferences: state.preferences,
+      feedbackSummary: state.feedbackSummary,
+      moodStats: state.moodStats,
+      diaryOverview: overview
+    });
+    if (restoreResult?.restored?.history > 0 && location.pathname === '/diary') {
+      overview = await api(`/api/diary/overview?${query.toString()}`);
+      state.diaryOverview = overview;
+      if (restoreResult.feedbackSummary) state.feedbackSummary = restoreResult.feedbackSummary;
+    }
     persistDeviceSnapshot({
       preferences: state.preferences,
       feedbackSummary: state.feedbackSummary,

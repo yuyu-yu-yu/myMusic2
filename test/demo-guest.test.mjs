@@ -19,6 +19,7 @@ import {
 } from '../server/db.mjs';
 import { cleanupDemoGuest, cleanupExpiredDemoGuests, DemoVisitorIdError, resolveRequestAccountContext } from '../server/demo-guest.mjs';
 import { getLibrary, getProfile, updateProfile } from '../server/library.mjs';
+import { getDiaryOverview } from '../server/music-recap.mjs';
 import { getPreferences, restoreDeviceSnapshot, submitFeedback, updatePreferences } from '../server/radio.mjs';
 
 function testDb(t) {
@@ -33,6 +34,16 @@ function testDb(t) {
 
 function requestFor(visitorId) {
   return { headers: { 'x-demo-visitor-id': visitorId } };
+}
+
+function localDateFor(iso, timeZone = 'Asia/Shanghai') {
+  const parts = new Intl.DateTimeFormat('zh-CN', {
+    timeZone,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(new Date(iso)).reduce((result, item) => ({ ...result, [item.type]: item.value }), {});
+  return `${parts.year}-${parts.month}-${parts.day}`;
 }
 
 function seedDemoAccount(db) {
@@ -179,6 +190,57 @@ test('demo guest snapshot restores same-device preferences and memories after se
   assert.equal(getPreferences({ db, accountContext: guest }).preferences.moodMode, 'night');
   assert.equal(listUserMemories(db, { accountId: guest.accountId }).length, 1);
   assert.equal(listUserMemories(db, { accountId: guest.accountId })[0].content, 'Same browser prefers soft late-night recommendations.');
+});
+
+test('demo guest snapshot restores same-device playback history for diary overview', (t) => {
+  const db = testDb(t);
+  seedDemoAccount(db);
+  const config = { demo: { guestMode: true } };
+  const guest = resolveRequestAccountContext(db, config, requestFor('history-device-1234'));
+  const playedAt = new Date().toISOString();
+  const localDate = localDateFor(playedAt);
+  const track = {
+    id: 'history-track-1',
+    name: 'History Song',
+    artists: ['History Artist'],
+    album: 'History Album',
+    coverUrl: '/assets/cover-1.svg',
+    durationMs: 180000
+  };
+
+  const result = restoreDeviceSnapshot({
+    db,
+    accountContext: guest,
+    payload: {
+      snapshot: {
+        history: [
+          { type: 'play', track, playedAt, source: 'browser' },
+          { type: 'feedback', track, eventType: 'complete', createdAt: playedAt, sessionId: 'history-session', elapsedMs: 180000, durationMs: 180000, source: 'browser' }
+        ]
+      }
+    }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.restored.history, 2);
+  const overview = getDiaryOverview(db, {
+    accountContext: guest,
+    days: 7,
+    date: localDate,
+    localDate,
+    timeZone: 'Asia/Shanghai'
+  });
+  assert.equal(overview.detail.hasActivity, true);
+  assert.equal(overview.detail.metrics.plays, 1);
+  assert.equal(overview.detail.metrics.completed, 1);
+  assert.equal(overview.detail.tracks[0].id, track.id);
+
+  const duplicateRestore = restoreDeviceSnapshot({
+    db,
+    accountContext: guest,
+    payload: { snapshot: { history: [{ type: 'play', track, playedAt, source: 'browser' }] } }
+  });
+  assert.equal(duplicateRestore.restored.history, 0);
 });
 
 test('device snapshot restore is blocked for the shared base account', (t) => {

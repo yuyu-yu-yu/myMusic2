@@ -29,6 +29,7 @@ import {
   listUserMemories,
   recordOrMergeUserMemory,
   recordTrackFeedback,
+  saveTrack,
   setAccountSetting,
   updateUserMemoryContent
 } from './db.mjs';
@@ -294,7 +295,7 @@ export function restoreDeviceSnapshot({ db, payload, accountContext }) {
   }
 
   const snapshot = payload?.snapshot && typeof payload.snapshot === 'object' ? payload.snapshot : payload || {};
-  const restored = { preferences: false, memories: 0 };
+  const restored = { preferences: false, memories: 0, history: 0 };
 
   if (snapshot.preferences && typeof snapshot.preferences === 'object') {
     const next = normalizePreferences({ ...getUserPrefs(db, account), ...snapshot.preferences });
@@ -316,6 +317,10 @@ export function restoreDeviceSnapshot({ db, payload, accountContext }) {
     }
   }
 
+  if (Array.isArray(snapshot.history)) {
+    restored.history = restoreSnapshotHistory(db, account, snapshot.history);
+  }
+
   return {
     ok: true,
     restored,
@@ -324,6 +329,152 @@ export function restoreDeviceSnapshot({ db, payload, accountContext }) {
     feedbackSummary: getFeedbackSummary(db, account.accountId),
     account: publicAccountContext(account)
   };
+}
+
+function restoreSnapshotHistory(db, account, history = []) {
+  const events = normalizeSnapshotHistory(history);
+  if (!events.length) return 0;
+  let restored = 0;
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    for (const event of events) {
+      saveTrack(db, event.track);
+      if (event.type === 'play') {
+        const exists = db.prepare(`
+          SELECT 1
+          FROM plays
+          WHERE account_id = ? AND track_id = ? AND played_at = ? AND COALESCE(source, '') = ?
+          LIMIT 1
+        `).get(account.accountId, event.track.id, event.playedAt, event.source || '');
+        if (exists) continue;
+        db.prepare(`
+          INSERT INTO plays (account_id, track_id, played_at, source, reason, host_text, report_status)
+          VALUES (?, ?, ?, ?, ?, ?, ?)
+        `).run(
+          account.accountId,
+          event.track.id,
+          event.playedAt,
+          event.source || 'browser',
+          event.reason || 'restored from device snapshot',
+          null,
+          'restored'
+        );
+        restored += 1;
+        continue;
+      }
+      const exists = db.prepare(`
+        SELECT 1
+        FROM track_feedback_events
+        WHERE account_id = ?
+          AND track_id = ?
+          AND event_type = ?
+          AND created_at = ?
+          AND COALESCE(session_id, '') = ?
+        LIMIT 1
+      `).get(
+        account.accountId,
+        event.track.id,
+        event.eventType,
+        event.createdAt,
+        event.sessionId || ''
+      );
+      if (exists) continue;
+      recordTrackFeedback(db, {
+        accountId: account.accountId,
+        trackId: event.track.id,
+        eventType: event.eventType,
+        sessionId: event.sessionId,
+        elapsedMs: event.elapsedMs,
+        durationMs: event.durationMs,
+        source: event.source,
+        createdAt: event.createdAt
+      });
+      restored += 1;
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+  return restored;
+}
+
+function normalizeSnapshotHistory(history = []) {
+  const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+  const maxFuture = Date.now() + 60 * 60 * 1000;
+  const map = new Map();
+  for (const raw of Array.isArray(history) ? history : []) {
+    const event = normalizeSnapshotHistoryEvent(raw, { cutoff, maxFuture });
+    if (!event) continue;
+    map.set(snapshotHistoryEventKey(event), event);
+  }
+  return [...map.values()]
+    .sort((a, b) => new Date(a.playedAt || a.createdAt) - new Date(b.playedAt || b.createdAt))
+    .slice(-400);
+}
+
+function normalizeSnapshotHistoryEvent(event = {}, { cutoff, maxFuture } = {}) {
+  if (!event || typeof event !== 'object') return null;
+  const type = event.type === 'feedback' ? 'feedback' : event.type === 'play' ? 'play' : '';
+  if (!type) return null;
+  const track = normalizeSnapshotTrack(event.track || event);
+  if (!track?.id) return null;
+  if (type === 'play') {
+    const playedAt = normalizeSnapshotIso(event.playedAt || event.createdAt, { cutoff, maxFuture });
+    if (!playedAt) return null;
+    return {
+      type,
+      track,
+      playedAt,
+      source: String(event.source || 'browser').slice(0, 40),
+      reason: String(event.reason || '').slice(0, 240)
+    };
+  }
+  const eventType = ['like', 'dislike', 'complete', 'skip'].includes(event.eventType) ? event.eventType : '';
+  const createdAt = normalizeSnapshotIso(event.createdAt || event.playedAt, { cutoff, maxFuture });
+  if (!eventType || !createdAt) return null;
+  return {
+    type,
+    track,
+    eventType,
+    createdAt,
+    sessionId: event.sessionId ? String(event.sessionId).slice(0, 80) : null,
+    elapsedMs: Math.max(0, Number(event.elapsedMs) || 0),
+    durationMs: Math.max(0, Number(event.durationMs || track.durationMs) || 0),
+    source: String(event.source || 'ui').slice(0, 40)
+  };
+}
+
+function normalizeSnapshotTrack(track = {}) {
+  if (!track || typeof track !== 'object') return null;
+  const id = String(track.id || track.trackId || '').trim();
+  if (!id) return null;
+  return {
+    id,
+    name: String(track.name || '未知歌曲').slice(0, 160),
+    artists: Array.isArray(track.artists)
+      ? track.artists.map((artist) => String(artist || '').trim()).filter(Boolean).slice(0, 8)
+      : [],
+    album: String(track.album || '').slice(0, 160),
+    coverUrl: String(track.coverUrl || track.cover_url || '').slice(0, 500),
+    durationMs: Math.max(0, Number(track.durationMs || track.duration_ms) || 0)
+  };
+}
+
+function normalizeSnapshotIso(value, { cutoff = 0, maxFuture = Date.now() + 60 * 60 * 1000 } = {}) {
+  const date = value ? new Date(value) : new Date();
+  const time = date.getTime();
+  if (!Number.isFinite(time) || time < cutoff || time > maxFuture) return '';
+  return date.toISOString();
+}
+
+function snapshotHistoryEventKey(event = {}) {
+  return [
+    event.type || '',
+    event.track?.id || '',
+    event.eventType || '',
+    event.playedAt || event.createdAt || ''
+  ].join('|');
 }
 
 function normalizeSnapshotMemory(memory = {}) {
