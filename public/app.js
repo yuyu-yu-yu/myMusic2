@@ -32,6 +32,8 @@ const state = {
   profileSelectionDirty: false,
   librarySyncNotice: '',
   radioPrefetchPromise: null,
+  radioPrefetchRetryTimer: null,
+  radioPrefetchRetryDepth: 0,
   playbackSequence: [],
   playbackCursor: -1,
   demoSelfCheck: null,
@@ -40,6 +42,10 @@ const state = {
   activeRadioTurn: null,
   playbackTokenSeq: 0,
   activePlaybackToken: 0,
+  songFadeInFrame: null,
+  songFadeInActive: false,
+  songFadeInTrackKey: null,
+  songFadeInOfficial: false,
   radioMode: 'single',
   scheduleStatus: null,
   schedulePlanning: false,
@@ -72,6 +78,11 @@ const DANMAKU_MIN_DELAY_MS = 4500;
 const DANMAKU_MAX_DELAY_MS = 9500;
 const DANMAKU_INITIAL_DELAY_MS = 1800;
 const DANMAKU_MAX_VISIBLE = 4;
+const RADIO_PREFETCH_TARGET_ACTIVE = 2;
+const RADIO_PREFETCH_RETRY_DELAY_MS = 8000;
+const RADIO_PREFETCH_MAX_RETRIES = 2;
+const TTS_SONG_OVERLAP_MS = 2000;
+const SONG_FADE_IN_MS = 2000;
 const danmakuState = {
   timer: null,
   token: 0,
@@ -1262,6 +1273,7 @@ function setRadioMode(mode = 'single') {
     state.activeConcert = null;
     state.concertStatus = 'idle';
   } else if (!state.activeConcert) {
+    clearRadioPrefetchRetry();
     state.concertStatus = 'loading';
   }
   setRadioButtonState(state.current?.track || state.sessionId ? 'active' : 'idle');
@@ -1462,6 +1474,7 @@ function readStoredAiMusicMode() {
 function setAiMusicMode(enabled, { announce = true } = {}) {
   state.aiMusicMode = Boolean(enabled);
   if (state.aiMusicMode) {
+    clearRadioPrefetchRetry();
     state.radioMode = 'single';
     state.activeConcert = null;
     state.concertStatus = 'idle';
@@ -1817,8 +1830,13 @@ function interruptPendingHostSpeech() {
   if (hostAudio && hostAudio.dataset.voicePriming !== 'true') {
     hostAudio.onended = null;
     hostAudio.onplay = null;
+    hostAudio.ontimeupdate = null;
     hostAudio.pause();
   }
+  const wasFadingSong = state.songFadeInActive || Boolean(state.songFadeInTrackKey);
+  const shouldPauseFadingSong = wasFadingSong && !state.songFadeInOfficial;
+  cancelSongFadeIn({ resetVolume: true });
+  if (shouldPauseFadingSong) document.querySelector('#song-audio')?.pause();
   window.speechSynthesis?.cancel?.();
 }
 
@@ -1826,7 +1844,42 @@ function invalidateActivePlaybackEvents() {
   state.activePlaybackToken = ++state.playbackTokenSeq;
 }
 
-function clearSongAudioHandlers({ reset = false } = {}) {
+function getSongFadeTrackKey(track = {}) {
+  return String(track?.id || track?.playUrl || '');
+}
+
+function audioHasTrackSource(audio, track = {}) {
+  if (!audio || !track?.playUrl) return false;
+  if (audio.getAttribute('src') === track.playUrl) return true;
+  try {
+    return audio.currentSrc === new URL(track.playUrl, window.location.href).href;
+  } catch {
+    return false;
+  }
+}
+
+function cancelSongFadeIn({ resetVolume = true } = {}) {
+  if (state.songFadeInFrame) {
+    cancelAnimationFrame(state.songFadeInFrame);
+    state.songFadeInFrame = null;
+  }
+  state.songFadeInActive = false;
+  state.songFadeInTrackKey = null;
+  state.songFadeInOfficial = false;
+  const songAudio = document.querySelector('#song-audio');
+  if (resetVolume && songAudio) songAudio.volume = 1;
+}
+
+function isSongFadeInPreparedForTrack(track = {}) {
+  const songAudio = document.querySelector('#song-audio');
+  if (!songAudio || !track?.playUrl || songAudio.ended) return false;
+  if (!audioHasTrackSource(songAudio, track)) return false;
+  const fadeKey = getSongFadeTrackKey(track);
+  return state.songFadeInTrackKey === fadeKey || state.songFadeInActive || !songAudio.paused;
+}
+
+function clearSongAudioHandlers({ reset = false, preserveFade = false } = {}) {
+  if (!preserveFade) cancelSongFadeIn({ resetVolume: true });
   const songAudio = document.querySelector('#song-audio');
   if (!songAudio) return;
   stopCommentDanmaku({ clearLayer: true });
@@ -1853,9 +1906,52 @@ function pauseCurrentPlaybackForTransition() {
   return api('/api/player/stop', { method: 'POST', body: {} }).catch(() => null);
 }
 
-function scheduleRadioPrefetch({ force = false } = {}) {
-  if (state.aiMusicMode) return Promise.resolve(null);
-  if (state.radioMode === 'concert') return Promise.resolve(null);
+function canUseRadioQueueWarmup() {
+  return !state.aiMusicMode && state.radioMode !== 'concert' && !state.activeConcert && !state.schedulePlanning;
+}
+
+function clearRadioPrefetchRetry() {
+  if (state.radioPrefetchRetryTimer) {
+    clearTimeout(state.radioPrefetchRetryTimer);
+    state.radioPrefetchRetryTimer = null;
+  }
+  state.radioPrefetchRetryDepth = 0;
+}
+
+function getRadioPrefetchActiveCount(result = {}) {
+  const queued = Number(result.queued) || 0;
+  const pending = Number(result.pending) || 0;
+  return queued + pending;
+}
+
+function maybeScheduleRadioPrefetchRetry(result = {}, retryDepth = 0) {
+  if (!canUseRadioQueueWarmup()) {
+    clearRadioPrefetchRetry();
+    return;
+  }
+  if (getRadioPrefetchActiveCount(result) >= RADIO_PREFETCH_TARGET_ACTIVE) {
+    clearRadioPrefetchRetry();
+    return;
+  }
+  if (retryDepth >= RADIO_PREFETCH_MAX_RETRIES || state.radioPrefetchRetryTimer) return;
+  state.radioPrefetchRetryDepth = retryDepth + 1;
+  state.radioPrefetchRetryTimer = setTimeout(() => {
+    state.radioPrefetchRetryTimer = null;
+    scheduleRadioPrefetch({ retryDepth: retryDepth + 1 });
+  }, RADIO_PREFETCH_RETRY_DELAY_MS);
+}
+
+function maybeWarmRadioQueueFromResponse(data = {}) {
+  if (!data.track || !canUseRadioQueueWarmup()) return;
+  void scheduleRadioPrefetch();
+}
+
+function scheduleRadioPrefetch({ force = false, retryDepth = 0 } = {}) {
+  if (!canUseRadioQueueWarmup()) {
+    clearRadioPrefetchRetry();
+    return Promise.resolve(null);
+  }
+  if (retryDepth === 0) clearRadioPrefetchRetry();
   if (state.radioPrefetchPromise && !force) return state.radioPrefetchPromise;
   const sessionId = ensureSessionId();
   state.radioPrefetchPromise = api('/api/radio/prefetch', {
@@ -1864,6 +1960,7 @@ function scheduleRadioPrefetch({ force = false } = {}) {
   })
     .then((result) => {
       console.debug('[radio queue prefetch]', result);
+      maybeScheduleRadioPrefetchRetry(result, retryDepth);
       return result;
     })
     .catch((error) => {
@@ -1899,6 +1996,7 @@ async function startRadio() {
     state.schedulePlanning = useSchedulePlanning;
     if (useSchedulePlanning) {
       state.radioMode = 'concert';
+      clearRadioPrefetchRetry();
       state.concertStatus = 'loading';
       state.activeConcert = null;
       renderConcertConsole();
@@ -2046,6 +2144,7 @@ async function startConcertRadio({ settings = state.concertSettings, message = '
   state.concertSettings = normalizeConcertSettingsClient(settings);
   state.schedulePlanning = false;
   state.radioMode = 'concert';
+  clearRadioPrefetchRetry();
   state.concertStatus = 'loading';
   state.activeConcert = null;
   closeConcertSetup();
@@ -2375,6 +2474,19 @@ async function resetMode() {
   appendChat({ role: 'dj', text: '好的，恢复正常推荐模式。' });
 }
 
+function playResponseAudio(data, { radioTurn = null, afterHostSpeech = null } = {}) {
+  if (!data?.track) return false;
+  setPlayerStatus('歌曲就绪', 'playing');
+  const startTrack = () => {
+    if (!isActiveRadioTurn(radioTurn)) return;
+    startSongPlayback(radioTurn);
+    afterHostSpeech?.();
+  };
+  if (responseShouldSpeak(data)) playHostSpeech(data, startTrack, { radioTurn });
+  else startTrack();
+  return true;
+}
+
 function handleRadioResponse(data, { loading = null, radioTurn = null, afterHostSpeech = null } = {}) {
   if (isInterruptedRadioTurn(radioTurn)) {
     stopLoadingMessages({ remove: true, loading });
@@ -2397,6 +2509,7 @@ function handleRadioResponse(data, { loading = null, radioTurn = null, afterHost
     };
   }
   if (data.concertMode) {
+    clearRadioPrefetchRetry();
     state.radioMode = 'concert';
     state.activeConcert = data.concert || null;
     state.concertStatus = data.concert ? data.concert.phase || 'ready' : 'empty';
@@ -2413,6 +2526,7 @@ function handleRadioResponse(data, { loading = null, radioTurn = null, afterHost
     rememberPlaybackRecommendation(data, { truncateFuture: true });
     state.current = data;
     updatePlayer(data, false);
+    maybeWarmRadioQueueFromResponse(data);
   }
 
   if (!suppressConcertHostBubble) {
@@ -2453,13 +2567,7 @@ function handleRadioResponse(data, { loading = null, radioTurn = null, afterHost
     return true;
   }
 
-  setPlayerStatus('歌曲就绪', 'playing');
-  if (responseShouldSpeak(data)) playHostSpeech(data, () => {
-    if (!isActiveRadioTurn(radioTurn)) return;
-    startSongPlayback(radioTurn);
-  }, { radioTurn });
-  else startSongPlayback(radioTurn);
-  return true;
+  return playResponseAudio(data, { radioTurn, afterHostSpeech });
 }
 
 function playbackSequenceState() {
@@ -2570,6 +2678,62 @@ function estimateAvatarSpeechMs(text = '') {
   return Math.min(AVATAR_MAX_TALKING_MS, Math.max(AVATAR_MIN_TALKING_MS, estimatedMs));
 }
 
+function maybeStartSongFadeInDuringHost(data, radioTurn, hostAudio) {
+  const track = data?.track;
+  if (!isActiveRadioTurn(radioTurn) || !track?.playUrl || !data?.ttsUrl || !hostAudio) return false;
+  const songAudio = document.querySelector('#song-audio');
+  const fadeKey = getSongFadeTrackKey(track);
+  if (!songAudio || isSongFadeInPreparedForTrack(track)) return false;
+  if (state.songFadeInActive && state.songFadeInTrackKey === fadeKey) return false;
+
+  const duration = Number(hostAudio.duration);
+  const currentTime = Number(hostAudio.currentTime);
+  if (!Number.isFinite(duration) || !Number.isFinite(currentTime) || duration <= 0) return false;
+  const remainingMs = (duration - currentTime) * 1000;
+  if (remainingMs > TTS_SONG_OVERLAP_MS || remainingMs < -250) return false;
+
+  if (!audioHasTrackSource(songAudio, track)) {
+    songAudio.crossOrigin = 'anonymous';
+    songAudio.src = track.playUrl;
+  }
+
+  const startedAt = performance.now();
+  state.songFadeInActive = true;
+  state.songFadeInTrackKey = fadeKey;
+  state.songFadeInOfficial = false;
+  try { songAudio.currentTime = 0; } catch {}
+  songAudio.volume = 0;
+
+  const step = (now) => {
+    if (!state.songFadeInActive || state.songFadeInTrackKey !== fadeKey || !isActiveRadioTurn(radioTurn)) {
+      cancelSongFadeIn({ resetVolume: true });
+      return;
+    }
+    const ratio = Math.min(1, Math.max(0, (now - startedAt) / SONG_FADE_IN_MS));
+    songAudio.volume = ratio;
+    if (ratio < 1) {
+      state.songFadeInFrame = requestAnimationFrame(step);
+      return;
+    }
+    state.songFadeInActive = false;
+    state.songFadeInFrame = null;
+    state.songFadeInTrackKey = null;
+    state.songFadeInOfficial = false;
+    songAudio.volume = 1;
+  };
+
+  songAudio.play()
+    .then(() => {
+      if (!state.songFadeInActive || state.songFadeInTrackKey !== fadeKey) return;
+      state.songFadeInFrame = requestAnimationFrame(step);
+    })
+    .catch((error) => {
+      console.warn('[song fade-in skipped]', error?.message || error);
+      cancelSongFadeIn({ resetVolume: true });
+    });
+  return true;
+}
+
 function playHostSpeech(data, onEnd, { radioTurn = null } = {}) {
   const text = data.chatText || data.hostText || '';
   const hostAudio = document.querySelector('#host-audio');
@@ -2587,6 +2751,7 @@ function playHostSpeech(data, onEnd, { radioTurn = null } = {}) {
     if (hostAudio) {
       hostAudio.onended = null;
       hostAudio.onplay = null;
+      hostAudio.ontimeupdate = null;
     }
     if (!isActiveRadioTurn(radioTurn)) return;
     onEnd?.();
@@ -2612,19 +2777,26 @@ function playHostSpeech(data, onEnd, { radioTurn = null } = {}) {
     hostAudio.muted = false;
     hostAudio.src = data.ttsUrl;
     hostAudio.onended = finish;
+    hostAudio.ontimeupdate = () => {
+      maybeStartSongFadeInDuringHost(data, radioTurn, hostAudio);
+    };
     hostAudio.onplay = () => {
       if (!isActiveRadioTurn(radioTurn)) return;
       setAvatarState('talking');
       ensureVisualizerAnalysis('host');
       switchVisualizerTo('host');
       if (data.track) setPlaybackToggleState(true);
+      maybeStartSongFadeInDuringHost(data, radioTurn, hostAudio);
     };
     hostAudio.play().catch((error) => {
       console.warn('[tts skipped]', error?.message || error);
+      hostAudio.ontimeupdate = null;
+      cancelSongFadeIn({ resetVolume: true });
       finishAfterVisualHold();
     });
   } catch (error) {
     console.warn('[tts skipped]', error?.message || error);
+    cancelSongFadeIn({ resetVolume: true });
     finishAfterVisualHold();
   }
 }
@@ -3347,24 +3519,41 @@ async function startSongPlayback(radioTurn = null) {
   if (!isActiveRadioTurn(radioTurn)) return;
   const track = state.current?.track;
   const songAudio = document.querySelector('#song-audio');
+  const prewarmed = isSongFadeInPreparedForTrack(track);
   const playbackToken = ++state.playbackTokenSeq;
   state.activePlaybackToken = playbackToken;
-  clearSongAudioHandlers();
+  clearSongAudioHandlers({ preserveFade: prewarmed });
 
   // If we have a direct URL, play it in browser
   if (track?.playUrl) {
-    markPlaybackStarted(track, 'browser');
+    let playbackActivated = false;
+    const activateBrowserPlayback = () => {
+      if (playbackActivated || !isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
+      playbackActivated = true;
+      if (state.songFadeInTrackKey === getSongFadeTrackKey(track)) state.songFadeInOfficial = true;
+      markPlaybackStarted(track, 'browser');
+      maybeStartCommentDanmaku({ initial: true });
+      startProgressAnimation();
+      setAvatarState('listening');
+      ensureVisualizerAnalysis('song');
+      if (visualizerState.mode !== 'song') switchVisualizerTo('song');
+      updateProgressBar();
+      maybeWarmRadioQueueFromResponse({ track });
+      api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
+    };
+
     setPlayerStatus(`正在播放：${track.name || '未知歌曲'}`, 'playing');
     setAvatarState('listening');
     setPlaybackToggleState(true);
     switchVisualizerTo('song');
-    songAudio.play().catch(() => handleBrowserPlaybackIssue(radioTurn, track, playbackToken));
     songAudio.onerror = () => {
       if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
+      cancelSongFadeIn({ resetVolume: true });
       handleBrowserPlaybackIssue(radioTurn, track, playbackToken);
     };
     songAudio.onended = async () => {
       if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
+      cancelSongFadeIn({ resetVolume: true });
       stopCommentDanmaku({ clearLayer: true });
       stopProgressAnimation();
       stopVisualizer();
@@ -3374,20 +3563,20 @@ async function startSongPlayback(radioTurn = null) {
       if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
       nextTrack({ skipCurrent: false });
     };
-    songAudio.onplay = () => {
-      if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
-      maybeStartCommentDanmaku({ initial: true });
-      startProgressAnimation();
-      setAvatarState('listening');
-      ensureVisualizerAnalysis('song');
-      if (visualizerState.mode !== 'song') switchVisualizerTo('song');
-      api('/api/play/report', { method: 'POST', body: { trackId: track.id, playType: 'play' } }).catch(() => {});
-    };
+    songAudio.onplay = activateBrowserPlayback;
     songAudio.ontimeupdate = () => {
       if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
       if (!progressSeekState.dragging) syncLyricTime(songAudio.currentTime);
       updateProgressBar();
     };
+    if (prewarmed) {
+      activateBrowserPlayback();
+      return;
+    }
+    songAudio.volume = 1;
+    songAudio.play()
+      .then(activateBrowserPlayback)
+      .catch(() => handleBrowserPlaybackIssue(radioTurn, track, playbackToken));
     return;
   }
 
@@ -3410,6 +3599,7 @@ function shouldUseServerPlayerFallback() {
 
 function handleBrowserPlaybackIssue(radioTurn, track, playbackToken = null) {
   if (!isCurrentPlaybackTurn(radioTurn, track, playbackToken)) return;
+  cancelSongFadeIn({ resetVolume: true });
   if (shouldUseServerPlayerFallback()) {
     playCurrentTrack(radioTurn, playbackToken);
     return;
@@ -3792,9 +3982,14 @@ async function playCurrentTrack(radioTurn = null, playbackToken = null) {
 async function pausePlayback() {
   stopCommentDanmaku({ clearLayer: true });
   stopVisualizer();
+  cancelSongFadeIn({ resetVolume: true });
   setAvatarState('idle');
   setPlaybackToggleState(false);
-  document.querySelector('#host-audio')?.pause();
+  const hostAudio = document.querySelector('#host-audio');
+  if (hostAudio) {
+    hostAudio.ontimeupdate = null;
+    hostAudio.pause();
+  }
   document.querySelector('#song-audio')?.pause();
   window.speechSynthesis?.cancel?.();
   try {
@@ -3833,9 +4028,14 @@ async function stopPlayback() {
   invalidateActivePlaybackEvents();
   stopCommentDanmaku({ clearLayer: true, invalidate: true });
   stopVisualizer();
+  cancelSongFadeIn({ resetVolume: true });
   setAvatarState('idle');
   setPlaybackToggleState(false);
-  document.querySelector('#host-audio')?.pause();
+  const hostAudio = document.querySelector('#host-audio');
+  if (hostAudio) {
+    hostAudio.ontimeupdate = null;
+    hostAudio.pause();
+  }
   const songAudio = document.querySelector('#song-audio');
   clearSongAudioHandlers({ reset: true });
   if (songAudio) songAudio.src = '';
