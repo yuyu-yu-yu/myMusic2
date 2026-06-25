@@ -81,6 +81,85 @@ test('MiniMax music generation posts lyrics and saves returned audio', async (t)
   assert.equal(result.explanation.factors.some(factor => factor.text.includes('Music-2.6')), false);
 });
 
+test('MiniMax music generation retries hosted audio downloads without authorization', async (t) => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mymusic-minimax-url-'));
+  t.after(() => fs.rmSync(rootDir, { recursive: true, force: true }));
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const audioBytes = Buffer.from('fake-mp3-from-url');
+  const downloadAuthHeaders = [];
+  globalThis.fetch = async (url, options = {}) => {
+    const href = String(url);
+    if (href.endsWith('/v1/lyrics_generation')) {
+      return new Response(JSON.stringify({
+        lyrics: '[Verse]\nurl audio',
+        base_resp: { status_code: 0, status_msg: 'success' }
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (href.endsWith('/v1/music_generation')) {
+      return new Response(JSON.stringify({
+        data: { audio: 'https://cdn.minimax.test/generated-song.mp3', status: 2 },
+        base_resp: { status_code: 0, status_msg: 'success' }
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    if (href === 'https://cdn.minimax.test/generated-song.mp3') {
+      const auth = options.headers?.authorization || '';
+      downloadAuthHeaders.push(auth);
+      if (auth) return new Response('forbidden', { status: 403 });
+      return new Response(audioBytes, { status: 200, headers: { 'content-type': 'audio/mpeg' } });
+    }
+    throw new Error(`unexpected fetch ${href}`);
+  };
+
+  const result = await generateAiMusic({
+    config: { apiKey: 'key-test', baseUrl: 'https://api.minimaxi.com', model: 'music-2.6-free' },
+    rootDir,
+    payload: { sessionId: 's1' }
+  });
+
+  assert.equal(result.ok, true);
+  assert.deepEqual(downloadAuthHeaders, ['Bearer key-test', '']);
+  const filePath = path.join(rootDir, 'public', result.track.playUrl);
+  assert.deepEqual(fs.readFileSync(filePath), audioBytes);
+});
+
+test('MiniMax music generation saves base64 data URL audio', async (t) => {
+  const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mymusic-minimax-data-url-'));
+  t.after(() => fs.rmSync(rootDir, { recursive: true, force: true }));
+  const originalFetch = globalThis.fetch;
+  t.after(() => {
+    globalThis.fetch = originalFetch;
+  });
+
+  const audioBytes = Buffer.from('fake-mp3-data-url');
+  globalThis.fetch = async (url) => {
+    const href = String(url);
+    if (href.endsWith('/v1/lyrics_generation')) {
+      return new Response(JSON.stringify({
+        lyrics: '[Verse]\ndata url audio',
+        base_resp: { status_code: 0, status_msg: 'success' }
+      }), { status: 200, headers: { 'content-type': 'application/json' } });
+    }
+    return new Response(JSON.stringify({
+      data: { audio: `data:audio/mpeg;base64,${audioBytes.toString('base64')}`, status: 2 },
+      base_resp: { status_code: 0, status_msg: 'success' }
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+
+  const result = await generateAiMusic({
+    config: { apiKey: 'key-test', baseUrl: 'https://api.minimaxi.com', model: 'music-2.6-free' },
+    rootDir,
+    payload: { sessionId: 's1' }
+  });
+
+  assert.equal(result.ok, true);
+  const filePath = path.join(rootDir, 'public', result.track.playUrl);
+  assert.deepEqual(fs.readFileSync(filePath), audioBytes);
+});
+
 test('AI music helpers create compact prompt and timed LRC', () => {
   const prompt = buildMusicPrompt({
     payload: { currentTrack: { name: 'Previous Song' }, preferences: { moodMode: 'night' } },

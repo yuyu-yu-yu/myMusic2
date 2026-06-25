@@ -18,7 +18,7 @@ export async function generateAiMusic({ config = {}, rootDir = process.cwd(), pr
       __error: true,
       ok: false,
       status: 400,
-      error: 'MiniMax 未配置：请在 .env.local 中设置 MINIMAX_API_KEY。'
+      error: 'MINIMAX_API_KEY is not configured. Set it in Render Environment or .env.local.'
     };
   }
 
@@ -303,22 +303,47 @@ async function resolveAudioBuffer(response, minimax) {
   const audio = response?.data?.audio || response?.data?.audio_url || response?.data?.audioUrl || response?.data?.url;
   if (!audio) return null;
   if (/^https?:\/\//i.test(audio)) {
-    const res = await fetch(audio, {
-      headers: minimax.apiKey ? { authorization: `Bearer ${minimax.apiKey}` } : undefined,
-      signal: AbortSignal.timeout?.(REQUEST_TIMEOUT_MS)
-    });
-    if (!res.ok) throw new Error(`MiniMax 音频下载失败：HTTP ${res.status}`);
+    const res = await fetchAudioUrl(audio, minimax);
     return Buffer.from(await res.arrayBuffer());
   }
-  return decodeHexAudio(audio);
+  return decodeInlineAudio(audio);
 }
 
-function decodeHexAudio(value) {
-  const hex = String(value || '').trim().replace(/^0x/i, '');
-  if (!hex || hex.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(hex)) {
-    throw new Error('MiniMax 返回的音频不是有效 hex 数据。');
+async function fetchAudioUrl(url, minimax) {
+  const timeout = minimax.requestTimeoutMs || REQUEST_TIMEOUT_MS;
+  const withAuth = minimax.apiKey
+    ? { authorization: `Bearer ${minimax.apiKey}` }
+    : undefined;
+  const first = await fetch(url, {
+    headers: withAuth,
+    signal: AbortSignal.timeout?.(timeout)
+  });
+  if (first.ok) return first;
+
+  if (withAuth && [400, 401, 403].includes(first.status)) {
+    const retry = await fetch(url, { signal: AbortSignal.timeout?.(timeout) });
+    if (retry.ok) return retry;
   }
-  return Buffer.from(hex, 'hex');
+
+  throw new Error(`MiniMax 音频下载失败：HTTP ${first.status}`);
+}
+
+function decodeInlineAudio(value) {
+  const text = String(value || '').trim();
+  const dataUrl = text.match(/^data:audio\/[^;,]+;base64,(.+)$/i);
+  if (dataUrl) return Buffer.from(dataUrl[1], 'base64');
+
+  const hex = text.replace(/^0x/i, '');
+  if (hex && hex.length % 2 === 0 && /^[0-9a-f]+$/i.test(hex)) {
+    return Buffer.from(hex, 'hex');
+  }
+
+  if (/^[A-Za-z0-9+/]+={0,2}$/.test(text) && text.length % 4 === 0) {
+    const decoded = Buffer.from(text, 'base64');
+    if (decoded.length) return decoded;
+  }
+
+  throw new Error('MiniMax 返回的音频不是有效 hex/base64 数据。');
 }
 
 function extractGeneratedLyrics(response = {}) {

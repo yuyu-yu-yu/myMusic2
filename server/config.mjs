@@ -87,6 +87,7 @@ export function getConfig() {
       baseUrl: env.MINIMAX_MUSIC_BASE_URL || env.MINIMAX_BASE_URL || 'https://api.minimaxi.com',
       apiKey: env.MINIMAX_API_KEY || env.MINIMAX_MUSIC_API_KEY || '',
       model: env.MINIMAX_MUSIC_MODEL || 'music-2.6-free',
+      requestTimeoutMs: Math.max(1000, Number(env.MINIMAX_MUSIC_TIMEOUT_MS || env.MINIMAX_REQUEST_TIMEOUT_MS || 180000) || 180000),
       allowPaidMusic: String(env.MINIMAX_ALLOW_PAID_MUSIC || '').toLowerCase() === 'true'
     },
     tts: {

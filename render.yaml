@@ -60,3 +60,11 @@ services:
         sync: false
       - key: LLM_MODEL
         sync: false
+      - key: MINIMAX_API_KEY
+        sync: false
+      - key: MINIMAX_MUSIC_MODEL
+        value: music-2.6-free
+      - key: MINIMAX_MUSIC_TIMEOUT_MS
+        value: 170000
+      - key: MINIMAX_ALLOW_PAID_MUSIC
+        value: false

@@ -161,7 +161,8 @@ const avatarFrameSequences = {
   happy: makeAvatarFrameSequence('happy', [160, 160, 170, 180, 180, 170, 160, 220], { sprite: false })
 };
 
-const AVATAR_VIDEO_VERSION = '3';
+const AVATAR_VIDEO_VERSION = '4';
+const AVATAR_FALLBACK_IMAGE = `/avatar/source/cancan-first-frame.png?v=${AVATAR_VIDEO_VERSION}`;
 const avatarMotionMap = {
   idle: `/avatar/webm/idle.webm?v=${AVATAR_VIDEO_VERSION}`,
   listening: `/avatar/webm/listening.webm?v=${AVATAR_VIDEO_VERSION}`,
@@ -945,13 +946,19 @@ function playAvatarVideoOrFallback(
   root.classList.remove('is-sprite-sequence');
   const sprite = root.querySelector('#avatar-sprite');
   if (sprite) sprite.hidden = true;
-  if (image) image.src = '/avatar/source/cancan-first-frame.png';
+  const activeVideo = getActiveAvatarVideo(root);
+  if (image && !activeVideo && image.getAttribute('src') !== AVATAR_FALLBACK_IMAGE) {
+    image.src = AVATAR_FALLBACK_IMAGE;
+  }
 
   const showSourceFallback = () => {
     if (requestToken !== avatarVideoToken) return;
     root.classList.add('is-fallback');
     hideAvatarVideos(root);
-    if (image) image.hidden = false;
+    if (image) {
+      if (image.getAttribute('src') !== AVATAR_FALLBACK_IMAGE) image.src = AVATAR_FALLBACK_IMAGE;
+      image.hidden = false;
+    }
     setDisplayedAvatarState(root, displayedState);
     scheduleAvatarRestore(options);
   };
@@ -965,7 +972,6 @@ function playAvatarVideoOrFallback(
     }
   };
 
-  const activeVideo = getActiveAvatarVideo(root);
   if (activeVideo?.getAttribute('src') === src && activeVideo.readyState >= 2) {
     hideAvatarVideos(root, activeVideo);
     clearAvatarVideoHandlers(activeVideo);
@@ -1144,7 +1150,7 @@ function setAvatarState(nextState = 'idle', options = {}) {
 
   if (src) {
     stopAvatarFrameSequence();
-    playAvatarVideoOrFallback(root, image, src, sequence, avatarVideoToken, normalized, options);
+    playAvatarVideoOrFallback(root, image, src, null, avatarVideoToken, normalized, options);
   } else if (sequence) {
     playAvatarFrameSequence(root, image, sequence, '', normalized, options);
   } else {
