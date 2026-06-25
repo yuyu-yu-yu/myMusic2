@@ -39,6 +39,8 @@ Each browser profile receives a persistent anonymous device id. Visitors share t
 
 Render Free web services sleep after 15 minutes without inbound traffic. A later request can take about one minute to wake the service. The local SQLite database, generated audio, login cache, visitor chat, preferences, memories, and diaries can be lost whenever the instance sleeps, restarts, or redeploys.
 
+To reduce surprise on the public demo, the browser keeps a same-device snapshot of non-secret preferences and long-term memories in `localStorage`. If Render restarts with an empty guest account, the frontend restores that snapshot through `/api/demo/guest/restore`. This does not store or expose NetEase cookies, LLM keys, TTS keys, chat text, diaries, or generated audio. Clearing browser site data, using a different browser, or pressing "reset this device" starts a fresh anonymous device.
+
 ## Verification
 
 After deployment:

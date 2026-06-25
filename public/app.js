@@ -10,6 +10,18 @@ import { ensureDemoDeviceId, rotateDemoDeviceId } from './device-identity.js';
 import { getTrackNeteaseSongId } from './track-identity.js';
 
 const AI_MUSIC_MODE_STORAGE_KEY = 'mymusic:aiMusicMode';
+const DEVICE_SNAPSHOT_STORAGE_PREFIX = 'mymusic:deviceSnapshot:v1:';
+const DEVICE_SNAPSHOT_VERSION = 1;
+const DEVICE_SNAPSHOT_MAX_MEMORIES = 80;
+const DEFAULT_DEVICE_PREFERENCES = {
+  chatMusicBalance: 'friend',
+  recommendationFrequency: 'medium',
+  voiceMode: 'recommendations',
+  moodMode: 'auto',
+  lowDistractionMode: false,
+  scheduleAwareEnabled: false,
+  note: ''
+};
 
 const state = {
   sessionId: null,
@@ -42,6 +54,7 @@ const state = {
   activeRadioTurn: null,
   playbackTokenSeq: 0,
   activePlaybackToken: 0,
+  deviceSnapshotRestorePromise: null,
   songFadeInFrame: null,
   songFadeInActive: false,
   songFadeInTrackKey: null,
@@ -97,6 +110,183 @@ const danmakuState = {
 
 function ensureDemoVisitorId() {
   return ensureDemoDeviceId();
+}
+
+function deviceSnapshotKey(deviceId = ensureDemoVisitorId()) {
+  return `${DEVICE_SNAPSHOT_STORAGE_PREFIX}${deviceId}`;
+}
+
+function readDeviceSnapshot(deviceId = ensureDemoVisitorId()) {
+  try {
+    const raw = localStorage.getItem(deviceSnapshotKey(deviceId));
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || parsed.version !== DEVICE_SNAPSHOT_VERSION) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function clearDeviceSnapshot(deviceId = ensureDemoVisitorId()) {
+  try {
+    localStorage.removeItem(deviceSnapshotKey(deviceId));
+  } catch {}
+}
+
+function persistDeviceSnapshot(data = {}, options = {}) {
+  let deviceId = '';
+  try {
+    deviceId = ensureDemoVisitorId();
+  } catch {
+    return;
+  }
+  const previous = readDeviceSnapshot(deviceId) || {};
+  const next = {
+    version: DEVICE_SNAPSHOT_VERSION,
+    deviceId,
+    updatedAt: new Date().toISOString(),
+    preferences: previous.preferences || null,
+    memories: Array.isArray(previous.memories) ? previous.memories : [],
+    feedbackSummary: previous.feedbackSummary || null,
+    moodStats: previous.moodStats || null
+  };
+
+  if (Object.prototype.hasOwnProperty.call(data, 'preferences')) {
+    const preferences = sanitizePreferenceSnapshot(data.preferences);
+    const hasUsefulNext = hasUsefulPreferenceSnapshot(preferences);
+    const hasUsefulPrevious = hasUsefulPreferenceSnapshot(previous.preferences);
+    next.preferences = hasUsefulNext || options.replaceDefaultPreferences || !hasUsefulPrevious
+      ? preferences
+      : previous.preferences;
+  }
+  if (Object.prototype.hasOwnProperty.call(data, 'memories')) {
+    const memories = sanitizeMemorySnapshotList(data.memories);
+    next.memories = memories.length || options.replaceEmptyMemories || !(previous.memories || []).length
+      ? memories
+      : previous.memories;
+  }
+  if (data.feedbackSummary) next.feedbackSummary = data.feedbackSummary;
+  if (data.moodStats) next.moodStats = data.moodStats;
+
+  if (!hasUsefulDeviceSnapshot(next)) return;
+  try {
+    localStorage.setItem(deviceSnapshotKey(deviceId), JSON.stringify(next));
+  } catch {}
+}
+
+function sanitizePreferenceSnapshot(preferences = {}) {
+  const source = preferences && typeof preferences === 'object' ? preferences : {};
+  return {
+    chatMusicBalance: source.chatMusicBalance || DEFAULT_DEVICE_PREFERENCES.chatMusicBalance,
+    recommendationFrequency: source.recommendationFrequency || DEFAULT_DEVICE_PREFERENCES.recommendationFrequency,
+    voiceMode: source.voiceMode || DEFAULT_DEVICE_PREFERENCES.voiceMode,
+    moodMode: source.moodMode || DEFAULT_DEVICE_PREFERENCES.moodMode,
+    lowDistractionMode: source.lowDistractionMode === true,
+    scheduleAwareEnabled: source.scheduleAwareEnabled === true,
+    note: String(source.note || '').slice(0, 500)
+  };
+}
+
+function sanitizeMemorySnapshotList(memories = []) {
+  return Array.isArray(memories)
+    ? memories.map(sanitizeMemorySnapshot).filter(Boolean).slice(0, DEVICE_SNAPSHOT_MAX_MEMORIES)
+    : [];
+}
+
+function sanitizeMemorySnapshot(memory = {}) {
+  if (!memory || typeof memory !== 'object') return null;
+  const content = String(memory.content || '').trim().slice(0, 180);
+  if (!content) return null;
+  return {
+    id: memory.id,
+    kind: String(memory.kind || 'preference'),
+    content,
+    tags: Array.isArray(memory.tags) ? memory.tags.map((tag) => String(tag || '').trim()).filter(Boolean).slice(0, 12) : [],
+    confidence: clampNumber(memory.confidence, 0, 1, 0.5),
+    importance: clampNumber(memory.importance, 0, 1, 0.5),
+    sourceSessionId: memory.sourceSessionId || 'device-snapshot',
+    updatedAt: memory.updatedAt || null
+  };
+}
+
+function clampNumber(value, min, max, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(min, Math.min(max, numeric));
+}
+
+function hasUsefulDeviceSnapshot(snapshot = {}) {
+  return hasUsefulPreferenceSnapshot(snapshot.preferences)
+    || (Array.isArray(snapshot.memories) && snapshot.memories.length > 0);
+}
+
+function hasUsefulPreferenceSnapshot(preferences = {}) {
+  if (!preferences || typeof preferences !== 'object') return false;
+  return Object.entries(DEFAULT_DEVICE_PREFERENCES).some(([key, defaultValue]) => {
+    const value = preferences[key];
+    return String(value ?? defaultValue) !== String(defaultValue);
+  });
+}
+
+function shouldRestoreDeviceSnapshot(snapshot = {}, serverState = {}) {
+  if (!hasUsefulDeviceSnapshot(snapshot)) return false;
+  const serverMemories = Array.isArray(serverState.memories) ? serverState.memories : [];
+  if ((snapshot.memories || []).length > 0 && serverMemories.length === 0) return true;
+
+  const localPrefs = sanitizePreferenceSnapshot(snapshot.preferences || {});
+  const serverPrefs = sanitizePreferenceSnapshot(serverState.preferences || {});
+  if (!hasUsefulPreferenceSnapshot(localPrefs)) return false;
+  return Object.entries(localPrefs).some(([key, value]) => {
+    const defaultValue = DEFAULT_DEVICE_PREFERENCES[key];
+    return String(value ?? defaultValue) !== String(defaultValue)
+      && String(serverPrefs[key] ?? defaultValue) === String(defaultValue);
+  });
+}
+
+async function restoreDeviceSnapshotIfNeeded(serverState = {}) {
+  const snapshot = readDeviceSnapshot();
+  if (!shouldRestoreDeviceSnapshot(snapshot, serverState)) {
+    persistDeviceSnapshot(serverState);
+    return null;
+  }
+  if (state.deviceSnapshotRestorePromise) return state.deviceSnapshotRestorePromise;
+  state.deviceSnapshotRestorePromise = api('/api/demo/guest/restore', {
+    method: 'POST',
+    body: { snapshot }
+  }).then((data) => {
+    if (data.preferences) {
+      state.preferences = data.preferences;
+      applyLowDistractionVisualMode(state.preferences);
+    }
+    if (Array.isArray(data.memories)) state.memories = data.memories;
+    if (data.feedbackSummary) state.feedbackSummary = data.feedbackSummary;
+    persistDeviceSnapshot({
+      preferences: state.preferences,
+      memories: state.memories,
+      feedbackSummary: state.feedbackSummary
+    }, { replaceDefaultPreferences: true, replaceEmptyMemories: true });
+    return data;
+  }).catch(() => null).finally(() => {
+    state.deviceSnapshotRestorePromise = null;
+  });
+  return state.deviceSnapshotRestorePromise;
+}
+
+async function bootstrapDeviceSnapshotRestore() {
+  const snapshot = readDeviceSnapshot();
+  if (!hasUsefulDeviceSnapshot(snapshot)) return;
+  const [prefData, memoryData] = await Promise.all([
+    api('/api/preferences').catch(() => ({ preferences: state.preferences || {}, feedbackSummary: state.feedbackSummary || {} })),
+    api('/api/memories').catch(() => ({ memories: state.memories || [] }))
+  ]);
+  const preferences = prefData.preferences || state.preferences || {};
+  const memories = Array.isArray(memoryData.memories) ? memoryData.memories : state.memories || [];
+  state.preferences = preferences;
+  state.feedbackSummary = prefData.feedbackSummary || state.feedbackSummary || {};
+  state.memories = memories;
+  await restoreDeviceSnapshotIfNeeded({ preferences, memories, feedbackSummary: state.feedbackSummary });
+  refreshMixerUsagePanels();
 }
 
 // Module-level mutable state — MUST be declared before render() call at line ~30
@@ -1296,6 +1486,7 @@ function renderPlayer() {
   view.innerHTML = '';
   view.append(template.content.cloneNode(true));
   loadPreferences().catch(() => {});
+  bootstrapDeviceSnapshotRestore().catch(() => {});
 
   // Move persistent audio elements into the player layout
   const leftCol = document.querySelector('.left-col');
@@ -3681,6 +3872,11 @@ function applyUsageInsights(data = {}) {
   if (data.feedbackSummary) state.feedbackSummary = data.feedbackSummary;
   if (Array.isArray(data.memories)) state.memories = data.memories;
   if (data.preferences) applyLowDistractionVisualMode(data.preferences);
+  persistDeviceSnapshot({
+    preferences: state.preferences,
+    memories: state.memories,
+    feedbackSummary: state.feedbackSummary
+  });
   if (data.sessionConstraints) {
     state.sessionConstraints = data.sessionConstraints;
     renderSessionConstraintBar();
@@ -3701,6 +3897,12 @@ async function refreshUsageInsights() {
     state.memories = memoryData.memories || state.memories || [];
     state.moodStats = moodStatsData || state.moodStats;
     applyLowDistractionVisualMode(state.preferences);
+    await restoreDeviceSnapshotIfNeeded({
+      preferences: state.preferences,
+      memories: state.memories,
+      feedbackSummary: state.feedbackSummary,
+      moodStats: state.moodStats
+    });
     refreshMixerUsagePanels();
   } catch {
     // Usage panels should not interrupt playback or chat.
@@ -4335,6 +4537,11 @@ async function renderDiary() {
     state.preferences = prefData.preferences || state.preferences || {};
     state.feedbackSummary = prefData.feedbackSummary || state.feedbackSummary || {};
     state.moodStats = moodStatsData || state.moodStats || { total: 0, buckets: [] };
+    persistDeviceSnapshot({
+      preferences: state.preferences,
+      feedbackSummary: state.feedbackSummary,
+      moodStats: state.moodStats
+    });
     renderDiaryOverview(overview, {
       feedback: state.feedbackSummary,
       moodStats: state.moodStats
@@ -4707,9 +4914,11 @@ async function renderMixer() {
   ]);
   const preferences = prefData.preferences || {};
   state.preferences = preferences;
-  const memories = (memoryData.memories || []).slice(0, 12);
+  let memories = (memoryData.memories || []).slice(0, 12);
   state.memories = memories;
   applyLowDistractionVisualMode(preferences);
+  await restoreDeviceSnapshotIfNeeded({ preferences, memories });
+  memories = (state.memories || memories || []).slice(0, 12);
 
   view.innerHTML = `
     <section class="mixer-hero page-panel">
@@ -4775,10 +4984,13 @@ async function renderSettings() {
     api('/api/preferences').catch(() => ({ preferences: state.preferences || {} })),
     api('/api/context/schedule/status').catch(() => ({ configured: false, connected: false, status: 'unavailable', errorCode: 'status_unavailable', context: null }))
   ]);
-  const memories = memoryData.memories || [];
+  let memories = memoryData.memories || [];
   const preferences = preferenceData.preferences || state.preferences || {};
   state.preferences = preferences;
+  state.memories = memories;
   state.scheduleStatus = scheduleStatus;
+  await restoreDeviceSnapshotIfNeeded({ preferences, memories });
+  memories = state.memories || memories || [];
   const demoGuestMode = Boolean(status.demo?.guestMode);
   view.innerHTML = `
     <section class="page-panel">
@@ -4916,11 +5128,15 @@ async function renderSettings() {
     if (!memories.length) return;
     if (!confirm('清空灿灿的全部长期记忆？聊天历史不会被删除。')) return;
     await api('/api/memories', { method: 'DELETE' });
+    state.memories = [];
+    persistDeviceSnapshot({ memories: [] }, { replaceEmptyMemories: true });
     renderSettings();
   });
   document.querySelector('#reset-device-data-btn')?.addEventListener('click', async () => {
     if (!confirm('重置本设备的全部数据？这会删除当前浏览器的聊天、历史、偏好、画像、记忆和日记，且无法恢复。')) return;
+    const previousDeviceId = ensureDemoVisitorId();
     await api('/api/demo/guest/reset', { method: 'POST', body: {} });
+    clearDeviceSnapshot(previousDeviceId);
     rotateDemoDeviceId();
     location.reload();
   });
@@ -5001,6 +5217,7 @@ async function toggleScheduleAwareness() {
   try {
     const result = await api('/api/preferences', { method: 'PUT', body: { scheduleAwareEnabled: nextEnabled } });
     state.preferences = result.preferences || { ...(state.preferences || {}), scheduleAwareEnabled: nextEnabled };
+    persistDeviceSnapshot({ preferences: state.preferences }, { replaceDefaultPreferences: true });
     state.schedulePlanning = nextEnabled;
     button.classList.toggle('is-on', nextEnabled);
     button.setAttribute('aria-checked', String(nextEnabled));
@@ -5685,6 +5902,7 @@ function bindMixerControls(initialPreferences = {}) {
       const result = await api('/api/preferences', { method: 'PUT', body: preferences });
       preferences = result.preferences || preferences;
       state.preferences = preferences;
+      persistDeviceSnapshot({ preferences }, { replaceDefaultPreferences: true });
       refresh();
       setMixerStatus(preferences.lowDistractionMode ? 'LOW DISTRACTION' : '已保存到灿灿的运行参数', 'ok');
     } catch (error) {
@@ -5905,9 +6123,13 @@ function bindMemoryManagement() {
         const result = await api(`/api/memories/${encodeURIComponent(id)}`, { method: 'PUT', body: { content: nextContent } });
         const memory = result.memory;
         if (memory) {
+          state.memories = (state.memories || []).map((item) => String(item.id) === String(id) ? memory : item);
+          persistDeviceSnapshot({ memories: state.memories }, { replaceEmptyMemories: true });
           item.outerHTML = memorySummaryItem(memory);
         } else if (content) {
           content.textContent = nextContent;
+          state.memories = (state.memories || []).map((item) => String(item.id) === String(id) ? { ...item, content: nextContent } : item);
+          persistDeviceSnapshot({ memories: state.memories }, { replaceEmptyMemories: true });
           setEditing(false);
         }
       } catch (error) {
@@ -5921,6 +6143,8 @@ function bindMemoryManagement() {
       setMemoryBusy(item, true);
       try {
         await api(`/api/memories/${encodeURIComponent(id)}`, { method: 'DELETE' });
+        state.memories = (state.memories || []).filter((memory) => String(memory.id) !== String(id));
+        persistDeviceSnapshot({ memories: state.memories }, { replaceEmptyMemories: true });
         item.remove();
         if (!list.querySelector('[data-memory-id]')) {
           list.innerHTML = '<p class="muted memory-empty">暂时还没有长期记忆。继续和灿灿聊天后，这里会出现稳定偏好、需求和边界。</p>';
@@ -6026,6 +6250,10 @@ async function loadPreferences({ force = false } = {}) {
         state.preferences = data.preferences || state.preferences || {};
         if (data.feedbackSummary) state.feedbackSummary = data.feedbackSummary;
         applyLowDistractionVisualMode(state.preferences);
+        persistDeviceSnapshot({
+          preferences: state.preferences,
+          feedbackSummary: state.feedbackSummary
+        });
         return state.preferences;
       })
       .finally(() => { preferencesLoadPromise = null; });

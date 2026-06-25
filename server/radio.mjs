@@ -287,6 +287,80 @@ export function updatePreferences({ db, payload, accountContext }) {
   };
 }
 
+export function restoreDeviceSnapshot({ db, payload, accountContext }) {
+  const account = getRequestAccount(db, accountContext);
+  if (account.source !== 'guest') {
+    return { __error: true, ok: false, status: 403, error: 'device snapshot restore is only available for demo guests' };
+  }
+
+  const snapshot = payload?.snapshot && typeof payload.snapshot === 'object' ? payload.snapshot : payload || {};
+  const restored = { preferences: false, memories: 0 };
+
+  if (snapshot.preferences && typeof snapshot.preferences === 'object') {
+    const next = normalizePreferences({ ...getUserPrefs(db, account), ...snapshot.preferences });
+    setUserPrefs(db, next, account);
+    restored.preferences = true;
+  }
+
+  const existingMemories = listUserMemories(db, { accountId: account.accountId, limit: 1 });
+  if (existingMemories.length === 0 && Array.isArray(snapshot.memories)) {
+    for (const memory of snapshot.memories.slice(0, 80)) {
+      const normalized = normalizeSnapshotMemory(memory);
+      if (!normalized) continue;
+      try {
+        recordOrMergeUserMemory(db, { accountId: account.accountId, ...normalized });
+        restored.memories += 1;
+      } catch {
+        // Ignore malformed individual memories; keep the rest of the snapshot useful.
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    restored,
+    preferences: normalizePreferences(getUserPrefs(db, account)),
+    memories: listUserMemories(db, { accountId: account.accountId, limit: 200 }),
+    feedbackSummary: getFeedbackSummary(db, account.accountId),
+    account: publicAccountContext(account)
+  };
+}
+
+function normalizeSnapshotMemory(memory = {}) {
+  if (!memory || typeof memory !== 'object') return null;
+  const content = String(memory.content || '').trim().slice(0, 180);
+  if (!content) return null;
+  const kind = memoryKindsForSnapshot.has(memory.kind) ? memory.kind : 'preference';
+  const tags = Array.isArray(memory.tags)
+    ? memory.tags
+    : Array.isArray(memory.tagsJson)
+      ? memory.tagsJson
+      : [];
+  return {
+    kind,
+    content,
+    tags: tags.map((tag) => String(tag || '').trim()).filter(Boolean).slice(0, 12),
+    confidence: clampSnapshotScore(memory.confidence, 0.5),
+    importance: clampSnapshotScore(memory.importance, 0.5),
+    sourceSessionId: memory.sourceSessionId || 'device-snapshot'
+  };
+}
+
+const memoryKindsForSnapshot = new Set([
+  'emotion_pattern',
+  'need',
+  'preference',
+  'boundary',
+  'life_context',
+  'music_preference'
+]);
+
+function clampSnapshotScore(value, fallback) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return fallback;
+  return Math.max(0, Math.min(1, numeric));
+}
+
 function normalizePreferences(raw = {}) {
   const pick = (value, allowed, fallback) => allowed.includes(value) ? value : fallback;
   return {

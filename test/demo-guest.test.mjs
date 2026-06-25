@@ -19,7 +19,7 @@ import {
 } from '../server/db.mjs';
 import { cleanupDemoGuest, cleanupExpiredDemoGuests, DemoVisitorIdError, resolveRequestAccountContext } from '../server/demo-guest.mjs';
 import { getLibrary, getProfile, updateProfile } from '../server/library.mjs';
-import { getPreferences, submitFeedback, updatePreferences } from '../server/radio.mjs';
+import { getPreferences, restoreDeviceSnapshot, submitFeedback, updatePreferences } from '../server/radio.mjs';
 
 function testDb(t) {
   const rootDir = fs.mkdtempSync(path.join(os.tmpdir(), 'mymusic-demo-guest-'));
@@ -145,6 +145,54 @@ test('demo mode rejects missing or invalid visitor ids instead of using the base
     (error) => error instanceof DemoVisitorIdError && error.status === 400
   );
   assert.equal(getAccountSetting(db, seeded.baseAccountId, 'user_preferences'), JSON.stringify({ note: 'base note', voiceMode: 'recommendations' }));
+});
+
+test('demo guest snapshot restores same-device preferences and memories after server data reset', (t) => {
+  const db = testDb(t);
+  seedDemoAccount(db);
+  const config = { demo: { guestMode: true } };
+  const guest = resolveRequestAccountContext(db, config, requestFor('restore-device-1234'));
+
+  const result = restoreDeviceSnapshot({
+    db,
+    accountContext: guest,
+    payload: {
+      snapshot: {
+        preferences: { note: 'same browser note', moodMode: 'night', lowDistractionMode: true },
+        memories: [
+          {
+            kind: 'music_preference',
+            content: 'Same browser prefers soft late-night recommendations.',
+            tags: ['night', 'soft'],
+            confidence: 0.8,
+            importance: 0.7
+          }
+        ]
+      }
+    }
+  });
+
+  assert.equal(result.ok, true);
+  assert.equal(result.restored.preferences, true);
+  assert.equal(result.restored.memories, 1);
+  assert.equal(getPreferences({ db, accountContext: guest }).preferences.note, 'same browser note');
+  assert.equal(getPreferences({ db, accountContext: guest }).preferences.moodMode, 'night');
+  assert.equal(listUserMemories(db, { accountId: guest.accountId }).length, 1);
+  assert.equal(listUserMemories(db, { accountId: guest.accountId })[0].content, 'Same browser prefers soft late-night recommendations.');
+});
+
+test('device snapshot restore is blocked for the shared base account', (t) => {
+  const db = testDb(t);
+  const seeded = seedDemoAccount(db);
+  const result = restoreDeviceSnapshot({
+    db,
+    accountContext: { accountId: seeded.baseAccountId, source: 'cookie' },
+    payload: { snapshot: { preferences: { note: 'should not write' } } }
+  });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.status, 403);
+  assert.equal(getPreferences({ db, accountContext: { accountId: seeded.baseAccountId, source: 'cookie' } }).preferences.note, 'base note');
 });
 
 test('guest portrait updates do not overwrite the shared demo portrait', async (t) => {

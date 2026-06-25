@@ -9,7 +9,7 @@ import { openDatabase, getSetting, saveTrack, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { extractOpenApiTokenPayload, getNeteaseLoginStatus, resolveQrOpenApiLogin, saveNeteaseUserProfile, saveOpenApiToken } from './netease-auth.mjs';
 import { clearLibraryAccountSnapshot, getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
-import { applyScheduleContext, chatRadio, encoreConcertRadio, getConcertAudience, getMemories, getMoodStatsSummary, getPreferences, getRadioDebug, jumpConcertRadio, jumpPlaylistRadio, nextConcertRadio, nextPlaylistRadio, nextRadioItem, playConcertHost, prefetchRadio, removeAllMemories, removeMemory, replanConcertRadio, reportPlay, startConcertRadio, startPlaylistRadio, startRadio, submitFeedback, updateMemory, updatePreferences } from './radio.mjs';
+import { applyScheduleContext, chatRadio, encoreConcertRadio, getConcertAudience, getMemories, getMoodStatsSummary, getPreferences, getRadioDebug, jumpConcertRadio, jumpPlaylistRadio, nextConcertRadio, nextPlaylistRadio, nextRadioItem, playConcertHost, prefetchRadio, removeAllMemories, removeMemory, replanConcertRadio, reportPlay, restoreDeviceSnapshot, startConcertRadio, startPlaylistRadio, startRadio, submitFeedback, updateMemory, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { getDiaryOverview, getDiaryRadioContext, recordDiarySignalFeedback } from './music-recap.mjs';
 import { createNcmPlayer } from './player.mjs';
@@ -196,6 +196,11 @@ const routes = {
     const visitorId = getVisitorIdFromRequest(req, body);
     if (!visitorId) return jsonError('A valid X-Demo-Visitor-Id header is required.', 400);
     return { ...cleanupDemoGuest(db, visitorId), reset: true };
+  },
+  'POST /api/demo/guest/restore': async (req) => {
+    if (!config.demo?.guestMode) return jsonError('Demo guest restore is only available in demo mode.', 403);
+    const body = await readJson(req);
+    return restoreDeviceSnapshot({ db, payload: body, accountContext: getRequestAccount(req) });
   },
   'POST /api/diagnostics/self-check': async (req) => {
     const body = await readJson(req);
