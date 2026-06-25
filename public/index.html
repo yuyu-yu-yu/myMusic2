@@ -181,6 +181,69 @@
         </div>
       </section>
     </template>
-    <script type="module" src="/app.js"></script>
+    <script>
+      (() => {
+        const params = new URLSearchParams(window.location.search);
+        const previewToken = params.get('eo_token');
+        const previewTime = params.get('eo_time');
+        const previewQuery = previewToken && previewTime
+          ? `eo_token=${encodeURIComponent(previewToken)}&eo_time=${encodeURIComponent(previewTime)}`
+          : '';
+        const withPreviewQuery = (path) => previewQuery ? `${path}${path.includes('?') ? '&' : '?'}${previewQuery}` : path;
+
+        if (previewQuery) {
+          document.querySelectorAll('link[href^="/"]').forEach((link) => {
+            if (!link.getAttribute('href').includes('eo_token=')) {
+              link.setAttribute('href', withPreviewQuery(link.getAttribute('href')));
+            }
+          });
+        }
+
+        const loadApp = () => {
+          const script = document.createElement('script');
+          script.type = 'module';
+          script.src = withPreviewQuery('/app.js');
+          document.body.appendChild(script);
+        };
+
+        if (!previewQuery || !('serviceWorker' in navigator)) {
+          loadApp();
+          return;
+        }
+
+        const reloadKey = `mymusic:edgeonePreviewReload:${previewToken}:${previewTime}`;
+        let loaded = false;
+        const safeLoadApp = () => {
+          if (loaded) return;
+          loaded = true;
+          loadApp();
+        };
+
+        const waitForController = () => new Promise((resolve) => {
+          if (navigator.serviceWorker.controller) {
+            resolve(true);
+            return;
+          }
+          const timer = setTimeout(() => resolve(false), 1500);
+          navigator.serviceWorker.addEventListener('controllerchange', () => {
+            clearTimeout(timer);
+            resolve(true);
+          }, { once: true });
+        });
+
+        navigator.serviceWorker.register(withPreviewQuery('/sw.js'), { scope: '/' })
+          .then(() => navigator.serviceWorker.ready)
+          .then(waitForController)
+          .then((controlled) => {
+            if (!controlled && sessionStorage.getItem(reloadKey) !== '1') {
+              sessionStorage.setItem(reloadKey, '1');
+              window.location.reload();
+              return;
+            }
+            safeLoadApp();
+          })
+          .catch(safeLoadApp);
+      })();
+    </script>
   </body>
 </html>

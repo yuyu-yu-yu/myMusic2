@@ -1,4 +1,4 @@
-import { animate } from '/vendor/anime.esm.min.js';
+import { animate } from '/assets/anime.esm.min.js';
 import {
   addPlaybackItem,
   canMovePlaybackPrevious,

@@ -1,5 +1,6 @@
-const CACHE = 'mymusic-v38';
-const ASSETS = ['/', '/styles.css', '/app.js', '/device-identity.js', '/track-identity.js', '/manifest.webmanifest', '/assets/icon.svg', '/avatar/source/cancan-first-frame.png'];
+const CACHE = 'mymusic-v39';
+const ASSETS = ['/', '/styles.css', '/app.js', '/device-identity.js', '/track-identity.js', '/playback-sequence.js', '/assets/anime.esm.min.js', '/manifest.webmanifest', '/assets/icon.svg', '/avatar/source/cancan-first-frame.png'];
+const previewAuth = parsePreviewAuth();
 
 function parseRange(rangeHeader, size) {
   const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader || '');
@@ -50,7 +51,7 @@ async function avatarVideoResponse(request) {
 
   if (cached) return cached;
 
-  const response = await fetch(request);
+  const response = await fetch(withPreviewAuth(request));
   if (response.ok && response.status === 200 && !rangeHeader) {
     await cache.put(request.url, response.clone());
   }
@@ -58,7 +59,12 @@ async function avatarVideoResponse(request) {
 }
 
 self.addEventListener('install', (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(ASSETS)));
+  event.waitUntil(
+    caches.open(CACHE)
+      .then((cache) => previewAuth
+        ? Promise.allSettled(ASSETS.map((asset) => cachePreviewAsset(cache, asset)))
+        : cache.addAll(ASSETS))
+  );
   self.skipWaiting();
 });
 
@@ -72,14 +78,15 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  if (url.pathname.startsWith('/api/')) return;
+  if (url.pathname.startsWith('/api/') && !previewAuth) return;
   if (event.request.method === 'GET' && url.pathname.startsWith('/avatar/webm/')) {
     event.respondWith(avatarVideoResponse(event.request));
     return;
   }
   event.respondWith(
-    fetch(event.request)
+    fetch(withPreviewAuth(event.request))
       .then((response) => {
+        if (url.pathname.startsWith('/api/') || event.request.method !== 'GET') return response;
         const copy = response.clone();
         caches.open(CACHE).then((cache) => cache.put(event.request, copy));
         return response;
@@ -87,3 +94,25 @@ self.addEventListener('fetch', (event) => {
       .catch(() => caches.match(event.request))
   );
 });
+
+function parsePreviewAuth() {
+  const params = new URL(self.location.href).searchParams;
+  const token = params.get('eo_token');
+  const time = params.get('eo_time');
+  return token && time ? { token, time } : null;
+}
+
+function withPreviewAuth(request) {
+  if (!previewAuth) return request;
+  const url = new URL(request.url);
+  if (url.origin !== self.location.origin || url.searchParams.has('eo_token')) return request;
+  url.searchParams.set('eo_token', previewAuth.token);
+  url.searchParams.set('eo_time', previewAuth.time);
+  return new Request(url.href, request);
+}
+
+async function cachePreviewAsset(cache, asset) {
+  const request = new Request(new URL(asset, self.location.origin).href, { cache: 'reload' });
+  const response = await fetch(withPreviewAuth(request));
+  if (response.ok) await cache.put(request, response.clone());
+}
