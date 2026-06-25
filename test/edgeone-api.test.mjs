@@ -81,6 +81,42 @@ function withEnv(values, fn) {
     });
 }
 
+function withMockedFetch(handler, fn) {
+  const previous = globalThis.fetch;
+  globalThis.fetch = async (input, init) => handler(input, init);
+  return Promise.resolve()
+    .then(fn)
+    .finally(() => {
+      globalThis.fetch = previous;
+    });
+}
+
+function edgeProviderFetch(input) {
+  const url = new URL(String(input));
+  if (url.pathname === '/v1/lyrics_generation') {
+    return new Response(JSON.stringify({
+      base_resp: { status_code: 0 },
+      lyrics: '[Verse]\nA small campus radio song',
+      song_title: 'Campus Signal',
+      style_tags: 'pop'
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url.pathname === '/v1/music_generation') {
+    return new Response(JSON.stringify({
+      base_resp: { status_code: 0 },
+      data: { audio: Buffer.from('fake-mp3').toString('hex') },
+      extra_info: { music_duration: 1 },
+      trace_id: 'trace-ai-music'
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  if (url.pathname === '/v1/chat/completions') {
+    return new Response(JSON.stringify({
+      choices: [{ message: { content: 'OK' } }]
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
+  }
+  return new Response('not found', { status: 404 });
+}
+
 test('EdgeOne health and public config do not expose provider secrets', async () => {
   const { app } = createHarness({
     config: {
@@ -167,27 +203,181 @@ test('EdgeOne API serves TTS audio blobs without requiring a visitor id', async 
   assert.equal(bytes.toString('utf8'), 'fake-mp3');
 });
 
-test('EdgeOne public quota returns 429 after the configured daily limit', async () => {
+test('EdgeOne AI music writes generated audio to Blob and enforces daily quota', async () => {
   await withEnv({ EDGEONE_DAILY_AI_MUSIC_LIMIT: '1' }, async () => {
-    const { app } = createHarness();
+    await withMockedFetch(edgeProviderFetch, async () => {
+      const { app } = createHarness({
+        config: {
+          minimax: {
+            baseUrl: 'https://minimax.test',
+            apiKey: 'private-minimax-key',
+            model: 'music-2.6-free',
+            allowPaidMusic: false,
+            requestTimeoutMs: 1000
+          }
+        }
+      });
 
-    const first = await requestJson(app, '/api/ai-music/generate', {
-      visitorId: VISITOR_A,
-      ip: '203.0.113.10',
-      method: 'POST',
-      body: { prompt: 'short demo' }
+      const first = await requestJson(app, '/api/ai-music/generate', {
+        visitorId: VISITOR_A,
+        ip: '203.0.113.10',
+        method: 'POST',
+        body: { prompt: 'short demo', sessionId: 'ai-session' }
+      });
+      const audio = await app.handle(buildRequest(first.body.track.playUrl));
+      const second = await requestJson(app, '/api/ai-music/generate', {
+        visitorId: VISITOR_A,
+        ip: '203.0.113.10',
+        method: 'POST',
+        body: { prompt: 'short demo again' }
+      });
+
+      assert.equal(first.response.status, 200);
+      assert.equal(first.body.ok, true);
+      assert.equal(first.body.track.aiGenerated, true);
+      assert.match(first.body.track.playUrl, /^\/api\/ai-music\/generated\/ai-minimax-.+\.mp3$/);
+      assert.equal(audio.status, 200);
+      assert.equal(Buffer.from(await audio.arrayBuffer()).toString('utf8'), 'fake-mp3');
+      assert.equal(second.response.status, 429);
+      assert.equal(second.body.code, 'quota_exceeded');
+      assert.equal(second.body.kind, 'aiMusic');
     });
-    const second = await requestJson(app, '/api/ai-music/generate', {
-      visitorId: VISITOR_A,
-      ip: '203.0.113.10',
-      method: 'POST',
-      body: { prompt: 'short demo again' }
+  });
+});
+
+test('EdgeOne prefetch queue is consumed by next and exposed in debug', async () => {
+  const { app } = createHarness();
+
+  const prefetch = await requestJson(app, '/api/radio/prefetch', {
+    visitorId: VISITOR_A,
+    method: 'POST',
+    body: { sessionId: 'queue-session', force: true }
+  });
+  const debugBefore = await requestJson(app, '/api/radio/debug?sessionId=queue-session', { visitorId: VISITOR_A });
+  const next = await requestJson(app, '/api/radio/next', {
+    visitorId: VISITOR_A,
+    method: 'POST',
+    body: { sessionId: 'queue-session' }
+  });
+  const debugAfter = await requestJson(app, '/api/radio/debug?sessionId=queue-session', { visitorId: VISITOR_A });
+
+  assert.equal(prefetch.response.status, 200);
+  assert.equal(prefetch.body.queued, true);
+  assert.equal(debugBefore.body.queue.length, 1);
+  assert.equal(next.body.track.id, prefetch.body.item.track.id);
+  assert.equal(debugAfter.body.queueMetrics.queueHitCount, 1);
+  assert.equal(debugAfter.body.queue.length, 0);
+});
+
+test('EdgeOne concert routes maintain a multi-track isolated program', async () => {
+  const { app } = createHarness();
+
+  const start = await requestJson(app, '/api/radio/concert/start', {
+    visitorId: VISITOR_A,
+    method: 'POST',
+    body: { sessionId: 'concert-session', settings: { length: 5, note: 'demo concert' } }
+  });
+  const next = await requestJson(app, '/api/radio/concert/next', {
+    visitorId: VISITOR_A,
+    method: 'POST',
+    body: { sessionId: 'concert-session' }
+  });
+  const hostEvent = start.body.concert.hostEvents.find(event => event.type === 'interlude');
+  const host = await requestJson(app, '/api/radio/concert/host', {
+    visitorId: VISITOR_A,
+    method: 'POST',
+    body: { sessionId: 'concert-session', eventId: hostEvent.id }
+  });
+  const jump = await requestJson(app, '/api/radio/concert/jump', {
+    visitorId: VISITOR_A,
+    method: 'POST',
+    body: { sessionId: 'concert-session', index: 3 }
+  });
+  const audience = await requestJson(app, '/api/radio/concert/audience', {
+    visitorId: VISITOR_A,
+    method: 'POST',
+    body: { sessionId: 'concert-session', trackId: jump.body.track.id }
+  });
+  const encore = await requestJson(app, '/api/radio/concert/encore', {
+    visitorId: VISITOR_A,
+    method: 'POST',
+    body: { sessionId: 'concert-session' }
+  });
+
+  assert.equal(start.response.status, 200);
+  assert.equal(start.body.concertMode, true);
+  assert.equal(start.body.concert.items.length, 5);
+  assert.equal(start.body.concert.items[0].status, 'current');
+  assert.equal(next.body.concert.currentIndex, 1);
+  assert.equal(next.body.track.id, start.body.concert.items[1].track.id);
+  assert.equal(host.body.track, null);
+  assert.equal(host.body.concert.hostEvents.find(event => event.id === hostEvent.id).status, 'played');
+  assert.equal(jump.body.concert.currentIndex, 3);
+  assert.ok(audience.body.comments.length >= 1);
+  assert.equal(encore.body.concert.encoreUsed, true);
+  assert.equal(encore.body.concert.phase, 'encore');
+});
+
+test('EdgeOne playlist routes expose a program without per-track host speech', async () => {
+  const { app } = createHarness();
+
+  const start = await requestJson(app, '/api/radio/playlist/start', {
+    visitorId: VISITOR_A,
+    method: 'POST',
+    body: { sessionId: 'playlist-session' }
+  });
+  const nextViaConcertCompat = await requestJson(app, '/api/radio/concert/next', {
+    visitorId: VISITOR_A,
+    method: 'POST',
+    body: { sessionId: 'playlist-session' }
+  });
+  const jump = await requestJson(app, '/api/radio/playlist/jump', {
+    visitorId: VISITOR_A,
+    method: 'POST',
+    body: { sessionId: 'playlist-session', index: 4 }
+  });
+
+  assert.equal(start.body.playlistMode, true);
+  assert.equal(start.body.concert.playlistMode, true);
+  assert.equal(start.body.concert.items.length, 5);
+  assert.equal(nextViaConcertCompat.body.playlistMode, true);
+  assert.equal(nextViaConcertCompat.body.hostPolicy, 'none');
+  assert.equal(jump.body.concert.currentIndex, 4);
+});
+
+test('EdgeOne diagnostics returns full sanitized checks', async () => {
+  await withMockedFetch(edgeProviderFetch, async () => {
+    const { app } = createHarness({
+      config: {
+        llm: {
+          baseUrl: 'https://private-llm.example.test',
+          apiKey: 'private-llm-key',
+          model: 'private-model',
+          timeoutMs: 1000
+        },
+        minimax: {
+          baseUrl: 'https://minimax.test',
+          apiKey: 'private-minimax-key',
+          model: 'music-2.6-free',
+          allowPaidMusic: false,
+          requestTimeoutMs: 1000
+        }
+      }
     });
 
-    assert.equal(first.response.status, 503);
-    assert.equal(second.response.status, 429);
-    assert.equal(second.body.code, 'quota_exceeded');
-    assert.equal(second.body.kind, 'aiMusic');
+    const result = await requestJson(app, '/api/diagnostics/self-check', {
+      visitorId: VISITOR_A,
+      method: 'POST',
+      body: { sessionId: 'diag-session' }
+    });
+    const serialized = JSON.stringify(result.body);
+
+    assert.equal(result.response.status, 200);
+    assert.equal(result.body.runtime, 'edgeone');
+    assert.ok(result.body.checks.some(check => check.id === 'llm'));
+    assert.ok(result.body.checks.some(check => check.id === 'storage'));
+    assert.ok(result.body.checks.some(check => check.id === 'ai_music'));
+    assert.doesNotMatch(serialized, /private-llm-key|private-minimax-key|MUSIC_U=/);
   });
 });
 

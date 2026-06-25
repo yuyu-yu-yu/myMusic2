@@ -1,6 +1,7 @@
 import crypto from 'node:crypto';
 import { getConfig, publicConfigStatus } from './config.mjs';
 import { generateChatCompletion } from './ai.mjs';
+import { generateAiMusic } from './ai-music.mjs';
 import {
   getCookieStatus,
   getCookieUserProfile,
@@ -14,6 +15,23 @@ import {
 import { createEdgeOneStore, EdgeOneStorageError } from './edgeone-store.mjs';
 import { DEFAULT_QUOTA_LIMITS, EdgeOneQuotaError, enforceQuota, getClientIp } from './edgeone-quota.mjs';
 import { synthesizeEdgeSpeech } from './edgeone-tts.mjs';
+import { runEdgeOneSelfCheck } from './edgeone-diagnostics.mjs';
+import {
+  edgeConcertAudience,
+  edgeConcertEncore,
+  edgeConcertHost,
+  edgeConcertJump,
+  edgeConcertNext,
+  edgeConcertReplan,
+  edgeConcertStart,
+  edgePlaylistJump,
+  edgePlaylistNext,
+  edgePlaylistStart,
+  edgePrefetchRadio,
+  edgeRadioDebug,
+  edgeRadioTurn,
+  ensureSession
+} from './edgeone-radio-engine.mjs';
 
 const SHARED_LIBRARY_KEY = 'shared/library/v1';
 const SHARED_PROFILE_KEY = 'shared/profile/v1';
@@ -71,9 +89,10 @@ export function createEdgeOneApi({ store, config = getConfig() } = {}) {
     if (pathname === '/api/environment') return jsonResponse({ ok: true, environment: edgeEnvironment(request, config) });
     if (pathname === '/api/track-comments') return handleTrackComments(url);
     if (pathname.startsWith('/api/tts/') && request.method === 'GET') return handleTts(pathname);
+    if (pathname.startsWith('/api/ai-music/generated/') && request.method === 'GET') return handleAiMusicBlob(pathname);
     if (pathname === '/api/admin/library/import' && request.method === 'POST') return handleAdminImport(request);
     if (pathname === '/api/admin/library/sync-cookie' && request.method === 'POST') return handleAdminSyncCookie(request);
-    if (pathname === '/api/admin/cleanup') return jsonResponse({ ok: true, cleaned: 0 });
+    if (pathname === '/api/admin/cleanup') return jsonResponse(await handleAdminCleanup(request));
 
     const ctx = await requestAccountContext(request);
     if (pathname === '/api/account/current') return jsonResponse({ ok: true, account: ctx.account });
@@ -94,11 +113,19 @@ export function createEdgeOneApi({ store, config = getConfig() } = {}) {
 
     if (pathname === '/api/radio/start' && request.method === 'POST') return jsonResponse(await radioTurn(ctx, await readJson(request), 'start'));
     if (pathname === '/api/radio/next' && request.method === 'POST') return jsonResponse(await radioTurn(ctx, await readJson(request), 'next'));
-    if (pathname === '/api/radio/prefetch' && request.method === 'POST') return jsonResponse({ ok: true, queued: false, runtime: 'edgeone' });
+    if (pathname === '/api/radio/prefetch' && request.method === 'POST') return jsonResponse(await prefetchTurn(ctx, await readJson(request)));
     if (pathname === '/api/radio/chat' && request.method === 'POST') return jsonResponse(await chatTurn(ctx, await readJson(request)));
-    if (pathname === '/api/radio/debug' && request.method === 'GET') return jsonResponse({ ok: true, sessionId: url.searchParams.get('sessionId') || '', runtime: 'edgeone', queue: [] });
-    if (pathname.startsWith('/api/radio/concert/') && request.method === 'POST') return jsonResponse(await radioTurn(ctx, await readJson(request), 'concert'));
-    if (pathname.startsWith('/api/radio/playlist/') && request.method === 'POST') return jsonResponse(await radioTurn(ctx, await readJson(request), 'playlist'));
+    if (pathname === '/api/radio/debug' && request.method === 'GET') return jsonResponse(edgeRadioDebug({ ctx, sessionId: url.searchParams.get('sessionId') || '' }));
+    if (pathname === '/api/radio/concert/start' && request.method === 'POST') return jsonResponse(await concertStart(ctx, await readJson(request)));
+    if (pathname === '/api/radio/concert/next' && request.method === 'POST') return jsonResponse(await concertNext(ctx, await readJson(request)));
+    if (pathname === '/api/radio/concert/host' && request.method === 'POST') return jsonResponse(await concertHost(ctx, await readJson(request)));
+    if (pathname === '/api/radio/concert/jump' && request.method === 'POST') return jsonResponse(await concertJump(ctx, await readJson(request)));
+    if (pathname === '/api/radio/concert/replan' && request.method === 'POST') return jsonResponse(await concertReplan(ctx, await readJson(request)));
+    if (pathname === '/api/radio/concert/audience' && request.method === 'POST') return jsonResponse(await concertAudience(ctx, await readJson(request)));
+    if (pathname === '/api/radio/concert/encore' && request.method === 'POST') return jsonResponse(await concertEncore(ctx, await readJson(request)));
+    if (pathname === '/api/radio/playlist/start' && request.method === 'POST') return jsonResponse(await playlistStart(ctx, await readJson(request)));
+    if (pathname === '/api/radio/playlist/next' && request.method === 'POST') return jsonResponse(await playlistNext(ctx, await readJson(request)));
+    if (pathname === '/api/radio/playlist/jump' && request.method === 'POST') return jsonResponse(await playlistJump(ctx, await readJson(request)));
     if (pathname === '/api/feedback' && request.method === 'POST') return jsonResponse(await recordFeedback(ctx, await readJson(request)));
     if (pathname === '/api/play/report' && request.method === 'POST') return jsonResponse(await recordPlayReport(ctx, await readJson(request)));
 
@@ -110,11 +137,11 @@ export function createEdgeOneApi({ store, config = getConfig() } = {}) {
     if (pathname === '/api/diary/radio' && request.method === 'POST') return jsonResponse(await radioTurn(ctx, await readJson(request), 'diary'));
     if (/^\/api\/diary\/[^/]+$/.test(pathname) && request.method === 'GET') return jsonResponse(await getDiary(ctx, decodeURIComponent(pathname.split('/').pop())));
 
-    if (pathname === '/api/ai-music/generate' && request.method === 'POST') return jsonResponse(await aiMusicNotReady(ctx));
+    if (pathname === '/api/ai-music/generate' && request.method === 'POST') return jsonResponse(await generateAiMusicEdge(ctx, await readJson(request)));
     if (pathname.startsWith('/api/player/')) return jsonResponse({ ok: true, state: { status: 'browser-direct', runtime: 'edgeone' } });
     if (pathname.startsWith('/api/auth/netease')) return jsonResponse(locked('NetEase login changes are locked on the public EdgeOne demo.'));
     if (pathname.startsWith('/api/context/schedule/')) return jsonResponse({ ok: true, configured: false, connected: false, status: 'disabled', context: null });
-    if (pathname === '/api/diagnostics/self-check') return jsonResponse({ ok: true, runtime: 'edgeone', checks: [] });
+    if (pathname === '/api/diagnostics/self-check') return jsonResponse(await diagnosticsSelfCheck(ctx, await readJson(request)));
     if (pathname.startsWith('/api/')) return jsonResponse({ ok: false, error: `API route not found: ${request.method} ${pathname}` }, 404);
     return jsonResponse({ ok: false, error: 'Not found' }, 404);
   }
@@ -205,21 +232,125 @@ export function createEdgeOneApi({ store, config = getConfig() } = {}) {
 
   async function radioTurn(ctx, payload = {}, source = 'start') {
     const library = await getSharedLibrary();
-    const track = selectNextTrack(library.tracks, ctx.state, payload);
-    const playable = await resolvePlayableTrack(track);
-    const sessionId = payload.sessionId || crypto.randomUUID();
-    const chatText = await hostLine(ctx, playable, payload.message || '', source);
-    const ttsUrl = await maybeSpeech(ctx, chatText, 'recommendation');
-    const play = {
-      trackId: playable.id,
-      playedAt: nowIso(),
+    return await edgeRadioTurn({
+      ctx,
+      payload,
       source,
-      reason: chatText
-    };
-    ctx.state.plays = [...(ctx.state.plays || []), play].slice(-200);
-    ctx.state.sessions[sessionId] = { id: sessionId, updatedAt: nowIso(), currentTrackId: playable.id };
-    await saveDeviceState(ctx);
-    return radioResponse({ sessionId, track: playable, chatText, ttsUrl, source });
+      library,
+      resolveTrack: resolvePlayableTrack,
+      hostLine,
+      maybeSpeech,
+      saveState: saveDeviceState
+    });
+  }
+
+  async function prefetchTurn(ctx, payload = {}) {
+    const library = await getSharedLibrary();
+    return await edgePrefetchRadio({
+      ctx,
+      payload,
+      library,
+      resolveTrack: resolvePlayableTrack,
+      saveState: saveDeviceState
+    });
+  }
+
+  async function concertStart(ctx, payload = {}) {
+    const library = await getSharedLibrary();
+    return await edgeConcertStart({
+      ctx,
+      payload,
+      library,
+      resolveTrack: resolvePlayableTrack,
+      hostLine,
+      maybeSpeech,
+      saveState: saveDeviceState
+    });
+  }
+
+  async function concertNext(ctx, payload = {}) {
+    const library = await getSharedLibrary();
+    return await edgeConcertNext({
+      ctx,
+      payload,
+      library,
+      resolveTrack: resolvePlayableTrack,
+      hostLine,
+      maybeSpeech,
+      saveState: saveDeviceState
+    });
+  }
+
+  async function concertHost(ctx, payload = {}) {
+    return await edgeConcertHost({ ctx, payload, maybeSpeech, saveState: saveDeviceState });
+  }
+
+  async function concertJump(ctx, payload = {}) {
+    return await edgeConcertJump({
+      ctx,
+      payload,
+      resolveTrack: resolvePlayableTrack,
+      hostLine,
+      maybeSpeech,
+      saveState: saveDeviceState
+    });
+  }
+
+  async function concertReplan(ctx, payload = {}) {
+    const library = await getSharedLibrary();
+    return await edgeConcertReplan({ ctx, payload, library, saveState: saveDeviceState });
+  }
+
+  async function concertAudience(ctx, payload = {}) {
+    return await edgeConcertAudience({ ctx, payload, saveState: saveDeviceState });
+  }
+
+  async function concertEncore(ctx, payload = {}) {
+    const library = await getSharedLibrary();
+    return await edgeConcertEncore({
+      ctx,
+      payload,
+      library,
+      resolveTrack: resolvePlayableTrack,
+      hostLine,
+      maybeSpeech,
+      saveState: saveDeviceState
+    });
+  }
+
+  async function playlistStart(ctx, payload = {}) {
+    const library = await getSharedLibrary();
+    return await edgePlaylistStart({
+      ctx,
+      payload,
+      library,
+      resolveTrack: resolvePlayableTrack,
+      saveState: saveDeviceState
+    });
+  }
+
+  async function playlistNext(ctx, payload = {}) {
+    const library = await getSharedLibrary();
+    return await edgePlaylistNext({
+      ctx,
+      payload,
+      library,
+      resolveTrack: resolvePlayableTrack,
+      hostLine,
+      maybeSpeech,
+      saveState: saveDeviceState
+    });
+  }
+
+  async function playlistJump(ctx, payload = {}) {
+    return await edgePlaylistJump({
+      ctx,
+      payload,
+      resolveTrack: resolvePlayableTrack,
+      hostLine,
+      maybeSpeech,
+      saveState: saveDeviceState
+    });
   }
 
   async function chatTurn(ctx, payload = {}) {
@@ -435,14 +566,130 @@ export function createEdgeOneApi({ store, config = getConfig() } = {}) {
     };
   }
 
-  async function aiMusicNotReady(ctx) {
+  async function generateAiMusicEdge(ctx, payload = {}) {
+    if (!config.minimax?.apiKey) {
+      return {
+        __error: true,
+        ok: false,
+        status: 503,
+        code: 'provider_unavailable',
+        error: 'MiniMax music API is not configured.'
+      };
+    }
     await enforceQuota({ store, kind: 'aiMusic', deviceId: ctx.visitorId, ip: ctx.ip, limit: quotaLimit('aiMusic') });
-    return {
-      __error: true,
-      ok: false,
-      status: 503,
-      error: 'AI music generation storage migration is not enabled on EdgeOne yet.'
-    };
+    const profile = (await getSharedProfile()).profile;
+    const environmentContext = edgeEnvironment(ctx.request, config);
+    let result;
+    try {
+      result = await generateAiMusic({
+        config: config.minimax,
+        profile,
+        payload: {
+          ...payload,
+          environmentContext,
+          recentMessages: (ctx.state.messages || []).slice(-12),
+          musicContext: latestMusicContext(ctx, payload.sessionId)
+        },
+        saveAudio: async ({ id, audioBuffer, title, prompt, lyrics, model, response }) => {
+          const audioKey = aiMusicAudioKey(id);
+          const meta = {
+            id,
+            title,
+            prompt,
+            lyrics,
+            model,
+            traceId: response?.trace_id || null,
+            ownerDeviceId: ctx.visitorId,
+            createdAt: nowIso(),
+            expiresAt: new Date(Date.now() + aiMusicTtlMs()).toISOString(),
+            contentType: 'audio/mpeg',
+            size: Buffer.from(audioBuffer || []).length
+          };
+          await store.setBytes(audioKey, audioBuffer, meta);
+          await store.setJson(aiMusicMetaKey(id), meta);
+          return { playUrl: `/api/ai-music/generated/${id}.mp3` };
+        }
+      });
+    } catch (error) {
+      return {
+        __error: true,
+        ok: false,
+        status: 503,
+        code: 'provider_unavailable',
+        error: `AI music provider failed: ${String(error?.message || error).slice(0, 180)}`
+      };
+    }
+    if (result?.ok && result.track?.id) {
+      ctx.state.aiMusic = [...(ctx.state.aiMusic || []), {
+        id: result.track.id,
+        name: result.track.name,
+        playUrl: result.track.playUrl,
+        createdAt: nowIso(),
+        expiresAt: new Date(Date.now() + aiMusicTtlMs()).toISOString()
+      }].slice(-50);
+      if (result.sessionId) {
+        const session = ensureSession(ctx, result.sessionId);
+        session.currentTrackId = result.track.id;
+        session.mode = 'ai_music';
+      }
+      ctx.state.plays = [...(ctx.state.plays || []), {
+        trackId: result.track.id,
+        playedAt: nowIso(),
+        source: 'ai_music',
+        reason: result.chatText || ''
+      }].slice(-200);
+      await saveDeviceState(ctx);
+    }
+    return result;
+  }
+
+  async function handleAiMusicBlob(pathname) {
+    const id = pathname.split('/').pop()?.replace(/\.mp3$/, '') || '';
+    if (!/^ai-minimax-[A-Za-z0-9-]+$/.test(id)) return emptyResponse(404);
+    const bytes = await store.getBytes(aiMusicAudioKey(id));
+    if (!bytes?.length) return emptyResponse(404);
+    return new Response(bytes, {
+      status: 200,
+      headers: {
+        'content-type': 'audio/mpeg',
+        'cache-control': 'public, max-age=604800'
+      }
+    });
+  }
+
+  async function diagnosticsSelfCheck(ctx, payload = {}) {
+    const sessionId = payload.sessionId || '';
+    const session = sessionId && ctx.state.sessions ? ctx.state.sessions[sessionId] : null;
+    return await runEdgeOneSelfCheck({
+      config,
+      store,
+      ctx,
+      session,
+      trackId: payload.trackId || '',
+      getSharedLibrary,
+      getSyncStatus,
+      resolveTrack: resolvePlayableTrack
+    });
+  }
+
+  async function handleAdminCleanup(request) {
+    if (request.method === 'POST') {
+      try { assertAdmin(request); } catch (error) {
+        if (process.env.EDGEONE_ADMIN_TOKEN) throw error;
+      }
+    }
+    const now = Date.now();
+    let cleaned = 0;
+    const keys = await store.list('ai-music/meta/');
+    for (const key of keys) {
+      const meta = await store.getJson(key, null);
+      const expired = Date.parse(meta?.expiresAt || '') || 0;
+      if (!expired || expired > now) continue;
+      await store.delete(key);
+      await store.delete(aiMusicAudioKey(meta.id));
+      cleaned += 1;
+    }
+    return { ok: true, cleaned, runtime: 'edgeone' };
   }
 
   return { handle };
@@ -500,6 +747,7 @@ function normalizeDeviceState(raw = {}) {
     memories: Array.isArray(raw.memories) ? raw.memories.slice(-120) : [],
     moodEvents: Array.isArray(raw.moodEvents) ? raw.moodEvents.slice(-120) : [],
     diaries: Array.isArray(raw.diaries) ? raw.diaries.slice(-60) : [],
+    aiMusic: Array.isArray(raw.aiMusic) ? raw.aiMusic.slice(-50) : [],
     sessions: raw.sessions && typeof raw.sessions === 'object' && !Array.isArray(raw.sessions) ? raw.sessions : {}
   };
 }
@@ -746,6 +994,24 @@ function normalizeVisitorId(value) {
 
 function deviceKey(visitorId) {
   return `devices/${visitorId}/state`;
+}
+
+function aiMusicAudioKey(id) {
+  return `ai-music/generated/${id}.mp3`;
+}
+
+function aiMusicMetaKey(id) {
+  return `ai-music/meta/${id}.json`;
+}
+
+function aiMusicTtlMs() {
+  const days = Math.max(1, Number(process.env.EDGEONE_AI_MUSIC_TTL_DAYS || 7) || 7);
+  return days * 24 * 60 * 60 * 1000;
+}
+
+function latestMusicContext(ctx, sessionId = '') {
+  const session = sessionId && ctx.state?.sessions ? ctx.state.sessions[sessionId] : null;
+  return session?.musicContext || session?.radioDebug?.musicContext || {};
 }
 
 function today(config = {}) {

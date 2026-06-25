@@ -7,7 +7,7 @@ const DEFAULT_BASE_URL = 'https://api.minimaxi.com';
 const DEFAULT_DURATION_MS = 150000;
 const REQUEST_TIMEOUT_MS = 180000;
 
-export async function generateAiMusic({ config = {}, rootDir = process.cwd(), profile = {}, payload = {} } = {}) {
+export async function generateAiMusic({ config = {}, rootDir = process.cwd(), profile = {}, payload = {}, saveAudio = null } = {}) {
   const minimax = normalizeMiniMaxConfig(config);
   const configuredModel = minimax.model;
   if (!minimax.allowPaidMusic && !isFreeModel(minimax.model)) {
@@ -59,10 +59,23 @@ export async function generateAiMusic({ config = {}, rootDir = process.cwd(), pr
   const audioBuffer = await resolveAudioBuffer(response, minimax);
   if (!audioBuffer?.length) throw new Error('MiniMax 未返回可保存的音频。');
 
-  const relativeFile = `/ai-music/generated/${id}.mp3`;
-  const outputPath = path.join(rootDir, 'public', 'ai-music', 'generated', `${id}.mp3`);
-  await fs.mkdir(path.dirname(outputPath), { recursive: true });
-  await fs.writeFile(outputPath, audioBuffer);
+  let relativeFile = `/ai-music/generated/${id}.mp3`;
+  if (typeof saveAudio === 'function') {
+    const saved = await saveAudio({
+      id,
+      audioBuffer,
+      response,
+      prompt,
+      lyrics: lyrics || extractGeneratedLyrics(response),
+      title,
+      model: usedModel
+    });
+    relativeFile = saved?.playUrl || relativeFile;
+  } else {
+    const outputPath = path.join(rootDir, 'public', 'ai-music', 'generated', `${id}.mp3`);
+    await fs.mkdir(path.dirname(outputPath), { recursive: true });
+    await fs.writeFile(outputPath, audioBuffer);
+  }
 
   const durationMs = normalizeDurationMs(response?.extra_info?.music_duration);
   const generatedLyrics = lyrics || extractGeneratedLyrics(response);
@@ -98,8 +111,8 @@ export async function generateAiMusic({ config = {}, rootDir = process.cwd(), pr
       model: usedModel,
       fallbackModelFrom: usedModel === minimax.model ? null : minimax.model,
       configuredModel,
-      paidModelBlocked: configuredModel !== minimax.model,
-      prompt,
+        paidModelBlocked: configuredModel !== minimax.model,
+        prompt,
       lyrics: generatedLyrics,
       lyricsGeneration: {
         status: lyricsResult.status,
@@ -252,7 +265,7 @@ async function callMiniMaxLyrics(minimax, body) {
       'content-type': 'application/json'
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout?.(REQUEST_TIMEOUT_MS)
+    signal: AbortSignal.timeout?.(minimax.requestTimeoutMs || REQUEST_TIMEOUT_MS)
   });
 
   const text = await response.text();
@@ -280,7 +293,7 @@ async function callMiniMaxMusic(minimax, body) {
       'content-type': 'application/json'
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout?.(REQUEST_TIMEOUT_MS)
+    signal: AbortSignal.timeout?.(minimax.requestTimeoutMs || REQUEST_TIMEOUT_MS)
   });
 
   const text = await response.text();
@@ -305,7 +318,7 @@ async function resolveAudioBuffer(response, minimax) {
   if (/^https?:\/\//i.test(audio)) {
     const res = await fetch(audio, {
       headers: minimax.apiKey ? { authorization: `Bearer ${minimax.apiKey}` } : undefined,
-      signal: AbortSignal.timeout?.(REQUEST_TIMEOUT_MS)
+      signal: AbortSignal.timeout?.(minimax.requestTimeoutMs || REQUEST_TIMEOUT_MS)
     });
     if (!res.ok) throw new Error(`MiniMax 音频下载失败：HTTP ${res.status}`);
     return Buffer.from(await res.arrayBuffer());
@@ -336,7 +349,8 @@ function normalizeMiniMaxConfig(config = {}) {
     baseUrl: config.baseUrl || DEFAULT_BASE_URL,
     apiKey: config.apiKey || '',
     model: config.model || DEFAULT_MODEL,
-    allowPaidMusic: Boolean(config.allowPaidMusic)
+    allowPaidMusic: Boolean(config.allowPaidMusic),
+    requestTimeoutMs: Math.max(1000, Number(config.requestTimeoutMs || config.timeoutMs || REQUEST_TIMEOUT_MS) || REQUEST_TIMEOUT_MS)
   };
 }
 
