@@ -5,9 +5,8 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const apiPath = resolveCommunityApiFile('main.js');
-const require = createRequire('file:///' + apiPath.replace(/\\/g, '/'));
-const api = require(apiPath);
+const packageRequire = createRequire(import.meta.url);
+const api = loadCommunityApi();
 
 let _cookie = null;
 let _cookiePath = null;
@@ -25,6 +24,20 @@ export function resolveCommunityApiFile(fileName) {
     throw new Error(`Cannot find NeteaseCloudMusicApi ${fileName}. Run packaging/build-release.ps1 or install NeteaseCloudMusicApi.`);
   }
   return found;
+}
+
+function loadCommunityApi() {
+  try {
+    return packageRequire('NeteaseCloudMusicApi');
+  } catch (packageError) {
+    try {
+      const apiPath = resolveCommunityApiFile('main.js');
+      const fileRequire = createRequire('file:///' + apiPath.replace(/\\/g, '/'));
+      return fileRequire(apiPath);
+    } catch {
+      throw packageError;
+    }
+  }
 }
 
 export function loadCookie(rootDir) {
