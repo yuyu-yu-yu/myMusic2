@@ -1,0 +1,27 @@
+{
+  "nodeVersion": "22.11.0",
+  "installCommand": "npm ci",
+  "outputDirectory": "./public",
+  "cloudFunctions": {
+    "nodejs": {
+      "maxDuration": 120,
+      "externalNodeModules": [
+        "NeteaseCloudMusicApi",
+        "@edgeone/pages-blob"
+      ]
+    },
+    "mainlandRegions": [
+      "ap-guangzhou"
+    ],
+    "overseasRegions": [
+      "ap-singapore"
+    ]
+  },
+  "schedules": [
+    {
+      "name": "daily-edgeone-cleanup",
+      "cron": "0 3 * * *",
+      "path": "/api/admin/cleanup"
+    }
+  ]
+}
