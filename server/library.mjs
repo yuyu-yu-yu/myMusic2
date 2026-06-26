@@ -688,7 +688,16 @@ export function publishDemoLibrarySnapshot(db, accountContext = null) {
   if (!sourceActiveIds.length) {
     return { __error: true, ok: false, status: 400, error: '当前设备还没有可发布的曲库快照。请先同步音乐。' };
   }
-  const sourceExcludedIds = normalizeIdList(safeJson(getAccountSetting(db, sourceAccount.accountId, PROFILE_EXCLUDED_PLAYLIST_IDS_KEY), []));
+  const sourceProfilePayload = safeJson(sourceProfile.profileJson, {});
+  const sourceProfileSelectedIds = normalizeIdList(sourceProfilePayload.selectedPlaylistIds);
+  const sourceProfileExcludedIds = normalizeIdList(sourceProfilePayload.excludedPlaylistIds);
+  const sourceStoredExcludedIds = normalizeIdList(safeJson(getAccountSetting(db, sourceAccount.accountId, PROFILE_EXCLUDED_PLAYLIST_IDS_KEY), []));
+  const fallbackExcludedSet = new Set(sourceProfileExcludedIds.length ? sourceProfileExcludedIds : sourceStoredExcludedIds);
+  const sourceSelectedIds = sourceProfileSelectedIds.length
+    ? sourceActiveIds.filter((id) => sourceProfileSelectedIds.includes(id))
+    : sourceActiveIds.filter((id) => !fallbackExcludedSet.has(id));
+  const sourceSelectedSet = new Set(sourceSelectedIds);
+  const sourceExcludedIds = sourceActiveIds.filter((id) => !sourceSelectedSet.has(id));
   const syncedUserId = getScopedLibrarySetting(db, sourceAccount, LIBRARY_SYNCED_USER_ID_KEY)
     || sourceAccount.providerUserId
     || baseAccount.providerUserId
@@ -697,7 +706,11 @@ export function publishDemoLibrarySnapshot(db, accountContext = null) {
   const activeIdsJson = JSON.stringify(sourceActiveIds);
   const excludedIdsJson = JSON.stringify(sourceExcludedIds);
   const tagsJson = JSON.stringify(safeJson(sourceProfile.tagsJson, []));
-  const profileJson = JSON.stringify(safeJson(sourceProfile.profileJson, {}));
+  const profileJson = JSON.stringify({
+    ...sourceProfilePayload,
+    selectedPlaylistIds: sourceSelectedIds,
+    excludedPlaylistIds: sourceExcludedIds
+  });
   const targetAccountIds = [
     baseAccount.accountId,
     ...db.prepare(`
@@ -749,7 +762,7 @@ export function publishDemoLibrarySnapshot(db, accountContext = null) {
     published: true,
     source: sourceAccount.source,
     targetAccounts: uniqueTargetAccountIds.length,
-    selectedPlaylistIds: sourceActiveIds.filter((id) => !sourceExcludedIds.includes(id)),
+    selectedPlaylistIds: sourceSelectedIds,
     excludedPlaylistIds: sourceExcludedIds,
     profile: {
       summary: sourceProfile.summary,

@@ -276,7 +276,11 @@ test('guest can publish the current music profile as the shared demo snapshot', 
   const config = { demo: { guestMode: true } };
   const sourceGuest = resolveRequestAccountContext(db, config, requestFor('publish-source-1234'));
   const otherGuest = resolveRequestAccountContext(db, config, requestFor('publish-other-1234'));
-  updateProfilePlaylistSelection(db, [seeded.playlistId], sourceGuest);
+  const excludedPlaylist = savePlaylist(db, { id: 'pl-publish-excluded', name: 'Excluded Publish Playlist' }, 'subscribed');
+  const selectedPlaylist = savePlaylist(db, { id: 'pl-publish-selected', name: 'Selected Publish Playlist' }, 'created');
+  const allPlaylistIds = [seeded.playlistId, excludedPlaylist.id, selectedPlaylist.id];
+  setAccountSetting(db, sourceGuest.accountId, 'library_synced_playlist_ids', JSON.stringify(allPlaylistIds));
+  updateProfilePlaylistSelection(db, allPlaylistIds, sourceGuest);
   db.prepare(`
     INSERT INTO account_music_profiles (account_id, summary, tags_json, profile_json, updated_at)
     VALUES (?, ?, ?, ?, ?)
@@ -289,7 +293,12 @@ test('guest can publish the current music profile as the shared demo snapshot', 
     sourceGuest.accountId,
     'Published guest music profile',
     JSON.stringify(['published', 'demo']),
-    JSON.stringify({ source: 'test', selectedPlaylistIds: [seeded.playlistId], trackCount: 1 }),
+    JSON.stringify({
+      source: 'test',
+      selectedPlaylistIds: [seeded.playlistId, selectedPlaylist.id],
+      excludedPlaylistIds: [excludedPlaylist.id],
+      trackCount: 1
+    }),
     new Date().toISOString()
   );
 
@@ -298,10 +307,18 @@ test('guest can publish the current music profile as the shared demo snapshot', 
   assert.equal(result.ok, true);
   assert.equal(result.published, true);
   assert.equal(result.targetAccounts, 3);
+  assert.deepEqual(result.selectedPlaylistIds, [seeded.playlistId, selectedPlaylist.id]);
+  assert.deepEqual(result.excludedPlaylistIds, [excludedPlaylist.id]);
   assert.equal(db.prepare('SELECT summary FROM music_profile WHERE id = 1').get().summary, 'Published guest music profile');
   assert.equal(getProfile(db, { accountId: seeded.baseAccountId, source: 'cookie' }).summary, 'Published guest music profile');
   assert.equal(getLibrary(db, otherGuest).profile.summary, 'Published guest music profile');
-  assert.deepEqual(JSON.parse(getAccountSetting(db, otherGuest.accountId, 'library_synced_playlist_ids')), [seeded.playlistId]);
+  assert.deepEqual(JSON.parse(getAccountSetting(db, otherGuest.accountId, 'library_synced_playlist_ids')), allPlaylistIds);
+  assert.deepEqual(JSON.parse(getAccountSetting(db, otherGuest.accountId, 'profile_excluded_playlist_ids')), [excludedPlaylist.id]);
+  const otherSelection = getLibrary(db, otherGuest).profileSelection;
+  assert.deepEqual([...otherSelection.selectedIds].sort(), [seeded.playlistId, selectedPlaylist.id].sort());
+  assert.deepEqual(otherSelection.excludedIds, [excludedPlaylist.id]);
+  assert.equal(otherSelection.selectedCount, 2);
+  assert.equal(otherSelection.totalCount, 3);
 });
 
 test('expired demo guest cleanup only deletes demo guest scoped data', (t) => {
