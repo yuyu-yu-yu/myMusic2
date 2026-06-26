@@ -972,7 +972,7 @@ button.danger:hover {
 
 .ai-music-toggle {
   display: grid;
-  grid-template-columns: 16px minmax(0, 1fr) minmax(0, 42%);
+  grid-template-columns: 16px minmax(0, 1fr);
   align-items: center;
   gap: 10px;
   width: 100%;
@@ -1011,6 +1011,7 @@ button.danger:hover {
   display: grid;
   gap: 2px;
   min-width: 0;
+  overflow: hidden;
 }
 
 .ai-music-toggle-copy strong,
@@ -1019,8 +1020,12 @@ button.danger:hover {
 }
 
 .ai-music-toggle-copy strong {
+  display: flex;
+  align-items: baseline;
   font-size: 12px;
   letter-spacing: 0.05em;
+  min-width: 0;
+  white-space: nowrap;
 }
 
 .ai-music-toggle-copy small {
@@ -1048,19 +1053,18 @@ button.danger:hover {
 }
 
 .ai-music-rights-note {
-  display: -webkit-box;
-  justify-self: end;
-  max-width: 100%;
-  max-height: 28px;
+  flex: 1 1 auto;
+  min-width: 0;
   overflow: hidden;
-  color: rgba(255, 78, 118, 0.94);
+  margin-left: 6px;
+  color: rgba(0, 240, 255, 0.9);
   font-size: 10px;
-  line-height: 1.35;
+  font-weight: 400;
+  line-height: inherit;
   letter-spacing: 0;
-  text-align: right;
-  text-shadow: 0 0 8px rgba(255, 0, 80, 0.24);
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
+  text-overflow: ellipsis;
+  text-shadow: 0 0 8px rgba(0, 240, 255, 0.24);
+  white-space: nowrap;
 }
 
 @media (max-width: 760px) {
