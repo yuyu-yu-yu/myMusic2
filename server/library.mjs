@@ -668,6 +668,98 @@ export function updateProfilePlaylistSelection(db, selectedPlaylistIds = [], acc
   return getLibrary(db, account);
 }
 
+export function publishDemoLibrarySnapshot(db, accountContext = null) {
+  const sourceAccount = getLibraryAccountContext(db, accountContext);
+  const baseAccount = resolveAccountContext(db);
+  const sourceProfile = db.prepare(`
+    SELECT summary, tags_json AS tagsJson, profile_json AS profileJson, updated_at AS updatedAt
+    FROM account_music_profiles
+    WHERE account_id = ?
+  `).get(sourceAccount.accountId) || db.prepare(`
+    SELECT summary, tags_json AS tagsJson, profile_json AS profileJson, updated_at AS updatedAt
+    FROM music_profile
+    WHERE id = 1
+  `).get();
+  if (!sourceProfile?.summary) {
+    return { __error: true, ok: false, status: 400, error: '当前设备还没有可发布的音乐画像。请先更新音乐画像。' };
+  }
+
+  const sourceActiveIds = normalizeIdList(safeJson(getScopedLibrarySetting(db, sourceAccount, LIBRARY_SYNCED_PLAYLIST_IDS_KEY), []));
+  if (!sourceActiveIds.length) {
+    return { __error: true, ok: false, status: 400, error: '当前设备还没有可发布的曲库快照。请先同步音乐。' };
+  }
+  const sourceExcludedIds = normalizeIdList(safeJson(getAccountSetting(db, sourceAccount.accountId, PROFILE_EXCLUDED_PLAYLIST_IDS_KEY), []));
+  const syncedUserId = getScopedLibrarySetting(db, sourceAccount, LIBRARY_SYNCED_USER_ID_KEY)
+    || sourceAccount.providerUserId
+    || baseAccount.providerUserId
+    || '';
+  const updatedAt = nowIso();
+  const activeIdsJson = JSON.stringify(sourceActiveIds);
+  const excludedIdsJson = JSON.stringify(sourceExcludedIds);
+  const tagsJson = JSON.stringify(safeJson(sourceProfile.tagsJson, []));
+  const profileJson = JSON.stringify(safeJson(sourceProfile.profileJson, {}));
+  const targetAccountIds = [
+    baseAccount.accountId,
+    ...db.prepare(`
+      SELECT DISTINCT account_id AS accountId
+      FROM account_settings
+      WHERE account_id LIKE 'demo:guest:%'
+        AND key = 'demo_guest_seeded_at'
+    `).all().map((row) => row.accountId)
+  ].filter(Boolean);
+  const uniqueTargetAccountIds = [...new Set(targetAccountIds)];
+
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    setSetting(db, LIBRARY_SYNCED_PLAYLIST_IDS_KEY, activeIdsJson);
+    if (syncedUserId) setSetting(db, LIBRARY_SYNCED_USER_ID_KEY, syncedUserId);
+    setSetting(db, PROFILE_EXCLUDED_PLAYLIST_IDS_KEY, excludedIdsJson);
+    db.prepare(`
+      INSERT INTO music_profile (id, summary, tags_json, profile_json, updated_at)
+      VALUES (1, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET
+        summary = excluded.summary,
+        tags_json = excluded.tags_json,
+        profile_json = excluded.profile_json,
+        updated_at = excluded.updated_at
+    `).run(sourceProfile.summary, tagsJson, profileJson, updatedAt);
+    const profileStmt = db.prepare(`
+      INSERT INTO account_music_profiles (account_id, summary, tags_json, profile_json, updated_at)
+      VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(account_id) DO UPDATE SET
+        summary = excluded.summary,
+        tags_json = excluded.tags_json,
+        profile_json = excluded.profile_json,
+        updated_at = excluded.updated_at
+    `);
+    for (const accountId of uniqueTargetAccountIds) {
+      setAccountSetting(db, accountId, LIBRARY_SYNCED_PLAYLIST_IDS_KEY, activeIdsJson);
+      if (syncedUserId) setAccountSetting(db, accountId, LIBRARY_SYNCED_USER_ID_KEY, syncedUserId);
+      setAccountSetting(db, accountId, PROFILE_EXCLUDED_PLAYLIST_IDS_KEY, excludedIdsJson);
+      profileStmt.run(accountId, sourceProfile.summary, tagsJson, profileJson, updatedAt);
+    }
+    db.exec('COMMIT');
+  } catch (error) {
+    db.exec('ROLLBACK');
+    throw error;
+  }
+
+  return {
+    ok: true,
+    published: true,
+    source: sourceAccount.source,
+    targetAccounts: uniqueTargetAccountIds.length,
+    selectedPlaylistIds: sourceActiveIds.filter((id) => !sourceExcludedIds.includes(id)),
+    excludedPlaylistIds: sourceExcludedIds,
+    profile: {
+      summary: sourceProfile.summary,
+      tags: safeJson(tagsJson, []),
+      structured: safeJson(profileJson, {}),
+      updatedAt
+    }
+  };
+}
+
 export function extractRecords(data) {
   if (!data) return [];
   if (Array.isArray(data)) return data;

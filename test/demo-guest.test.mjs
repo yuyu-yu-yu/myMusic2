@@ -18,7 +18,7 @@ import {
   setSetting
 } from '../server/db.mjs';
 import { cleanupDemoGuest, cleanupExpiredDemoGuests, DemoVisitorIdError, resolveRequestAccountContext } from '../server/demo-guest.mjs';
-import { getLibrary, getProfile, updateProfile } from '../server/library.mjs';
+import { getLibrary, getProfile, publishDemoLibrarySnapshot, updateProfile, updateProfilePlaylistSelection } from '../server/library.mjs';
 import { getDiaryOverview } from '../server/music-recap.mjs';
 import { getPreferences, restoreDeviceSnapshot, submitFeedback, updatePreferences } from '../server/radio.mjs';
 
@@ -268,6 +268,40 @@ test('guest portrait updates do not overwrite the shared demo portrait', async (
   assert.equal(getProfile(db, guest).structured.trackCount, 1);
   assert.equal(getProfile(db, { accountId: seeded.baseAccountId, source: 'cookie' }).summary, 'Base music profile');
   assert.equal(db.prepare('SELECT summary FROM music_profile WHERE id = 1').get().summary, 'Base music profile');
+});
+
+test('guest can publish the current music profile as the shared demo snapshot', (t) => {
+  const db = testDb(t);
+  const seeded = seedDemoAccount(db);
+  const config = { demo: { guestMode: true } };
+  const sourceGuest = resolveRequestAccountContext(db, config, requestFor('publish-source-1234'));
+  const otherGuest = resolveRequestAccountContext(db, config, requestFor('publish-other-1234'));
+  updateProfilePlaylistSelection(db, [seeded.playlistId], sourceGuest);
+  db.prepare(`
+    INSERT INTO account_music_profiles (account_id, summary, tags_json, profile_json, updated_at)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(account_id) DO UPDATE SET
+      summary = excluded.summary,
+      tags_json = excluded.tags_json,
+      profile_json = excluded.profile_json,
+      updated_at = excluded.updated_at
+  `).run(
+    sourceGuest.accountId,
+    'Published guest music profile',
+    JSON.stringify(['published', 'demo']),
+    JSON.stringify({ source: 'test', selectedPlaylistIds: [seeded.playlistId], trackCount: 1 }),
+    new Date().toISOString()
+  );
+
+  const result = publishDemoLibrarySnapshot(db, sourceGuest);
+
+  assert.equal(result.ok, true);
+  assert.equal(result.published, true);
+  assert.equal(result.targetAccounts, 3);
+  assert.equal(db.prepare('SELECT summary FROM music_profile WHERE id = 1').get().summary, 'Published guest music profile');
+  assert.equal(getProfile(db, { accountId: seeded.baseAccountId, source: 'cookie' }).summary, 'Published guest music profile');
+  assert.equal(getLibrary(db, otherGuest).profile.summary, 'Published guest music profile');
+  assert.deepEqual(JSON.parse(getAccountSetting(db, otherGuest.accountId, 'library_synced_playlist_ids')), [seeded.playlistId]);
 });
 
 test('expired demo guest cleanup only deletes demo guest scoped data', (t) => {

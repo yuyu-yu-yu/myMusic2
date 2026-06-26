@@ -8,7 +8,7 @@ import { getConfig, loadEnv, publicConfigStatus } from './config.mjs';
 import { openDatabase, getSetting, saveTrack, setSetting } from './db.mjs';
 import { NeteaseClient } from './netease.mjs';
 import { extractOpenApiTokenPayload, getNeteaseLoginStatus, resolveQrOpenApiLogin, saveNeteaseUserProfile, saveOpenApiToken } from './netease-auth.mjs';
-import { clearLibraryAccountSnapshot, getLibrary, getProfile, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
+import { clearLibraryAccountSnapshot, getLibrary, getProfile, publishDemoLibrarySnapshot, syncLibrary, updateProfile, updateProfilePlaylistSelection } from './library.mjs';
 import { applyScheduleContext, chatRadio, encoreConcertRadio, getConcertAudience, getMemories, getMoodStatsSummary, getPreferences, getRadioDebug, jumpConcertRadio, jumpPlaylistRadio, nextConcertRadio, nextPlaylistRadio, nextRadioItem, playConcertHost, prefetchRadio, removeAllMemories, removeMemory, replanConcertRadio, reportPlay, restoreDeviceSnapshot, startConcertRadio, startPlaylistRadio, startRadio, submitFeedback, updateMemory, updatePreferences } from './radio.mjs';
 import { generateDiary, getDiary, listDiaries, today } from './diary.mjs';
 import { getDiaryOverview, getDiaryRadioContext, recordDiarySignalFeedback } from './music-recap.mjs';
@@ -313,6 +313,12 @@ const routes = {
     const accountContext = getRequestAccount(req);
     await updateProfile(db, (await getRequestConfig(req)).llm, { force: true, accountContext });
     return getLibrary(db, accountContext);
+  },
+  'POST /api/library/profile/publish-demo': async (req) => {
+    if (!config.demo?.guestMode) return jsonError('Demo profile publishing is only available in demo mode.', 403);
+    const body = await readJson(req);
+    if (body.confirm !== 'publish-current-profile') return jsonError('publish confirmation is required', 400);
+    return publishDemoLibrarySnapshot(db, getRequestAccount(req));
   },
   'POST /api/radio/start': async (req) => {
     const body = await readJson(req);
