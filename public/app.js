@@ -585,6 +585,10 @@ globalThis.myMusicAvatar = {
 render();
 
 async function render() {
+  const isRadioRoute = location.pathname === '/';
+  document.body.classList.toggle('is-radio-route', isRadioRoute);
+  if (isRadioRoute) window.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+
   // Save chat messages before clearing (they're in #view)
   const chatEl = document.querySelector('#chat-messages');
   if (chatEl) savedChatHTML = chatEl.innerHTML;
