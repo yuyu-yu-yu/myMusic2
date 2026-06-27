@@ -576,6 +576,8 @@ if ('serviceWorker' in navigator) {
   navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
 
+document.addEventListener('visibilitychange', handlePlaybackVisibilityChange);
+
 globalThis.myMusicAvatar = {
   states: Object.keys(avatarFrameSequences),
   setState: setAvatarState,
@@ -2283,6 +2285,23 @@ function cancelSongFadeIn({ resetVolume = true } = {}) {
   if (hostAudio && hostAudio.dataset.voicePriming !== 'true') hostAudio.volume = 1;
 }
 
+function cancelPendingSongFadeInForHiddenPage() {
+  if (!document.hidden) return false;
+  const shouldCancel = (state.songFadeInActive || Boolean(state.songFadeInTrackKey)) && !state.songFadeInOfficial;
+  if (!shouldCancel) return false;
+  const songAudio = document.querySelector('#song-audio');
+  cancelSongFadeIn({ resetVolume: true });
+  if (songAudio) {
+    songAudio.pause();
+    try { songAudio.currentTime = 0; } catch {}
+  }
+  return true;
+}
+
+function handlePlaybackVisibilityChange() {
+  if (document.hidden) cancelPendingSongFadeInForHiddenPage();
+}
+
 function isSongFadeInPreparedForTrack(track = {}) {
   const songAudio = document.querySelector('#song-audio');
   if (!songAudio || !track?.playUrl || songAudio.ended) return false;
@@ -3094,6 +3113,7 @@ function estimateAvatarSpeechMs(text = '') {
 function maybeStartSongFadeInDuringHost(data, radioTurn, hostAudio) {
   const track = data?.track;
   if (!isActiveRadioTurn(radioTurn) || !track?.playUrl || !data?.ttsUrl || !hostAudio) return false;
+  if (document.hidden) return false;
   const songAudio = document.querySelector('#song-audio');
   const fadeKey = getSongFadeTrackKey(track);
   if (!songAudio || isSongFadeInPreparedForTrack(track)) return false;
@@ -3122,6 +3142,10 @@ function maybeStartSongFadeInDuringHost(data, radioTurn, hostAudio) {
       cancelSongFadeIn({ resetVolume: true });
       return;
     }
+    if (document.hidden && !state.songFadeInOfficial) {
+      cancelPendingSongFadeInForHiddenPage();
+      return;
+    }
     const ratio = Math.min(1, Math.max(0, (now - startedAt) / SONG_FADE_IN_MS));
     songAudio.volume = ratio;
     hostAudio.volume = 1 - ((1 - HOST_TTS_DUCK_VOLUME) * ratio);
@@ -3140,6 +3164,10 @@ function maybeStartSongFadeInDuringHost(data, radioTurn, hostAudio) {
   songAudio.play()
     .then(() => {
       if (!state.songFadeInActive || state.songFadeInTrackKey !== fadeKey) return;
+      if (document.hidden) {
+        cancelPendingSongFadeInForHiddenPage();
+        return;
+      }
       state.songFadeInFrame = requestAnimationFrame(step);
     })
     .catch((error) => {
