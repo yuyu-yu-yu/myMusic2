@@ -239,37 +239,15 @@ body.fx-live .fx-horizon-grid {
   to   { background-position: 200% 0; }
 }
 
-.brand {
-  gap: 12px;
-  text-shadow: none;
-}
-
-.brand-copy {
+/* No brand block: a 3-column grid keeps the nav centred and the signal
+   pill on the right. */
+.topbar {
   display: grid;
-  gap: 5px;
+  grid-template-columns: 1fr auto 1fr;
 }
 
-.brand-title {
-  font-size: 15px;
-  letter-spacing: 0.12em;
-  background: linear-gradient(90deg, #fff, #c9f6ff 40%, #d9c6ff);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-}
-
-.brand-sub {
-  color: var(--muted);
-  font-size: 9px;
-  letter-spacing: 0.32em;
-  line-height: 1;
-}
-
-.brand:hover .brand-title {
-  background: var(--fx-grad);
-  -webkit-background-clip: text;
-  background-clip: text;
-}
+.topbar > .nav { grid-column: 2; }
+.topbar > .topbar-signal { grid-column: 3; justify-self: end; }
 
 .nav {
   position: relative;
@@ -1787,6 +1765,7 @@ body.fx-ready #view > :nth-child(n + 6) { animation-delay: 0.3s; }
      inside it is positioned against the viewport (backdrop-filter would
      otherwise become its containing block). */
   .topbar {
+    display: flex;
     flex-direction: row;
     flex-wrap: nowrap;
     align-items: center;
@@ -1813,11 +1792,6 @@ body.fx-ready #view > :nth-child(n + 6) { animation-delay: 0.3s; }
     -webkit-backdrop-filter: blur(14px) saturate(1.3);
     pointer-events: none;
   }
-
-  .brand { order: 1; min-width: 0; }
-  .brand-copy { gap: 4px; }
-  .brand-title { font-size: 15px; letter-spacing: 0.1em; }
-  .brand-sub { display: block; font-size: 8px; letter-spacing: 0.28em; }
 
   .topbar-signal {
     order: 2;

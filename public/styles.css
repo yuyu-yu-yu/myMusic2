@@ -427,27 +427,6 @@ button.danger:hover {
   border-bottom: 1px solid var(--line);
 }
 
-.brand {
-  display: inline-flex;
-  align-items: center;
-  font-weight: 700;
-  font-family: var(--font-mono);
-  letter-spacing: 0.08em;
-  color: var(--text);
-  text-shadow: 0 0 8px rgba(0, 240, 255, 0.25);
-}
-
-.brand-title {
-  display: inline-block;
-  font-size: 13px;
-  line-height: 1;
-  white-space: nowrap;
-}
-
-.brand:hover {
-  color: var(--cyan);
-}
-
 .nav {
   display: flex;
   gap: 6px;
