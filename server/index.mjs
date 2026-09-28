@@ -19,7 +19,7 @@ import { publicAccountContext, resolveAccountContext } from './account-scope.mjs
 import { generateAiMusic } from './ai-music.mjs';
 import { cleanupDemoGuest, cleanupExpiredDemoGuests, getVisitorIdFromRequest, resolveRequestAccountContext } from './demo-guest.mjs';
 import { configWithEnvironment, resolveRequestEnvironment, resolveRequestEnvironmentContext } from './environment.mjs';
-import { initializeDemoRuntime } from './startup.mjs';
+import { initializeDemoRuntime, sharedLibrarySyncGuard } from './startup.mjs';
 import { createScheduleProvider, createScheduleService } from './schedule.mjs';
 import { getStaticCacheControl, serveStaticFile } from './static-files.mjs';
 
@@ -724,6 +724,8 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, removeMemory({ db, id: pathname.split('/').pop(), accountContext: getRequestAccount(req) }));
     }
     const key = `${req.method} ${pathname}`;
+    const syncGuard = sharedLibrarySyncGuard({ config, syncStatus: librarySyncStatus, method: req.method, pathname });
+    if (syncGuard) return sendJson(res, syncGuard, syncGuard.status);
     if (routes[key]) {
       const result = await routes[key](req, res);
       if (result?.__error) return sendJson(res, result, result.status);

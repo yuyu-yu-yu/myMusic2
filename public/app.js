@@ -2359,7 +2359,7 @@ async function startRadio() {
     }
     clearRadioTurnLoading(radioTurn, loading);
     stopLoadingMessages({ loading });
-    replaceLoadingMessage({ text: '启动电台时出了一点问题：' + e.message, loading });
+    replaceLoadingMessage({ text: radioErrorText('启动电台时出了一点问题：', e), loading });
     setAvatarState('idle');
     setRadioButtonState(state.current?.track ? 'active' : 'idle');
     setPlayerStatus(e.message, 'error');
@@ -2502,7 +2502,7 @@ async function startConcertRadio({ settings = state.concertSettings, message = '
     }
     clearRadioTurnLoading(radioTurn, loading);
     stopLoadingMessages({ loading });
-    replaceLoadingMessage({ text: '编排音乐会时出了一点问题：' + e.message, loading });
+    replaceLoadingMessage({ text: radioErrorText('编排音乐会时出了一点问题：', e), loading });
     setAvatarState(getContextualAvatarState());
     setRadioButtonState(state.current?.track ? 'active' : 'idle');
     setPlayerStatus(e.message, 'error');
@@ -2561,7 +2561,7 @@ async function nextTrack({ skipCurrent = true, silent = false, forceFresh = fals
     }
     clearRadioTurnLoading(radioTurn, loading);
     stopLoadingMessages({ loading });
-    replaceLoadingMessage({ text: '抱歉，刚才找歌时出了一点问题：' + e.message, loading });
+    replaceLoadingMessage({ text: radioErrorText('抱歉，刚才找歌时出了一点问题：', e), loading });
     setAvatarState(getContextualAvatarState());
     setPlayerStatus(e.message, 'error');
   }
@@ -2613,7 +2613,7 @@ async function advanceConcertPlayback({ skipCurrent = true, silent = false } = {
   } catch (error) {
     if (isInterruptedRadioTurn(radioTurn, error)) return;
     stopLoadingMessages({ loading });
-    replaceLoadingMessage({ text: `切换音乐会曲目失败：${error.message}`, loading });
+    replaceLoadingMessage({ text: radioErrorText('切换音乐会曲目失败：', error), loading });
     setAvatarState(getContextualAvatarState());
   }
 }
@@ -2695,7 +2695,7 @@ async function jumpConcertTo(index) {
     }
     clearRadioTurnLoading(radioTurn, loading);
     stopLoadingMessages({ loading });
-    replaceLoadingMessage({ text: '跳转音乐会歌曲时出了一点问题：' + e.message, loading });
+    replaceLoadingMessage({ text: radioErrorText('跳转音乐会歌曲时出了一点问题：', e), loading });
     setAvatarState(getContextualAvatarState());
     setPlayerStatus(e.message, 'error');
   }
@@ -2741,7 +2741,7 @@ async function sendChat(msg) {
     clearRadioTurnLoading(radioTurn, loading);
     stopLoadingMessages({ loading });
     setAvatarState(getContextualAvatarState());
-    replaceLoadingMessage({ text: '抱歉，出了一点问题：' + e.message, loading });
+    replaceLoadingMessage({ text: radioErrorText('抱歉，出了一点问题：', e), loading });
   }
 }
 
@@ -6308,9 +6308,16 @@ async function api(path, options = {}) {
   });
   const data = await response.json();
   if (!response.ok || data.ok === false || data.__error) {
-    throw new Error(data.error || `HTTP ${response.status}`);
+    const error = new Error(data.error || `HTTP ${response.status}`);
+    if (data.code) error.code = data.code;
+    throw error;
   }
   return data;
+}
+
+function radioErrorText(prefix, error) {
+  if (error?.code === 'library_syncing') return error.message;
+  return prefix + (error?.message || '');
 }
 
 function clientEnvironmentHeaders() {
