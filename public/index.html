@@ -3,18 +3,32 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <meta name="theme-color" content="#06060e" />
+    <meta name="theme-color" content="#05040d" />
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="preload" href="/assets/fusion-pixel-12px-monospaced-zh_hans.ttf" as="font" type="font/ttf" crossorigin />
     <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/fx.css" />
     <title>灿灿校园电台</title>
   </head>
   <body>
+    <!-- Ambient backdrop: aurora + synthwave horizon (pure decoration) -->
+    <div class="fx-backdrop" aria-hidden="true">
+      <div class="fx-aurora fx-aurora--a"></div>
+      <div class="fx-aurora fx-aurora--b"></div>
+      <div class="fx-aurora fx-aurora--c"></div>
+      <div class="fx-horizon"><div class="fx-horizon-grid"></div></div>
+      <div class="fx-vignette"></div>
+    </div>
+    <canvas id="fx-canvas" aria-hidden="true"></canvas>
     <div id="crt-overlay"></div>
     <div id="app">
       <header class="topbar">
         <a class="brand" href="/" data-link aria-label="灿灿校园电台">
-          <span class="brand-title">灿灿校园电台</span>
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></span>
+          <span class="brand-copy">
+            <span class="brand-title">灿灿校园电台</span>
+            <span class="brand-sub">AI DJ · CYBER FM</span>
+          </span>
         </a>
         <nav class="nav">
           <a href="/" data-link>电台</a>
@@ -23,6 +37,10 @@
           <a href="/mixer" data-link>调音台</a>
           <a href="/settings" data-link>设置</a>
         </nav>
+        <div class="topbar-signal" aria-hidden="true">
+          <span class="topbar-signal-dot"></span>
+          <span class="topbar-signal-label" data-live="ON AIR" data-idle="STANDBY">STANDBY</span>
+        </div>
       </header>
       <!-- Persistent audio layer — survives SPA navigation -->
       <div id="audio-layer" style="display:none">
@@ -36,16 +54,21 @@
       <section class="player-shell">
         <div class="left-col">
           <div class="now-panel">
-            <div id="ai-dj-avatar" class="ai-dj-avatar" data-state="idle" aria-label="AI DJ 灿灿">
-              <video id="avatar-video" class="avatar-video" muted playsinline preload="auto"></video>
-              <video id="avatar-video-buffer" class="avatar-video" muted playsinline preload="none" hidden></video>
-              <img id="avatar-image" class="avatar-image" src="/avatar/source/cancan-first-frame.png?v=4" alt="AI DJ 灿灿" />
-              <canvas id="avatar-transition-frame" class="avatar-transition-frame" aria-hidden="true" hidden></canvas>
-              <span class="avatar-transition-mask" aria-hidden="true"></span>
-              <span class="avatar-status">IDLE</span>
+            <div class="avatar-stage">
+              <span class="avatar-halo" aria-hidden="true"></span>
+              <span class="avatar-orbit" aria-hidden="true"><i></i><i></i><i></i></span>
+              <canvas class="avatar-spectrum" aria-hidden="true"></canvas>
+              <div id="ai-dj-avatar" class="ai-dj-avatar" data-state="idle" aria-label="AI DJ 灿灿">
+                <video id="avatar-video" class="avatar-video" muted playsinline preload="auto"></video>
+                <video id="avatar-video-buffer" class="avatar-video" muted playsinline preload="none" hidden></video>
+                <img id="avatar-image" class="avatar-image" src="/avatar/source/cancan-first-frame.png?v=4" alt="AI DJ 灿灿" />
+                <canvas id="avatar-transition-frame" class="avatar-transition-frame" aria-hidden="true" hidden></canvas>
+                <span class="avatar-transition-mask" aria-hidden="true"></span>
+                <span class="avatar-status">IDLE</span>
+              </div>
             </div>
             <div class="track-meta">
-              <p class="eyebrow">AI PRIVATE RADIO</p>
+              <p class="eyebrow"><span class="eyebrow-pulse" aria-hidden="true"></span>AI PRIVATE RADIO</p>
               <h1 id="track-title">myMusic</h1>
               <p id="track-artist" class="muted">等待启动</p>
               <div class="playback-console">
@@ -144,7 +167,6 @@
               <button id="concert-create-btn" class="primary" type="button">生成音乐会</button>
             </div>
           </section>
-          <aside id="concert-console-panel" class="playlist-queue-panel concert-console-panel" hidden></aside>
           <div class="ai-music-mode">
             <button id="ai-music-toggle" class="ai-music-toggle" type="button" aria-pressed="false">
               <span class="ai-music-toggle-led" aria-hidden="true"></span>
@@ -154,11 +176,23 @@
               </span>
             </button>
           </div>
-          <div id="lyric" class="lyric"></div>
+        </div>
+        <div class="stage-col">
+          <aside id="concert-console-panel" class="playlist-queue-panel concert-console-panel" hidden></aside>
+          <div class="lyric-shell">
+            <div class="lyric-shell-head" aria-hidden="true">
+              <span class="lyric-shell-title">LYRICS · 实时歌词</span>
+              <span class="lyric-shell-eq"><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span>
+            </div>
+            <div id="lyric" class="lyric"></div>
+          </div>
         </div>
         <div class="chat-panel">
           <div class="chat-header">
-            <span class="eyebrow">灿灿 · AI DJ</span>
+            <span class="chat-header-id">
+              <span class="chat-header-dot" aria-hidden="true"></span>
+              <span class="eyebrow">灿灿 · AI DJ</span>
+            </span>
             <button id="mode-reset-btn" class="ghost" title="恢复正常推荐" style="display:none">恢复正常</button>
           </div>
           <div id="session-constraint-bar" class="session-constraint-bar" hidden aria-live="polite"></div>
@@ -182,5 +216,6 @@
       </section>
     </template>
     <script type="module" src="/app.js"></script>
+    <script type="module" src="/fx.js"></script>
   </body>
 </html>

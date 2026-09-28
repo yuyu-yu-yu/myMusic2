@@ -323,6 +323,7 @@ function clampNumber(value, min, max, fallback) {
 }
 
 function hasUsefulDeviceSnapshot(snapshot = {}) {
+  if (!snapshot || typeof snapshot !== 'object') return false;
   return hasUsefulPreferenceSnapshot(snapshot.preferences)
     || (Array.isArray(snapshot.memories) && snapshot.memories.length > 0)
     || (Array.isArray(snapshot.history) && snapshot.history.length > 0);
@@ -479,6 +480,13 @@ const visualizerCaptureCache = new WeakMap();
 const visualizerCaptureEntries = new Set();
 let _drawFrameCount = 0;
 let _drawLogged = false;
+
+// Read-only bridge for the ambient FX layer (public/fx.js): exposes audio intensity + spectrum.
+globalThis.__radioFx = Object.freeze({
+  get mode() { return visualizerState.mode; },
+  get intensity() { return visualizerState.intensity; },
+  getSpectrum: () => visualizerFrequencyData
+});
 
 visualizerReducedMotion?.addEventListener?.('change', () => {
   const canvas = document.querySelector('#visualizer-canvas');
