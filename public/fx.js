@@ -513,7 +513,7 @@ function stopLoop() {
 
 const SPOTLIGHT_SELECTOR = [
   '.now-panel', '.chat-panel', '.lyric-shell', '.page-panel', '.list-item', '.stat',
-  '.mixer-control', '.mixer-status-card', '.diary-detail', '.diary-header', '.ai-music-toggle',
+  '.mixer-control', '.mixer-status-card', '.diary-detail', '.diary-header',
   '.radio-mode-btn', '.playlist-queue-item'
 ].join(',');
 

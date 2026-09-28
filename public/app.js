@@ -9,7 +9,6 @@ import {
 import { ensureDemoDeviceId, rotateDemoDeviceId } from './device-identity.js';
 import { getTrackNeteaseSongId } from './track-identity.js';
 
-const AI_MUSIC_MODE_STORAGE_KEY = 'mymusic:aiMusicMode';
 const DEVICE_SNAPSHOT_STORAGE_PREFIX = 'mymusic:deviceSnapshot:v1:';
 const DEVICE_SNAPSHOT_VERSION = 1;
 const DEVICE_SNAPSHOT_MAX_MEMORIES = 80;
@@ -75,8 +74,7 @@ const state = {
     note: ''
   },
   concertDanmaku: { ai: true, real: true },
-  sessionConstraints: { rules: [], remainingTracks: 0 },
-  aiMusicMode: readStoredAiMusicMode()
+  sessionConstraints: { rules: [], remainingTracks: 0 }
 };
 
 const progressSeekState = {
@@ -1749,8 +1747,6 @@ function renderPlayer() {
   const chatForm = document.querySelector('#chat-form');
   const scenePrompts = document.querySelector('#scene-prompts');
   const modeResetBtn = document.querySelector('#mode-reset-btn');
-  const aiMusicToggle = document.querySelector('#ai-music-toggle');
-  const aiMusicDownload = document.querySelector('#ai-music-download');
   const { likeBtn, dislikeBtn } = ensureFeedbackButtons();
 
   startBtn.addEventListener('click', () => startSingleRadioFromControls());
@@ -1763,10 +1759,6 @@ function renderPlayer() {
     else resumePlayback();
   });
   modeResetBtn.addEventListener('click', () => resetMode());
-  aiMusicToggle?.addEventListener('click', () => setAiMusicMode(!state.aiMusicMode));
-  aiMusicDownload?.addEventListener('click', (event) => {
-    if (aiMusicDownload.getAttribute('aria-disabled') === 'true') event.preventDefault();
-  });
   likeBtn.addEventListener('click', () => {
     setAvatarState('happy', { temporaryMs: AVATAR_HAPPY_DISPLAY_MS });
     showLikeBurst();
@@ -1842,8 +1834,6 @@ function renderPlayer() {
   initButtonFeedback();
   initVisualizer();
   initProgressBar();
-  updateAiMusicToggle();
-  updateAiMusicDownload(state.current?.track || null);
   renderConcertConsole();
   renderSessionConstraintBar();
   scheduleRadioPrefetch();
@@ -1881,88 +1871,6 @@ function setPlaybackToggleState(isPlaying) {
   const label = isPlaying ? '暂停' : '继续';
   button.title = label;
   button.setAttribute('aria-label', label);
-}
-
-function readStoredAiMusicMode() {
-  try {
-    return localStorage.getItem(AI_MUSIC_MODE_STORAGE_KEY) === 'on';
-  } catch {
-    return false;
-  }
-}
-
-function setAiMusicMode(enabled, { announce = true } = {}) {
-  state.aiMusicMode = Boolean(enabled);
-  if (state.aiMusicMode) {
-    clearRadioPrefetchRetry();
-    state.radioMode = 'single';
-    state.activeConcert = null;
-    state.concertStatus = 'idle';
-  }
-  try {
-    localStorage.setItem(AI_MUSIC_MODE_STORAGE_KEY, state.aiMusicMode ? 'on' : 'off');
-  } catch {
-    // Storage failures should not block the local playback mode switch.
-  }
-  updateAiMusicToggle();
-  setRadioButtonState(state.current?.track || state.sessionId ? 'active' : 'idle');
-  renderConcertConsole();
-  if (announce) {
-    appendChat({
-      role: 'dj',
-      text: state.aiMusicMode
-        ? 'AI 原创电台模式已开启，后续歌曲会由灿灿根据此刻状态和音乐画像生成。'
-        : 'AI 原创电台模式已关闭，后续恢复普通推荐播放。'
-    });
-  }
-}
-
-function updateAiMusicToggle() {
-  const button = document.querySelector('#ai-music-toggle');
-  if (!button) return;
-  button.classList.toggle('is-active', state.aiMusicMode);
-  button.setAttribute('aria-pressed', state.aiMusicMode ? 'true' : 'false');
-  button.title = state.aiMusicMode ? '关闭 AI 原创电台模式' : '开启 AI 原创电台模式';
-}
-
-function updateAiMusicDownload(track = null) {
-  const link = document.querySelector('#ai-music-download');
-  const label = document.querySelector('#ai-music-download-label');
-  if (!link) return;
-
-  const canDownload = Boolean(track?.aiGenerated && track?.playUrl);
-  link.classList.toggle('is-ready', canDownload);
-  link.classList.toggle('is-disabled', !canDownload);
-  link.setAttribute('aria-disabled', canDownload ? 'false' : 'true');
-  link.tabIndex = canDownload ? 0 : -1;
-
-  if (canDownload) {
-    link.href = track.playUrl;
-    link.download = buildAiMusicDownloadFilename(track);
-    link.title = '下载当前 AI 原创歌曲';
-    link.setAttribute('aria-label', '下载本次AI原创的歌曲');
-    label && (label.textContent = '下载AI原创');
-  } else {
-    link.href = '#';
-    link.removeAttribute('download');
-    link.title = 'AI 原创歌曲生成后可下载';
-    link.setAttribute('aria-label', 'AI 原创歌曲生成后可下载');
-    label && (label.textContent = '下载AI原创');
-  }
-}
-
-function buildAiMusicDownloadFilename(track = {}) {
-  const base = sanitizeDownloadFilename(track.name || 'AI原创歌曲') || 'AI原创歌曲';
-  return `${base}-灿灿AI原创.mp3`;
-}
-
-function sanitizeDownloadFilename(value = '') {
-  return String(value || '')
-    .replace(/[\\/:*?"<>|]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/^[.\-\s]+|[.\-\s]+$/g, '')
-    .slice(0, 80);
 }
 
 async function handleDislike() {
@@ -2063,13 +1971,6 @@ const loadingMessages = [
   '灿灿正在连接赛博音乐网络...',
 ];
 
-const aiMusicLoadingMessages = [
-  '灿灿正在读取此刻状态...',
-  '灿灿正在匹配你的音乐画像...',
-  '灿灿正在写更贴近当下的歌词...',
-  '灿灿正在把最近对话做成旋律...',
-];
-
 const concertLoadingMessages = [
   '灿灿正在编排整场音乐会...',
   '灿灿正在校验每首歌能不能稳定播放...',
@@ -2091,8 +1992,6 @@ const chatLoadingMessages = [
 function startLoadingMessages(kind = 'music') {
   const messages = kind === 'chat'
     ? chatLoadingMessages
-    : kind === 'aiMusic'
-    ? aiMusicLoadingMessages
     : kind === 'concert'
     ? concertLoadingMessages
     : kind === 'concertNext'
@@ -2347,7 +2246,7 @@ function pauseCurrentPlaybackForTransition() {
 }
 
 function canUseRadioQueueWarmup() {
-  return !state.aiMusicMode && state.radioMode !== 'concert' && !state.activeConcert && !state.schedulePlanning;
+  return state.radioMode !== 'concert' && !state.activeConcert && !state.schedulePlanning;
 }
 
 function clearRadioPrefetchRetry() {
@@ -2421,18 +2320,16 @@ async function startRadio() {
   setRadioButtonState('loading');
   appendChat({
     role: 'user',
-    text: state.aiMusicMode
-      ? '开启 AI 原创模式'
-      : state.preferences?.scheduleAwareEnabled
-        ? '按接下来的日程安排一段音乐'
-        : '启动电台'
+    text: state.preferences?.scheduleAwareEnabled
+      ? '按接下来的日程安排一段音乐'
+      : '启动电台'
   });
-  const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : 'music');
+  const loading = startLoadingMessages('music');
   attachRadioTurnLoading(radioTurn, loading);
   try {
     await loadPreferences().catch(() => null);
     if (!isActiveRadioTurn(radioTurn)) return;
-    const useSchedulePlanning = !state.aiMusicMode && state.preferences?.scheduleAwareEnabled === true;
+    const useSchedulePlanning = state.preferences?.scheduleAwareEnabled === true;
     state.schedulePlanning = useSchedulePlanning;
     if (useSchedulePlanning) {
       state.radioMode = 'concert';
@@ -2441,30 +2338,19 @@ async function startRadio() {
       state.activeConcert = null;
       renderConcertConsole();
     }
-    const data = state.aiMusicMode
-      ? await requestAiMusicTrack({ sessionId, trigger: 'start', signal: radioTurnSignal(radioTurn) })
-      : useSchedulePlanning
-        ? await api('/api/radio/playlist/start', {
-            method: 'POST',
-            body: { sessionId, planning: { source: 'schedule', refresh: true } },
-            signal: radioTurnSignal(radioTurn)
-          })
-        : await api('/api/radio/start', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
+    const data = useSchedulePlanning
+      ? await api('/api/radio/playlist/start', {
+          method: 'POST',
+          body: { sessionId, planning: { source: 'schedule', refresh: true } },
+          signal: radioTurnSignal(radioTurn)
+        })
+      : await api('/api/radio/start', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
     handleRadioResponse(data, { loading, radioTurn });
   } catch (e) {
     if (isInterruptedRadioTurn(radioTurn, e)) {
       stopLoadingMessages({ remove: true, loading });
       clearRadioTurnLoading(radioTurn, loading);
       return;
-    }
-    if (state.aiMusicMode) {
-      try {
-        const fallback = await api('/api/radio/start', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
-        handleRadioResponse(withAiMusicFallbackNotice(fallback, e), { loading, radioTurn });
-        return;
-      } catch (fallbackError) {
-        e = fallbackError;
-      }
     }
     if (isInterruptedRadioTurn(radioTurn, e)) {
       stopLoadingMessages({ remove: true, loading });
@@ -2592,7 +2478,6 @@ async function startConcertRadio({ settings = state.concertSettings, message = '
   renderSessionConstraintBar();
   setAvatarState('searching');
   setRadioButtonState('loading');
-  if (state.aiMusicMode) setAiMusicMode(false, { announce: false });
   if (userMessage) appendChat({ role: 'user', text: userMessage });
   if (!userMessage) {
     appendChat({ role: 'user', text: `生成一场 ${state.concertSettings.length} 首音乐会` });
@@ -2645,9 +2530,9 @@ async function nextTrack({ skipCurrent = true, silent = false, forceFresh = fals
   if (stopCurrentPromise) await stopCurrentPromise;
   if (!isActiveRadioTurn(radioTurn)) return;
   if (!silent) {
-    appendChat({ role: 'user', text: state.aiMusicMode ? '生成此刻歌曲' : state.radioMode === 'concert' ? '音乐会下一首' : '下一首' });
+    appendChat({ role: 'user', text: state.radioMode === 'concert' ? '音乐会下一首' : '下一首' });
   }
-  const loading = startLoadingMessages(state.aiMusicMode ? 'aiMusic' : state.radioMode === 'concert' ? 'concertNext' : 'music');
+  const loading = startLoadingMessages(state.radioMode === 'concert' ? 'concertNext' : 'music');
   attachRadioTurnLoading(radioTurn, loading);
   try {
     await loadPreferences().catch(() => null);
@@ -2655,9 +2540,7 @@ async function nextTrack({ skipCurrent = true, silent = false, forceFresh = fals
     const scheduleActive = state.schedulePlanning && state.preferences?.scheduleAwareEnabled === true;
     if (state.schedulePlanning && !scheduleActive) state.schedulePlanning = false;
     const schedulePlanning = getSchedulePlanningForNextTurn();
-    const data = state.aiMusicMode
-      ? await requestAiMusicTrack({ sessionId, trigger: 'next', signal: radioTurnSignal(radioTurn) })
-      : state.radioMode === 'concert'
+    const data = state.radioMode === 'concert'
       ? await api(scheduleActive ? '/api/radio/playlist/next' : '/api/radio/concert/next', {
           method: 'POST',
           body: { sessionId, ...(schedulePlanning ? { planning: schedulePlanning } : {}) },
@@ -2670,15 +2553,6 @@ async function nextTrack({ skipCurrent = true, silent = false, forceFresh = fals
       stopLoadingMessages({ remove: true, loading });
       clearRadioTurnLoading(radioTurn, loading);
       return;
-    }
-    if (state.aiMusicMode) {
-      try {
-        const fallback = await api('/api/radio/next', { method: 'POST', body: { sessionId }, signal: radioTurnSignal(radioTurn) });
-        handleRadioResponse(withAiMusicFallbackNotice(fallback, e), { loading, radioTurn });
-        return;
-      } catch (fallbackError) {
-        e = fallbackError;
-      }
     }
     if (isInterruptedRadioTurn(radioTurn, e)) {
       stopLoadingMessages({ remove: true, loading });
@@ -2827,43 +2701,6 @@ async function jumpConcertTo(index) {
   }
 }
 
-async function requestAiMusicTrack({ sessionId, trigger, signal }) {
-  setPlayerStatus('灿灿正在根据状态生成音乐', '');
-  const currentTrack = state.current?.track
-    ? {
-      id: state.current.track.id,
-      name: state.current.track.name,
-      artists: state.current.track.artists || [],
-      album: state.current.track.album || ''
-    }
-    : null;
-  return api('/api/ai-music/generate', {
-    method: 'POST',
-    signal,
-    body: {
-      sessionId,
-      trigger,
-      preferences: state.preferences || {},
-      currentTrack
-    }
-  });
-}
-
-function withAiMusicFallbackNotice(data = {}, error = {}) {
-  return {
-    ...data,
-    chatText: `AI 原创生成暂时失败，先切回普通推荐。${data.chatText || data.hostText || ''}`,
-    ttsUrl: null,
-    ttsStatus: 'disabled',
-    speech: { shouldSpeak: false, mode: 'off' },
-    aiMusic: {
-      enabled: true,
-      status: 'fallback',
-      error: error?.message || String(error || '')
-    }
-  };
-}
-
 function buildScenePromptMessage(scene) {
   return `\u6211\u6b63\u5728${scene}\uff0c\u8bf7\u5e2e\u6211\u63a8\u8350\u9002\u5408${scene}\u7684\u6b4c`;
 }
@@ -2954,7 +2791,7 @@ function handleRadioResponse(data, { loading = null, radioTurn = null, afterHost
     state.activeConcert = data.concert || null;
     state.concertStatus = data.concert ? data.concert.phase || 'ready' : 'empty';
   } else if (data.track) {
-    state.radioMode = state.aiMusicMode ? 'single' : state.radioMode === 'concert' ? 'single' : state.radioMode;
+    state.radioMode = state.radioMode === 'concert' ? 'single' : state.radioMode;
     state.activeConcert = null;
     state.concertStatus = 'idle';
   }
@@ -3633,7 +3470,6 @@ async function updatePlayer(data, autoplay) {
   const track = data.track || {};
   document.querySelector('#track-title').textContent = track.name || '灿灿校园电台';
   document.querySelector('#track-artist').textContent = (track.artists || []).join(' / ') || '等待启动';
-  updateAiMusicDownload(track);
   buildLyricDOM(data.track?.lyric || '', { syncMode: data.track?.lyricSync || 'timed' });
   prepareCommentDanmakuForTrack(track);
 
