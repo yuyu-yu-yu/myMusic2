@@ -249,6 +249,79 @@ body.fx-live .fx-horizon-grid {
 .topbar > .nav { grid-column: 2; }
 .topbar > .topbar-signal { grid-column: 3; justify-self: end; }
 
+/* Desktop: a taller, fully transparent top band so the cursor constellation
+   (fx.js) has open sky to play in. The nav sits in the band's bottom 74px row.
+   Between 761–899px the negative sticky offset lets the empty sky scroll away
+   while that row stays pinned (frosted once scrolled); from 900px the scaled
+   #app breaks sticky, so the band scrolls with the page. Phones keep their own
+   top bar in @media (max-width: 760px). */
+@media (min-width: 761px) {
+  :root {
+    --fx-topbar-row: 74px;
+    --fx-topbar-h: clamp(118px, 17vh, 172px);
+  }
+
+  .topbar {
+    top: calc(var(--fx-topbar-row) - var(--fx-topbar-h));
+    min-height: var(--fx-topbar-h);
+    grid-template-rows: minmax(0, 1fr) var(--fx-topbar-row);
+    background: transparent;
+    background-color: rgba(8, 6, 22, 0);
+    backdrop-filter: none;
+    -webkit-backdrop-filter: none;
+    border-bottom-color: transparent;
+    transition: background-color 0.35s ease, border-color 0.35s ease;
+  }
+
+  .topbar > .nav,
+  .topbar > .topbar-signal {
+    grid-row: 2;
+    align-self: center;
+  }
+
+  .topbar::after {
+    opacity: 0;
+    transition: opacity 0.35s ease;
+  }
+
+  body.fx-scrolled .topbar {
+    background-color: rgba(8, 6, 22, 0.72);
+    backdrop-filter: blur(18px) saturate(1.4);
+    -webkit-backdrop-filter: blur(18px) saturate(1.4);
+    border-bottom-color: rgba(150, 130, 255, 0.1);
+  }
+
+  body.fx-scrolled .topbar::after {
+    opacity: 0.55;
+  }
+
+  /* Radio stage keeps fitting one screen under the taller band
+     (was 100vh - 130px = 74px bar + 56px view padding). */
+  .player-shell {
+    height: calc(100vh - var(--fx-topbar-h) - 56px);
+  }
+}
+
+@media (min-width: 900px) {
+  /* #app is scaled here, which skews sticky offsets (the bar used to drift off
+     screen anyway); let the band scroll away with the page instead. */
+  .topbar {
+    position: relative;
+    top: auto;
+  }
+
+  .player-shell {
+    height: calc((100vh / var(--desktop-visual-scale)) - var(--fx-topbar-h) - 56px);
+  }
+}
+
+@media (min-width: 1180px) {
+  .playlist-queue-panel {
+    top: calc(var(--fx-topbar-h) + 52px);
+    max-height: calc((100vh / var(--desktop-visual-scale)) - var(--fx-topbar-h) - 94px);
+  }
+}
+
 .nav {
   position: relative;
   gap: 2px;

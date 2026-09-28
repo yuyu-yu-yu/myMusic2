@@ -73,7 +73,10 @@ const bg = {
   rings: [],
   meteors: [],
   sprites: new Map(),
-  pointer: { x: -9999, y: -9999, active: false, px: 0, py: 0 },
+  pointer: { x: -9999, y: -9999, active: false, px: 0, py: 0, inBand: false },
+  // Desktop only: bottom edge (viewport px) of the transparent top band where
+  // the cursor effect is amplified. 0 on phones.
+  band: 0,
   focus: { x: 0, y: 0, valid: false, measuredAt: 0 },
   lastBeatAt: 0,
   nextMeteorAt: performance.now() + 4000
@@ -145,6 +148,17 @@ function resizeBackground() {
     p.y = clamp(p.y, 0, bg.h);
   }
   if (reduceMotion()) drawBackground(0, performance.now());
+  measureBand();
+}
+
+function measureBand() {
+  if (isPhone()) {
+    bg.band = 0;
+    bg.pointer.inBand = false;
+    return;
+  }
+  const bar = doc.querySelector('.topbar');
+  bg.band = bar ? Math.max(0, bar.getBoundingClientRect().bottom) : 0;
 }
 
 function measureFocus(now) {
@@ -235,12 +249,14 @@ function updateBackground(dt, now) {
     }
 
     if (pointer.active) {
+      // Desktop top band: a wider, stronger wake around the cursor.
+      const reach = pointer.inBand ? 215 : 150;
       const dx = p.x - pointer.x;
       const dy = p.y - pointer.y;
       const d2 = dx * dx + dy * dy;
-      if (d2 < 150 * 150) {
+      if (d2 < reach * reach) {
         const d = Math.sqrt(d2) || 1;
-        const force = (1 - d / 150) * 1.6;
+        const force = (1 - d / reach) * (pointer.inBand ? 2.3 : 1.6);
         p.bx += (dx / d) * force * 0.35;
         p.by += (dy / d) * force * 0.35;
       }
@@ -300,6 +316,9 @@ function drawBackground(dt, now) {
   const linkDist = isPhone() ? 100 : isCompact() ? 90 : 128;
   const linkDist2 = linkDist * linkDist;
   const lineBoost = 0.55 + audio.level * 1.6 + audio.beat * 0.8;
+  const pointerReach = pointer.inBand ? 250 : 170;
+  const pointerReach2 = pointerReach * pointerReach;
+  const pointerAlpha = pointer.inBand ? 0.58 : 0.42;
 
   // Constellation links.
   ctx.lineWidth = 1;
@@ -327,8 +346,8 @@ function drawBackground(dt, now) {
       const dx = ax - pointer.x;
       const dy = ay - pointer.y;
       const d2 = dx * dx + dy * dy;
-      if (d2 < 170 * 170) {
-        const alpha = (1 - d2 / (170 * 170)) * 0.42;
+      if (d2 < pointerReach2) {
+        const alpha = (1 - d2 / pointerReach2) * pointerAlpha;
         ctx.strokeStyle = `rgba(${a.rgb[0]}, ${a.rgb[1]}, ${a.rgb[2]}, ${alpha.toFixed(3)})`;
         ctx.beginPath();
         ctx.moveTo(ax, ay);
@@ -352,6 +371,16 @@ function drawBackground(dt, now) {
     ctx.fillRect(Math.round(x - s / 2), Math.round(y - s / 2), s, s);
   }
   ctx.globalAlpha = 1;
+
+  // Desktop top band: a soft halo that rides under the cursor.
+  if (pointer.active && pointer.inBand) {
+    const halo = 120 + audio.level * 60;
+    ctx.globalAlpha = 0.28 + audio.beat * 0.2;
+    ctx.drawImage(glowSprite([34, 230, 255]), pointer.x - halo / 2, pointer.y - halo / 2, halo, halo);
+    ctx.globalAlpha = 0.16;
+    ctx.drawImage(glowSprite([139, 92, 255]), pointer.x - halo, pointer.y - halo, halo * 2, halo * 2);
+    ctx.globalAlpha = 1;
+  }
 
   // Meteors.
   for (const m of bg.meteors) {
@@ -607,12 +636,29 @@ const SPOTLIGHT_SELECTOR = [
 ].join(',');
 
 let spotlightEl = null;
+// Desktop top band: amplified cursor wake plus a stardust trail.
+const bandTrail = { x: 0, y: 0 };
+function updateBandPointer(event) {
+  if (isPhone() || !bg.pointer.active) {
+    bg.pointer.inBand = false;
+    return;
+  }
+  if (!bg.band) measureBand();
+  bg.pointer.inBand = event.clientY <= bg.band;
+  if (!bg.pointer.inBand || fxQuiet()) return;
+  if (Math.hypot(event.clientX - bandTrail.x, event.clientY - bandTrail.y) < 14) return;
+  bandTrail.x = event.clientX;
+  bandTrail.y = event.clientY;
+  emitTrail(event.clientX, event.clientY);
+}
+
 function onPointerMove(event) {
   // On phones touches are driven by the touch handlers below.
   if (event.pointerType === 'touch' && isPhone()) return;
   bg.pointer.x = event.clientX;
   bg.pointer.y = event.clientY;
   bg.pointer.active = event.pointerType !== 'touch';
+  updateBandPointer(event);
 
   const target = event.target instanceof Element ? event.target.closest(SPOTLIGHT_SELECTOR) : null;
   if (spotlightEl && spotlightEl !== target) spotlightEl.classList.remove('fx-lit');
@@ -656,6 +702,7 @@ function onPointerMove(event) {
 
 function onPointerLeave() {
   bg.pointer.active = false;
+  bg.pointer.inBand = false;
   spotlightEl?.classList.remove('fx-lit');
   spotlightEl = null;
 }
@@ -737,8 +784,15 @@ function onTouchEnd(event) {
 }
 
 let lastScrollY = globalThis.scrollY || 0;
+function syncScrolledBar() {
+  // Desktop: the transparent top band turns frosted once content scrolls under it.
+  body.classList.toggle('fx-scrolled', !isPhone() && (globalThis.scrollY || 0) > 8);
+  measureBand();
+}
+
 function onScroll() {
   const y = globalThis.scrollY || 0;
+  syncScrolledBar();
   const delta = clamp(y - lastScrollY, -90, 90);
   lastScrollY = y;
   if (!delta || !isPhone() || fxQuiet()) return;
@@ -859,11 +913,13 @@ function init() {
   resizeBackground();
   playIntro();
   syncIndicator();
+  syncScrolledBar();
   onViewMutated();
 
   globalThis.addEventListener('resize', () => {
     resizeBackground();
     syncIndicator();
+    syncScrolledBar();
     bg.focus.measuredAt = 0;
     ring.checkedAt = 0;
   }, { passive: true });
