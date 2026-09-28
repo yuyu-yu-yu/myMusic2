@@ -5056,7 +5056,6 @@ async function renderMixer() {
     </section>
     <section class="mixer-console">
       <div class="mixer-rack">
-        ${lowDistractionControl(preferences)}
         ${mixerControl('chatMusicBalance', '聊天 vs 推歌比例', '控制灿灿先像朋友聊，还是更积极接歌。', preferences)}
         ${mixerControl('recommendationFrequency', '主动推荐频率', '决定普通聊天中灿灿多久自然接一首歌。', preferences)}
         ${mixerControl('voiceMode', '语音播报', '控制灿灿什么时候把文字变成主持语音。', preferences)}
@@ -5949,37 +5948,6 @@ function mixerControl(key, title, description, preferences = {}) {
   `;
 }
 
-function lowDistractionControl(preferences = {}) {
-  const active = Boolean(preferences.lowDistractionMode);
-  return `
-    <article class="mixer-control low-distraction-control ${active ? 'is-active' : ''}" data-pref-control="lowDistractionMode">
-      <div class="mixer-control-head">
-        <div>
-          <h2>宿舍 / 自习室低打扰</h2>
-          <p class="muted">文字优先、减少口播和主动接歌，推荐更偏安静专注。</p>
-        </div>
-        <button
-          id="low-distraction-toggle"
-          class="switch-control ${active ? 'is-on' : ''}"
-          type="button"
-          role="switch"
-          aria-checked="${active ? 'true' : 'false'}"
-          data-pref-key="lowDistractionMode"
-          data-pref-value="${active ? 'false' : 'true'}"
-        >
-          <span class="switch-track" aria-hidden="true"><span></span></span>
-          <strong>${active ? 'LOW DISTRACTION' : 'NORMAL SIGNAL'}</strong>
-        </button>
-      </div>
-      <div class="low-distraction-strip" aria-hidden="true">
-        <span>LOW VOICE</span>
-        <span>SOFT MOTION</span>
-        <span>QUIET PICKS</span>
-      </div>
-    </article>
-  `;
-}
-
 function bindMixerControls(initialPreferences = {}) {
   let preferences = { ...initialPreferences };
   const controls = [...document.querySelectorAll('[data-pref-key]')];
@@ -5996,17 +5964,6 @@ function bindMixerControls(initialPreferences = {}) {
         button.classList.toggle('active', isMixerOptionActive(key, preferences[key], button.dataset.prefValue));
       });
     }
-    const lowToggle = document.querySelector('#low-distraction-toggle');
-    const lowPanel = document.querySelector('[data-pref-control="lowDistractionMode"]');
-    const lowActive = Boolean(preferences.lowDistractionMode);
-    if (lowToggle) {
-      lowToggle.classList.toggle('is-on', lowActive);
-      lowToggle.setAttribute('aria-checked', lowActive ? 'true' : 'false');
-      lowToggle.dataset.prefValue = lowActive ? 'false' : 'true';
-      const label = lowToggle.querySelector('strong');
-      if (label) label.textContent = lowActive ? 'LOW DISTRACTION' : 'NORMAL SIGNAL';
-    }
-    if (lowPanel) lowPanel.classList.toggle('is-active', lowActive);
     if (summaryEl) summaryEl.textContent = mixerModeSummary(preferences);
     applyLowDistractionVisualMode(preferences);
   };
@@ -6046,6 +6003,10 @@ function bindMixerControls(initialPreferences = {}) {
   });
 
   noteSave?.addEventListener('click', () => save({ note: note?.value || '' }));
+
+  // The low-distraction switch was removed from the mixer; turn the mode off
+  // for devices that had it enabled so they are not stuck in it.
+  if (preferences.lowDistractionMode) save({ lowDistractionMode: false });
 
   function setMixerStatus(text, kind) {
     if (!statusEl) return;
