@@ -4411,7 +4411,7 @@ async function renderLibrary() {
         <div class="stat"><span class="muted">最近播放</span><strong>${data.recent.length}</strong></div>
       </div>
       <div class="library-actions">
-        <button id="sync-btn" class="primary" ${isDemoGuestLibrary ? 'disabled' : ''}>同步音乐</button>
+        ${isDemoGuestLibrary ? '' : '<button id="sync-btn" class="primary">同步音乐</button>'}
         <button id="profile-update-btn" class="ghost profile-update-btn">更新音乐画像</button>
       </div>
       <div id="library-sync-progress" class="library-sync-progress" hidden></div>
@@ -4421,7 +4421,7 @@ async function renderLibrary() {
       ${data.tracks.slice(0, 50).map(trackItem).join('')}
     </section>
   `;
-  document.querySelector('#sync-btn').addEventListener('click', async () => {
+  document.querySelector('#sync-btn')?.addEventListener('click', async () => {
     if (isDemoGuestLibrary) return;
     const btn = document.querySelector('#sync-btn');
     const status = document.querySelector('#library-selection-status');
@@ -4543,6 +4543,7 @@ function librarySyncRunningText(syncStatus = {}) {
 }
 
 function librarySyncSourceLabel(source) {
+  if (state.library?.account?.source === 'guest') return '共享曲库';
   if (source === 'cookie') return '音乐扫码登录';
   if (source === 'openapi') return 'OpenAPI';
   if (source === 'demo') return 'Demo';
@@ -5120,6 +5121,7 @@ async function renderSettings() {
         ${statusRow('天气城市', status.weather.configured, status.weather.city)}
         ${statusRow('日程 MCP', status.schedule?.configured, status.schedule?.provider || 'feishu')}
       </table>
+      ${demoGuestMode ? '' : `
       <div class="netease-login-console trial-login-console ${cookieLogin.profileReadable ? 'is-online' : 'is-offline'}">
         <div class="trial-login-main">
           <div class="trial-login-title-row">
@@ -5146,11 +5148,11 @@ async function renderSettings() {
             </div>
             <img id="cookie-qr-img" class="qr-img" src="" alt="试用版登录二维码" style="display:none" />
           </div>
-          <button id="cookie-qr-btn" class="trial-login-primary" ${demoGuestMode ? 'disabled' : ''}>扫码登录音乐</button>
-          <button id="cookie-logout-btn" class="ghost trial-login-secondary" ${cookieLogin.hasCookie && !demoGuestMode ? '' : 'disabled'}>退出登录</button>
+          <button id="cookie-qr-btn" class="trial-login-primary">扫码登录音乐</button>
+          <button id="cookie-logout-btn" class="ghost trial-login-secondary" ${cookieLogin.hasCookie ? '' : 'disabled'}>退出登录</button>
           <p id="cookie-qr-status" class="muted"></p>
         </div>
-      </div>
+      </div>`}
     </section>
     ${scheduleSettingsPanel(scheduleStatus, preferences)}
     <section class="page-panel self-check-panel">
@@ -5199,6 +5201,7 @@ async function renderSettings() {
       </div>
       <p class="muted">长期记忆共有 ${memories.length} 条。重置本设备会删除当前浏览器的聊天、历史、偏好、画像、记忆和日记，但不会影响共享曲库、网易云账号或其他访客。</p>
     </section>
+    ${demoGuestMode ? '' : `
     <section class="page-panel developer-login-panel">
       <details class="openapi-login-advanced">
         <summary>
@@ -5216,13 +5219,13 @@ async function renderSettings() {
           ${statusRow('OpenAPI token', status.neteaseToken)}
         </table>
         <div class="netease-login compact">
-          <button id="qr-btn" class="ghost" ${demoGuestMode ? 'disabled' : ''}>开发者 OpenAPI 扫码</button>
-          <button id="qr-refresh-btn" class="ghost" ${demoGuestMode ? 'disabled' : ''}>刷新 OpenAPI token</button>
+          <button id="qr-btn" class="ghost">开发者 OpenAPI 扫码</button>
+          <button id="qr-refresh-btn" class="ghost">刷新 OpenAPI token</button>
           <p id="qr-status"></p>
           <img id="qr-img" class="qr-img" src="" alt="OpenAPI 登录二维码" style="display:none" />
         </div>
       </details>
-    </section>
+    </section>`}
   `;
   document.querySelector('#cookie-qr-btn')?.addEventListener('click', () => startCookieQrLogin());
   document.querySelector('#cookie-logout-btn')?.addEventListener('click', async () => {

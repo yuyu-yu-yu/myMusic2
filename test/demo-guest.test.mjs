@@ -18,7 +18,7 @@ import {
   setSetting
 } from '../server/db.mjs';
 import { cleanupDemoGuest, cleanupExpiredDemoGuests, DemoVisitorIdError, resolveRequestAccountContext } from '../server/demo-guest.mjs';
-import { getLibrary, getProfile, publishDemoLibrarySnapshot, updateProfile, updateProfilePlaylistSelection } from '../server/library.mjs';
+import { getLibrary, getProfile, publishDemoLibrarySnapshot, syncLibrary, updateProfile, updateProfilePlaylistSelection } from '../server/library.mjs';
 import { getDiaryOverview } from '../server/music-recap.mjs';
 import { getPreferences, restoreDeviceSnapshot, submitFeedback, updatePreferences } from '../server/radio.mjs';
 
@@ -319,6 +319,39 @@ test('guest can publish the current music profile as the shared demo snapshot', 
   assert.deepEqual(otherSelection.excludedIds, [excludedPlaylist.id]);
   assert.equal(otherSelection.selectedCount, 2);
   assert.equal(otherSelection.totalCount, 3);
+});
+
+test('publishing after a public allow-list sync refreshes guests seeded before the sync', async (t) => {
+  const db = testDb(t);
+  const seeded = seedDemoAccount(db);
+  const config = { demo: { guestMode: true } };
+  const earlyGuest = resolveRequestAccountContext(db, config, requestFor('early-visitor-1234'));
+  assert.deepEqual(JSON.parse(getAccountSetting(db, earlyGuest.accountId, 'library_synced_playlist_ids')), [seeded.playlistId]);
+
+  const netease = {
+    isConfigured: () => true,
+    hasToken: () => true,
+    userProfile: async () => ({ data: { profile: { userId: 'base-user', nickname: 'Base Demo' } } }),
+    starPlaylist: async () => ({ data: { records: [] } }),
+    subscribedPlaylists: async () => ({ data: { records: [{ id: 'pl-hidden', name: 'Hidden', trackCount: 1 }] } }),
+    createdPlaylists: async () => ({ data: { records: [{ id: 'pl-shown', name: 'Shown', trackCount: 1 }] } }),
+    playlistSongs: async (playlistId, offset) => {
+      if (offset > 0) return { data: { songs: [] } };
+      return { data: { songs: [{ id: `song-${playlistId}`, name: `Song ${playlistId}`, artists: [`Artist ${playlistId}`], album: 'Album' }] } };
+    },
+    recentSongs: async () => ({ data: { records: [] } })
+  };
+  const baseAccount = { accountId: seeded.baseAccountId, source: 'cookie', providerUserId: 'base-user' };
+  const synced = await syncLibrary(db, netease, { accountContext: baseAccount, playlistAllowList: ['pl-shown'] });
+  assert.equal(synced.playlists, 1);
+
+  const published = publishDemoLibrarySnapshot(db, baseAccount);
+  assert.equal(published.ok, true);
+
+  const library = getLibrary(db, earlyGuest);
+  assert.deepEqual(library.playlists.map((item) => item.id), ['pl-shown']);
+  assert.equal(library.profile.structured.artists.some((item) => item.name === 'Artist pl-hidden'), false);
+  assert.ok(library.profile.structured.artists.some((item) => item.name === 'Artist pl-shown'));
 });
 
 test('expired demo guest cleanup only deletes demo guest scoped data', (t) => {

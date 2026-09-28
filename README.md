@@ -41,6 +41,8 @@ DEMO_GUEST_TTL_HOURS=720
 
 When enabled, each browser profile stores a long-lived anonymous device id in `localStorage` and sends it as `X-Demo-Visitor-Id`. Tabs in the same browser profile share one sandbox, while chat, memories, feedback, preferences, plays, portraits, and diaries remain isolated from other visitors and the shared demo account. Inactive sandboxes are removed after 30 days by default.
 
+In guest mode the shared sync only keeps the playlists listed in `server/public-playlists.json` (override with a comma-separated `DEMO_PUBLIC_PLAYLIST_IDS`), and the music portrait is regenerated from those playlists only. Visitors cannot see or use QR login, logout or manual sync.
+
 ## TTS and Weather
 
 Real host narration uses Volcengine/Doubao TTS when these values are set:

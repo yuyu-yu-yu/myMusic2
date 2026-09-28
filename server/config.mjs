@@ -37,7 +37,8 @@ export function getConfig() {
     demo: {
       guestMode: parseBoolean(env.DEMO_GUEST_MODE) && !localDevUnlockDemo,
       guestTtlHours: Math.max(1, Number(env.DEMO_GUEST_TTL_HOURS || 720) || 720),
-      localDevUnlock: localDevUnlockDemo
+      localDevUnlock: localDevUnlockDemo,
+      publicPlaylistIds: resolvePublicPlaylistIds(env.DEMO_PUBLIC_PLAYLIST_IDS)
     },
     playback: {
       requireBrowserPlayUrl: parseBoolean(env.REQUIRE_BROWSER_PLAY_URL) && !localDevUnlockDemo
@@ -167,6 +168,24 @@ function buildScheduleConfig(env) {
     failureCacheMs: Math.max(1000, Number(env.SCHEDULE_MCP_FAILURE_CACHE_MS || 30 * 60 * 1000) || 30 * 60 * 1000),
     lookaheadHours: Math.max(1, Math.min(72, Number(env.SCHEDULE_MCP_LOOKAHEAD_HOURS || 24) || 24))
   };
+}
+
+const PUBLIC_PLAYLISTS_FILE = new URL('./public-playlists.json', import.meta.url);
+
+// Demo guest mode only exposes these NetEase playlists. The env var (comma or
+// whitespace separated ids) overrides the committed server/public-playlists.json.
+export function resolvePublicPlaylistIds(envValue) {
+  const fromEnv = String(envValue || '').split(/[\s,]+/).map(item => item.trim()).filter(Boolean);
+  if (fromEnv.length) return [...new Set(fromEnv)];
+  try {
+    const parsed = JSON.parse(fs.readFileSync(PUBLIC_PLAYLISTS_FILE, 'utf8'));
+    const list = Array.isArray(parsed) ? parsed : parsed?.playlists;
+    if (!Array.isArray(list)) return [];
+    const ids = list.map(item => String((item && typeof item === 'object') ? item.id ?? '' : item ?? '').trim()).filter(Boolean);
+    return [...new Set(ids)];
+  } catch {
+    return [];
+  }
 }
 
 function parseStringArray(value, fallback = []) {

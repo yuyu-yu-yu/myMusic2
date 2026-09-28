@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { getConfig, publicConfigStatus } from '../server/config.mjs';
+import { getConfig, publicConfigStatus, resolvePublicPlaylistIds } from '../server/config.mjs';
 
 const ENV_KEYS = [
   'DEMO_GUEST_MODE',
@@ -136,4 +136,12 @@ test('schedule MCP config uses read-only defaults and keeps credentials out of p
     assert.equal(status.schedule.cacheMs, 300000);
     assert.doesNotMatch(JSON.stringify(status), /private_feishu_secret|cli_test_app_id|FEISHU_APP_SECRET/);
   });
+});
+
+test('public playlist allow-list reads env override before the committed file', () => {
+  assert.deepEqual(resolvePublicPlaylistIds(' 111, 222 333,111 '), ['111', '222', '333']);
+  const fromFile = resolvePublicPlaylistIds('');
+  assert.ok(fromFile.length > 0);
+  assert.ok(fromFile.every((id) => /^\d+$/.test(id)));
+  assert.equal(new Set(fromFile).size, fromFile.length);
 });

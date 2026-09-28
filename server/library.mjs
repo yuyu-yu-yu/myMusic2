@@ -129,10 +129,27 @@ export async function syncLibrary(db, netease, options = {}) {
     }
   }
 
+  const playlistAllowList = normalizeIdList(options.playlistAllowList);
+  if (playlistAllowList.length && playlistRecords.length) {
+    const allowed = new Set(playlistAllowList);
+    const fetchedCount = playlistRecords.length;
+    const kept = playlistRecords.filter(({ kind, item }) => allowed.has(playlistRecordId(item, kind)));
+    playlistRecords.splice(0, playlistRecords.length, ...kept);
+    result.diagnostics.push({
+      kind: 'public_playlist_filter',
+      ok: kept.length > 0,
+      recordCount: kept.length,
+      message: `公开歌单白名单：保留 ${kept.length} / ${fetchedCount} 个歌单。`,
+      dataKeys: []
+    });
+  }
+
   if (!playlistRecords.length) {
-    const noPlaylistMessage = result.source === 'cookie'
-      ? 'Cookie login succeeded but no NetEase playlists were read. Please rescan or check account permissions.'
-      : 'Login succeeded but no NetEase playlists were read. Please check account permissions or rescan.';
+    const noPlaylistMessage = playlistAllowList.length
+      ? 'None of the public playlist allow-list ids were found in this NetEase account.'
+      : result.source === 'cookie'
+        ? 'Cookie login succeeded but no NetEase playlists were read. Please rescan or check account permissions.'
+        : 'Login succeeded but no NetEase playlists were read. Please check account permissions or rescan.';
     return {
       __error: true,
       ok: false,
@@ -1066,6 +1083,11 @@ function normalizeIdList(values = []) {
   return [...new Set((Array.isArray(values) ? values : [])
     .map((value) => String(value || '').trim())
     .filter(Boolean))];
+}
+
+// Must stay in sync with the id resolution in db.mjs savePlaylist().
+function playlistRecordId(playlist, kind = 'playlist') {
+  return String(playlist?.id ?? playlist?.playlistId ?? playlist?.resourceId ?? playlist?.coverId ?? kind);
 }
 
 function countTop(values = [], limit = 10) {

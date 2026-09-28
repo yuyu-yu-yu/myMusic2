@@ -126,6 +126,7 @@ function startLibrarySyncJob() {
       const result = await syncLibrary(db, netease, {
         llmConfig: config.llm,
         accountContext: resolveAccountContext(db),
+        playlistAllowList: config.demo?.guestMode ? config.demo.publicPlaylistIds : [],
         isCancelled: () => librarySyncStatus.jobId !== jobId,
         onProgress: (progress) => {
           if (librarySyncStatus.jobId !== jobId) return;
@@ -138,6 +139,14 @@ function startLibrarySyncJob() {
       if (librarySyncStatus.jobId !== jobId) return;
       if (result?.__error || result?.ok === false) {
         throw Object.assign(new Error(result.error || '同步失败'), { result });
+      }
+      if (config.demo?.guestMode) {
+        // Visitors seeded before this shared sync finished still hold the old snapshot; refresh them all.
+        try {
+          publishDemoLibrarySnapshot(db, resolveAccountContext(db));
+        } catch (error) {
+          console.warn('[sync] failed to publish shared snapshot to demo guests:', error?.message || error);
+        }
       }
       patchLibrarySyncStatus({
         status: 'success',

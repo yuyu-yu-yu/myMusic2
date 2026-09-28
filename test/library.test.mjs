@@ -180,6 +180,59 @@ test('library sync paginates all playlists and replaces stale playlist links', a
   assert.deepEqual(JSON.parse(getSetting(db, 'library_synced_playlist_ids')), playlists.map(playlist => playlist.id));
 });
 
+test('library sync with a public allow-list only syncs, lists and profiles allowed playlists', async (t) => {
+  const db = testDb(t);
+  const remotePlaylists = [
+    { id: 'pl-public-a', name: 'Public A', trackCount: 1 },
+    { id: 'pl-private', name: 'Private', trackCount: 1 },
+    { id: 12345, name: 'Public Numeric', trackCount: 1 }
+  ];
+  const fetched = [];
+  const netease = {
+    isConfigured: () => true,
+    hasToken: () => true,
+    userProfile: async () => ({ data: { profile: { userId: 'user-1', nickname: 'Tester' } } }),
+    starPlaylist: async () => ({ data: { records: [] } }),
+    subscribedPlaylists: async () => ({ data: { records: [remotePlaylists[1]] } }),
+    createdPlaylists: async () => ({ data: { records: [remotePlaylists[0], remotePlaylists[2]] } }),
+    playlistSongs: async (playlistId, offset) => {
+      fetched.push(String(playlistId));
+      if (offset > 0) return { data: { songs: [] } };
+      return { data: { songs: [{ id: `song-${playlistId}`, name: `Song ${playlistId}`, artists: [`Artist ${playlistId}`], album: 'Album' }] } };
+    },
+    recentSongs: async () => ({ data: { records: [] } })
+  };
+
+  const result = await syncLibrary(db, netease, { playlistAllowList: ['pl-public-a', '12345', 'missing-id'] });
+  const library = getLibrary(db);
+
+  assert.equal(result.playlists, 2);
+  assert.deepEqual(fetched.sort(), ['12345', 'pl-public-a']);
+  assert.deepEqual(library.playlists.map(item => item.id).sort(), ['12345', 'pl-public-a']);
+  assert.deepEqual(library.tracks.map(item => item.id).sort(), ['song-12345', 'song-pl-public-a']);
+  assert.equal(library.profile.structured.artists.some(item => item.name === 'Artist pl-private'), false);
+  assert.ok(result.diagnostics.some(item => item.kind === 'public_playlist_filter' && item.recordCount === 2));
+});
+
+test('library sync reports an error when no playlist matches the public allow-list', async (t) => {
+  const db = testDb(t);
+  const netease = {
+    isConfigured: () => true,
+    hasToken: () => true,
+    userProfile: async () => ({ data: { profile: { userId: 'user-1', nickname: 'Tester' } } }),
+    starPlaylist: async () => ({ data: { records: [{ id: 'pl-other', name: 'Other', trackCount: 1 }] } }),
+    subscribedPlaylists: async () => ({ data: { records: [] } }),
+    createdPlaylists: async () => ({ data: { records: [] } }),
+    playlistSongs: async () => { throw new Error('should not fetch songs'); },
+    recentSongs: async () => ({ data: { records: [] } })
+  };
+
+  const result = await syncLibrary(db, netease, { playlistAllowList: ['pl-public'] });
+
+  assert.equal(result.ok, false);
+  assert.match(result.error, /allow-list/);
+});
+
 test('sync clears previous playlist links before rebuilding current account snapshot', async (t) => {
   const db = testDb(t);
   const playlist = savePlaylist(db, { id: 'pl-fail', name: 'Fail Playlist', trackCount: 2 }, 'created');

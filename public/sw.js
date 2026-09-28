@@ -1,4 +1,4 @@
-const CACHE = 'mymusic-v54';
+const CACHE = 'mymusic-v55';
 const ASSETS = ['/', '/styles.css', '/app.js', '/fx.css', '/fx.js', '/device-identity.js', '/track-identity.js', '/playback-sequence.js', '/manifest.webmanifest', '/assets/icon.svg', '/assets/fonts/fusion-pixel-core.woff2', '/avatar/source/cancan-first-frame.png?v=4'];
 
 function parseRange(rangeHeader, size) {
