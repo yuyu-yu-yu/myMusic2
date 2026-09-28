@@ -840,7 +840,8 @@ function serveStatic(req, res) {
     '.jpeg': 'image/jpeg',
     '.webm': 'video/webm',
     '.mp4': 'video/mp4',
-    '.mp3': 'audio/mpeg'
+    '.mp3': 'audio/mpeg',
+    '.woff2': 'font/woff2'
   };
   serveStaticFile(
     req,

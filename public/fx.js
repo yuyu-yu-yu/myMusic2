@@ -7,6 +7,9 @@ const root = doc.documentElement;
 const body = doc.body;
 const motionQuery = globalThis.matchMedia?.('(prefers-reduced-motion: reduce)');
 const coarseQuery = globalThis.matchMedia?.('(pointer: coarse)');
+// Phone layout gets its own FX logic; everything gated by isPhone() leaves the
+// desktop / tablet behaviour exactly as it was.
+const phoneQuery = globalThis.matchMedia?.('(max-width: 760px)');
 
 const PALETTE = [
   { rgb: [34, 230, 255], weight: 0.44 }, // cyan
@@ -18,6 +21,7 @@ const PALETTE = [
 const reduceMotion = () => Boolean(motionQuery?.matches);
 const lowDistraction = () => body.classList.contains('low-distraction-mode');
 const isCompact = () => globalThis.innerWidth <= 760 || Boolean(coarseQuery?.matches);
+const isPhone = () => Boolean(phoneQuery?.matches);
 const rand = (min, max) => min + Math.random() * (max - min);
 const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
 
@@ -95,6 +99,12 @@ function glowSprite(rgb) {
 
 function particleBudget() {
   const area = bg.w * bg.h;
+  if (isPhone()) {
+    // Phones used to get ~23 dots (desktop budget scaled by area). Give them a
+    // proper constellation sized to the phone screen instead.
+    const phone = Math.round(60 * clamp(area / (390 * 844), 0.75, 1.25));
+    return reduceMotion() ? Math.round(phone * 0.5) : phone;
+  }
   const base = isCompact() ? 42 : 96;
   const scaled = Math.round(base * clamp(area / (1440 * 900), 0.55, 1.35));
   return reduceMotion() ? Math.round(scaled * 0.5) : scaled;
@@ -123,6 +133,9 @@ function resizeBackground() {
   bg.h = globalThis.innerHeight;
   bg.canvas.width = Math.round(bg.w * bg.dpr);
   bg.canvas.height = Math.round(bg.h * bg.dpr);
+  // Mobile browsers resize innerHeight as the toolbar collapses; pin the CSS
+  // size to the backing store so the canvas never stretches.
+  bg.canvas.style.height = isPhone() ? `${bg.h}px` : '';
   bg.ctx = bg.canvas.getContext('2d');
   const budget = particleBudget();
   while (bg.particles.length < budget) bg.particles.push(makeParticle());
@@ -135,7 +148,7 @@ function resizeBackground() {
 }
 
 function measureFocus(now) {
-  if (now - bg.focus.measuredAt < 400) return bg.focus;
+  if (now - bg.focus.measuredAt < (isPhone() ? 120 : 400)) return bg.focus;
   bg.focus.measuredAt = now;
   const stage = doc.querySelector('.avatar-stage');
   const rect = stage?.getBoundingClientRect();
@@ -261,7 +274,7 @@ function updateBackground(dt, now) {
 
   if (now > bg.nextMeteorAt) {
     bg.nextMeteorAt = now + rand(5200, 11000) / (audio.live ? 1.6 : 1);
-    if (!isCompact() || Math.random() > 0.5) spawnMeteor();
+    if (!isCompact() || isPhone() || Math.random() > 0.5) spawnMeteor();
   }
   for (const m of bg.meteors) {
     m.x += m.vx * dt * 0.06;
@@ -284,7 +297,7 @@ function drawBackground(dt, now) {
   pointer.py += (parallaxY - pointer.py) * 0.05;
 
   const particles = bg.particles;
-  const linkDist = isCompact() ? 90 : 128;
+  const linkDist = isPhone() ? 100 : isCompact() ? 90 : 128;
   const linkDist2 = linkDist * linkDist;
   const lineBoost = 0.55 + audio.level * 1.6 + audio.beat * 0.8;
 
@@ -426,6 +439,11 @@ function drawSpectrum(now) {
     ring.bars[i] += (clamp(target, 0, 1) - ring.bars[i]) * (target > ring.bars[i] ? 0.45 : 0.12);
   }
 
+  if (isPhone()) {
+    drawOrbitRing(ctx, size, now);
+    return;
+  }
+
   const cx = size / 2;
   const cy = size / 2;
   const inner = size * 0.39;
@@ -448,6 +466,77 @@ function drawSpectrum(now) {
     ctx.lineTo(cx + cos * (inner + len), cy + sin * (inner + len));
     ctx.stroke();
   }
+}
+
+/* Phone: a ring of orbiting glow particles around the round avatar orb.
+   Each particle rides the spectrum bin under its angle, so the ring breathes
+   and spikes with the music (a particle version of the desktop spectrum). */
+const orbit = { dots: [], last: 0 };
+
+function makeOrbitDots(count) {
+  const dots = [];
+  for (let i = 0; i < count; i += 1) {
+    const inner = Math.random() < 0.7;
+    dots.push({
+      a: rand(0, Math.PI * 2),
+      r: inner ? rand(0.305, 0.35) : rand(0.36, 0.45), // × canvas size
+      w: (Math.random() < 0.82 ? 1 : -1) * rand(0.16, 0.5), // rad / s
+      s: Math.random() > 0.72 ? 3 : 2,
+      ph: rand(0, Math.PI * 2),
+      rgb: pickColor()
+    });
+  }
+  return dots;
+}
+
+function drawOrbitRing(ctx, size, now) {
+  if (!orbit.dots.length) orbit.dots = makeOrbitDots(84);
+  const dt = orbit.last ? Math.min(48, now - orbit.last) / 1000 : 0;
+  orbit.last = now;
+  const t = now / 1000;
+  const cx = size / 2;
+  const cy = size / 2;
+  const count = ring.bars.length;
+  const total = count * 2;
+  const speed = 1 + audio.level * 3 + audio.beat * 2.2;
+
+  // faint dashed track
+  ctx.setLineDash([2, 6]);
+  ctx.lineWidth = 1;
+  ctx.strokeStyle = `rgba(160, 140, 255, ${(0.14 + audio.level * 0.25).toFixed(3)})`;
+  ctx.beginPath();
+  ctx.arc(cx, cy, size * 0.4, t * 0.1, t * 0.1 + Math.PI * 2);
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  for (const d of orbit.dots) {
+    d.a += d.w * speed * dt;
+    let norm = ((d.a + Math.PI / 2) / (Math.PI * 2)) % 1;
+    if (norm < 0) norm += 1;
+    const k = Math.min(total - 1, Math.floor(norm * total));
+    const v = ring.bars[k < count ? k : total - 1 - k];
+    const r = size * (d.r + v * 0.12) + Math.sin(t * 1.8 + d.ph) * 1.5 + audio.beat * 4;
+    const x = cx + Math.cos(d.a) * r;
+    const y = cy + Math.sin(d.a) * r;
+    const alpha = clamp(0.4 + v * 0.7 + Math.sin(t * 2.6 + d.ph) * 0.18, 0.12, 1);
+
+    if (d.s > 2) {
+      const tail = 0.2 * Math.sign(d.w) * Math.min(speed, 2.6);
+      ctx.strokeStyle = `rgba(${d.rgb[0]}, ${d.rgb[1]}, ${d.rgb[2]}, ${(alpha * 0.32).toFixed(3)})`;
+      ctx.lineWidth = 1.5;
+      ctx.beginPath();
+      ctx.arc(cx, cy, r, d.a - tail, d.a, tail < 0);
+      ctx.stroke();
+    }
+
+    const glow = (6 + d.s * 3) * (1 + v * 1.3 + audio.beat * 0.6);
+    ctx.globalAlpha = alpha * 0.85;
+    ctx.drawImage(glowSprite(d.rgb), x - glow / 2, y - glow / 2, glow, glow);
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = `rgb(${d.rgb[0]}, ${d.rgb[1]}, ${d.rgb[2]})`;
+    ctx.fillRect(Math.round(x - d.s / 2), Math.round(y - d.s / 2), d.s, d.s);
+  }
+  ctx.globalAlpha = 1;
 }
 
 /* ------------------------------------------------------------------ */
@@ -519,6 +608,8 @@ const SPOTLIGHT_SELECTOR = [
 
 let spotlightEl = null;
 function onPointerMove(event) {
+  // On phones touches are driven by the touch handlers below.
+  if (event.pointerType === 'touch' && isPhone()) return;
   bg.pointer.x = event.clientX;
   bg.pointer.y = event.clientY;
   bg.pointer.active = event.pointerType !== 'touch';
@@ -575,6 +666,84 @@ function onPointerDown(event) {
   const strong = target.matches('.transport-main-btn, .radio-mode-btn, #like-btn');
   emitSparks(event.clientX, event.clientY, strong ? 22 : 12, strong ? 1.25 : 0.8);
   if (strong && !reduceMotion()) emitRing(event.clientX, event.clientY, 0.25, target.matches('#like-btn') ? [255, 79, 216] : [34, 230, 255]);
+}
+
+/* ------------------------------------------------------------------ */
+/* Phone: touch + scroll interactions                                  */
+/* ------------------------------------------------------------------ */
+
+// While a finger is down the constellation links to it and particles part
+// around it (the desktop cursor effect), a short comet trail follows the
+// finger, a tap on empty space sends out a ripple, and scrolling moves the
+// particles at depth-dependent speeds for a parallax feel.
+const touch = { down: false, x: 0, y: 0, sx: 0, sy: 0, t0: 0, moved: false, lastTrailAt: 0 };
+const fxQuiet = () => lowDistraction() || reduceMotion();
+
+function emitTrail(x, y) {
+  for (let i = 0; i < 2; i += 1) {
+    bg.sparks.push({
+      x: x + rand(-5, 5),
+      y: y + rand(-5, 5),
+      vx: rand(-0.7, 0.7),
+      vy: rand(-1, -0.1),
+      life: 1,
+      decay: rand(0.03, 0.05),
+      size: Math.random() > 0.6 ? 3 : 2,
+      rgb: pickColor()
+    });
+  }
+  if (bg.sparks.length > 220) bg.sparks.splice(0, bg.sparks.length - 220);
+}
+
+function onTouchStart(event) {
+  if (!isPhone()) return;
+  const point = event.touches[0];
+  if (!point) return;
+  touch.down = true;
+  touch.moved = false;
+  touch.t0 = performance.now();
+  touch.x = touch.sx = point.clientX;
+  touch.y = touch.sy = point.clientY;
+  bg.pointer.x = touch.x;
+  bg.pointer.y = touch.y;
+  bg.pointer.active = !fxQuiet();
+}
+
+function onTouchMove(event) {
+  if (!touch.down) return;
+  const point = event.touches[0];
+  if (!point) return;
+  touch.x = bg.pointer.x = point.clientX;
+  touch.y = bg.pointer.y = point.clientY;
+  if (Math.hypot(touch.x - touch.sx, touch.y - touch.sy) > 10) touch.moved = true;
+  const now = performance.now();
+  if (!fxQuiet() && now - touch.lastTrailAt > 40) {
+    touch.lastTrailAt = now;
+    emitTrail(touch.x, touch.y);
+  }
+}
+
+function onTouchEnd(event) {
+  if (!touch.down) return;
+  if (event.touches?.length) return;
+  touch.down = false;
+  bg.pointer.active = false;
+  const interactive = event.target instanceof Element
+    ? event.target.closest('button, a, input, select, textarea, label, [role="slider"]')
+    : null;
+  if (touch.moved || interactive || fxQuiet() || performance.now() - touch.t0 > 400) return;
+  emitRing(touch.x, touch.y, 0.2, pickColor());
+  emitSparks(touch.x, touch.y, 12, 0.75);
+}
+
+let lastScrollY = globalThis.scrollY || 0;
+function onScroll() {
+  const y = globalThis.scrollY || 0;
+  const delta = clamp(y - lastScrollY, -90, 90);
+  lastScrollY = y;
+  if (!delta || !isPhone() || fxQuiet()) return;
+  for (const p of bg.particles) p.y -= delta * (0.1 + p.z * 0.4);
+  bg.focus.measuredAt = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -702,6 +871,11 @@ function init() {
   globalThis.addEventListener('pointerdown', onPointerDown, { passive: true });
   doc.addEventListener('pointerleave', onPointerLeave);
   globalThis.addEventListener('blur', onPointerLeave);
+  globalThis.addEventListener('touchstart', onTouchStart, { passive: true });
+  globalThis.addEventListener('touchmove', onTouchMove, { passive: true });
+  globalThis.addEventListener('touchend', onTouchEnd, { passive: true });
+  globalThis.addEventListener('touchcancel', onTouchEnd, { passive: true });
+  globalThis.addEventListener('scroll', onScroll, { passive: true });
 
   if (view) new MutationObserver(onViewMutated).observe(view, { childList: true });
   if (nav) {
